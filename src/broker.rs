@@ -460,17 +460,7 @@ impl Broker {
                 json!({"subscribed":false,"agent":agent,"board":"main"})
             }
             Request::Register { mut agent, replace } => {
-                if agent.provider == Provider::Claude {
-                    agent.endpoint = delivery::validate_socket(Path::new(&agent.endpoint))?
-                        .to_string_lossy()
-                        .into_owned();
-                }
-                if agent.provider != Provider::Claude {
-                    ensure!(
-                        agent.endpoint.is_empty(),
-                        "Only Claude registrations accept a socket endpoint"
-                    );
-                }
+                crate::clients::validate_registration(&mut agent)?;
                 db.register(&agent, replace)?;
                 json!(agent)
             }
@@ -732,7 +722,11 @@ impl Broker {
             Request::LanPairingWatch { agent, id, seconds } => {
                 let agent = db.agent(&agent)?;
                 ensure!(
-                    agent.enabled && agent.provider != Provider::Inbox,
+                    agent.enabled
+                        && crate::clients::supports(
+                            &agent.provider,
+                            crate::clients::Capability::ControlNotices
+                        ),
                     "Choose an enabled native agent for pairing notifications"
                 );
                 let now = crate::db::now();
@@ -1300,15 +1294,8 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     tokio::pin!(board_notifications);
     let networking = crate::network::worker::run(broker.clone());
     tokio::pin!(networking);
-    let observer = async {
-        if let Some(home) = codex_home {
-            crate::discovery::run(bound.broker.clone(), home).await;
-        }
-        std::future::pending::<()>().await;
-    };
+    let observer = crate::clients::observe(bound.broker.clone(), codex_home);
     tokio::pin!(observer);
-    let claude_observer = crate::claude_discovery::run(bound.broker.clone());
-    tokio::pin!(claude_observer);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     eprintln!(
         "agent-bridge {} listening at {}",
@@ -1330,7 +1317,6 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
             res=&mut pairing_notifications=>break res,
             res=&mut board_notifications=>break res,
             _=&mut networking=>unreachable!("Network worker runs until shutdown"),
-            _=&mut claude_observer=>unreachable!("Claude title observer runs until shutdown"),
             _=&mut observer=>unreachable!("Discovery observer runs until shutdown"),
             _=tokio::signal::ctrl_c()=>break Ok(()),
             _=terminate.recv()=>break Ok(()),

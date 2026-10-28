@@ -5,11 +5,12 @@ mod board_notifications;
 mod board_selection;
 pub mod board_tui;
 pub mod broker;
-pub mod claude_discovery;
+pub mod clients;
+pub use clients::claude_discovery;
 pub mod db;
 pub mod delivery;
-pub mod discovery;
-pub mod hook;
+pub use clients::codex_discovery as discovery;
+pub use clients::lifecycle as hook;
 pub mod mcp;
 pub mod migrations;
 pub mod network;
@@ -19,7 +20,6 @@ pub mod service;
 pub mod monitor;
 mod monitor_data;
 
-mod codex_queue;
 mod pairing_notifications;
 
 /// Application version selected by the release tag or packaged source metadata.

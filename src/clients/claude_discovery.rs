@@ -27,7 +27,7 @@ impl Titles {
             }
             for session in &sessions {
                 // Session IDs originate in native hooks, but still must not become arbitrary paths.
-                if uuid::Uuid::parse_str(session).is_err() {
+                if super::claude::validate_session(session).is_err() {
                     continue;
                 }
                 let path = project.path().join(format!("{session}.jsonl"));

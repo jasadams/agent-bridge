@@ -298,18 +298,7 @@ impl Db {
             agent.name != "user",
             "The name user is reserved for your inbox"
         );
-        ensure!(
-            !agent.session.is_empty() && agent.session.len() <= 200,
-            "Invalid session ID"
-        );
-        if agent.provider == Provider::Codex {
-            uuid::Uuid::parse_str(&agent.session)
-                .context("Codex registration requires a thread UUID, not a mutable display name")?;
-        }
-        if agent.provider == Provider::Claude {
-            uuid::Uuid::parse_str(&agent.session)
-                .context("Claude registration requires a session UUID")?;
-        }
+        crate::clients::validate_session(&agent.provider, &agent.session)?;
         let tx = self.conn.transaction()?;
         let old: Option<(String, String)> = tx
             .query_row(

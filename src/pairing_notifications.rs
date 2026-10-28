@@ -4,7 +4,7 @@ use crate::{
     broker::Broker,
     delivery,
     network::lan_pairing::View,
-    protocol::{Agent, Message, Provider},
+    protocol::{Agent, Message},
 };
 use anyhow::{Result, ensure};
 use std::{
@@ -69,7 +69,11 @@ impl State {
         now: i64,
     ) -> Result<()> {
         ensure!(
-            agent.enabled && agent.provider != Provider::Inbox,
+            agent.enabled
+                && crate::clients::supports(
+                    &agent.provider,
+                    crate::clients::Capability::ControlNotices
+                ),
             "Pairing notifications require an enabled native session"
         );
         ensure!(
@@ -323,9 +327,13 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
                 created: now,
                 updated: now,
             };
-            let outcome =
-                delivery::deliver_control_notice(&notice.agent, &message, &broker.state_dir, &text)
-                    .await;
+            let outcome = delivery::deliver_control_notice(
+                &notice.agent,
+                &message,
+                &broker.state_dir,
+                crate::clients::ControlNotice::Pairing(&text),
+            )
+            .await;
             if outcome.state != "submitted" {
                 eprintln!(
                     "Pairing notification {} was not submitted: {}",
@@ -339,6 +347,7 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Provider;
     fn agent() -> Agent {
         Agent {
             name: "local-agent".into(),

@@ -4,7 +4,7 @@
 use crate::{
     broker::Broker,
     delivery,
-    protocol::{Agent, Message, Provider},
+    protocol::{Agent, Message},
 };
 use anyhow::{Result, ensure};
 use std::{
@@ -57,7 +57,11 @@ impl State {
     /// edits still belong to existing subscribers, never to the new subscriber.
     pub(crate) fn subscribe(&mut self, agent: Agent, revision: &str, now: Instant) -> Result<()> {
         ensure!(
-            agent.enabled && matches!(agent.provider, Provider::Codex | Provider::Claude),
+            agent.enabled
+                && crate::clients::supports(
+                    &agent.provider,
+                    crate::clients::Capability::ControlNotices
+                ),
             "Board notifications require an enabled local native session"
         );
         ensure!(
@@ -253,7 +257,7 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
                         &notice.agent,
                         &message,
                         &this.state_dir,
-                        &message.body,
+                        crate::clients::ControlNotice::BoardChanged(&message.body),
                     )
                     .await;
                     if outcome.state != "submitted" {
@@ -271,6 +275,7 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Provider;
 
     fn agent(name: &str) -> Agent {
         Agent {

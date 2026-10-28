@@ -102,7 +102,7 @@ async fn prepare(path: &Path, home: &Path, session: &str) -> Result<Socket> {
     bail!("Destination session is not loaded; bridge will not start or resume it")
 }
 async fn deliver_at(paths: Vec<PathBuf>, home: &Path, msg: &Message, text: &str) -> Outcome {
-    if uuid::Uuid::parse_str(&msg.recipient_session).is_err() {
+    if validate_session(&msg.recipient_session).is_err() {
         return Outcome::failed("Invalid Codex session UUID");
     }
     let mut socket = None;
@@ -159,7 +159,7 @@ pub(crate) async fn deliver(msg: &Message, text: &str) -> Outcome {
     // Bound the entire lookup+write exchange, including silent or busy daemons.
     match timeout(
         Duration::from_secs(20),
-        deliver_at(crate::discovery::socket_paths(), &home, msg, text),
+        deliver_at(super::codex_discovery::socket_paths(), &home, msg, text),
     )
     .await
     {
@@ -168,6 +168,13 @@ pub(crate) async fn deliver(msg: &Message, text: &str) -> Outcome {
             "Native queue timed out; inspect native conversation before explicitly retrying",
         ),
     }
+}
+
+/// Stable native identity, never a mutable display name.
+pub fn validate_session(session: &str) -> anyhow::Result<()> {
+    uuid::Uuid::parse_str(session)
+        .context("Codex registration requires a thread UUID, not a mutable display name")?;
+    Ok(())
 }
 
 #[cfg(test)]

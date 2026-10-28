@@ -8,7 +8,7 @@ use crate::{
             WireResponse,
         },
     },
-    protocol::{MAX_BODY, MAX_FRAME, Message, Provider},
+    protocol::{MAX_BODY, MAX_FRAME, Message},
 };
 use anyhow::{Context, Result, bail, ensure};
 use libp2p::Multiaddr;
@@ -56,15 +56,7 @@ fn canonical_peer(peer: &str) -> Result<()> {
 
 fn validate_agent(agent: &RemoteAgent) -> Result<()> {
     ensure!(valid_name(&agent.name), "Invalid remote agent name");
-    ensure!(
-        !agent.session.is_empty()
-            && agent.session.len() <= 200
-            && !agent.session.chars().any(char::is_control),
-        "Invalid remote session"
-    );
-    if agent.provider != Provider::Inbox {
-        uuid::Uuid::parse_str(&agent.session).context("Native remote session must be a UUID")?;
-    }
+    crate::clients::validate_remote_session(&agent.provider, &agent.session)?;
     Ok(())
 }
 
