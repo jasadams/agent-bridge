@@ -2,3 +2,6 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# Local independent-review records; preserved in the canonical clone.
+/docs/review-logs/

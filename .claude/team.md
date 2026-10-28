@@ -1,8 +1,9 @@
 # Agent Bridge
 
-team_key: AB
+team_key: AGB
 team_name: Agent Bridge
 github_repo: jasadams/agent-bridge
+default_branch: main
 
 ## Versioning
 
