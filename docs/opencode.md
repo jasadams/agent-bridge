@@ -4,14 +4,49 @@ The built-in `opencode` provider targets an exact existing OpenCode session, not
 its build/plan mode. This integration supports OpenCode **1.18.35**, its **V1**
 `@opencode-ai/plugin` and `@opencode-ai/sdk` packages at **1.18.35**. Native
 OpenCode embeds Bun **1.3.14**; standalone plugin tests use Bun **1.3.11**. The plugin package and lockfile are in `plugins/opencode/`.
-Installation into the owner's configuration is separate work; this ticket does
-not install a plugin, replace a service, or change native permissions.
+Opt-in setup is available through `agent-bridge opencode install`; see
+[installation and removal](install.md). Setup writes plugin/MCP configuration and
+bundled assets only. It does not start a native session, run inference, replace a
+service, enable sharing or change native permissions. Restart affected OpenCode
+instances after installation, updates or removal.
 
 The plugin uses the SDK client supplied by OpenCode. That client can use an
 in-process fetch transport: `serverUrl` is deliberately not used to discover or
 contact an HTTP server. No model API key belongs in the broker. Normal native
 usage continues, and delivery never creates a replacement conversation or edits
 transcript files.
+
+## Session context and presentation
+
+The V1 system transform supplies one stable messaging block on each model request
+for a verified live session. It names the exact `opencode-SESSION_ID` route and
+broker state directory, explains explicit acknowledgement and correlated replies,
+and gives brief shared-board guidance. It replaces its own block if a hook array
+is reused. Missing, expired or replaced identities omit the block; context hooks
+do not activate stored history. Native compaction receives additional summary
+guidance without replacing its default prompt. The next model request refreshes
+the messaging block, including after reload when lifecycle activity verifies the
+session again.
+
+Ordinary peer messages contain a bounded sender display label, the complete body
+and minimal message/from/to/parent references. Setup instructions are not appended
+to each peer message. The resulting user text and system context are separately
+model-visible: the system block still costs tokens on each request. This is plain
+native text, with no claim of Claude-style peer cards or a custom rich renderer.
+Display labels never replace exact route references.
+
+The existing MCP connection provides discovery, send, acknowledge, correlated
+reply and shared-board read/update. Board notifications remain off by default;
+subscribe with the exact session identity, attribute own writes, and unsubscribe
+when no longer needed. Keep board task/status/blocker or user-action entries
+brief and revise the current entry; leave detailed logs in the native terminal.
+The board has no required table schema. See [board behavior](board.md).
+
+Native owner pairing prompts are unavailable for OpenCode: no supported V1 owner
+Yes/No input workflow has been established. CLI/MCP pairing selectors reject an
+OpenCode target before creating an exchange; use the explicit owner CLI pairing
+workflow instead. Board controls remain supported. Peer text, board content and
+native permission requests cannot supply pairing consent or change permissions.
 
 ## Live session scope
 
@@ -152,6 +187,10 @@ configuration or credentials. Rust local transport coverage is in `tests/opencod
 isolated two-broker remote coverage are in `tests/opencode_store.rs` and
 `tests/opencode_network.rs`. These source checks do not establish live model
 reasoning, physical cross-machine delivery or macOS runtime acceptance.
+`tools/opencode-setup-native.sh` separately runs the built installer and extracted
+plugin/MCP assets, checking model-visible context, native compaction/reload,
+compact peer presentation and board opt-in/notification behavior. These checks
+use the same credential-free local provider boundary.
 The deterministic native harness uses a local model fixture; it checks real
 OpenCode/plugin/broker execution, acknowledgement/reply, read-only reconciliation,
 held native tools, queued pause/cancel, unanswered permission waits and the residual

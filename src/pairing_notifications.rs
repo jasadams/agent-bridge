@@ -72,9 +72,9 @@ impl State {
             agent.enabled
                 && crate::clients::supports(
                     &agent.provider,
-                    crate::clients::Capability::ControlNotices
+                    crate::clients::Capability::PairingPrompts
                 ),
-            "Pairing notifications require an enabled native session"
+            "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
         );
         ensure!(
             (30..=600).contains(&seconds),

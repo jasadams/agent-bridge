@@ -350,19 +350,18 @@ async fn shared_opencode_sessions_submit_once_and_exchange_exact_acknowledged_re
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0]["id"], local);
     let content = frames[0]["content"].as_str().unwrap();
-    let native_envelope: Value = serde_json::from_str(content.lines().nth(1).unwrap()).unwrap();
-    assert_eq!(native_envelope["body"], body);
     assert_eq!(
-        native_envelope["from"],
-        format!("{}/{}", a.identity(), na.name())
+        content,
+        format!(
+            "alice/{}:\n{body}\n\n[peer id={local} from={}/{} to={}]",
+            na.name(),
+            a.identity(),
+            na.name(),
+            nb.name()
+        )
     );
-    assert_eq!(native_envelope["id"], local);
-    assert_eq!(native_envelope["source_machine"]["peer_id"], a.identity());
-    assert_eq!(
-        native_envelope["destination_machine"]["peer_id"],
-        b.identity()
-    );
-    assert!(content.contains(&format!("--in-reply-to '{local}'")));
+    assert!(!content.contains("Prefer the configured"));
+    assert!(!content.contains("--in-reply-to"));
     b.request(Request::Ack {
         id: local.into(),
         agent: nb.name(),

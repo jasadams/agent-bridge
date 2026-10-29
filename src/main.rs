@@ -159,6 +159,11 @@ enum Commands {
         #[arg(long, value_enum)]
         provider: Provider,
     },
+    /// Explicitly install or remove the OpenCode V1 plugin and MCP configuration.
+    Opencode {
+        #[command(subcommand)]
+        action: OpenCodeAction,
+    },
     Hooks {
         #[command(subcommand)]
         action: HookAction,
@@ -166,6 +171,18 @@ enum Commands {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum OpenCodeAction {
+    Install {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    Uninstall {
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -482,6 +499,18 @@ async fn main() -> Result<()> {
             return update_install::run(&state_dir, check, disable_checks, enable_checks);
         }
         Commands::Mcp => return agent_bridge::mcp::run(state_dir).await,
+        Commands::Opencode { action } => {
+            let (install, config) = match action {
+                OpenCodeAction::Install { config } => (true, config),
+                OpenCodeAction::Uninstall { config } => (false, config),
+            };
+            return agent_bridge::opencode_install::configure(
+                &state_dir,
+                config.as_deref(),
+                install,
+            );
+        }
+
         Commands::Board { raw } => {
             if raw {
                 let value = broker::rpc(&state_dir, &Request::BoardRead).await?;
@@ -836,9 +865,9 @@ async fn main() -> Result<()> {
                         .and_then(|provider| provider.parse::<Provider>().ok())
                         .is_some_and(|provider| agent_bridge::clients::supports(
                             &provider,
-                            agent_bridge::clients::Capability::ControlNotices
+                            agent_bridge::clients::Capability::PairingPrompts
                         )))),
-            "Pairing notification agent must be an enabled local native session; use --agent with a registered name"
+            "Pairing owner input is unavailable for this session; omit --agent and use the explicit pairing CLI confirmation path"
         );
     }
     let mut result = broker::rpc(&state_dir, &req).await?;

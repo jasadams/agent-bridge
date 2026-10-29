@@ -26,6 +26,40 @@ pub fn validate_session(session: &str) -> Result<()> {
     Ok(())
 }
 
+/// Plain text presentation, with immutable tool identities separate from labels.
+/// Stable instructions belong to the plugin's system context, not each message.
+pub(crate) fn message_content(msg: &Message, machines: &Value) -> String {
+    use unicode_general_category::{GeneralCategory as Category, get_general_category};
+    let label = machines["sender_name"].as_str().unwrap_or(&msg.sender);
+    let label: String = label
+        .chars()
+        .filter(|c| {
+            !matches!(
+                get_general_category(*c),
+                Category::Control
+                    | Category::Format
+                    | Category::LineSeparator
+                    | Category::ParagraphSeparator
+            )
+        })
+        .take(160)
+        .collect();
+    let label = if label.trim().is_empty() {
+        msg.sender.as_str()
+    } else {
+        label.trim()
+    };
+    let parent = msg
+        .parent
+        .as_ref()
+        .map(|id| format!(" parent={id}"))
+        .unwrap_or_default();
+    format!(
+        "{label}:\n{}\n\n[peer id={} from={} to={}{parent}]",
+        msg.body, msg.id, msg.sender, msg.recipient
+    )
+}
+
 pub fn validate_endpoint(endpoint: &str) -> Result<PathBuf> {
     let path = super::claude::validate_socket(Path::new(endpoint))?;
     endpoint_instance(&path)?;

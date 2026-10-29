@@ -126,7 +126,7 @@ authenticated approval: agents can also edit this shared document.
 
 ## Subscribe to changes
 
-Notifications are off by default. An enabled local Codex or Claude session can
+Notifications are off by default. An enabled local Codex, Claude or OpenCode session can
 opt in with the `subscribe_board` MCP tool, selecting its exact registration:
 
 ```json
@@ -146,6 +146,12 @@ scheduling thresholds; a paused broker, queued work or native transport can dela
 receipt. The notice contains no Markdown and is not a normal message requiring
 acknowledgement. Failed or uncertain native submissions are not automatically
 retried; the board remains available through `read_board`.
+
+OpenCode notices use its durable native admission and receipt path: busy or
+permission-waiting work can delay insertion, pause holds delivery, and an
+uncertain native attempt is not resubmitted. Unsubscribe cancels pending notices;
+close, lease expiry or registration replacement removes the subscription. A
+notice is local board guidance, never an owner pairing or permission response.
 
 To avoid being notified of its own writes, an agent supplies its own registered
 name in the optional `agent` field of `update_board`. Unattributed updates,

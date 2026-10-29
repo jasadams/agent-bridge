@@ -11,6 +11,30 @@ from package_release import license_files, normalized_entry, release_notes, sour
 
 
 class PackagingTests(unittest.TestCase):
+    def test_opencode_runtime_import_closure_is_embedded_and_archived(self):
+        repo = Path(__file__).resolve().parents[1]
+        installer = (repo / 'src/opencode_install.rs').read_text()
+        expected = {'index.ts', 'rpc.ts', 'peer.ts', 'journal.ts'}
+        for name in expected:
+            relative = f'plugins/opencode/{name}'
+            content = (repo / relative).read_bytes()
+            self.assertTrue(content, relative)
+            self.assertIn(f'include_str!("../{relative}")', installer)
+            entry = normalized_entry(tarfile.TarInfo(f'agent-bridge/{relative}'), 123)
+            self.assertIsNotNone(entry)
+        self.assertIn('include_str!("../LICENSE")', installer)
+        # Keep the shipped closure complete when a runtime module gains an import.
+        import re
+        for name in expected:
+            text = (repo / 'plugins/opencode' / name).read_text()
+            for imported in re.findall(r'from ["\']\./([^"\']+)["\']', text):
+                self.assertIn(imported, expected, f'{name} imports unbundled {imported}')
+        archive_names = subprocess.check_output(['git', 'ls-files'], cwd=repo, text=True).splitlines()
+        for relative in ['LICENSE', 'plugins/opencode/package.json', 'plugins/opencode/bun.lock']:
+            self.assertIn(relative, archive_names)
+        for name in expected:
+            self.assertIn(f'plugins/opencode/{name}', archive_names)
+
     def test_release_notes_cannot_escape_the_archived_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

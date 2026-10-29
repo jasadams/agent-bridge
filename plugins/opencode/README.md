@@ -14,7 +14,22 @@ bun run --cwd plugins/opencode typecheck
 bun run --cwd plugins/opencode test
 ```
 
-A disposable project's `opencode.json` can opt into an existing private broker:
+For normal opt-in setup use the built executable:
+
+```sh
+agent-bridge opencode install
+# After a binary update, refresh the extracted assets explicitly:
+agent-bridge opencode install
+agent-bridge opencode uninstall
+```
+
+Restart affected OpenCode instances after each change. This configures the plugin
+and existing MCP connection, preserving unrelated config and broker state; it
+does not start sessions, inference or a service. See [installation](../../docs/install.md)
+for config paths, conflicts, backups, retained immutable assets and removal.
+
+For source development, a disposable project's `opencode.json` can instead opt
+into an existing private broker:
 
 ```json
 {
@@ -26,7 +41,18 @@ A disposable project's `opencode.json` can opt into an existing private broker:
 
 Alternatively set `AGENT_BRIDGE_STATE_DIR` in that OpenCode process. Loading
 never scans history, starts sessions, grants remote access or modifies native
-permissions. Owner configuration and service installation remain separate work.
+permissions. The explicit installer also configures the MCP connection; the
+manual plugin-only example above does not.
+
+The V1 system transform adds a stable exact-session messaging/board block to each
+model request after live identity verification. Compaction augments the default
+summary context, and later requests refresh the block without appending setup to
+peer transcript messages. Ordinary peer text is a concise sender label, complete
+body and minimal route/message references. System context still consumes request
+tokens; this is plain text, not a rich native peer card. Board subscriptions are
+opt-in and retain own-write suppression, debounce, pause and lifecycle cleanup.
+Native owner pairing prompts remain unavailable; use the explicit owner CLI
+workflow. Peer text and board edits never supply consent.
 
 ## Scope and leases
 
@@ -114,6 +140,7 @@ native run. See [the recovery contract](../../docs/opencode-recovery.md).
 
 ```sh
 tools/opencode-native.sh /absolute/path/to/agent-bridge /absolute/path/to/opencode
+tools/opencode-setup-native.sh /absolute/path/to/agent-bridge /absolute/path/to/opencode
 ```
 
 The harness uses isolated HOME/XDG/config/session/broker state and a scripted
@@ -126,3 +153,11 @@ All children and temporary state are cleaned up. Registry access may be needed
 for native dependency initialization. Synthetic model responses validate real
 execution/tool wiring, not independent language-model judgement, production
 owner settings or physical-network behavior.
+
+The setup harness runs the real installer in temporary HOME/XDG directories,
+loads its extracted assets and MCP connection, and checks model-visible context,
+actual compaction/reload, compact peer text, explicit acknowledgement/reply and
+board tool/notification behavior. It also checks unavailable native owner pairing
+selection before any exchange is created. Its scripted provider demonstrates
+transport and tool execution, not independent model judgement. Linux execution
+does not establish macOS native-runtime or interactive UI qualification.

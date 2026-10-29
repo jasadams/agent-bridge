@@ -866,9 +866,9 @@ impl Broker {
                     agent.enabled
                         && crate::clients::supports(
                             &agent.provider,
-                            crate::clients::Capability::ControlNotices
+                            crate::clients::Capability::PairingPrompts
                         ),
-                    "Choose an enabled native agent for pairing notifications"
+                    "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
                 );
                 let now = crate::db::now();
                 let mut pairing = self.lan_pairing.lock().unwrap();
@@ -1660,6 +1660,51 @@ mod opencode_admission_tests {
         network::wire::{Envelope, RemoteAgent},
         protocol::Agent,
     };
+    #[tokio::test]
+    async fn opencode_board_opt_in_does_not_enable_owner_pairing_prompts() {
+        let root = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let agent = Agent {
+            name: "opencode-owner-test".into(),
+            provider: Provider::OpenCode,
+            session: "ses_0123456789abcdefghijklmnop".into(),
+            endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
+            enabled: true,
+        };
+        // A verified-live registration fixture isolates the capability selector;
+        // native endpoint/probe checks have separate real-socket coverage.
+        broker
+            .db
+            .lock()
+            .unwrap()
+            .opencode_observe(&agent, true)
+            .unwrap();
+        assert!(
+            broker
+                .request(Request::BoardSubscribe {
+                    agent: agent.name.clone()
+                })
+                .unwrap()["subscribed"]
+                .as_bool()
+                == Some(true)
+        );
+        let error = broker
+            .request(Request::LanPairingWatch {
+                agent: agent.name.clone(),
+                id: None,
+                seconds: 120,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Pairing prompts are unavailable")
+        );
+        broker
+            .request(Request::BoardUnsubscribe { agent: agent.name })
+            .unwrap();
+    }
     #[tokio::test]
     async fn remote_policy_is_rechecked_through_actual_admission_request_after_claim() {
         for revoke in [false, true] {

@@ -30,11 +30,16 @@ unchanged.
 
 Claude ordinary messages retain its native peer wrapper, sanitized sender display
 label, and compact stable references; Codex retains the shared peer envelope and
-acknowledgement guidance.
+acknowledgement guidance. OpenCode ordinary messages use a sender-labelled body
+with complete compact route/message references. Its V1 system context hook
+supplies session-specific messaging guidance separately from peer message text.
 Locally generated `ControlNotice::BoardChanged` and `ControlNotice::Pairing` travel
 through a separate typed entry point and retain their existing text without a peer
-envelope. Board and pairing subscriptions require the control-notice capability,
-an enabled exact registration, and their existing local opt-in checks. Capabilities
+envelope. Board subscriptions require the control-notice capability. Pairing
+selectors additionally require `PairingPrompts`, supported by Claude and Codex;
+OpenCode retains board controls but rejects native pairing prompt selection with
+an explicit CLI fallback. Both require an enabled exact registration and their
+existing local opt-in checks. Capabilities
 do not grant peer permissions, owner approval, or acknowledgement authority.
 
 Durable queues, reply correlation, grants, network routing, retry decisions, board

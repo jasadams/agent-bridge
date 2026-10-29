@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 pub enum Capability {
     Messages,
     ControlNotices,
+    /// Session-selected pairing prompts require a supported owner-input workflow.
+    PairingPrompts,
     LifecycleRegistration,
 }
 
@@ -61,7 +63,7 @@ impl Adapter {
                 Capability::Messages
                     | Capability::ControlNotices
                     | Capability::LifecycleRegistration
-            )
+            ) | (Self::Claude | Self::Codex, Capability::PairingPrompts)
         )
     }
 
@@ -99,9 +101,8 @@ impl Adapter {
     ) -> String {
         match self {
             Self::Claude => claude::claude_content(msg, machines),
-            Self::Codex | Self::OpenCode => {
-                crate::delivery::envelope_with_machines(msg, state_dir, machines)
-            }
+            Self::OpenCode => opencode::message_content(msg, machines),
+            Self::Codex => crate::delivery::envelope_with_machines(msg, state_dir, machines),
         }
     }
 

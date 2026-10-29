@@ -46,6 +46,46 @@ fn native_capabilities_are_explicit_and_inbox_has_none() {
     assert!(lifecycle::registration_context(&Provider::Inbox, "user", Path::new("/tmp")).is_err());
 }
 
+#[test]
+fn opencode_keeps_board_controls_without_advertising_owner_pairing_input() {
+    assert!(supports(&Provider::OpenCode, Capability::ControlNotices));
+    assert!(!supports(&Provider::OpenCode, Capability::PairingPrompts));
+    assert!(!supports(&Provider::Inbox, Capability::PairingPrompts));
+    assert!(supports(&Provider::Claude, Capability::PairingPrompts));
+    assert!(supports(&Provider::Codex, Capability::PairingPrompts));
+}
+
+#[test]
+fn opencode_peer_text_is_compact_and_display_labels_do_not_replace_routes() {
+    let mut target = agent(Provider::OpenCode);
+    target.session = "ses_0123456789abcdefghijklmnop".into();
+    let mut msg = message(&target);
+    msg.sender = "peer-id/exact-sender".into();
+    msg.parent = Some(uuid::Uuid::new_v4().to_string());
+    let machines = serde_json::json!({"sender_name":"remote/Actual agent\n\u{202e}"});
+    let text = Adapter::OpenCode.message_content(&msg, Path::new("/private/state"), &machines);
+    assert!(text.starts_with("remote/Actual agent:\n"));
+    assert!(text.contains(&msg.body));
+    assert!(text.ends_with(&format!(
+        "[peer id={} from={} to={} parent={}]",
+        msg.id,
+        msg.sender,
+        msg.recipient,
+        msg.parent.as_ref().unwrap()
+    )));
+    assert!(!text.contains("Agent Bridge:"));
+    assert!(!text.contains("Prefer the configured"));
+    assert!(!text.contains('\u{202e}'));
+    assert!(text.len() < crate::delivery::envelope(&msg, Path::new("/private/state")).len());
+    let long = serde_json::json!({"sender_name":"x".repeat(400)});
+    let shortened = Adapter::OpenCode.message_content(&msg, Path::new("/private/state"), &long);
+    assert!(shortened.contains(&format!("from={}", msg.sender)));
+    assert!(shortened.contains(&format!("to={}", msg.recipient)));
+    // Existing client presentation and setup behavior stay independent.
+    let codex = Adapter::Codex.message_content(&msg, Path::new("/private/state"), &machines);
+    assert!(codex.starts_with("[Agent Bridge:"));
+}
+
 #[tokio::test]
 async fn unsupported_native_delivery_fails_while_inbox_messages_remain_broker_owned() {
     let agent = agent(Provider::Inbox);

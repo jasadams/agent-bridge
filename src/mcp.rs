@@ -251,9 +251,9 @@ impl Bridge {
                         .and_then(|provider| provider.parse::<crate::protocol::Provider>().ok())
                         .is_some_and(|provider| crate::clients::supports(
                             &provider,
-                            crate::clients::Capability::ControlNotices
+                            crate::clients::Capability::PairingPrompts
                         )))),
-            "Choose an enabled local native agent for pairing notifications"
+            "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
         );
         Ok(())
     }

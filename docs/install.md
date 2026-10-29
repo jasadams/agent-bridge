@@ -44,6 +44,60 @@ stdio server for structured agent tools. See [MCP setup](mcp.md) to register it 
 your agent application. Installation does not automatically edit client MCP
 configuration or change tool approval settings.
 
+## Optional OpenCode integration
+
+OpenCode **1.18.35** V1 with Bun **1.3.11** can use the bundled native plugin and
+existing Agent Bridge MCP tools. Installation is explicit and does not start a
+service, OpenCode, a model or a package manager:
+
+```sh
+agent-bridge --state-dir /absolute/private/state opencode install
+# Choose a particular supported JSON/JSONC configuration file.
+agent-bridge --state-dir /absolute/private/state opencode install --config /absolute/opencode.jsonc
+agent-bridge opencode uninstall --config /absolute/opencode.jsonc
+```
+
+The installer registers the current executable's absolute path for MCP and the
+same broker state directory for both MCP and the plugin. Keep that executable at
+its installed path. Repeat `opencode install` after upgrading the binary to update
+the extracted plugin; repeat installation without changes is a no-op. Fully restart
+the OpenCode process after installing, updating or removing the integration.
+Existing running instances keep their loaded code. No client permissions, tool
+approvals, peer grants or board subscriptions are enabled by installation.
+
+On Linux and macOS the default global directory is `$XDG_CONFIG_HOME/opencode`,
+otherwise `~/.config/opencode`. With multiple global files, the active `plugin`
+array's file is selected to preserve inherited plugins. Otherwise the existing
+`opencode.jsonc`, `opencode.json`, then legacy `config.json` is preferred; a new
+installation uses `opencode.jsonc`. `OPENCODE_CONFIG` selects a custom file;
+additional directory/inline configuration is checked for conflicting integration
+entries. Project configuration is edited only through explicit `--config`.
+An extensionless global `config` file contains legacy TOML that V1 can migrate
+and merge after these JSON files. Setup refuses while that file exists: migrate
+it with OpenCode, review the resulting JSON configuration, then retry. The installer
+never edits or migrates that legacy file. Its appearance during an interrupted
+setup also prevents automatic recovery from overwriting configuration.
+An explicit file that would hide an existing global plugin array is refused with
+the correct target path. The pinned V1 format uses singular `plugin` and a flat
+`mcp` map; V2 configuration is outside this integration's supported scope.
+
+JSONC comments, unrelated plugins/MCP settings and permissions are preserved.
+Every changed existing file has an exact-byte backup beside it. Private ownership
+and recovery sidecars also live beside the selected config. Existing unowned
+integration entries and owner changes to managed entries are preserved and reported
+as conflicts. If removal would discard an adjacent owner comment, move that comment
+outside the managed entry before retrying. A concurrent edit or interrupted setup
+is checked before recovery; retry never restores a whole backup over newer edits.
+
+Plugin source and license assets are embedded in normal binaries and source
+packages, then extracted into immutable hash directories beneath
+`$XDG_DATA_HOME/agent-bridge/opencode` or `~/.local/share/agent-bridge/opencode`.
+They live outside auto-discovered OpenCode plugin directories. Removal deletes
+only the recorded config entries and ownership manifest; it retains immutable
+assets for already-running instances, backups, broker state, history and grants.
+Remove retained asset directories manually only after every session using them
+has stopped. See [OpenCode transport and validation](opencode.md).
+
 ## Options and pinned builds
 
 Pass installer arguments after `sh -s --`:

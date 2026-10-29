@@ -33,6 +33,7 @@ notify = "8"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+jsonc-parser = { version = "=0.34.0", features = ["cst", "serde_json"] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 uuid = { version = "1.28.0", features = ["v4"] }

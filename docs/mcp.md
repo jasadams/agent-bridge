@@ -49,6 +49,21 @@ lifecycle hooks described in [native session setup](native-sessions.md).
 See the [official Claude Code MCP documentation](https://code.claude.com/docs/en/mcp)
 for client scopes and approvals.
 
+## Connect OpenCode
+
+Use `agent-bridge opencode install` to opt into the bundled V1 plugin and the
+existing `agent-bridge` stdio MCP connection. See [installation](install.md) for
+config selection, preservation, updates and removal. Restart OpenCode after a
+change. The exact session route and broker state directory are supplied through
+its verified native system context; check `connection_status` before using a
+connection shared by several conversations. No new transport or per-message
+setup prompt is required.
+
+OpenCode supports the same message and shared-board tools, including explicit
+acknowledgement and correlated replies. It cannot be selected for native owner
+pairing prompts; retain explicit owner CLI confirmation. Native permissions are
+unchanged. See [OpenCode support and limits](opencode.md).
+
 ## Tools
 
 | Tool | Purpose |
