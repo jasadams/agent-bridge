@@ -289,3 +289,39 @@ fn interrupted_metadata_copy_leaves_only_the_old_registry_and_can_retry() {
         100006
     );
 }
+
+#[test]
+fn schema_thirteen_unknown_local_codex_queue_is_blocked_without_replay_and_is_idempotent() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("db");
+    let mut db = Db::open(&path).unwrap();
+    let agent = agent_bridge::protocol::Agent {
+        name: "native".into(),
+        provider: Provider::Codex,
+        session: "123e4567-e89b-12d3-a456-426614174000".into(),
+        endpoint: String::new(),
+        enabled: true,
+    };
+    db.register(&agent, false).unwrap();
+    let identifier = uuid::Uuid::new_v4().to_string();
+    db.send(&identifier, "user", &agent.name, "legacy", &None)
+        .unwrap();
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE message_context SET destination=json_remove(destination,'$.provider') WHERE id=?",
+        [&identifier],
+    )
+    .unwrap();
+    conn.execute_batch("DROP TABLE codex_notices; PRAGMA user_version=13;")
+        .unwrap();
+    drop(conn);
+    for _ in 0..2 {
+        let mut db = Db::open(&path).unwrap();
+        let message = db.get(&identifier).unwrap();
+        assert_eq!(message.state, "blocked");
+        assert!(message.detail.unwrap().contains("unknown"));
+        assert!(db.retry(&identifier, false).is_err());
+        assert!(db.claim().unwrap().is_none());
+    }
+}

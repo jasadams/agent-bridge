@@ -189,6 +189,11 @@ pub(crate) async fn deliver_notice(
     msg: &Message,
     notice: ControlNotice<'_>,
 ) -> Outcome {
+    if agent.provider == Provider::Codex {
+        return Outcome::failed(
+            "Codex controls require the broker's bounded durable notice admission",
+        );
+    }
     let Some(adapter) = Adapter::for_provider(&agent.provider)
         .filter(|adapter| adapter.supports(Capability::ControlNotices))
     else {

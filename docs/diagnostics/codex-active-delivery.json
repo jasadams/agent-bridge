@@ -1,0 +1,1232 @@
+{
+  "ticket": "AGB-13",
+  "purpose": "FINAL post-integration production Codex adapter native regression on a00d963 named-board base; controlled loopback model, no external judgement/UI claim",
+  "artifact_root": "/home/jason/agb13-native-tmp/agb13-codex-mpgtoo7s",
+  "validation": {
+    "production_native_cases": {
+      "exit": 0,
+      "accepted": 6
+    },
+    "offline_replay": {
+      "exit": 0,
+      "accepted": 6
+    },
+    "offline_corruptions": {
+      "exit": 0,
+      "rejected": [
+        "missing_acceptance",
+        "missing_tool_completion",
+        "interrupted_original",
+        "premature_model",
+        "wrong_native_client",
+        "missing_capability",
+        "double_write",
+        "altered_compatibility"
+      ]
+    },
+    "historical_AGB11_replay": {
+      "exit": 0,
+      "accepted": 8,
+      "artifact_root": "/tmp/agb11-codex-ybkph6le"
+    },
+    "python_compile": {
+      "exit": 0
+    },
+    "help": {
+      "exit": 0
+    },
+    "production_direct_feasibility_case_guard": {
+      "expected_exit": 2,
+      "actual_exit": 2
+    }
+  },
+  "versions": {
+    "platform": "Linux-7.0.9-204.fc44.x86_64-x86_64-with-glibc2.43",
+    "python": "3.14.4",
+    "websockets": "15.0.1",
+    "production": true,
+    "source_diff_sha256": "86e798d3d1daf4e621e24a06c84008eaff09489aa7b8554e4f57b0eaa0efff3e",
+    "source_commit": "a00d963ab1782192b53c290d3779ac7f0906a6f5",
+    "source_files_sha256": {
+      ".claude/build-test.md": "3b13cb9fbadc0a213a3c5fd76191d6bd00a9fdd15e0cea4ec263155424e33a51",
+      ".claude/team.md": "63a2f4dcc4a365329fa0e230cc5c6a054b11177772464a47dcf37b39bd623d4a",
+      ".github/workflows/release.yml": "4eef33366e6861e4cf09cf06002295f1715c9c394566cadcb2725ad48d8586c8",
+      ".gitignore": "48b60829e3e75bde7510564ef5a4d9d84dc029f31e2cb935af84db9988cd57e1",
+      "AGENTS.md": "c69baa8e918376a0edebac3103211285301d1ae09d354ecd851678f4f2e1ea0d",
+      "CLAUDE.md": "5ea6a30696e4ddbe08296b7891403d2978fa9d113fd295299217631daf7953da",
+      "Cargo.lock": "88d82fc971cb3fce9c26e4234f1bd1f24adca119ea8a005bd0d78b2ab0dd14d3",
+      "Cargo.toml": "ea541910a223e0fc8971b4360822b191bcf417c94ac229f78fc511617dd1c1b9",
+      "LICENSE": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+      "README.md": "c26b3bed18caf3395d437e09efa9efecfd6475e7fc4455eb93487948c4576343",
+      "THIRD_PARTY_NOTICES.md": "b50958787190ce2f9dec13cf9c9a45f458768847852b0e9fef470ccb1b273d63",
+      "assets/monitor/app.js": "3845e221d6b3210a3d0702412561ebbd70f84b3f14b7f1a8b55939a1f6d8c1d2",
+      "assets/monitor/index.html": "a8dcb95a60a67eda71ada82f5a6bb406ba838e3bca27472472d385b88c318fc3",
+      "assets/monitor/style.css": "e0fc470967d7ff4b3973cfddb3d76d5f2a376931fad31ba053572b892f8b8e6c",
+      "build.rs": "e2e260fb31e3473f8a47a978c4695019750b8dca00ce74d2dfa4d5c8f685b637",
+      "docs/CODING_STANDARDS.md": "f225d2301aa9ec6affd4814db3e30e614800c1b52d4e3f4826c62deecd2592d9",
+      "docs/board.md": "2320abe7e2a0f4356c668eacc852052548ceb5b56cbfa4e7bbfb78a6f574ca7e",
+      "docs/client-adapters.md": "913129b21a57ebf7a73b00396403788c0b2a7d28f73695fb1a6d8b41ec6891cf",
+      "docs/codex-active-delivery-regression.md": "f60e0d8ff7dbf8ebe6616eb1f4ec1018c3129563d7c2f409f512a3d9a060eca9",
+      "docs/codex-delivery-diagnosis.md": "3fe097f1c78656839ef370c19825ca48d21a4391330bb283a7708a8b6b377d4f",
+      "docs/codex-delivery.md": "436515d75d9610676fb0ec165953d3e0751336e4317f33580c22a75da0b827f9",
+      "docs/diagnostics/codex-active-delivery.json": "52e752ab82cbe80abf257d58c65761e5b444fb19c4f0fa1f11a5c727f128222b",
+      "docs/diagnostics/codex-native-delivery.json": "d31612502bb64d2fa163825a7c3239b4609e9ef3b8f19d24b99a2d0fd8ddcb2c",
+      "docs/explicit-peer-messaging.md": "cc0bbe35bad84c2333f18e69b98164a2150eec7e37949af4c3ed8dbfe49b916f",
+      "docs/install.md": "b0d2bdd778380cafd1d2b95edabe763d7480e0c8d66664ba4b229ab0195912a8",
+      "docs/internet-invitations.md": "d088112f69348f2a6a96cc07cdcd88e89664da875b0cb9d492f4f43456668f72",
+      "docs/internet-validation-2026-10-27.md": "60fa91e5d2efe2645256f3ac2ae9c6d2f15c5e2373996a82334d42f8478ff6de",
+      "docs/lan-messaging.md": "26520b068cb5d5b108ed66b0bb29267240472440a027a3f35f1aab7aacc03b98",
+      "docs/lan-pairing.md": "c08740582cbd7a427ee79d12372fb6261579621181873405920d86a55efbd4fd",
+      "docs/lan-validation-2026-10-27.md": "e2c2ba1ec44a8c9128c1d36f4d7747e9a353a856b299ddbbbca6e28690feecbb",
+      "docs/local-monitor.md": "59095f85d3bbded48a8376a22f7443787b6acf951a7833f29de56f68b9e892f7",
+      "docs/machine-names.md": "e1072746abf7d700f4f99dc7caf4e159b34e8e445288f2f58701552f1afc602d",
+      "docs/mcp.md": "e662cbe3792294ddac4661bc71a119ee24647a0507ec6cd6ac09e1e72b086a81",
+      "docs/monitor-validation-2026-10-27.md": "00bd4edd0fb79107e2aa5bbf5ce565e9982b3c64760f6bd2fdbdcae3c655a472",
+      "docs/nat-traversal.md": "6a2b926ae181c593914704a3212af4219d47bb66b3dc064feb391349c21722fa",
+      "docs/nat-validation-2026-10-27.md": "3ba71c2de65df7cb7a01c7876dcbfc0ddfad557616a2cb0a352e4fef1bbd61ad",
+      "docs/native-sessions.md": "9aff5f492dafc5347e542ef3197204fe9075c994d0999e69105804ea815f9f0d",
+      "docs/opencode-recovery.md": "8b7dbd7b0fc708a2b61cd79f2e97baaf04afa34ef457aa3ce16ea46ce49476c7",
+      "docs/opencode.md": "8164cef66a72bc424b9068dd2cad56e1eb6f5c85ed8971c5045ce08aa182fff2",
+      "docs/p2p-implementation-plan.md": "2bf02672b241ebc6ff974b6dc0f353a55f342b1774224e7c032090f3e3cd55a2",
+      "docs/p2p-progress.md": "8ce9f0aad75a6ecc41feb23908b226604adb373a2e20111f605f7612e5fd12c1",
+      "docs/peer-trust.md": "5b2fdf8f7040fa27daf196fb8338fdf3d455a8926233355387685ee514cf84b4",
+      "docs/public-p2p-roadmap.md": "6bc53233e9813374ab6e4d7bd9dfbc1fa853068aa6f5ea4b19b131834861f1f3",
+      "docs/public-relays.md": "5cf3a201b0cbccba2589e75cd61403e57121084705192075b883e465e6a89521",
+      "docs/relay-validation-2026-10-27.md": "40de4944e24858f36a741b1b1ba30941d9a6752b6e8df1aed85466476075b7e1",
+      "docs/releases/v0.2.0.md": "c29409bc54ae6ac4b0dd1ce48385015175735b3b51ac69e19fcae5ea94e09b0b",
+      "docs/releases/v0.2.1.md": "823daffb62c3ae41377c3b7a1310debeecfe17b8ee93e1afdf263be472592c63",
+      "docs/releases/v0.2.2.md": "b5bb2ed7c264c0ce3f2241c14b28e46e982d8398abc6ccb8d4052ee6488cf58a",
+      "docs/releasing.md": "f0677c6f119015207ddaeb1db8a512a17fa3e1e1f5ec4bbd49ebcc170af9f093",
+      "docs/secure-pairing.md": "95215762c16218953c8b084fcff3668e1a7dab9089817f52e586aceaed8faf42",
+      "docs/security-review-browser.md": "4cfaeebedcbc31e6be5164367b23a10d6aa88798f7226230e51885cbcaee7781",
+      "docs/security-review-protocol.md": "884275d7c396b91c93ffec0e427b76e8490a54843ccb82cd770e4f39ca24b3df",
+      "docs/security-review-state.md": "b237919ab73e4f897a7f14cad5f7b9372834440bf421116a0ba6ad93fe565b94",
+      "docs/security-review.md": "eb71d1bafa3c975600fa92ac122f4adfe4480383a32c1ff6b7866745a7254832",
+      "docs/session-sharing.md": "17c3eddee87f3d41766bf6e8439fa07cdf12b4ad1866fa19f2b449dcb32fd3ab",
+      "install.sh": "3c9e4a159938cfa5eeb14c0fb90ec2e8fd844c01b8aa253b82b32f3950da1dba",
+      "plugins/opencode/.gitignore": "4d56952b0fb13bf8f9b6c13a6d4c34a075bac3af447636a1df4335d7576e2f97",
+      "plugins/opencode/README.md": "bd3dc432c424a4253939a99ff8ae8a8b3242f5324b3014423c458b9ba5994c62",
+      "plugins/opencode/bun.lock": "1c4bd98b5e17b20253fc67cac1558d61bae87f4092aaefcd62d51b23e2f9bdcd",
+      "plugins/opencode/index.test.ts": "ff5019a43b6607918af18c2e511a108e2ee7340a9978810fd2dd9c686baf2a4b",
+      "plugins/opencode/index.ts": "ded0c48097af3bb40b7f104fcc79f417527bf5f87b8e689c08418111b86b794d",
+      "plugins/opencode/journal.ts": "c8f06fcc01bc4b0820fbb0c190d9ab6bece02b57d1a2041aee96b9789120fe70",
+      "plugins/opencode/native.ts": "2477a2c4e964510e92d63cd74f4cf5285722225c7af49ce5e2dd1dac641d68b9",
+      "plugins/opencode/package.json": "13beaa1f3248d9a682edfb809317371a83be3afc0ddb2e8f5f49bb92efb4a12e",
+      "plugins/opencode/peer.ts": "7b6cb9c4aea67c8f7e0ee953d1238c7d9c3d2c58315c658b7cf8fec2d630fdbb",
+      "plugins/opencode/rpc.ts": "885215120dfd9b74f9dea7ef30ba5b073bb82de93f61f817552a45500ced23dd",
+      "plugins/opencode/setup-native.ts": "768de1eec51357836f9d0509a016653a8f9bd37438f92dd9d185197f443f3d8c",
+      "plugins/opencode/tsconfig.json": "a3effd3a66754988d049bad393e0d4bb058aedbcfa249077ca04c3f2da530e45",
+      "scripts/append-review-log.sh": "61f3e6e170d28568b4163ea3683d632e297efba7b28cf712230bb7e252314095",
+      "src/board.rs": "a7b9ad87af441f690634b3deae67308268a9c4e053738c40623b9c459712b322",
+      "src/board_clipboard.rs": "f405635af94f152d8be23a00fccc071a2872d51a532e6701a7fb2cbd24166952",
+      "src/board_interaction.rs": "77275138b1cea101cbb86ea912d41960debbbf283cb7d4797c3f5754910fac0f",
+      "src/board_notifications.rs": "12c7282895148f6f72b5659f51f9a12aa3e89ee5527976cc300e4fd3fe159f73",
+      "src/board_selection.rs": "10187d97fb806063c677bf3d6822a3311a437527a3825cc64fb74e53bd41b31f",
+      "src/board_tui.rs": "e8bd45dfb60468606bc0cb4bbef846620cd4930475a41f56521c57ca7ab204c8",
+      "src/broker.rs": "d185e3234ce4d5b17a7a4f796fcf7231ec30c39906972f4de07444b0a33dd67e",
+      "src/clients/claude.rs": "437635ce585357e6e66ef42dcdbfcc8b0195504c06cbb32cbea9f1eadd93a5ff",
+      "src/clients/claude_discovery.rs": "58887a0ad691753789fb5873084771566c9959cf8b3790030d74a21240a9b541",
+      "src/clients/codex.rs": "9e1f200784810ee5728864e6906031cabc9ea7156e65acce4289b986516ebe52",
+      "src/clients/codex_discovery.rs": "0de762af5503c77513189068d13fc748e51c73edebfa6daf11985be3661eac00",
+      "src/clients/lifecycle.rs": "cde3a72ed6fce9d165604a8e9da4b6b17e0e7054ebd7e7a7f1e502db4272b87a",
+      "src/clients/mod.rs": "3144988d36b6ed7caa2d46efa15eb4fe5a87029b624a4d85a1904250cb2e0647",
+      "src/clients/opencode.rs": "d5607ef7c5f7db31a3a3a0cf6712b3fdf606c16c046e24b00c1103e348f1fb6f",
+      "src/clients/tests.rs": "08ab01016cdc3e9f572eae06104709bd1742aa5d69cc570a9c424bed22f67732",
+      "src/codex_admission.rs": "be9abdeb33b2a692ef0b701e98fd2ae84c682a6d6d69f7a4a9ae65d33c2edfb5",
+      "src/db.rs": "819ab5d0561e314ede20c23ccc53141c7fb89b84daaf5d4b3adaf73495ef153a",
+      "src/delivery.rs": "450f31e5f574e3d69d5bfa05014a2b17e178ff976847d675e8fbb7290d8d8cc5",
+      "src/lib.rs": "8edea37064c9ed9d7580355516178301b3522d4bc074b3fe3bbd120ed7fc51ea",
+      "src/main.rs": "c833563d7d61753b76a11ff001a1353c7991387ce8268ee22e021478aef24291",
+      "src/mcp.rs": "3829147ca5c983d5a4998b8a66f0918ccd7e252bddf63dff738ce0d3fd554e57",
+      "src/mcp_output.rs": "b65470d12c90f831b0820b1a16e422926633932c9e9e6a6b7c6cca073dbf285c",
+      "src/migrations.rs": "3a217906a5c3b57f6362969cb3158614245a0e8ef3bed158be73e85edca38ec0",
+      "src/monitor.rs": "044fbb178842f36bdc565a1a474de659248d010d7517058d8d1bf48d0b7b0fb9",
+      "src/monitor_data.rs": "7788667e55e5e610597889c27fc4f8caf0c37c0306199069e0c68abac74da853",
+      "src/network/contact.rs": "ad4747a95fecaf026ec20e4dc312730f221aca8b618331723a90d3a8c8ad9dc3",
+      "src/network/discovery.rs": "a86cebab4862f4b2395fb74dcc99789a6bc50fa8e0be071bb0c6a342c056548b",
+      "src/network/identity.rs": "37511b19a87c7d53ac2c9f6506ae62a1d6764b667d106b4b66ec99ae258541b4",
+      "src/network/invitation.rs": "e7538f77882f4fee00dbaa54fbc18bceff0d6360b7fc3086a2f9976ece2d89ee",
+      "src/network/lan_pairing.rs": "aeadd6d39c2763ea579248d21b13af1d39ce05fa2a9d2f0ecd82643d733db9fe",
+      "src/network/machine.rs": "13934f7ab9e3b158c6c0d81cac8b22832b32ad190695158ea42e15de0fe56b25",
+      "src/network/mod.rs": "576183b16a0124e1745b61c6d1fba452db99c38927c554ac41162dc33b5900b8",
+      "src/network/nat_server.rs": "d3c928663d08ea3197f20b11d8f7322a0cb592177117ab58e559786b9d8699fd",
+      "src/network/pairing.rs": "9a603f5ebce27e1cb2acfcf29cb4d1fb2e0cb5c37a589888c74c63cccdf2e2a7",
+      "src/network/relay_config.rs": "4c4c3ea82e331f7dea367779e12e077546faf0092af02481951ebcb15a838dfd",
+      "src/network/relay_node.rs": "6304a3654423f7df3b38f6f71dde04e492d72609e8cceb4fb097f30f751f21f7",
+      "src/network/sharing.rs": "f480fd9722c5a4131c85a8d93b0d1c35ba000479ea68aa8179a3a84d1be43d2e",
+      "src/network/store.rs": "e583ba753547d961f1ca2ca078191e06df89c1df36ee1539d7d472f4b7140b63",
+      "src/network/transport.rs": "5e0bb3077764dc0c09fc6074c88a1eec76a9fd101ffc9aeb330f8a2cd67101c1",
+      "src/network/trust.rs": "fab0c35f1d40f69ad4d2b13fdc4b9de2bc96f727b2f3255e2229d2a47ff46d9d",
+      "src/network/wire.rs": "11dd68fc810b5f424f27483eeb7a61298cf4578f1c0e07ed73a57633ed8cc264",
+      "src/network/worker.rs": "3d7cd5d3a7ecc46e2ba6e175822e4a519aca53f6f0cb15304fca0695f6de4a8a",
+      "src/opencode_install.rs": "e98ca38e711f090c96da66d2f7c48b0d046804a950679e7de9cd754b575a5fbe",
+      "src/opencode_install/config.rs": "58cdd3493610bc9384029f42d0923628c0a5c68e8c6ad3337852d1ea79acbe44",
+      "src/opencode_install/tests.rs": "f2d0cdf06849e5aa85cfd3b75377705fa5d238fb2373b337ba61808eb7b35d89",
+      "src/opencode_state.rs": "017ee97aeb8d9ed141a79e9532ce9fa1aacc36cd6a1f4edcc9ed5f4a7b95024c",
+      "src/pairing_notifications.rs": "2a524084d4c834cdebd6f665bab647d4150e7cd7f5b9495b3bbaad961141e0e3",
+      "src/protocol.rs": "8992177b6ef3863698c3f8fc23145d858220f24805ab74cf594f13acce52f9bb",
+      "src/service.rs": "56d83d8880d0ee789f8e83ecfe1018017f8c0bc51b5e516d54272189dbefd70a",
+      "src/update.rs": "02ed054621e1cd3d25c7786051a5e2040ca848f1bb42c54c70dd9fa92e470bea",
+      "src/update_install.rs": "d8614d4205cca40042d99e0a41f6d55f9c8ef7a4972cffd33cb7e0ba177827b1",
+      "tests/claude_discovery.rs": "47bc14e01aee79ba7f7ba8c4de40b64b00499cf1bc1c13faf87cd20a365bcb1e",
+      "tests/clients_contracts.rs": "b92f4afa1ef1cd78be2f246e5a8d4cb4657ea6d090794d71a38ab054d5290f94",
+      "tests/connection_links.rs": "04cb082a7f7e666506bdf633b21ff6c5fa0eed4021a96660276f45c83930d0ea",
+      "tests/contact_brokers.rs": "1c611421072a5eb3f552dc61a996fc3296ba19979b53c81a6942b83f27c3ff3a",
+      "tests/discovery.rs": "37ad71496e6ec8b00a6c886c05f71cda7d7291660f0cbce60aeb87a6486450e6",
+      "tests/durability.rs": "da27c90c2b25b5bdf60ad01d5a0857b12bbfcf97f8758d70653dc1b65780410c",
+      "tests/fixtures/native-metadata-v10.sql": "48bb6141f63cd318ca84b2ce590288bc178d553ac2dcde1a8d071ee1fd335256",
+      "tests/fixtures/opencode-migrated-frame.json": "dd92eac258c11742f8420fb3d0fa3b1bd0345cdc2f1696cb527a9241ee59a632",
+      "tests/identity.rs": "7d8d49ba4f7cfe39ee5dc4b073594b20622614541935e79747d5fb630a4c5fa8",
+      "tests/incremental_history.rs": "faf08a9033d5ab24e61fc455927e28cc30181faf39101d7f9147035f98eae432",
+      "tests/internet_transport.rs": "91cca539ce6129f52e4f7ae8f63a990b726813caefbf1a93e8d0024d9378b694",
+      "tests/lan_brokers.rs": "273f6c4c11058ffb600ecb3e88e5aa396f319053c0944dbe23ecc6eb72b78c76",
+      "tests/lan_cli.rs": "08ab15dce4e8a1ae984e455ae5d66eec9100b79eaf15cbb7b1744111801b1b41",
+      "tests/lan_discovery.rs": "7a6b09d33799a71e74511c127cf2cf466ff2c8f2b1765de5d424dc84a8cade30",
+      "tests/lan_pairing_brokers.rs": "31eea054decb66921eb51a3099e05171eb595bcec3020638b3f84099f62b1bcd",
+      "tests/lan_pairing_state.rs": "25a24d26aa0cd5ee6351e05ae972c27119fc24c6bf7a4aef1b7fed35a2bc6b2c",
+      "tests/machine_brokers.rs": "8eb61a64d4c2cf11ca5fb779f925c04528ab3dd75c47d7d6ea03b93bf88177ea",
+      "tests/machine_store.rs": "d472585589c62abc49566bef5985911b8e019df4e1b401275ecb0e76e7538939",
+      "tests/mcp.rs": "31963cf6e38de3890df7a56f0ca0aa7e69c69c53d844b62290e443a58c05ada1",
+      "tests/migrations.rs": "2a8190b35fe983fbb538ba57d094c35a3a877eaf13554575142ac67ac4c99f60",
+      "tests/monitor_http.rs": "2bf134af933c6f3f85341c1a589fe070b0f3958827c31c9bf2b9618156ce38cf",
+      "tests/mutual_pairing.rs": "4951a803ce16a2da3fccc980b06d9dabafaf2b1d173e07625b0c130a1a07a50a",
+      "tests/named_boards_cli.rs": "599d2430fea2d6a9285a03e1118c19126c3c018f0f01c1adecb04bfbe97f2fd2",
+      "tests/nat_transport.rs": "213595a89207e2fc80a0fdfeae5f5fd276b990beb1315815481753d61138bc95",
+      "tests/native_delivery.rs": "99ed219a0e6d554506f11e8ae719d1ad5d1f21f9ee1f9226b0c7fa8f453185ee",
+      "tests/network_brokers.rs": "bb2166787be79418910fa3429a082749ac9cbf623212f89eea1d208b5656c037",
+      "tests/network_store.rs": "ff9a42a27ec2e72717e3477e8b210d9146aac371dc48ce791f905202fd068b1c",
+      "tests/network_transport.rs": "844836f7cd826e7e1b387ec184aa3d08d8bb36c8e7b0bd6a766d50e7435bd0d2",
+      "tests/opencode.rs": "2c750a14bb2256be85ea3430f8a2c5e31c6f3a552fb42a314add505351b7e633",
+      "tests/opencode_network.rs": "774e15ac3325cad66835f44081bebb8c737d62a71c2a7b60a7826240f93ad7c6",
+      "tests/opencode_store.rs": "af27e81c9a821884daca7adccd2c7a201641d4c539ef58d8732380655910e4ca",
+      "tests/p2p_transport.rs": "4d7cb3efa912a075bdab1797290b5f7c27ae5f8b12e44b18d140fac3d35bae5f",
+      "tests/pairing_cli.rs": "c31bb64b19a0379becef241caa5b83229e2fbf38fc3be96e0525f208750bb5bc",
+      "tests/pairing_invitation.rs": "25a6dec3bc43b7c438108e1c4b011c1369c9ec54db91cff74ae56620721fa101",
+      "tests/pairing_notifications.rs": "23d3027d610cef82dd91c0c719e3c9489680822450239c1c20c679d121b0eb3a",
+      "tests/pairing_transport.rs": "047e22e50b66d5517751c3aee46db540bf9d205a4a97706856748510a0e19c8f",
+      "tests/peer_cli.rs": "02afc148acef60c6d5d4a611c0c755b153ffb373be94975e5d7b429b7e075bf0",
+      "tests/relay_brokers.rs": "a99debcaaeccae9f90d555c6ea73efc597b808ddbfab957742776bc64d98dab3",
+      "tests/relay_config.rs": "b25ddaf64bda24dd7ccb2e1410700de1c11f8a3dbaadba0ca73b2f36a1d93811",
+      "tests/relay_node.rs": "473b2757f4c447ac8c013beadea5bf2d16aedf36d1e0e32fa74efcb387ac8ef2",
+      "tests/relay_transport.rs": "b5bd290357cb175c361fda4132d84cbf6a7af440d45885b8a645780e0d73f3f4",
+      "tests/session_metadata.rs": "041631c9c7ccec21f9900f6cc506c6771e0d87e04f6e5339de006073128d4185",
+      "tests/session_sharing.rs": "ff744dcd33934b84451b2c1e5ad4af147d3d9cd9085428a6aff23644be60749c",
+      "tests/sharing_brokers.rs": "f6cfb942d97414feb74c40ee43a65664bd32441b49dce187fc73961ef1b4e2f0",
+      "tests/sharing_cli.rs": "eda88c53513a40030625703a2848726ac0cd3c280da6065e6e175124fe7056fc",
+      "tests/trust.rs": "30fadf27526a78589c758daa4d4fdde6640d4fbfd940e9380e0abfc7dff2f415",
+      "tests/updates.rs": "3f10dff0d07aec5829228337d367c68a1071d9ee4de1682ced204c3a35007460",
+      "tools/codex-native-delivery.py": "b12c9c3cf3482c3151c4e6156f83c3dbc36f084972f4531b32b6731fe7824ae3",
+      "tools/opencode-native.sh": "e61a29f886c71ed97ed401cae10a3bf4990b8426902f1082c8771888329c28ee",
+      "tools/opencode-setup-native.sh": "fa1abcb9c2699dc5142bd2971f1d68f0863c077a5cec7e7ff8494d8f24397449",
+      "tools/package_release.py": "8ba27cb27f03a9e0aac82756af6ccc81ceedc1c5837a7f82e1e1377bfb0c3b47",
+      "tools/release_publish.py": "5e86f2405d9ad9f2847d071ac03c9f618f66a60d9387e5f3c3b96206a3489005",
+      "tools/release_version.py": "2538facddd260a4e5462584ad5007cd2e1cd8800c11c9400c71018ae5a9e4e21",
+      "tools/test_installer.py": "c74c328ba5c2e2ab0a83f4efba57357cefb5b64f7a666c38dced58cd4e0bbaf6",
+      "tools/test_internet_connectivity.py": "313b7922d8af495ad8df2aefef99aabb32ab00c218abc81549862594fe7b6bfe",
+      "tools/test_monitor.py": "a4845dd548aadad3f2a913abd680102c94f35a3600791ca33802b2d27a92e87c",
+      "tools/test_nat_traversal.py": "5d9aa566555bc76457ebb601f3f1ed378423437882cc5e79fe0ef7e984ac9ea4",
+      "tools/test_packaging.py": "75d4ef45ade8300cf8762cecebbe7398aabf26c9e4b57eec91f02273e75c4139",
+      "tools/test_relay_nat.py": "fc6aad8ff356c32587f56beed14d11f7ffda5213756f65620457b8192c67062b",
+      "tools/test_release.py": "fb2f59f3bec2f0e3623c7d649ca428dbc1913ee8863d71dac1038c8c85f8cef0",
+      "vendor/libp2p-autonat/.cargo_vcs_info.json": "4aac3f99acac35f0d22ad58a8cdb7b961838da119933dd31142d9845c7f66c78",
+      "vendor/libp2p-autonat/CHANGELOG.md": "a51f568e98cecd593414409f2ae261a92087bef1a43c253bf8d60613b687dd1e",
+      "vendor/libp2p-autonat/Cargo.lock": "3048c53f166bdddf9ec134589ad388610fff0b9124d05ee0032f7ee99063dbea",
+      "vendor/libp2p-autonat/Cargo.toml": "2c8e84296e9f6610e8c29e90b62844d8189e805739e90f40944ea25ae1292f11",
+      "vendor/libp2p-autonat/Cargo.toml.orig": "ac71f4c2705bf25c13866917890bd5eeaa2433078322aea1a8ff6db957bc74b1",
+      "vendor/libp2p-autonat/LICENSE": "43e1acefdde2119bcbac3a88394796f7105d7279a75a392be08ac804ec3aab81",
+      "vendor/libp2p-autonat/PATCHES.md": "e1c3b2705e2e23eb85cbb76094b3e6b83e82e3c588e228ed149ea385b04cff7c",
+      "vendor/libp2p-autonat/src/lib.rs": "551363583957908c9e8066c17537abc687a12f2faf66a7724622176ed3b57365",
+      "vendor/libp2p-autonat/src/v1.rs": "695f74f17d982a6cb50f11944becaced1d063fe00f1f2159c0bd7eefdea74f0b",
+      "vendor/libp2p-autonat/src/v1/behaviour.rs": "72b671a990b168facf783aac47523503ee8d203a03701a1afcc9bb8dc21a15a3",
+      "vendor/libp2p-autonat/src/v1/behaviour/as_client.rs": "e8c3006a788df215d648b8dc156865511b0753d73079a73afbd41c4511a2fe43",
+      "vendor/libp2p-autonat/src/v1/behaviour/as_server.rs": "4d97de64cc97876d4d85df3444aebd242e3b5f4120228313501bf1a5fcfae818",
+      "vendor/libp2p-autonat/src/v1/generated/mod.rs": "d66ac1693427e516e88ddb5f703c13171bdfc62600926da14aa8147e52852889",
+      "vendor/libp2p-autonat/src/v1/generated/structs.proto": "29191bc73b18b5ab736616741705868794c44b398077063f24c049da365334d8",
+      "vendor/libp2p-autonat/src/v1/generated/structs.rs": "7c12bf4da9efbeb54d05c77ee7f6dd7805185bd06521783863e0e19351a259d0",
+      "vendor/libp2p-autonat/src/v1/protocol.rs": "fd1528b7f7f97a6e41bbace2119f71a27003ae57049ed0c71b0839f41b12e735",
+      "vendor/libp2p-autonat/src/v2.rs": "ef3fcad03254305020060dfc53b6e1541079dcf168501550a1b2ab461609a66d",
+      "vendor/libp2p-autonat/src/v2/client.rs": "d9025fd06c5bc827cadedfe1590cdaa2d6f6b3591ac08cd4e2166adfe52846d5",
+      "vendor/libp2p-autonat/src/v2/client/behaviour.rs": "c06ac95c009c085d8005c978513184396fecb7132f3ef8f341923e722f82db25",
+      "vendor/libp2p-autonat/src/v2/client/handler.rs": "9491e92c462e7aa8fc652eb8ee6af4975308a759a0938e40e1f46ef006978693",
+      "vendor/libp2p-autonat/src/v2/client/handler/dial_back.rs": "0787d5bb776d830d29b85e43edd350e70673bc9d2b072ef83241906ed975db25",
+      "vendor/libp2p-autonat/src/v2/client/handler/dial_request.rs": "d1c45ec6358cadedc54f43bb50bdc885a2b768c062ee08302bc5ef757075673a",
+      "vendor/libp2p-autonat/src/v2/generated/mod.rs": "d66ac1693427e516e88ddb5f703c13171bdfc62600926da14aa8147e52852889",
+      "vendor/libp2p-autonat/src/v2/generated/structs.proto": "5f0390db61fa8d44f5ee5154176fee6d9db49932005ebbad97b7965b192460f5",
+      "vendor/libp2p-autonat/src/v2/generated/structs.rs": "ff8e0450dc9fc6e69f45934a6a09dea8c3a1d3505375111e7c8988eadc8bd2a2",
+      "vendor/libp2p-autonat/src/v2/protocol.rs": "cad5eaee72b98d507ec0ae2b0d3a96b0e52bb97f968f0e08e847ea3b3ec4b8ad",
+      "vendor/libp2p-autonat/src/v2/server.rs": "246cc108fdecc52c70c999dbd00d1e26b93e6f4822c007f095f0ae11e36c4b2f",
+      "vendor/libp2p-autonat/src/v2/server/behaviour.rs": "0c5ba54fd888d10d58abbb642bdd34a4f269182279df96208bd8bf24939ed3fb",
+      "vendor/libp2p-autonat/src/v2/server/handler.rs": "b7f83e5b04abbcef547994be988719645ba8879615c7d1856c8fb2707bdb726a",
+      "vendor/libp2p-autonat/src/v2/server/handler/dial_back.rs": "5050c169ec0338a290ea10d968628331eed4557cb4fc3aa25575b596d1e3a1d1",
+      "vendor/libp2p-autonat/src/v2/server/handler/dial_request.rs": "635d10a6d34ee6e11447978f6a657257a0a89023921cf8996a92280f30fbf604",
+      "vendor/libp2p-autonat/tests/autonatv2.rs": "35b1e84295f7a3ef47827099018c82dbb59dcf14c745149c713f1db72321387d",
+      "vendor/libp2p-autonat/tests/test_client.rs": "9b436d76317644247c4ba3a378e50a2e95610e861f74eeb1c3132b7b15a76c89",
+      "vendor/libp2p-autonat/tests/test_server.rs": "6b2075252156ccc919bf0216ddfa442ee10d7a4961e6a4b9537ccb5ee084af39",
+      "vendor/libp2p-dcutr/.cargo_vcs_info.json": "153bb5345d449cd7365572876fb6be2dabe42262b84d39cf4da2f1cd34a3bf52",
+      "vendor/libp2p-dcutr/CHANGELOG.md": "efce7f4ccf258152d6e302fe513e70038cbfd539bdf28f3510501561480906e4",
+      "vendor/libp2p-dcutr/Cargo.lock": "a5e57f2f24ce9aa1a532c6d1ec4fb2fa12aaabb2a2e3027ac6d8d1854213d261",
+      "vendor/libp2p-dcutr/Cargo.toml": "d67dc3d104ba19751f296988316dd5ef578e5a3262da55104061af2edbf7af6d",
+      "vendor/libp2p-dcutr/Cargo.toml.orig": "c3a5e9a0312b119ea49c4c4c64d34c3b36bdb8d16f118f9edd6e8ebd85fbbe1c",
+      "vendor/libp2p-dcutr/LICENSE": "43e1acefdde2119bcbac3a88394796f7105d7279a75a392be08ac804ec3aab81",
+      "vendor/libp2p-dcutr/PATCHES.md": "4c0a7bac2bf1902d52e17d182ce643dab80885f7ae43b9a5d3297a6cf1387031",
+      "vendor/libp2p-dcutr/src/behaviour.rs": "aa9a06a70690015e14b274f12f0861a8372a06dfc318de594595aa8e9254063b",
+      "vendor/libp2p-dcutr/src/generated/holepunch.pb.rs": "fdf6e9b6433878f2b7038bd66b411a4ccfb44e2d9055f65b922e9987a3cff9b0",
+      "vendor/libp2p-dcutr/src/generated/message.proto": "000d940585ca625509134d8d6bfc3bd4a66c1fae25b1ab6d8c28ead0c826ccdc",
+      "vendor/libp2p-dcutr/src/generated/mod.rs": "2ad7f4d17dc789115fc015088ffeba1662c02caa082f140ed537e2a83ffd4529",
+      "vendor/libp2p-dcutr/src/handler.rs": "ec9fc0d89222265d08bb51c254265f94320f876872121fde59c0f6ff3d134701",
+      "vendor/libp2p-dcutr/src/handler/relayed.rs": "72c19fedadbf670e85abba201e524b1fc1247f02063a9f70d78c8c3d96fabc86",
+      "vendor/libp2p-dcutr/src/lib.rs": "253edcf29ed5c016fb48791e02c82f3b30e0166ed383e0131acedac340dae083",
+      "vendor/libp2p-dcutr/src/protocol.rs": "2a3c52943c0920d50935bc255568702fadcf5962a7a0946d1cccbcb64e7e4ee7",
+      "vendor/libp2p-dcutr/src/protocol/inbound.rs": "38d46b008c909a68e58ee0ceed729042fd99cfc5342d6f1f3edfdbdd4a700886",
+      "vendor/libp2p-dcutr/src/protocol/outbound.rs": "f9e188f08d6b6cd50e597d416f27d03d3e84db165f49322471073a53c41f81b0",
+      "vendor/libp2p-dcutr/tests/lib.rs": "35963821ab46c4bf37c970570a9fb5e93ce676c4fbed744cfc77ca66b2100fea",
+      "vendor/libp2p-mdns/.gitignore": "7fddeb99c2f6a8bf0c57f8ec992f4f3dd643174aaf358faaa704d9ae103eddda",
+      "vendor/libp2p-mdns/Cargo.lock": "ac627450b9a6aa93e4c0984e71e6877d8af851b6f56dcfcb3800425a4e31b744",
+      "vendor/libp2p-mdns/Cargo.toml": "eee3e7001130bae553210808488cef9922cd57338da15cafe62b45d7ec7f61bb",
+      "vendor/libp2p-mdns/Cargo.toml.orig": "a45fb79724f8679c4b2bdbbc124f0f51e5f29cbbbd6125d9b9ecd83eed39f817",
+      "vendor/libp2p-mdns/LICENSE": "3fbbd39c23c8b065af400ff22a45c15111b49183399d3df3df63841ffbd88c9f",
+      "vendor/libp2p-mdns/PATCHES.md": "a9c411d5c94e27523292818b11319cf6c4ec54bdda48dc8bced7970a0c91821f",
+      "vendor/libp2p-mdns/UPSTREAM.json": "d43aecebf9a4a5aa6f74e2c4f48a9cb347e399705d64b2dc44215af203df4765",
+      "vendor/libp2p-mdns/src/behaviour.rs": "e5d4235ff4e967bc271225c044274fed69be178ac7187d1a38519d12566d2154",
+      "vendor/libp2p-mdns/src/behaviour/iface.rs": "b3ebc1f3b2a9f7efef95284a92b3e317edfa9a22ef3b029723055160282eb6f9",
+      "vendor/libp2p-mdns/src/behaviour/iface/dns.rs": "433a12d979e5a2c8251b8d1b733a37238e597ad6ab8541f01eedfa3ab104da05",
+      "vendor/libp2p-mdns/src/behaviour/iface/query.rs": "a200bf0cea88b8d58b8363b4eefcc68ca6c0fbdea37b05ee1387d85ba3186c72",
+      "vendor/libp2p-mdns/src/behaviour/socket.rs": "9f0868ba857d0757192cbc0086768972a8cbe31621110dad70a3af846366023f",
+      "vendor/libp2p-mdns/src/behaviour/timer.rs": "5f6a1e4532ad8119ead76da4bb9ea4df5af4ed89bae740978311754053fd82e4",
+      "vendor/libp2p-mdns/src/lib.rs": "41bf447e7239bb0b222bda59fb66ff9dbbb19ce1e7f1f7bd391305cb3cc22cb9",
+      "vendor/libp2p-relay/.cargo_vcs_info.json": "60536e0069049282c0f397b68734d2d3c205e9c1d037702ad341c39e50935c67",
+      "vendor/libp2p-relay/CHANGELOG.md": "001fa0754e6e37f0e76854c881daa31abcd4ac9c6dd4ec4c697ebe2390057466",
+      "vendor/libp2p-relay/Cargo.lock": "1ba4c4302113953a6bcddd8fcb2a9ee9c48b974f43bbfec580953e0ce343f77a",
+      "vendor/libp2p-relay/Cargo.toml": "f74a70ccc6e23367cc715bf8344d5d06d4ba56000f0753c59bb6a30cb240124d",
+      "vendor/libp2p-relay/Cargo.toml.orig": "87739fb937add68d55242f94f8f884125b9552625dde18dd33a94ce49a700817",
+      "vendor/libp2p-relay/LICENSE": "79f0692aaac52422ef72f779045149f07a0b94f70486b99b46830abf9a3738fb",
+      "vendor/libp2p-relay/PATCHES.md": "bc8caeafd804d282cc002808ff77fb9f2b031b931209914d8193df83c9d6c5ab",
+      "vendor/libp2p-relay/src/behaviour.rs": "4b42bf4b84d392042d4a82ff734825232aa168d6b8e65ce18e860c72eb7aefbf",
+      "vendor/libp2p-relay/src/behaviour/handler.rs": "d77fbb516322973327c5218bfec90f80ca63443808e3a15f1001f45e468db14b",
+      "vendor/libp2p-relay/src/behaviour/rate_limiter.rs": "eb5244a84daff61e33bdab7f7e6fba62e9482b59497ba97289fdb7549447cca0",
+      "vendor/libp2p-relay/src/copy_future.rs": "f9a2ce457d2a542d7b1a1017ebdf885d411b3fe6ed9ba9f6936fe5b4ca66cedf",
+      "vendor/libp2p-relay/src/generated/message.proto": "aef8ae29c0ecc9334850b5e2fd078c3077d118fedf92d901d1d60378bd8045c3",
+      "vendor/libp2p-relay/src/generated/message_v2.pb.rs": "551eea3ec2ae106fcfce8f0a2e19f4f4cb1d0749d622e8f1cb48f98b79739a06",
+      "vendor/libp2p-relay/src/generated/mod.rs": "e77e59f0fdbcbec0aa432e4d6639a1bf45bd5ac5bd724e09d5fcec67af035a2e",
+      "vendor/libp2p-relay/src/lib.rs": "f4963302d33c64da41c3d2fb6b0ec70abea4a6c17da658c5952a88f2436457b3",
+      "vendor/libp2p-relay/src/multiaddr_ext.rs": "136170493671e1b98304a519f9d607978eb1e48ccad15a562afd4c719d1ecd2a",
+      "vendor/libp2p-relay/src/priv_client.rs": "16ca54f004627ce25417c002e5bc84351d306b0601ca46138c8b6ad35a727ca6",
+      "vendor/libp2p-relay/src/priv_client/handler.rs": "dc45db718f4c38ec60238277b6335be070f2bcb75a4c2b4ec13476fd2d28eef7",
+      "vendor/libp2p-relay/src/priv_client/transport.rs": "82f4f981d0f5ca568c46149500afecfd1905c81ed35e21b6cad46d95b52777a8",
+      "vendor/libp2p-relay/src/protocol.rs": "e151910546f1a46d8d2ce09132155d2b21384070262aca667b8e7c2a8741a1fa",
+      "vendor/libp2p-relay/src/protocol/inbound_hop.rs": "7a709af44a00f11c93b69310e45a8e1b00af7939a727e02e2a3a60f4362aa16b",
+      "vendor/libp2p-relay/src/protocol/inbound_stop.rs": "85cfe3033a25f84061ddae55e8e2566ae63736dabd87e5336402e0b39175a7d6",
+      "vendor/libp2p-relay/src/protocol/outbound_hop.rs": "97b8e0cbad21e8f28c480e65372eebfafa16c812967620eeb87b532b2caea1fd",
+      "vendor/libp2p-relay/src/protocol/outbound_stop.rs": "805689ef35e06286d4df50b09c129e6e7fdde30d4aeefa8d9f0dc70acae76835",
+      "vendor/libp2p-relay/tests/lib.rs": "924836098b3ae406ab96a2b566893856a14b2ac4aba14a03d2a8dce19a0d729f",
+      "vendor/libp2p-rendezvous/.cargo_vcs_info.json": "e5fca001ef37012318beda4d603090763bfef05ee5a1b03898478ce9a662a75a",
+      "vendor/libp2p-rendezvous/CHANGELOG.md": "687281833e9413e26c97347686a528e9aef6b4a3f9bdb506a05903dbcb0fa933",
+      "vendor/libp2p-rendezvous/Cargo.lock": "0cb12e4dfebf453483d1b94b315dad5b881a2e3f3ace1cf851a19d9aca782394",
+      "vendor/libp2p-rendezvous/Cargo.toml": "26743acaf663a04c29cbdaebba70428a6fee4015a328128c3150c0b7253dff63",
+      "vendor/libp2p-rendezvous/Cargo.toml.orig": "bdfe3b3edb06bdb73f452a945a4de74a0354bf3ece0efbc0717c935fd016914e",
+      "vendor/libp2p-rendezvous/LICENSE": "3f4086423515526c35990387fec7839f700aa48004159204ce7bcbf702456a72",
+      "vendor/libp2p-rendezvous/PATCHES.md": "e80e28cdb222bbc81cfc7e77d20afdad51b2a28210c0b07b3b4dbc261cce1d3a",
+      "vendor/libp2p-rendezvous/src/client.rs": "d71471e54e5302891fa1051506e098491defffdfb3b7534ca3343986aadc9b17",
+      "vendor/libp2p-rendezvous/src/codec.rs": "8e12dd9a4f961ca698fdda89c69f2756c7fd9c3237f895a551e5361cfad08765",
+      "vendor/libp2p-rendezvous/src/generated/mod.rs": "ddddf40173b17998b4efc873f77fbdf4537d6a04299e6641a87bb1c5ca5e7d52",
+      "vendor/libp2p-rendezvous/src/generated/rendezvous.pb.rs": "dcaa54ebc6703705ae6d4ea6f946b02728786f8716d6f1dc83971783f2d49d5c",
+      "vendor/libp2p-rendezvous/src/generated/rpc.proto": "bc3a63957fc7c175487017f31ca44fde70f25d67444f3bbfc0bd5b7d10c83495",
+      "vendor/libp2p-rendezvous/src/lib.rs": "c3243f2c835348ffef541abffbce0760578423dff5012edbd4a5c56d37c9acc4",
+      "vendor/libp2p-rendezvous/src/server.rs": "cb33eb42c46034a36b9218154d38324230e563e5dcf9a11688e47f0b44f88565",
+      "vendor/libp2p-rendezvous/tests/rendezvous.rs": "5ab35a4800397f40e847b1ba6743a9df1ae58b82a8f801d3d11c760034a08af9"
+    },
+    "broker": {
+      "path": "/home/jason/agb13-native-tmp/agb13-merged-build-n0w4mf4t/agent-bridge",
+      "sha256": "ec2114e380a7a0954d19fce4aa106a3ac5d39d72956be031c364a5b719176cdc",
+      "version": "agent-bridge 0.2.0"
+    },
+    "codex": {
+      "path": "/home/jason/.codex/packages/standalone/releases/0.165.0-x86_64-unknown-linux-musl/bin/codex",
+      "sha256": "c06a67fd8ac76508dc78bd99ce20c9f317b8d568beda59485f3f4134df9962d5",
+      "version": "codex-cli 0.165.0"
+    }
+  },
+  "compiled_source_manifest_path": "/home/jason/agb13-native-tmp/agb13-merged-build-n0w4mf4t/manifest.json",
+  "compiled_source_manifest_file_sha256": "6745bbed50c2caf3042e6133aeae9b69abf6ea25186c5c3d48d532e767f166a3",
+  "compiled_source_manifest": {
+    "base_commit": "a00d963ab1782192b53c290d3779ac7f0906a6f5",
+    "command": "cargo +1.98.0 build --locked -p agent-bridge",
+    "exit": 0,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "source_inputs_sha256": {
+      "Cargo.lock": "88d82fc971cb3fce9c26e4234f1bd1f24adca119ea8a005bd0d78b2ab0dd14d3",
+      "Cargo.toml": "ea541910a223e0fc8971b4360822b191bcf417c94ac229f78fc511617dd1c1b9",
+      "build.rs": "e2e260fb31e3473f8a47a978c4695019750b8dca00ce74d2dfa4d5c8f685b637",
+      "src/board.rs": "a7b9ad87af441f690634b3deae67308268a9c4e053738c40623b9c459712b322",
+      "src/board_clipboard.rs": "f405635af94f152d8be23a00fccc071a2872d51a532e6701a7fb2cbd24166952",
+      "src/board_interaction.rs": "77275138b1cea101cbb86ea912d41960debbbf283cb7d4797c3f5754910fac0f",
+      "src/board_notifications.rs": "12c7282895148f6f72b5659f51f9a12aa3e89ee5527976cc300e4fd3fe159f73",
+      "src/board_selection.rs": "10187d97fb806063c677bf3d6822a3311a437527a3825cc64fb74e53bd41b31f",
+      "src/board_tui.rs": "e8bd45dfb60468606bc0cb4bbef846620cd4930475a41f56521c57ca7ab204c8",
+      "src/broker.rs": "d185e3234ce4d5b17a7a4f796fcf7231ec30c39906972f4de07444b0a33dd67e",
+      "src/clients/claude.rs": "437635ce585357e6e66ef42dcdbfcc8b0195504c06cbb32cbea9f1eadd93a5ff",
+      "src/clients/claude_discovery.rs": "58887a0ad691753789fb5873084771566c9959cf8b3790030d74a21240a9b541",
+      "src/clients/codex.rs": "9e1f200784810ee5728864e6906031cabc9ea7156e65acce4289b986516ebe52",
+      "src/clients/codex_discovery.rs": "0de762af5503c77513189068d13fc748e51c73edebfa6daf11985be3661eac00",
+      "src/clients/lifecycle.rs": "cde3a72ed6fce9d165604a8e9da4b6b17e0e7054ebd7e7a7f1e502db4272b87a",
+      "src/clients/mod.rs": "3144988d36b6ed7caa2d46efa15eb4fe5a87029b624a4d85a1904250cb2e0647",
+      "src/clients/opencode.rs": "d5607ef7c5f7db31a3a3a0cf6712b3fdf606c16c046e24b00c1103e348f1fb6f",
+      "src/clients/tests.rs": "08ab01016cdc3e9f572eae06104709bd1742aa5d69cc570a9c424bed22f67732",
+      "src/codex_admission.rs": "be9abdeb33b2a692ef0b701e98fd2ae84c682a6d6d69f7a4a9ae65d33c2edfb5",
+      "src/db.rs": "819ab5d0561e314ede20c23ccc53141c7fb89b84daaf5d4b3adaf73495ef153a",
+      "src/delivery.rs": "450f31e5f574e3d69d5bfa05014a2b17e178ff976847d675e8fbb7290d8d8cc5",
+      "src/lib.rs": "8edea37064c9ed9d7580355516178301b3522d4bc074b3fe3bbd120ed7fc51ea",
+      "src/main.rs": "c833563d7d61753b76a11ff001a1353c7991387ce8268ee22e021478aef24291",
+      "src/mcp.rs": "3829147ca5c983d5a4998b8a66f0918ccd7e252bddf63dff738ce0d3fd554e57",
+      "src/mcp_output.rs": "b65470d12c90f831b0820b1a16e422926633932c9e9e6a6b7c6cca073dbf285c",
+      "src/migrations.rs": "3a217906a5c3b57f6362969cb3158614245a0e8ef3bed158be73e85edca38ec0",
+      "src/monitor.rs": "044fbb178842f36bdc565a1a474de659248d010d7517058d8d1bf48d0b7b0fb9",
+      "src/monitor_data.rs": "7788667e55e5e610597889c27fc4f8caf0c37c0306199069e0c68abac74da853",
+      "src/network/contact.rs": "ad4747a95fecaf026ec20e4dc312730f221aca8b618331723a90d3a8c8ad9dc3",
+      "src/network/discovery.rs": "a86cebab4862f4b2395fb74dcc99789a6bc50fa8e0be071bb0c6a342c056548b",
+      "src/network/identity.rs": "37511b19a87c7d53ac2c9f6506ae62a1d6764b667d106b4b66ec99ae258541b4",
+      "src/network/invitation.rs": "e7538f77882f4fee00dbaa54fbc18bceff0d6360b7fc3086a2f9976ece2d89ee",
+      "src/network/lan_pairing.rs": "aeadd6d39c2763ea579248d21b13af1d39ce05fa2a9d2f0ecd82643d733db9fe",
+      "src/network/machine.rs": "13934f7ab9e3b158c6c0d81cac8b22832b32ad190695158ea42e15de0fe56b25",
+      "src/network/mod.rs": "576183b16a0124e1745b61c6d1fba452db99c38927c554ac41162dc33b5900b8",
+      "src/network/nat_server.rs": "d3c928663d08ea3197f20b11d8f7322a0cb592177117ab58e559786b9d8699fd",
+      "src/network/pairing.rs": "9a603f5ebce27e1cb2acfcf29cb4d1fb2e0cb5c37a589888c74c63cccdf2e2a7",
+      "src/network/relay_config.rs": "4c4c3ea82e331f7dea367779e12e077546faf0092af02481951ebcb15a838dfd",
+      "src/network/relay_node.rs": "6304a3654423f7df3b38f6f71dde04e492d72609e8cceb4fb097f30f751f21f7",
+      "src/network/sharing.rs": "f480fd9722c5a4131c85a8d93b0d1c35ba000479ea68aa8179a3a84d1be43d2e",
+      "src/network/store.rs": "e583ba753547d961f1ca2ca078191e06df89c1df36ee1539d7d472f4b7140b63",
+      "src/network/transport.rs": "5e0bb3077764dc0c09fc6074c88a1eec76a9fd101ffc9aeb330f8a2cd67101c1",
+      "src/network/trust.rs": "fab0c35f1d40f69ad4d2b13fdc4b9de2bc96f727b2f3255e2229d2a47ff46d9d",
+      "src/network/wire.rs": "11dd68fc810b5f424f27483eeb7a61298cf4578f1c0e07ed73a57633ed8cc264",
+      "src/network/worker.rs": "3d7cd5d3a7ecc46e2ba6e175822e4a519aca53f6f0cb15304fca0695f6de4a8a",
+      "src/opencode_install/config.rs": "58cdd3493610bc9384029f42d0923628c0a5c68e8c6ad3337852d1ea79acbe44",
+      "src/opencode_install/tests.rs": "f2d0cdf06849e5aa85cfd3b75377705fa5d238fb2373b337ba61808eb7b35d89",
+      "src/opencode_install.rs": "e98ca38e711f090c96da66d2f7c48b0d046804a950679e7de9cd754b575a5fbe",
+      "src/opencode_state.rs": "017ee97aeb8d9ed141a79e9532ce9fa1aacc36cd6a1f4edcc9ed5f4a7b95024c",
+      "src/pairing_notifications.rs": "2a524084d4c834cdebd6f665bab647d4150e7cd7f5b9495b3bbaad961141e0e3",
+      "src/protocol.rs": "8992177b6ef3863698c3f8fc23145d858220f24805ab74cf594f13acce52f9bb",
+      "src/service.rs": "56d83d8880d0ee789f8e83ecfe1018017f8c0bc51b5e516d54272189dbefd70a",
+      "src/update.rs": "02ed054621e1cd3d25c7786051a5e2040ca848f1bb42c54c70dd9fa92e470bea",
+      "src/update_install.rs": "d8614d4205cca40042d99e0a41f6d55f9c8ef7a4972cffd33cb7e0ba177827b1",
+      "tests/claude_discovery.rs": "47bc14e01aee79ba7f7ba8c4de40b64b00499cf1bc1c13faf87cd20a365bcb1e",
+      "tests/clients_contracts.rs": "b92f4afa1ef1cd78be2f246e5a8d4cb4657ea6d090794d71a38ab054d5290f94",
+      "tests/connection_links.rs": "04cb082a7f7e666506bdf633b21ff6c5fa0eed4021a96660276f45c83930d0ea",
+      "tests/contact_brokers.rs": "1c611421072a5eb3f552dc61a996fc3296ba19979b53c81a6942b83f27c3ff3a",
+      "tests/discovery.rs": "37ad71496e6ec8b00a6c886c05f71cda7d7291660f0cbce60aeb87a6486450e6",
+      "tests/durability.rs": "da27c90c2b25b5bdf60ad01d5a0857b12bbfcf97f8758d70653dc1b65780410c",
+      "tests/fixtures/native-metadata-v10.sql": "48bb6141f63cd318ca84b2ce590288bc178d553ac2dcde1a8d071ee1fd335256",
+      "tests/identity.rs": "7d8d49ba4f7cfe39ee5dc4b073594b20622614541935e79747d5fb630a4c5fa8",
+      "tests/incremental_history.rs": "faf08a9033d5ab24e61fc455927e28cc30181faf39101d7f9147035f98eae432",
+      "tests/internet_transport.rs": "91cca539ce6129f52e4f7ae8f63a990b726813caefbf1a93e8d0024d9378b694",
+      "tests/lan_brokers.rs": "273f6c4c11058ffb600ecb3e88e5aa396f319053c0944dbe23ecc6eb72b78c76",
+      "tests/lan_cli.rs": "08ab15dce4e8a1ae984e455ae5d66eec9100b79eaf15cbb7b1744111801b1b41",
+      "tests/lan_discovery.rs": "7a6b09d33799a71e74511c127cf2cf466ff2c8f2b1765de5d424dc84a8cade30",
+      "tests/lan_pairing_brokers.rs": "31eea054decb66921eb51a3099e05171eb595bcec3020638b3f84099f62b1bcd",
+      "tests/lan_pairing_state.rs": "25a24d26aa0cd5ee6351e05ae972c27119fc24c6bf7a4aef1b7fed35a2bc6b2c",
+      "tests/machine_brokers.rs": "8eb61a64d4c2cf11ca5fb779f925c04528ab3dd75c47d7d6ea03b93bf88177ea",
+      "tests/machine_store.rs": "d472585589c62abc49566bef5985911b8e019df4e1b401275ecb0e76e7538939",
+      "tests/mcp.rs": "31963cf6e38de3890df7a56f0ca0aa7e69c69c53d844b62290e443a58c05ada1",
+      "tests/migrations.rs": "2a8190b35fe983fbb538ba57d094c35a3a877eaf13554575142ac67ac4c99f60",
+      "tests/monitor_http.rs": "2bf134af933c6f3f85341c1a589fe070b0f3958827c31c9bf2b9618156ce38cf",
+      "tests/mutual_pairing.rs": "4951a803ce16a2da3fccc980b06d9dabafaf2b1d173e07625b0c130a1a07a50a",
+      "tests/named_boards_cli.rs": "599d2430fea2d6a9285a03e1118c19126c3c018f0f01c1adecb04bfbe97f2fd2",
+      "tests/nat_transport.rs": "213595a89207e2fc80a0fdfeae5f5fd276b990beb1315815481753d61138bc95",
+      "tests/native_delivery.rs": "99ed219a0e6d554506f11e8ae719d1ad5d1f21f9ee1f9226b0c7fa8f453185ee",
+      "tests/network_brokers.rs": "bb2166787be79418910fa3429a082749ac9cbf623212f89eea1d208b5656c037",
+      "tests/network_store.rs": "ff9a42a27ec2e72717e3477e8b210d9146aac371dc48ce791f905202fd068b1c",
+      "tests/network_transport.rs": "844836f7cd826e7e1b387ec184aa3d08d8bb36c8e7b0bd6a766d50e7435bd0d2",
+      "tests/opencode.rs": "2c750a14bb2256be85ea3430f8a2c5e31c6f3a552fb42a314add505351b7e633",
+      "tests/opencode_network.rs": "774e15ac3325cad66835f44081bebb8c737d62a71c2a7b60a7826240f93ad7c6",
+      "tests/opencode_store.rs": "af27e81c9a821884daca7adccd2c7a201641d4c539ef58d8732380655910e4ca",
+      "tests/p2p_transport.rs": "4d7cb3efa912a075bdab1797290b5f7c27ae5f8b12e44b18d140fac3d35bae5f",
+      "tests/pairing_cli.rs": "c31bb64b19a0379becef241caa5b83229e2fbf38fc3be96e0525f208750bb5bc",
+      "tests/pairing_invitation.rs": "25a6dec3bc43b7c438108e1c4b011c1369c9ec54db91cff74ae56620721fa101",
+      "tests/pairing_notifications.rs": "23d3027d610cef82dd91c0c719e3c9489680822450239c1c20c679d121b0eb3a",
+      "tests/pairing_transport.rs": "047e22e50b66d5517751c3aee46db540bf9d205a4a97706856748510a0e19c8f",
+      "tests/peer_cli.rs": "02afc148acef60c6d5d4a611c0c755b153ffb373be94975e5d7b429b7e075bf0",
+      "tests/relay_brokers.rs": "a99debcaaeccae9f90d555c6ea73efc597b808ddbfab957742776bc64d98dab3",
+      "tests/relay_config.rs": "b25ddaf64bda24dd7ccb2e1410700de1c11f8a3dbaadba0ca73b2f36a1d93811",
+      "tests/relay_node.rs": "473b2757f4c447ac8c013beadea5bf2d16aedf36d1e0e32fa74efcb387ac8ef2",
+      "tests/relay_transport.rs": "b5bd290357cb175c361fda4132d84cbf6a7af440d45885b8a645780e0d73f3f4",
+      "tests/session_metadata.rs": "041631c9c7ccec21f9900f6cc506c6771e0d87e04f6e5339de006073128d4185",
+      "tests/session_sharing.rs": "ff744dcd33934b84451b2c1e5ad4af147d3d9cd9085428a6aff23644be60749c",
+      "tests/sharing_brokers.rs": "f6cfb942d97414feb74c40ee43a65664bd32441b49dce187fc73961ef1b4e2f0",
+      "tests/sharing_cli.rs": "eda88c53513a40030625703a2848726ac0cd3c280da6065e6e175124fe7056fc",
+      "tests/trust.rs": "30fadf27526a78589c758daa4d4fdde6640d4fbfd940e9380e0abfc7dff2f415",
+      "tests/updates.rs": "3f10dff0d07aec5829228337d367c68a1071d9ee4de1682ced204c3a35007460",
+      "tools/codex-native-delivery.py": "b12c9c3cf3482c3151c4e6156f83c3dbc36f084972f4531b32b6731fe7824ae3"
+    },
+    "source_manifest_sha256": "a738d8a4942ec301ebf88b49e4ac79700496d680e2c1e7c696566ecf62ea48e5",
+    "binary": "/home/jason/agb13-native-tmp/agb13-merged-build-n0w4mf4t/agent-bridge",
+    "binary_sha256": "ec2114e380a7a0954d19fce4aa106a3ac5d39d72956be031c364a5b719176cdc",
+    "binary_version": "agent-bridge 0.2.0",
+    "scope": "Merged named-board base plus all src/tests Rust and SQL, Cargo/build configuration, current native harness and any modified/new authored executable sources; immutable private production-binary copy is independent of later cargo-test output replacement."
+  },
+  "compiled_inputs_match_native_run": true,
+  "compiled_to_native_differences": {},
+  "artifacts_sha256": {
+    "events.json": "33cb6bf85a60bbfa2eeb005761c16df410ebf8249375ce3d542de91453a00262",
+    "results.json": "24de9ac6d00446861e947ca1c57084e2d96b92ca87f894aa51c9723533331b77",
+    "versions.json": "a89ce1b4c07dfecb42607747bba2ff2d6259c7e5cde1f4652b4dc9bd3412dc19",
+    "summary.json": "b887b8429e436041674d1bdef85346db2edae4375ab81b2720fc94eef7915800"
+  },
+  "cases": [
+    {
+      "name": "idle",
+      "thread": "01a1863c-0eb8-70e3-80f3-391cd1d084ec",
+      "message_id": "a1b6d65d-c396-463c-a083-5c593afe7edd",
+      "native_user_item": "01a1863c-0f5b-7f53-a157-f5a1b68d8fea",
+      "native_user_observed": "2026-10-29T05:57:25.470065+00:00",
+      "queue_request": "2026-10-29T05:57:25.368642+00:00",
+      "queue_response": "2026-10-29T05:57:25.385787+00:00",
+      "native_queue_id": "01a1863c-0ef9-7301-ba27-192fe34b0bcd",
+      "model_received": "2026-10-29T05:57:25.526059+00:00",
+      "ack_and_reply_verified": "2026-10-29T05:57:25.786076+00:00",
+      "original_active_turn": null,
+      "exact_id_timeline": [
+        {
+          "kind": "case_start",
+          "utc": "2026-10-29T05:57:25.329278+00:00",
+          "monotonic_ns": 1881448616178747
+        },
+        {
+          "kind": "native_write",
+          "utc": "2026-10-29T05:57:25.368642+00:00",
+          "monotonic_ns": 1881448655550871
+        },
+        {
+          "kind": "native_receipt",
+          "utc": "2026-10-29T05:57:25.385787+00:00",
+          "monotonic_ns": 1881448672697058
+        },
+        {
+          "kind": "case_verified",
+          "utc": "2026-10-29T05:57:25.786076+00:00",
+          "monotonic_ns": 1881449072977174
+        }
+      ],
+      "first_model_marker_timeline": {
+        "utc": "2026-10-29T05:57:25.526059+00:00",
+        "monotonic_ns": 1881448812975194
+      }
+    },
+    {
+      "name": "generating",
+      "thread": "01a1863c-10a6-7c02-ae29-d481eb6195a4",
+      "message_id": "fab1cbc6-0788-4a82-bc31-7e183316d838",
+      "native_user_item": "01a1863c-117a-7bc0-bce5-59fdcbbcff39",
+      "native_user_observed": "2026-10-29T05:57:26.012250+00:00",
+      "path": "production_active_steer",
+      "native_accepted": "2026-10-29T05:57:25.964622+00:00",
+      "model_received": "2026-10-29T05:57:26.055065+00:00",
+      "ack_and_reply_verified": "2026-10-29T05:57:26.237292+00:00",
+      "original_active_turn": "01a1863c-10c4-7581-a6d4-e8765b8d3348",
+      "exact_id_timeline": [
+        {
+          "kind": "case_start",
+          "utc": "2026-10-29T05:57:25.808322+00:00",
+          "monotonic_ns": 1881449095223816
+        },
+        {
+          "kind": "native_write",
+          "utc": "2026-10-29T05:57:25.963509+00:00",
+          "monotonic_ns": 1881449250419066
+        },
+        {
+          "kind": "native_receipt",
+          "utc": "2026-10-29T05:57:25.964622+00:00",
+          "monotonic_ns": 1881449251530472
+        },
+        {
+          "kind": "fixture_released",
+          "utc": "2026-10-29T05:57:26.007275+00:00",
+          "monotonic_ns": 1881449294175808
+        },
+        {
+          "kind": "original_turn_completed",
+          "utc": "2026-10-29T05:57:26.226780+00:00",
+          "monotonic_ns": 1881449513684283
+        },
+        {
+          "kind": "case_verified",
+          "utc": "2026-10-29T05:57:26.237292+00:00",
+          "monotonic_ns": 1881449524192219
+        }
+      ],
+      "first_model_marker_timeline": {
+        "utc": "2026-10-29T05:57:26.055065+00:00",
+        "monotonic_ns": 1881449341984938
+      }
+    },
+    {
+      "name": "held-tool",
+      "thread": "01a1863c-1265-7702-a430-97a19d2f193a",
+      "message_id": "739fc4ca-1805-426a-a273-7c3c58c2e207",
+      "native_user_item": "01a1863c-22ec-77b1-9240-db94b31f9564",
+      "native_user_observed": "2026-10-29T05:57:30.478698+00:00",
+      "held_tool_completed": "2026-10-29T05:57:30.461132+00:00",
+      "path": "production_active_steer",
+      "native_accepted": "2026-10-29T05:57:26.585781+00:00",
+      "model_received": "2026-10-29T05:57:30.508417+00:00",
+      "ack_and_reply_verified": "2026-10-29T05:57:30.640480+00:00",
+      "original_active_turn": "01a1863c-128a-7b92-8a7b-9d11e148b40d",
+      "exact_id_timeline": [
+        {
+          "kind": "case_start",
+          "utc": "2026-10-29T05:57:26.257032+00:00",
+          "monotonic_ns": 1881449543933606
+        },
+        {
+          "kind": "native_write",
+          "utc": "2026-10-29T05:57:26.584688+00:00",
+          "monotonic_ns": 1881449871598316
+        },
+        {
+          "kind": "native_receipt",
+          "utc": "2026-10-29T05:57:26.585781+00:00",
+          "monotonic_ns": 1881449872689956
+        },
+        {
+          "kind": "fixture_released",
+          "utc": "2026-10-29T05:57:26.625469+00:00",
+          "monotonic_ns": 1881449912369304
+        },
+        {
+          "kind": "original_turn_completed",
+          "utc": "2026-10-29T05:57:30.631969+00:00",
+          "monotonic_ns": 1881453918871296
+        },
+        {
+          "kind": "case_verified",
+          "utc": "2026-10-29T05:57:30.640480+00:00",
+          "monotonic_ns": 1881453927381674
+        }
+      ],
+      "first_model_marker_timeline": {
+        "utc": "2026-10-29T05:57:30.508417+00:00",
+        "monotonic_ns": 1881453795331689
+      }
+    },
+    {
+      "name": "long-turn",
+      "thread": "01a1863c-2397-7ac0-80d7-3f266c966409",
+      "message_id": "ab9cabb5-a122-442f-a301-3acde20f95f2",
+      "native_user_item": "01a1863c-291f-7e40-9d4c-b62358f95b1b",
+      "native_user_observed": "2026-10-29T05:57:32.065280+00:00",
+      "held_tool_completed": "2026-10-29T05:57:31.923866+00:00",
+      "path": "production_active_steer",
+      "native_accepted": "2026-10-29T05:57:32.021641+00:00",
+      "model_received": "2026-10-29T05:57:32.094347+00:00",
+      "ack_and_reply_verified": "2026-10-29T05:57:32.278562+00:00",
+      "original_active_turn": "01a1863c-23a9-7e53-8232-27a69c128d51",
+      "exact_id_timeline": [
+        {
+          "kind": "case_start",
+          "utc": "2026-10-29T05:57:30.659407+00:00",
+          "monotonic_ns": 1881453946309061
+        },
+        {
+          "kind": "native_write",
+          "utc": "2026-10-29T05:57:32.020331+00:00",
+          "monotonic_ns": 1881455307241261
+        },
+        {
+          "kind": "native_receipt",
+          "utc": "2026-10-29T05:57:32.021641+00:00",
+          "monotonic_ns": 1881455308552470
+        },
+        {
+          "kind": "fixture_released",
+          "utc": "2026-10-29T05:57:32.060324+00:00",
+          "monotonic_ns": 1881455347224583
+        },
+        {
+          "kind": "original_turn_completed",
+          "utc": "2026-10-29T05:57:32.268101+00:00",
+          "monotonic_ns": 1881455555020566
+        },
+        {
+          "kind": "case_verified",
+          "utc": "2026-10-29T05:57:32.278562+00:00",
+          "monotonic_ns": 1881455565462278
+        }
+      ],
+      "first_model_marker_timeline": {
+        "utc": "2026-10-29T05:57:32.094347+00:00",
+        "monotonic_ns": 1881455381262769
+      }
+    },
+    {
+      "name": "disconnected",
+      "thread": "01a1863c-29ff-78e3-932e-9aae16ea9979",
+      "message_id": "a5a422ef-e8f3-492d-a5fe-346f9ab3620e",
+      "native_user_item": "01a1863c-2af2-7c61-80ab-ad66e862dba0",
+      "native_user_observed": "2026-10-29T05:57:32.843635+00:00",
+      "path": "production_active_steer",
+      "native_accepted": "2026-10-29T05:57:32.469115+00:00",
+      "model_received": "2026-10-29T05:57:32.586032+00:00",
+      "ack_and_reply_verified": "2026-10-29T05:57:32.904715+00:00",
+      "original_active_turn": "01a1863c-2a1b-7292-820c-a6c247703580",
+      "exact_id_timeline": [
+        {
+          "kind": "case_start",
+          "utc": "2026-10-29T05:57:32.300076+00:00",
+          "monotonic_ns": 1881455586977683
+        },
+        {
+          "kind": "observer_disconnected",
+          "utc": "2026-10-29T05:57:32.425926+00:00",
+          "monotonic_ns": 1881455712840031
+        },
+        {
+          "kind": "observer_reconnected",
+          "utc": "2026-10-29T05:57:32.444150+00:00",
+          "monotonic_ns": 1881455731056657
+        },
+        {
+          "kind": "native_write",
+          "utc": "2026-10-29T05:57:32.467283+00:00",
+          "monotonic_ns": 1881455754194363
+        },
+        {
+          "kind": "native_receipt",
+          "utc": "2026-10-29T05:57:32.469115+00:00",
+          "monotonic_ns": 1881455756028007
+        },
+        {
+          "kind": "fixture_released",
+          "utc": "2026-10-29T05:57:32.508895+00:00",
+          "monotonic_ns": 1881455795795921
+        },
+        {
+          "kind": "case_verified",
+          "utc": "2026-10-29T05:57:32.904715+00:00",
+          "monotonic_ns": 1881456191617257
+        }
+      ],
+      "first_model_marker_timeline": {
+        "utc": "2026-10-29T05:57:32.586032+00:00",
+        "monotonic_ns": 1881455872947925
+      }
+    },
+    {
+      "name": "saturation",
+      "thread": "01a1863c-2c6f-7da2-8620-961d9a3b4e18",
+      "message_id": "1b08bbdf-f657-43c4-9899-0d182a789dcb",
+      "queue_request": "2026-10-29T05:57:33.585003+00:00",
+      "queue_response": "2026-10-29T05:57:33.586057+00:00",
+      "fixture": "missing-capability compatibility metadata; real native queue capacity",
+      "error": {
+        "code": -32600,
+        "message": "queue cannot contain more than 100 submissions"
+      },
+      "accepted_count": 100,
+      "original_active_turn": "01a1863c-2c89-7453-8da2-e9bf323f305f",
+      "exact_id_timeline": [
+        {
+          "kind": "case_start",
+          "utc": "2026-10-29T05:57:32.923978+00:00",
+          "monotonic_ns": 1881456210881697
+        },
+        {
+          "kind": "native_write",
+          "utc": "2026-10-29T05:57:33.585003+00:00",
+          "monotonic_ns": 1881456871911667
+        },
+        {
+          "kind": "native_receipt",
+          "utc": "2026-10-29T05:57:33.586057+00:00",
+          "monotonic_ns": 1881456872968050
+        },
+        {
+          "kind": "saturation_verified",
+          "utc": "2026-10-29T05:57:33.740374+00:00",
+          "monotonic_ns": 1881457027276073
+        },
+        {
+          "kind": "original_turn_completed",
+          "utc": "2026-10-29T05:57:33.766995+00:00",
+          "monotonic_ns": 1881457053901568
+        },
+        {
+          "kind": "saturation_drained",
+          "utc": "2026-10-29T05:57:41.146382+00:00",
+          "monotonic_ns": 1881464433283361
+        }
+      ],
+      "first_model_marker_timeline": null
+    }
+  ],
+  "cleanup": {
+    "native": 0,
+    "broker": 0
+  },
+  "cleanup_audit": {
+    "native": {
+      "process_group": 1672756,
+      "surviving_non_zombie_pids": [],
+      "utc": "2026-10-29T05:57:41.386837+00:00",
+      "monotonic_ns": 1881464673751195
+    },
+    "broker": {
+      "process_group": 1672596,
+      "surviving_non_zombie_pids": [],
+      "utc": "2026-10-29T05:57:41.483373+00:00",
+      "monotonic_ns": 1881464770288024
+    }
+  },
+  "limits": [
+    "Only saturation uses a missing-capability metadata compatibility fixture on the actual adapter thread/read response; stock active metadata is transparent. Native queue100/101 is real.",
+    "Synthetic Responses output proves native execution and actual broker MCP correlation, not external-model judgement or UI presentation.",
+    "Current final native proof uses an immutable copied normal-build binary and all101 authored source inputs match native-run file hashes, including the unchanged interpreted harness. Documentation/evidence updates occur after that run."
+  ],
+  "failed_attempts": [
+    {
+      "artifact_root": "/tmp/agb13-codex-6jbclai_",
+      "exit": 1,
+      "cases_executed": 6,
+      "reason": "Strict post-cleanup verifier rejected compatibility transformation on disposable creator thread/start response. Fixed proxy to transform only matching actual adapter thread/read. No production defect claim.",
+      "cleanup": {
+        "native": 0,
+        "broker": 0
+      },
+      "audited_survivors": []
+    },
+    {
+      "artifact_root": "/tmp/agb13-codex-r8el2xw1",
+      "exit": 1,
+      "reason": "Environment failure: /tmp tmpfs user quota os122 rejected native rollout/history writes and subsequent events persistence. Remaining cases blocked quota. Existing stderr/versions/rollouts retained; events.json empty and no results metadata persisted.",
+      "independent_cleanup_audit": "Exact /proc cwd/args/openfds run-root audit found zero owned native/broker/MCP survivors; no proxy remained. Switched to root-authorized private0700/home task TMPDIR, no evidence deleted."
+    }
+  ],
+  "prior_preintegration_proof": {
+    "artifact_root": "/home/jason/agb13-native-tmp/agb13-codex-iva291bv",
+    "validation": {
+      "production_native_cases": {
+        "exit": 0,
+        "accepted": 6
+      },
+      "offline_replay": {
+        "exit": 0,
+        "accepted": 6
+      },
+      "offline_corruptions": {
+        "exit": 0,
+        "rejected": [
+          "missing_acceptance",
+          "missing_tool_completion",
+          "interrupted_original",
+          "premature_model",
+          "wrong_native_client",
+          "missing_capability",
+          "double_write",
+          "altered_compatibility"
+        ]
+      },
+      "historical_AGB11_replay": {
+        "exit": 0,
+        "accepted": 8,
+        "artifact_root": "/tmp/agb11-codex-ybkph6le"
+      },
+      "python_compile": {
+        "exit": 0
+      },
+      "help": {
+        "exit": 0
+      },
+      "production_direct_feasibility_case_guard": {
+        "expected_exit": 2,
+        "actual_exit": 2
+      }
+    },
+    "artifacts_sha256": {
+      "events.json": "b36ba74c2ac50649213aeed6c74fa909cd40e4be1bc7b3ede978a6140635127c",
+      "results.json": "2c89ed270b1738e11f54da021d9828a5c21eb800d57ffc7948da7c07c4e2bf36",
+      "versions.json": "d4a85d42d7f0cdae5fbe8169a958192b93f6ad6b25a23b929abba384c71df434",
+      "summary.json": "455c883f6d5eefa2f1dc5436ea7bf287c40ef1fd17669e732f947fd23b77be90"
+    },
+    "cases": [
+      {
+        "name": "idle",
+        "thread": "01a18628-602d-7fe1-8311-a9cccf3e0593",
+        "message_id": "4e7ad9fa-162c-40bb-b77b-f94be30c432e",
+        "native_user_item": "01a18628-60d7-7ef2-8433-bc330310aabb",
+        "native_user_observed": "2026-10-29T05:35:55.608924+00:00",
+        "queue_request": "2026-10-29T05:35:55.506657+00:00",
+        "queue_response": "2026-10-29T05:35:55.518428+00:00",
+        "native_queue_id": "01a18628-6073-7940-8d39-2466b4104730",
+        "model_received": "2026-10-29T05:35:55.653029+00:00",
+        "ack_and_reply_verified": "2026-10-29T05:35:55.817832+00:00",
+        "original_active_turn": null,
+        "exact_id_timeline": [
+          {
+            "kind": "case_start",
+            "utc": "2026-10-29T05:35:55.466778+00:00",
+            "monotonic_ns": 1880158753679924
+          },
+          {
+            "kind": "native_write",
+            "utc": "2026-10-29T05:35:55.506657+00:00",
+            "monotonic_ns": 1880158793570959
+          },
+          {
+            "kind": "native_receipt",
+            "utc": "2026-10-29T05:35:55.518428+00:00",
+            "monotonic_ns": 1880158805339825
+          },
+          {
+            "kind": "case_verified",
+            "utc": "2026-10-29T05:35:55.817832+00:00",
+            "monotonic_ns": 1880159104733894
+          }
+        ],
+        "first_model_marker_timeline": {
+          "utc": "2026-10-29T05:35:55.653029+00:00",
+          "monotonic_ns": 1880158939944557
+        }
+      },
+      {
+        "name": "generating",
+        "thread": "01a18628-61b8-7f12-8e1e-56ce1464218b",
+        "message_id": "e7c24390-c896-4219-91b8-f26c12c5f8ad",
+        "native_user_item": "01a18628-63b2-7cd2-bafc-ffc67e112c6b",
+        "native_user_observed": "2026-10-29T05:35:56.339564+00:00",
+        "path": "production_active_steer",
+        "native_accepted": "2026-10-29T05:35:56.087973+00:00",
+        "model_received": "2026-10-29T05:35:56.378036+00:00",
+        "ack_and_reply_verified": "2026-10-29T05:35:56.543692+00:00",
+        "original_active_turn": "01a18628-61d8-7ae2-8f8b-0c70b0170d56",
+        "exact_id_timeline": [
+          {
+            "kind": "case_start",
+            "utc": "2026-10-29T05:35:55.853138+00:00",
+            "monotonic_ns": 1880159140038104
+          },
+          {
+            "kind": "native_write",
+            "utc": "2026-10-29T05:35:56.082659+00:00",
+            "monotonic_ns": 1880159369569522
+          },
+          {
+            "kind": "native_receipt",
+            "utc": "2026-10-29T05:35:56.087973+00:00",
+            "monotonic_ns": 1880159374892980
+          },
+          {
+            "kind": "fixture_released",
+            "utc": "2026-10-29T05:35:56.334079+00:00",
+            "monotonic_ns": 1880159620980677
+          },
+          {
+            "kind": "original_turn_completed",
+            "utc": "2026-10-29T05:35:56.530041+00:00",
+            "monotonic_ns": 1880159816947827
+          },
+          {
+            "kind": "case_verified",
+            "utc": "2026-10-29T05:35:56.543692+00:00",
+            "monotonic_ns": 1880159830594176
+          }
+        ],
+        "first_model_marker_timeline": {
+          "utc": "2026-10-29T05:35:56.378036+00:00",
+          "monotonic_ns": 1880159664949831
+        }
+      },
+      {
+        "name": "held-tool",
+        "thread": "01a18628-6489-7cd1-897c-2e664fc86a59",
+        "message_id": "c16d535f-4dbd-4b1c-b71a-5b6a83261676",
+        "native_user_item": "01a18628-7537-76d3-8b37-0837b8292057",
+        "native_user_observed": "2026-10-29T05:36:00.824177+00:00",
+        "held_tool_completed": "2026-10-29T05:36:00.818996+00:00",
+        "path": "production_active_steer",
+        "native_accepted": "2026-10-29T05:35:56.951848+00:00",
+        "model_received": "2026-10-29T05:36:00.841159+00:00",
+        "ack_and_reply_verified": "2026-10-29T05:36:00.920788+00:00",
+        "original_active_turn": "01a18628-649d-79a3-a31b-e1d8c21f845e",
+        "exact_id_timeline": [
+          {
+            "kind": "case_start",
+            "utc": "2026-10-29T05:35:56.561679+00:00",
+            "monotonic_ns": 1880159848582665
+          },
+          {
+            "kind": "native_write",
+            "utc": "2026-10-29T05:35:56.950446+00:00",
+            "monotonic_ns": 1880160237353645
+          },
+          {
+            "kind": "native_receipt",
+            "utc": "2026-10-29T05:35:56.951848+00:00",
+            "monotonic_ns": 1880160238755473
+          },
+          {
+            "kind": "fixture_released",
+            "utc": "2026-10-29T05:35:56.993056+00:00",
+            "monotonic_ns": 1880160279957051
+          },
+          {
+            "kind": "original_turn_completed",
+            "utc": "2026-10-29T05:36:00.913213+00:00",
+            "monotonic_ns": 1880164200116226
+          },
+          {
+            "kind": "case_verified",
+            "utc": "2026-10-29T05:36:00.920788+00:00",
+            "monotonic_ns": 1880164207685622
+          }
+        ],
+        "first_model_marker_timeline": {
+          "utc": "2026-10-29T05:36:00.841159+00:00",
+          "monotonic_ns": 1880164128066522
+        }
+      },
+      {
+        "name": "long-turn",
+        "thread": "01a18628-759e-7c03-8c92-e06abc45781f",
+        "message_id": "10d3f847-8ec0-4f7d-8a37-6e1958df9444",
+        "native_user_item": "01a18628-7aa4-7020-bfed-80d03ccdfbac",
+        "native_user_observed": "2026-10-29T05:36:02.213746+00:00",
+        "held_tool_completed": "2026-10-29T05:36:02.082821+00:00",
+        "path": "production_active_steer",
+        "native_accepted": "2026-10-29T05:36:02.166147+00:00",
+        "model_received": "2026-10-29T05:36:02.231469+00:00",
+        "ack_and_reply_verified": "2026-10-29T05:36:02.328553+00:00",
+        "original_active_turn": "01a18628-75aa-7802-90dc-81c3a2b58065",
+        "exact_id_timeline": [
+          {
+            "kind": "case_start",
+            "utc": "2026-10-29T05:36:00.934942+00:00",
+            "monotonic_ns": 1880164221843094
+          },
+          {
+            "kind": "native_write",
+            "utc": "2026-10-29T05:36:02.165003+00:00",
+            "monotonic_ns": 1880165451908054
+          },
+          {
+            "kind": "native_receipt",
+            "utc": "2026-10-29T05:36:02.166147+00:00",
+            "monotonic_ns": 1880165453054078
+          },
+          {
+            "kind": "fixture_released",
+            "utc": "2026-10-29T05:36:02.209974+00:00",
+            "monotonic_ns": 1880165496875046
+          },
+          {
+            "kind": "original_turn_completed",
+            "utc": "2026-10-29T05:36:02.319937+00:00",
+            "monotonic_ns": 1880165606839851
+          },
+          {
+            "kind": "case_verified",
+            "utc": "2026-10-29T05:36:02.328553+00:00",
+            "monotonic_ns": 1880165615453572
+          }
+        ],
+        "first_model_marker_timeline": {
+          "utc": "2026-10-29T05:36:02.231469+00:00",
+          "monotonic_ns": 1880165518375596
+        }
+      },
+      {
+        "name": "disconnected",
+        "thread": "01a18628-7b1f-70b3-a4a4-cf84bdc9b61e",
+        "message_id": "a869d6d1-e673-44cd-9197-8119a3afcaf7",
+        "native_user_item": "01a18628-7ba6-7023-a88f-7a0b36d23858",
+        "native_user_observed": "2026-10-29T05:36:02.573193+00:00",
+        "path": "production_active_steer",
+        "native_accepted": "2026-10-29T05:36:02.424892+00:00",
+        "model_received": "2026-10-29T05:36:02.489961+00:00",
+        "ack_and_reply_verified": "2026-10-29T05:36:02.634079+00:00",
+        "original_active_turn": "01a18628-7b2d-7b52-98bc-e43e575fb969",
+        "exact_id_timeline": [
+          {
+            "kind": "case_start",
+            "utc": "2026-10-29T05:36:02.345338+00:00",
+            "monotonic_ns": 1880165632239495
+          },
+          {
+            "kind": "observer_disconnected",
+            "utc": "2026-10-29T05:36:02.403999+00:00",
+            "monotonic_ns": 1880165690911347
+          },
+          {
+            "kind": "observer_reconnected",
+            "utc": "2026-10-29T05:36:02.412797+00:00",
+            "monotonic_ns": 1880165699702953
+          },
+          {
+            "kind": "native_write",
+            "utc": "2026-10-29T05:36:02.423769+00:00",
+            "monotonic_ns": 1880165710676840
+          },
+          {
+            "kind": "native_receipt",
+            "utc": "2026-10-29T05:36:02.424892+00:00",
+            "monotonic_ns": 1880165711803421
+          },
+          {
+            "kind": "fixture_released",
+            "utc": "2026-10-29T05:36:02.467933+00:00",
+            "monotonic_ns": 1880165754831034
+          },
+          {
+            "kind": "case_verified",
+            "utc": "2026-10-29T05:36:02.634079+00:00",
+            "monotonic_ns": 1880165920979416
+          }
+        ],
+        "first_model_marker_timeline": {
+          "utc": "2026-10-29T05:36:02.489961+00:00",
+          "monotonic_ns": 1880165776868468
+        }
+      },
+      {
+        "name": "saturation",
+        "thread": "01a18628-7c4f-71f0-8588-2be1249b7f90",
+        "message_id": "ef9f015f-4b82-483a-80aa-d4457a1b9bbd",
+        "queue_request": "2026-10-29T05:36:02.914702+00:00",
+        "queue_response": "2026-10-29T05:36:02.915902+00:00",
+        "fixture": "missing-capability compatibility metadata; real native queue capacity",
+        "error": {
+          "code": -32600,
+          "message": "queue cannot contain more than 100 submissions"
+        },
+        "accepted_count": 100,
+        "original_active_turn": "01a18628-7c5e-7802-a223-7f472df56006",
+        "exact_id_timeline": [
+          {
+            "kind": "case_start",
+            "utc": "2026-10-29T05:36:02.650064+00:00",
+            "monotonic_ns": 1880165936966981
+          },
+          {
+            "kind": "native_write",
+            "utc": "2026-10-29T05:36:02.914702+00:00",
+            "monotonic_ns": 1880166201618290
+          },
+          {
+            "kind": "native_receipt",
+            "utc": "2026-10-29T05:36:02.915902+00:00",
+            "monotonic_ns": 1880166202815323
+          },
+          {
+            "kind": "saturation_verified",
+            "utc": "2026-10-29T05:36:02.962053+00:00",
+            "monotonic_ns": 1880166248956440
+          },
+          {
+            "kind": "original_turn_completed",
+            "utc": "2026-10-29T05:36:03.002704+00:00",
+            "monotonic_ns": 1880166289612808
+          },
+          {
+            "kind": "saturation_drained",
+            "utc": "2026-10-29T05:36:08.438393+00:00",
+            "monotonic_ns": 1880171725294310
+          }
+        ],
+        "first_model_marker_timeline": null
+      }
+    ],
+    "cleanup": {
+      "native": 0,
+      "broker": 0
+    },
+    "cleanup_audit": {
+      "native": {
+        "process_group": 1590966,
+        "surviving_non_zombie_pids": [],
+        "utc": "2026-10-29T05:36:08.592497+00:00",
+        "monotonic_ns": 1880171879407476
+      },
+      "broker": {
+        "process_group": 1590949,
+        "surviving_non_zombie_pids": [],
+        "utc": "2026-10-29T05:36:08.627559+00:00",
+        "monotonic_ns": 1880171914469147
+      }
+    },
+    "independent_review": {
+      "baseline_accepted": 6,
+      "tampered_copies_rejected": 8,
+      "artifact_root": "/home/jason/agb13-native-tmp/agb13-review-evidence-ilc2a0ov",
+      "harness_sha256": "b12c9c3cf3482c3151c4e6156f83c3dbc36f084972f4531b32b6731fe7824ae3",
+      "tamper_cases": [
+        "missing acceptance",
+        "tool nonzero exit",
+        "duplicate write",
+        "broader transformation",
+        "missing raw model marker",
+        "changed capacity error",
+        "missing capability",
+        "interrupted original turn"
+      ]
+    },
+    "final_test_only_delta": {
+      "path": "src/clients/codex.rs",
+      "before_preserved_path": "/home/jason/agb13-native-tmp/codex-before-timeout-fixture.rs",
+      "before_file_sha256": "f27cd133fae028dedc6bda0e50c6e824d1123a0550e3633af4cd216eb569a648",
+      "after_file_sha256": "9e1f200784810ee5728864e6906031cabc9ea7156e65acce4289b986516ebe52",
+      "scope": "Only final cfg(test) mod tests held timeout fixtures: await peer close instead of competing 100 ms success response timer. Production source bytes unchanged.",
+      "unchanged_raw_prefix": {
+        "boundary": "Immediately before final #[cfg(test)]\\nmod tests",
+        "bytes": 12038,
+        "sha256": "7da74b6c48b210413746ff31e6f42ee1cfe49570821b0ef40f449617a79ac2e8",
+        "equal_before_after": true
+      },
+      "native_exercised_binary_preserved": {
+        "path": "/home/jason/agb13-native-tmp/agent-bridge-native-exercised-0737ce98",
+        "sha256": "0737ce98d051de5ad4c6880fa6b98373080111946f57273eee91b8cda172fd22"
+      },
+      "current_cargo_test_normal_binary": {
+        "path": "/home/jason/repos/agent-bridge-worktrees/agb-13-codex-active-delivery-20261029/target/debug/agent-bridge",
+        "sha256": "78dd5088dd256ba3e9b803cd9475a196bf888f4a0bdc1533a6dfa6736db24875",
+        "native_exercised": false,
+        "reason": "Cargo test normal binary uses a distinct dev-dependency feature graph: tempfile activates rustix default/fs, changing crossterm dependency fingerprint. It is not the native-exercised artifact."
+      },
+      "feature_graph_evidence": {
+        "/home/jason/agb13-native-tmp/cargo-test-feature-edges.txt": "cb7f3952f918d4e74cc34737f5b709aa92af505e5436e6b9126cdcc18359c88f",
+        "/home/jason/agb13-native-tmp/cargo-build-feature-edges.txt": "13462a50aa9290a414646c8101de24bb4cbfcfae208cc7a856587cb7b3c91931"
+      },
+      "validation_boundary": "Full package run 49398 exited 0 with 387 passed, 0 failed, 3 ignored before this test-only fixture correction. Root selected focused timeout/fmt/check/Clippy for the correction and no repeat native/full suite; final gate results are tracked by the coordinating agent."
+    },
+    "source_commit": "e7347b4f258a3a44fc9421157eedf3ab30a329e1",
+    "native_binary": {
+      "path": "/home/jason/repos/agent-bridge-worktrees/agb-13-codex-active-delivery-20261029/target/debug/agent-bridge",
+      "sha256": "0737ce98d051de5ad4c6880fa6b98373080111946f57273eee91b8cda172fd22",
+      "version": "agent-bridge 0.2.0"
+    },
+    "compiled_source_manifest_path": "/tmp/agb13-built-source-c_mghnxp/manifest.json",
+    "compiled_source_manifest_file_sha256": "e1c34f3a62c6d415cd5576076f3ed15d5f4f097464e6d0f90cf3b8927625e76e",
+    "interpreted_harness_difference": {
+      "tools/codex-native-delivery.py": {
+        "build_snapshot_sha256": "a3ba85ccffd4e0584c2fce2523af8ca5c0c7f34e8501a92ac7c2573ee75b30e9",
+        "native_run_sha256": "b12c9c3cf3482c3151c4e6156f83c3dbc36f084972f4531b32b6731fe7824ae3"
+      }
+    },
+    "purpose": "Prior pre-integration e734/0737 proof; not the final merged production artifact."
+  },
+  "independent_review": {
+    "exit": 0,
+    "baseline_accepted": 6,
+    "checked_in_negative_cases_rejected": 8,
+    "independently_constructed_copies_rejected": 8,
+    "artifact_root": "/home/jason/agb13-native-tmp/agb13-merged-review-83xjgsbh",
+    "compiled_current_native_source_inputs_matching": 101,
+    "immutable_binary_sha256": "ec2114e380a7a0954d19fce4aa106a3ac5d39d72956be031c364a5b719176cdc",
+    "tamper_cases": [
+      "nonzero tool exit",
+      "missing raw model input",
+      "missing receipt",
+      "duplicate write",
+      "wrong compatibility thread",
+      "unknown capacity error",
+      "missing capability",
+      "interrupted original turn"
+    ]
+  }
+}

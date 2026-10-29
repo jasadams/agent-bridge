@@ -34,7 +34,7 @@ impl std::fmt::Display for Capacity {
 impl std::error::Error for Capacity {}
 
 pub fn retryable(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<Capacity>().is_some() || error.chain().any(|cause| {
+    (error.downcast_ref::<Capacity>().is_some() || error.downcast_ref::<crate::codex_admission::Capacity>().is_some()) || error.chain().any(|cause| {
         matches!(cause.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(e, _)) if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
     })
 }
@@ -592,6 +592,7 @@ impl Db {
         self.check_capacity(authenticated_peer, true)?;
         let local_id = uuid::Uuid::new_v4().to_string();
         let tx = self.conn.unchecked_transaction()?;
+        crate::codex_admission::check(&tx, &destination.provider, &destination.session, None)?;
         let encoded = serde_json::to_string(envelope)?;
         check_retained_capacity(&tx, authenticated_peer, envelope.body.len() + encoded.len())?;
         let t = now();

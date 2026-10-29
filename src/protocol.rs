@@ -106,6 +106,12 @@ pub enum Request {
         recipient: String,
         content: String,
     },
+    CodexNotice {
+        id: String,
+        recipient: String,
+        session: String,
+        content: String,
+    },
     Unregister {
         name: String,
         session: String,

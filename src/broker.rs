@@ -25,6 +25,31 @@ use tokio::{
     time::timeout,
 };
 
+// Native receipt acknowledgement may change durable state before its worker
+// finishes. Keep the concurrency fence until the actual task is joined.
+#[derive(Default)]
+struct CodexWorkers(std::collections::HashMap<tokio::task::Id, String>);
+impl CodexWorkers {
+    fn sessions(&self) -> Vec<String> {
+        self.0.values().cloned().collect()
+    }
+    fn track(&mut self, id: tokio::task::Id, agent: &crate::protocol::Agent) {
+        if agent.provider == Provider::Codex {
+            self.0.insert(id, agent.session.clone());
+        }
+    }
+    fn completed<T>(
+        &mut self,
+        result: &std::result::Result<(tokio::task::Id, T), tokio::task::JoinError>,
+    ) {
+        let id = match result {
+            Ok((id, _)) => *id,
+            Err(error) => error.id(),
+        };
+        self.0.remove(&id);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct NetworkSnapshot {
     pub generation: u64,
@@ -628,6 +653,15 @@ impl Broker {
                 );
                 let message = db.send(&id, "user", &agent.name, &content, &None)?;
                 db.opencode_notice_content(&id, &content)?;
+                json!({"queued":true,"message":message,"acknowledged":false})
+            }
+            Request::CodexNotice {
+                id,
+                recipient,
+                session,
+                content,
+            } => {
+                let message = db.codex_notice(&id, &recipient, &session, &content)?;
                 json!({"queued":true,"message":message,"acknowledged":false})
             }
             Request::Unregister { name, session } => {
@@ -1391,6 +1425,7 @@ impl Broker {
 
     async fn dispatch(&self) -> Result<()> {
         let mut workers = JoinSet::new();
+        let mut codex_workers = CodexWorkers::default();
         loop {
             self.db.lock().unwrap().opencode_tick(crate::db::now())?;
             // Construct and enable before querying so arrivals cannot be lost between query and wait.
@@ -1400,7 +1435,7 @@ impl Broker {
             while workers.len() < 16 {
                 let next = {
                     let mut db = self.db.lock().unwrap();
-                    db.claim()?.map(|(msg, agent)| {
+                    db.claim_excluding_codex(&codex_workers.sessions())?.map(|(msg, agent)| {
                         let machines = json!({"source_machine":self.message_machine(&db, &msg.sender)?,"destination_machine":self.message_machine(&db, &msg.recipient)?,"sender_name":self.message_sender_name(&db, &msg.sender)});
                         let dispatch = if agent.provider==Provider::OpenCode {
                             let content = crate::clients::Adapter::OpenCode.message_content(&msg,&self.state_dir,&machines);
@@ -1412,15 +1447,19 @@ impl Broker {
                                 }
                             }
                         } else { None };
-                        Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch)))
+                        let raw_codex_notice = agent.provider == Provider::Codex && db.codex_is_notice(&msg.id)?;
+                        Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch, raw_codex_notice)))
                     }).transpose()?.flatten()
                 };
-                let Some((msg, agent, machines, dispatch)) = next else {
+                let Some((msg, agent, machines, dispatch, raw_codex_notice)) = next else {
                     break;
                 };
                 let this = self.clone();
-                workers.spawn(async move {
-                    let outcome = if let Some(dispatch) = &dispatch {
+                let worker_agent = agent.clone();
+                let worker = workers.spawn(async move {
+                    let mut outcome = if raw_codex_notice {
+                        crate::clients::deliver_content(&agent, &msg, &msg.body).await
+                    } else if let Some(dispatch) = &dispatch {
                         crate::clients::opencode::deliver_dispatch(&agent, dispatch).await
                     } else {
                         delivery::deliver_with_machines(
@@ -1432,6 +1471,10 @@ impl Broker {
                         )
                         .await
                     };
+                    if raw_codex_notice && outcome.state == "submitted" {
+                        outcome.detail =
+                            "Native accepted typed control; no acknowledgement is required".into();
+                    }
                     let db = this.db.lock().unwrap();
                     let result = if let Some(dispatch) = &dispatch {
                         db.opencode_finish(&msg.id, dispatch, outcome.state, &outcome.detail)
@@ -1445,11 +1488,15 @@ impl Broker {
                     this.wake.notify_one();
                     this.network_wake.notify_one();
                 });
+                codex_workers.track(worker.id(), &worker_agent);
             }
             tokio::select! {
                 _=&mut notified=>{},
                 _=tokio::time::sleep(Duration::from_secs(1))=>{},
-                Some(result)=workers.join_next(),if !workers.is_empty()=>{result.context("Delivery task panicked")?;},
+                Some(result)=workers.join_next_with_id(),if !workers.is_empty()=>{
+                    codex_workers.completed(&result);
+                    result.context("Delivery task panicked")?;
+                },
             }
         }
     }
@@ -1855,6 +1902,114 @@ mod opencode_admission_tests {
             )
             .unwrap();
             assert_eq!(db.get(&message.id).unwrap().state, "queued");
+        }
+    }
+}
+
+#[cfg(test)]
+mod codex_worker_tests {
+    use super::*;
+    use crate::protocol::Agent;
+    #[tokio::test]
+    async fn codex_fast_ack_cannot_release_worker_fence_and_all_completions_remove_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&root.path().join("db")).unwrap();
+        let one = Agent {
+            name: "one".into(),
+            provider: Provider::Codex,
+            session: "123e4567-e89b-12d3-a456-426614174000".into(),
+            endpoint: String::new(),
+            enabled: true,
+        };
+        let mut alias = one.clone();
+        alias.name = "alias".into();
+        let mut other = one.clone();
+        other.name = "other".into();
+        other.session = "123e4567-e89b-12d3-a456-426614174001".into();
+        for agent in [&one, &alias, &other] {
+            db.register(agent, false).unwrap();
+        }
+        let send = |db: &Db, agent: &Agent| {
+            db.send(
+                &uuid::Uuid::new_v4().to_string(),
+                "user",
+                &agent.name,
+                "peer input",
+                &None,
+            )
+            .unwrap()
+        };
+        let first = send(&db, &one);
+        let second = send(&db, &alias);
+        assert_eq!(db.claim().unwrap().unwrap().0.id, first.id);
+        let mut workers = JoinSet::new();
+        let mut busy = CodexWorkers::default();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let worker = workers.spawn(async move {
+            held.await.unwrap();
+        });
+        busy.track(worker.id(), &one);
+        db.ack(&first.id, &one.name).unwrap();
+        assert!(
+            db.claim_excluding_codex(&busy.sessions())
+                .unwrap()
+                .is_none()
+        );
+        let unrelated = send(&db, &other);
+        assert_eq!(
+            db.claim_excluding_codex(&busy.sessions())
+                .unwrap()
+                .unwrap()
+                .0
+                .id,
+            unrelated.id
+        );
+        db.finish(&unrelated.id, "submitted", "accepted").unwrap();
+        release.send(()).unwrap();
+        let result = workers.join_next_with_id().await.unwrap();
+        busy.completed(&result);
+        result.unwrap();
+        assert_eq!(
+            db.claim_excluding_codex(&busy.sessions())
+                .unwrap()
+                .unwrap()
+                .0
+                .id,
+            second.id
+        );
+        db.finish(&second.id, "submitted", "accepted").unwrap();
+        assert_eq!(db.get(&first.id).unwrap().state, "acknowledged");
+        for cancel in [false, true] {
+            let queued = send(&db, &alias);
+            let worker = workers.spawn(async move {
+                if !cancel {
+                    panic!("injected worker panic");
+                }
+                std::future::pending::<()>().await;
+            });
+            busy.track(worker.id(), &one);
+            assert!(
+                db.claim_excluding_codex(&busy.sessions())
+                    .unwrap()
+                    .is_none()
+            );
+            if cancel {
+                worker.abort();
+            }
+            let result = workers.join_next_with_id().await.unwrap();
+            assert!(result.is_err());
+            busy.completed(&result);
+            assert!(busy.sessions().is_empty());
+            assert_eq!(
+                db.claim_excluding_codex(&busy.sessions())
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .id,
+                queued.id
+            );
+            db.finish(&queued.id, "failed", "test worker cleanup")
+                .unwrap();
         }
     }
 }

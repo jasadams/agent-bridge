@@ -27,10 +27,12 @@ receiving messages do not depend on trusting the optional hooks. See the
 [official Codex documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 for MCP client configuration.
 
-On Codex 0.165.0, native queue acceptance can wait for the entire active turn to
-finish, including tool continuations; the native queue is limited to 100 entries.
-Acceptance is not model receipt. See the [delivery diagnosis and proposed active
-handoff path](codex-delivery-diagnosis.md) for reproducible evidence and limits.
+On Codex 0.165.0, verified active threads that support direct input receive peer
+handoffs through their current turn's native steer path. Idle or unsupported-capability
+threads retain native queuing, which may wait for the whole active turn to finish.
+Native acceptance is not acknowledgement. See [Codex delivery and backpressure](codex-delivery.md)
+for version limits, bounded admission and explicit recovery; the [original diagnosis](codex-delivery-diagnosis.md)
+retains queue-only evidence and historical uncertainty.
 
 ## Claude Code
 

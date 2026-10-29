@@ -687,4 +687,78 @@ mod tests {
         assert_eq!(next.agent.name, "z-last");
         assert!(state.watches["a-first"].pending.is_some());
     }
+    #[tokio::test]
+    async fn named_board_codex_notice_preserves_identity_in_the_bounded_raw_control_queue() {
+        use crate::protocol::Request;
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let mut native = agent("native");
+        native.session = "123e4567-e89b-12d3-a456-426614174000".into();
+        broker
+            .request(Request::Register {
+                agent: native.clone(),
+                replace: false,
+            })
+            .unwrap();
+        let now = Instant::now();
+        let alpha: Name = "alpha".parse().unwrap();
+        let beta: Name = "beta".parse().unwrap();
+        let mut subscriptions = State::default();
+        for name in [&alpha, &beta] {
+            subscriptions
+                .subscribe_named(name, native.clone(), "initial", now)
+                .unwrap();
+        }
+        subscriptions.observe_named(&alpha, "alpha-revision", None, now);
+        let notices = subscriptions.due(now + DEBOUNCE, MAX_DELIVERIES);
+        assert_eq!(notices.len(), 1);
+        let notice = &notices[0];
+        let text = notice.text();
+        let metadata: serde_json::Value =
+            serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(metadata["board"], "alpha");
+        assert_eq!(metadata["revision"], "alpha-revision");
+        assert!(text.contains("{\"board\":\"alpha\"}"));
+        assert!(text.contains("Do not acknowledge"));
+        let id = uuid::Uuid::new_v4().to_string();
+        broker.db.lock().unwrap().pause(true).unwrap();
+        let result = broker
+            .request(Request::CodexNotice {
+                id: id.clone(),
+                recipient: native.name.clone(),
+                session: native.session.clone(),
+                content: text.clone(),
+            })
+            .unwrap();
+        assert_eq!(result["queued"], true);
+        assert_eq!(result["acknowledged"], false);
+        let mut db = broker.db.lock().unwrap();
+        assert!(db.claim().unwrap().is_none());
+        db.pause(false).unwrap();
+        let (claimed, target) = db.claim().unwrap().unwrap();
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.body, text);
+        assert_eq!(target.session, native.session);
+        assert!(db.codex_is_notice(&id).unwrap());
+        assert!(!claimed.body.contains("local peer message"));
+        db.finish(
+            &id,
+            "submitted",
+            "typed control requires no acknowledgement",
+        )
+        .unwrap();
+        assert_eq!(db.get(&id).unwrap().state, "submitted");
+        drop(db);
+        assert!(
+            broker
+                .request(Request::CodexNotice {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    recipient: native.name,
+                    session: "123e4567-e89b-12d3-a456-426614174001".into(),
+                    content: text
+                })
+                .is_err()
+        );
+    }
 }

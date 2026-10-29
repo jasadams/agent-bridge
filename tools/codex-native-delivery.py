@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable Codex queue-boundary diagnostic; never uses owner configuration.
+"""Disposable Codex delivery diagnostic and production regression; isolated state only.
 
 Requires Python 3.11+, websockets, codex 0.165.0 and a current agent-bridge.
 All model traffic is served by a deterministic loopback Responses fixture.
@@ -41,7 +41,7 @@ def text_of(value):
 class Probe:
     def __init__(self, args):
         self.args = args
-        self.root = Path(tempfile.mkdtemp(prefix="agb11-codex-"))
+        self.root = Path(tempfile.mkdtemp(prefix="agb13-codex-" if args.production else "agb11-codex-"))
         self.root.chmod(0o700)
         for child in ("home", "codex", "state"):
             (self.root / child).mkdir(mode=0o700)
@@ -121,8 +121,11 @@ class Probe:
                                "status": "completed", "content": [{"type": "output_text",
                                "text": "ACTIVE_TURN_FINISHED", "annotations": []}]}
                     if case["name"] in ("held-tool", "long-turn", "steer-held-tool") and case["active_requests"] == 1:
+                        command = "sleep 4" if case["name"] in ("held-tool", "steer-held-tool") else "sleep 1"
+                        if case["production"]:
+                            command = "sh -c '" + command + "; printf " + case["tool_marker"] + "'"
                         message = {"id": "fc_hold", "type": "function_call", "call_id": "call_hold",
-                                   "name": "exec_command", "arguments": json.dumps({"cmd": "sleep 4" if case["name"] in ("held-tool", "steer-held-tool") else "sleep 1", "yield_time_ms": 10000, "max_output_tokens": 100}), "status": "completed"}
+                                   "name": "exec_command", "arguments": json.dumps({"cmd": command, "yield_time_ms": 10000, "max_output_tokens": 100}), "status": "completed"}
                 else:
                     stage = case["stage"]
                     if stage < 2:
@@ -177,15 +180,32 @@ class Probe:
     async def proxy(self, ws):
         from websockets.asyncio.client import unix_connect
         connection = uuid.uuid4().hex
+        requests = {}
+        adapter_connection = False
         async with unix_connect(str(self.native_sock), uri="ws://localhost/") as native:
             async def forward(source, destination, direction):
+                nonlocal adapter_connection
                 async for message in source:
                     frame = json.loads(message)
+                    if direction == "to_native" and "id" in frame and frame.get("method"):
+                        requests[frame["id"]] = frame["method"]
+                        if frame["method"] == "initialize":
+                            adapter_connection = frame["params"]["clientInfo"]["name"] == "agent_bridge_queue"
                     self.event("wire_frame", connection=connection, direction=direction, frame=frame)
                     if (self.current and self.current["name"] in ("held-tool", "steer-held-tool") and direction == "from_native"
                             and frame.get("method") == "item/started"
                             and frame.get("params", {}).get("item", {}).get("type") == "commandExecution"):
                         self.current["gate_entered"].set()
+                    if (self.args.production and self.current and self.current["name"] == "saturation"
+                            and direction == "from_native" and adapter_connection
+                            and requests.get(frame.get("id")) == "thread/read"
+                            and frame.get("result", {}).get("thread", {}).get("id") == self.current.get("thread")
+                            and "canAcceptDirectInput" in frame.get("result", {}).get("thread", {})):
+                        transformed = json.loads(message)
+                        del transformed["result"]["thread"]["canAcceptDirectInput"]
+                        self.event("compatibility_metadata", case="saturation", connection=connection,
+                                   original=frame, transformed=transformed)
+                        message = json.dumps(transformed)
                     await destination.send(message)
             tasks = [asyncio.create_task(forward(ws, native, "to_native")),
                      asyncio.create_task(forward(native, ws, "from_native"))]
@@ -225,8 +245,8 @@ class Probe:
 
     async def case(self, name):
         case = {"name": name, "alias": "fixture-" + name, "marker": "AGB11_" + uuid.uuid4().hex,
-                "incoming": str(uuid.uuid4()), "reply": str(uuid.uuid4()), "stage": 0,
-                "active_requests": 0, "gate_entered": threading.Event(), "release": threading.Event(), "model_finished": threading.Event()}
+                "tool_marker": "AGB13_TOOL_" + uuid.uuid4().hex, "incoming": str(uuid.uuid4()), "reply": str(uuid.uuid4()), "stage": 0,
+                "production": self.args.production, "active_requests": 0, "gate_entered": threading.Event(), "release": threading.Event(), "model_finished": threading.Event()}
         self.current = case
         ws = await self.connect()
         try:
@@ -300,7 +320,7 @@ class Probe:
                         break
                     await asyncio.sleep(.05)
             if name == "saturation":
-                assert state["state"] == "uncertain", state
+                assert state["state"] == ("failed" if self.args.production else "uncertain"), state
                 queue = await self.rpc(ws, "thread/queue/list", {"threadId": case["thread"], "limit": 100})
                 assert len(queue["data"]) == 100 and queue["nextCursor"] is None, queue
                 assert all(row["clientUserMessageId"] != case["incoming"] for row in queue["data"])
@@ -320,7 +340,11 @@ class Probe:
             assert state["state"] in ("submitted", "acknowledged"), state
             queue = await self.rpc(ws, "thread/queue/list", {"threadId": case["thread"], "limit": 100})
             self.event("queue_snapshot", case=name, result=queue)
-            if name != "idle":
+            if self.args.production and name != "idle":
+                assert not any(row["clientUserMessageId"] == case["incoming"] for row in queue["data"]), queue
+                case["release"].set()
+                self.event("fixture_released", case=name)
+            elif name != "idle":
                 assert any(row["clientUserMessageId"] == case["incoming"] for row in queue["data"]), queue
                 await asyncio.sleep(self.args.hold_seconds)
                 assert case["stage"] == 0, "queued input reached model during gated active turn"
@@ -344,7 +368,12 @@ class Probe:
                         if value.get("method") == "turn/completed" and case["stage"] == 2:
                             assert value["params"]["turn"]["status"] == "completed" and value["params"]["turn"]["error"] is None, value
                             break
-            final = await self.rpc(ws, "thread/read", {"threadId": case["thread"], "includeTurns": True})
+            async with asyncio.timeout(15):
+                while True:
+                    final = await self.rpc(ws, "thread/read", {"threadId": case["thread"], "includeTurns": True})
+                    if all(turn["status"] == "completed" for turn in final["thread"]["turns"]):
+                        break
+                    await asyncio.sleep(.05)
             assert case["marker"] in text_of(final)
             original = self.broker({"op": "get", "id": case["incoming"]})
             reply = self.broker({"op": "get", "id": case["reply"]})
@@ -379,6 +408,7 @@ class Probe:
         if self.current:
             self.current["release"].set()
         results = {}
+        audits = {}
         for label, proc in reversed(self.children):
             # Each owned child has its own session; include its MCP descendants.
             try:
@@ -411,6 +441,7 @@ class Probe:
                 if not survivors or time.monotonic() >= deadline:
                     break
                 time.sleep(.05)
+            audits[label] = {"process_group": proc.pid, "surviving_non_zombie_pids": survivors, **stamp()}
             assert not survivors, (label, survivors)
         if self.server:
             self.server.shutdown()
@@ -424,7 +455,65 @@ class Probe:
         for handle in self.files:
             handle.close()
         (self.root / "events.json").write_text(json.dumps(self.events, indent=2))
-        (self.root / "results.json").write_text(json.dumps({"cases": self.cases, "cleanup": results}, indent=2))
+        (self.root / "results.json").write_text(json.dumps({"cases": self.cases, "cleanup": results, "cleanup_audit": audits}, indent=2))
+
+
+def verify_production_active(case, rows, wire, outgoing, models, timeline):
+    """Reconstruct production delivery from raw requests, native state and model input."""
+    assert len(outgoing) == 1 and outgoing[0]["frame"]["method"] == "turn/steer", outgoing
+    request = outgoing[0]
+    params = request["frame"]["params"]
+    assert params["threadId"] == case["thread"] and params["expectedTurnId"] == case["active_turn"]
+    connection = [event for event in wire if event["connection"] == request["connection"]]
+    methods = [event["frame"].get("method") for event in connection if event["direction"] == "to_native"]
+    assert methods[:2] == ["initialize", "initialized"] and methods[-1] == "turn/steer", methods
+    assert "thread/loaded/list" in methods, methods
+    assert [method for method in methods if method != "thread/loaded/list"] == ["initialize", "initialized", "thread/read", "thread/turns/list", "turn/steer"], methods
+    def response(method):
+        query = next(event for event in connection if event["direction"] == "to_native" and event["frame"].get("method") == method)
+        replies = [event for event in connection if event["direction"] == "from_native" and event["frame"].get("id") == query["frame"]["id"] and not event["frame"].get("method")]
+        assert len(replies) == 1
+        assert query["monotonic_ns"] < replies[0]["monotonic_ns"]
+        return query, replies[0]
+    _, metadata = response("thread/read")
+    assert metadata["frame"]["result"]["thread"]["canAcceptDirectInput"] is True
+    query, turns = response("thread/turns/list")
+    assert query["frame"]["params"]["limit"] == 1
+    assert turns["frame"]["result"]["data"][0]["id"] == case["active_turn"]
+    assert turns["frame"]["result"]["data"][0]["status"] == "inProgress"
+    _, receipt = response("turn/steer")
+    assert receipt["frame"]["result"]["turnId"] == case["active_turn"]
+    assert metadata["monotonic_ns"] < query["monotonic_ns"] < turns["monotonic_ns"] < request["monotonic_ns"]
+    verified = next(event for event in rows if event["kind"] == "case_verified")
+    assert verified["incoming"]["id"] == case["incoming"] and verified["incoming"]["state"] == "acknowledged"
+    assert verified["reply"]["id"] == case["reply"] and verified["reply"]["parent"] == case["incoming"]
+    assert verified["reply"]["sender"] == case["alias"] and verified["reply"]["recipient"] == "user"
+    assert len(models) == 3
+    outputs = {item["call_id"]: item["output"] for item in models[-1]["body"]["input"] if item.get("type") == "function_call_output"}
+    assert case["incoming"] in outputs.get("call_0", "") and '"state":"acknowledged"' in outputs["call_0"]
+    assert case["reply"] in outputs.get("call_1", "") and '"state":"queued"' in outputs["call_1"]
+    reads = [event["frame"].get("result", {}).get("thread", {}) for event in wire]
+    original = [turn for read in reads if read.get("id") == case["thread"] for turn in read.get("turns", []) if turn["id"] == case["active_turn"]]
+    assert any(turn["status"] == "completed" and turn.get("error") is None for turn in original)
+    assert all(turn["status"] != "interrupted" for turn in original)
+    completed = [event for event in wire if event["frame"].get("method") == "turn/completed" and event["frame"].get("params", {}).get("turn", {}).get("id") == case["active_turn"]]
+    if case["name"] != "disconnected":
+        assert completed and models[0]["monotonic_ns"] < completed[0]["monotonic_ns"]
+    else:
+        # Final native history has only the original turn: no queued follow-up turn.
+        assert any(len(read.get("turns", [])) == 1 and read["turns"][0]["id"] == case["active_turn"] and read["turns"][0]["status"] == "completed" for read in reads if read.get("id") == case["thread"])
+    if case["name"] in ("held-tool", "long-turn"):
+        tools = [event for event in wire if event["frame"].get("method") == "item/completed" and event["frame"].get("params", {}).get("threadId") == case["thread"] and event["frame"]["params"].get("turnId") == case["active_turn"] and event["frame"]["params"].get("item", {}).get("id") == "call_hold"]
+        assert tools
+        tool = tools[0]["frame"]["params"]["item"]
+        assert tool["status"] == "completed" and tool["exitCode"] == 0
+        outputs = [item for item in models[0]["body"]["input"] if item.get("type") == "function_call_output" and item.get("call_id") == "call_hold"]
+        assert len(outputs) == 1 and "Process exited with code 0" in outputs[0]["output"]
+        assert tool["aggregatedOutput"] == case["tool_marker"]
+        assert case["tool_marker"] in outputs[0]["output"]
+        assert tools[0]["monotonic_ns"] < models[0]["monotonic_ns"]
+        timeline["held_tool_completed"] = tools[0]["utc"]
+    timeline.update(path="production_active_steer", native_accepted=receipt["utc"], model_received=models[0]["utc"], ack_and_reply_verified=verified["utc"])
 
 
 def verify_artifacts(root):
@@ -434,7 +523,10 @@ def verify_artifacts(root):
     wire = [event for event in events if event["kind"] == "wire_frame"]
     assert results["cleanup"] == {"native": 0, "broker": 0}, results["cleanup"]
     assert results["cases"], "no completed cases"
-    forbidden = {"turn/interrupt", "thread/resume", "thread/queue/start", "thread/queue/delete"}
+    if any(case.get("production") for case in results["cases"]):
+        assert set(results["cleanup_audit"]) == {"native", "broker"}
+        assert all(not audit["surviving_non_zombie_pids"] for audit in results["cleanup_audit"].values())
+    forbidden = {"turn/interrupt", "turn/cancel", "thread/resume", "thread/queue/start", "thread/queue/delete"}
     assert not any(event["frame"].get("method") in forbidden for event in wire)
     summary = {"versions": json.loads((root / "versions.json").read_text()), "cases": []}
     for case in results["cases"]:
@@ -463,9 +555,21 @@ def verify_artifacts(root):
             observed, item = next(iter(native_items.values()))
             assert len(outgoing) == 1 and item["content"] == outgoing[0]["frame"]["params"]["input"]
             timeline.update(native_user_item=item["id"], native_user_observed=observed["utc"])
-        models = [event for event in rows if event["kind"] == "model_request"
-                  and event["queued_marker_present"]]
-        if name.startswith("steer"):
+        model_rows = [event for event in rows if event["kind"] == "model_request"]
+        assert all(event["queued_marker_present"] == (case["marker"] in text_of(event["body"].get("input", []))) for event in model_rows)
+        models = [event for event in model_rows if case["marker"] in text_of(event["body"].get("input", []))]
+        if case.get("production"):
+            assert not any(event["kind"] == "compatibility_metadata" for event in rows) or name == "saturation"
+            sends = [event for event in events if event["kind"] == "broker_request" and event["frame"].get("op") == "send" and event["frame"].get("id") == identifier]
+            assert len(sends) == 1 and sends[0]["frame"]["body"] == case["marker"]
+            marker_writes = [event for event in wire if event["direction"] == "to_native" and event["frame"].get("method") in ("thread/queue/add", "turn/steer") and case["marker"] in text_of(event["frame"].get("params", {}).get("input", []))]
+            assert marker_writes == outgoing
+            assert case["marker"] in text_of(outgoing[0]["frame"]["params"]["input"])
+            adapter_methods = [event["frame"].get("method") for event in wire if event["connection"] == outgoing[0]["connection"] and event["direction"] == "to_native"]
+            assert set(adapter_methods) <= {"initialize", "initialized", "thread/loaded/list", "thread/read", "thread/turns/list", "thread/queue/add", "turn/steer"}
+        if case.get("production") and name not in ("idle", "saturation"):
+            verify_production_active(case, rows, wire, outgoing, models, timeline)
+        elif name.startswith("steer"):
             assert len(outgoing) == 1 and outgoing[0]["frame"]["method"] == "turn/steer"
             connection = outgoing[0]["connection"]
             connection_methods = [event["frame"].get("method") for event in wire
@@ -506,7 +610,7 @@ def verify_artifacts(root):
             if name == "saturation":
                 assert reply["frame"]["error"] == {"code": -32600, "message": "queue cannot contain more than 100 submissions"}
                 verified = next(event for event in rows if event["kind"] == "saturation_verified")
-                assert verified["accepted_count"] == 100 and verified["rejected"]["state"] == "uncertain"
+                assert verified["accepted_count"] == 100 and verified["rejected"]["state"] == ("failed" if case.get("production") else "uncertain")
                 accepted_ids = set()
                 for entry in wire:
                     frame = entry["frame"]
@@ -530,6 +634,22 @@ def verify_artifacts(root):
                 assert identifier not in accepted_ids
                 assert not models, "rejected submission reached the model"
                 assert any(event["kind"] == "saturation_drained" for event in rows)
+                if case.get("production"):
+                    compatibility = [event for event in rows if event["kind"] == "compatibility_metadata"]
+                    assert compatibility
+                    for event in compatibility:
+                        original = event["original"]
+                        assert original["result"]["thread"]["id"] == case["thread"]
+                        assert original["result"]["thread"]["canAcceptDirectInput"] is True
+                        expected = json.loads(json.dumps(original))
+                        del expected["result"]["thread"]["canAcceptDirectInput"]
+                        assert expected == event["transformed"]
+                        queries = [entry for entry in wire if entry["connection"] == event["connection"] and entry["direction"] == "to_native" and entry["frame"].get("id") == original["id"]]
+                        assert len(queries) == 1 and queries[0]["frame"]["method"] == "thread/read"
+                        assert queries[0]["frame"]["params"]["threadId"] == case["thread"]
+                        initializes = [entry for entry in wire if entry["connection"] == event["connection"] and entry["direction"] == "to_native" and entry["frame"].get("method") == "initialize"]
+                        assert len(initializes) == 1 and initializes[0]["frame"]["params"]["clientInfo"]["name"] == "agent_bridge_queue"
+                    timeline["fixture"] = "missing-capability compatibility metadata; real native queue capacity"
                 timeline.update(error=reply["frame"]["error"], accepted_count=100)
             else:
                 queued = reply["frame"]["result"]["queuedSubmission"]
@@ -561,29 +681,105 @@ def verify_artifacts(root):
     return summary
 
 
+def verify_negative_tests(root):
+    """Reject independent corruptions of saved production wire/model evidence."""
+    verify_artifacts(root)
+    original = json.loads((root / "events.json").read_text())
+    cases = json.loads((root / "results.json").read_text())["cases"]
+    by_name = {case["name"]: case for case in cases}
+    assert all(name in by_name for name in ("generating", "held-tool", "saturation"))
+    assert all(case.get("production") for case in cases)
+    rejected = []
+    for corruption in ("missing_acceptance", "missing_tool_completion", "interrupted_original",
+                       "premature_model", "wrong_native_client", "missing_capability",
+                       "double_write", "altered_compatibility"):
+        events = json.loads(json.dumps(original))
+        active = by_name["generating"]
+        write = next(event for event in events if event["kind"] == "wire_frame" and event["direction"] == "to_native" and event["frame"].get("params", {}).get("clientUserMessageId") == active["incoming"])
+        if corruption == "missing_acceptance":
+            events = [event for event in events if not (event["kind"] == "wire_frame" and event["direction"] == "from_native" and event["connection"] == write["connection"] and event["frame"].get("id") == write["frame"]["id"])]
+        elif corruption == "missing_tool_completion":
+            events = [event for event in events if not (event["kind"] == "wire_frame" and event["frame"].get("method") == "item/completed" and event["frame"].get("params", {}).get("threadId") == by_name["held-tool"]["thread"] and event["frame"]["params"].get("item", {}).get("id") == "call_hold")]
+        elif corruption in ("interrupted_original", "wrong_native_client"):
+            def mutate(value):
+                if isinstance(value, dict):
+                    if corruption == "interrupted_original" and value.get("id") == active["active_turn"] and "status" in value:
+                        value["status"] = "interrupted"
+                    if corruption == "wrong_native_client" and value.get("type") == "userMessage" and value.get("clientId") == active["incoming"]:
+                        value["clientId"] = str(uuid.uuid4())
+                    for child in value.values():
+                        mutate(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        mutate(child)
+            mutate(events)
+        elif corruption == "premature_model":
+            for event in events:
+                if event.get("case") == "generating" and event["kind"] == "model_request" and event["queued_marker_present"]:
+                    event["monotonic_ns"] = 2 ** 63
+        elif corruption == "missing_capability":
+            for event in events:
+                if event["kind"] == "wire_frame" and event["connection"] == write["connection"]:
+                    event["frame"].get("result", {}).get("thread", {}).pop("canAcceptDirectInput", None)
+        elif corruption == "double_write":
+            events.append(json.loads(json.dumps(write)))
+        else:
+            next(event for event in events if event["kind"] == "compatibility_metadata")["transformed"]["result"]["thread"]["id"] = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory(prefix="agb13-verifier-negative-") as temporary:
+            target = Path(temporary)
+            (target / "events.json").write_text(json.dumps(events))
+            for filename in ("results.json", "versions.json"):
+                (target / filename).write_bytes((root / filename).read_bytes())
+            try:
+                verify_artifacts(target)
+            except (AssertionError, KeyError, StopIteration):
+                rejected.append(corruption)
+            else:
+                raise AssertionError("verifier accepted corruption: " + corruption)
+    return rejected
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--broker", type=lambda value: str(Path(value).resolve()), required=False)
     parser.add_argument("--codex", default="/home/jason/.local/bin/codex")
     parser.add_argument("--cases", default="idle,generating,held-tool,long-turn,disconnected,saturation,steer,steer-held-tool")
+    parser.add_argument("--production", action="store_true", help="verify built production adapter active steer through broker sends")
     parser.add_argument("--hold-seconds", type=float, default=2)
     parser.add_argument("--verify-artifacts", type=Path, help="offline evidence self-check; starts no processes")
+    parser.add_argument("--verify-negative-tests", type=Path, help="offline production evidence corruption tests")
     args = parser.parse_args()
+    if args.verify_negative_tests:
+        rejected = verify_negative_tests(args.verify_negative_tests)
+        print("REJECTED", ",".join(rejected))
+        return
     if args.verify_artifacts:
         summary = verify_artifacts(args.verify_artifacts)
         print("VERIFIED", ",".join(case["name"] for case in summary["cases"]))
         return
     if not args.broker:
         parser.error("--broker is required for native runs")
+    if args.production and args.cases == "idle,generating,held-tool,long-turn,disconnected,saturation,steer,steer-held-tool":
+        args.cases = "idle,generating,held-tool,long-turn,disconnected,saturation"
+    if args.production and any(name.startswith("steer") for name in args.cases.split(",")):
+        parser.error("--production requires broker-send cases; steer cases are historical direct-API feasibility only")
     assert 0 < args.hold_seconds <= 10
     assert set(args.cases.split(",")) <= {"idle", "generating", "held-tool", "long-turn", "disconnected", "saturation", "steer", "steer-held-tool"}
     probe = Probe(args)
     print("ARTIFACT_ROOT", probe.root, flush=True)
     import websockets
+    assert platform.system() == "Linux" and tuple(map(int, platform.python_version_tuple()[:2])) >= (3, 11)
+    assert websockets.__version__ == "15.0.1", "native regression pins websockets 15.0.1"
     versions = {"platform": platform.platform(), "python": platform.python_version(),
-                "websockets": websockets.__version__, "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent.parent, text=True).strip()}
+                "websockets": websockets.__version__, "production": args.production,
+                "source_diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=Path(__file__).resolve().parent.parent)).hexdigest(), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent.parent, text=True).strip()}
+    repository = Path(__file__).resolve().parent.parent
+    paths = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=repository).decode().split("\0")
+    versions["source_files_sha256"] = {path: hashlib.sha256((repository / path).read_bytes()).hexdigest()
+                                       for path in sorted(set(paths)) if path and (repository / path).is_file()}
     for name, binary in (("broker", args.broker), ("codex", args.codex)):
         versions[name] = {"path": str(Path(binary).resolve()), "sha256": hashlib.sha256(Path(binary).resolve().read_bytes()).hexdigest(), "version": subprocess.check_output([binary, "--version"], text=True).strip()}
+    assert versions["codex"]["version"] == "codex-cli 0.165.0", versions["codex"]["version"]
     (probe.root / "versions.json").write_text(json.dumps(versions, indent=2))
     try:
         asyncio.run(probe.run())

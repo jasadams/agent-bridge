@@ -88,6 +88,24 @@ pub(crate) async fn deliver_control_notice(
     state_dir: &Path,
     notice: crate::clients::ControlNotice<'_>,
 ) -> Outcome {
+    if agent.provider == Provider::Codex {
+        return match crate::broker::rpc(
+            state_dir,
+            &crate::protocol::Request::CodexNotice {
+                id: msg.id.clone(),
+                recipient: agent.name.clone(),
+                session: agent.session.clone(),
+                content: notice.text().to_owned(),
+            },
+        )
+        .await
+        {
+            Ok(_) => Outcome::submitted(
+                "Codex typed notice durably queued; native insertion is unconfirmed and no acknowledgement is required",
+            ),
+            Err(error) => Outcome::failed(error),
+        };
+    }
     if agent.provider == Provider::OpenCode {
         return match crate::broker::rpc(
             state_dir,
