@@ -1,4 +1,5 @@
 //! Mouse selection over a frozen, rendered viewport, independent of Markdown.
+use crate::board_links::Hyperlinks;
 use ratatui::{
     buffer::{Buffer, Cell, CellDiffOption},
     layout::{Position, Rect},
@@ -12,6 +13,7 @@ const MAX_VIEWPORT_CELLS: usize = 256 * 1024;
 #[derive(Clone)]
 pub(crate) struct Viewport {
     buffer: Buffer,
+    links: Hyperlinks,
 }
 impl Viewport {
     pub(crate) fn capture(buffer: &Buffer, area: Rect) -> Option<Self> {
@@ -27,7 +29,14 @@ impl Viewport {
                 frozen[(x, y)] = buffer[(x, y)].clone();
             }
         }
-        Some(Self { buffer: frozen })
+        Some(Self {
+            buffer: frozen,
+            links: Hyperlinks::default(),
+        })
+    }
+
+    pub(crate) fn set_links(&mut self, links: Hyperlinks) {
+        self.links = links;
     }
 
     pub(crate) fn area(&self) -> Rect {
@@ -101,9 +110,9 @@ impl Selection {
     }
 
     /// Repaint the exact body seen at mouse-down, then highlight whole graphemes.
-    pub(crate) fn paint(&self, buffer: &mut Buffer) {
+    pub(crate) fn paint(&self, buffer: &mut Buffer) -> bool {
         if buffer.area.intersection(self.area()) != self.area() {
-            return;
+            return true;
         }
         for y in self.area().top()..self.area().bottom() {
             let selected = self.row_bounds(y);
@@ -123,6 +132,7 @@ impl Selection {
                 x = next;
             }
         }
+        self.viewport.links.paint(buffer)
     }
 
     /// Finishing a click or a drag returned to its anchor never changes a clipboard.

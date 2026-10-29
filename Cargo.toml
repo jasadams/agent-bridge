@@ -48,6 +48,7 @@ http-body-util = "=0.1.5"
 serde_urlencoded = "=0.7.1"
 subtle = "=2.6.1"
 unicode-general-category = "=1.1.0"
+url = "=2.5.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -62,3 +63,5 @@ libp2p-autonat = { path = "vendor/libp2p-autonat" }
 libp2p-dcutr = { path = "vendor/libp2p-dcutr" }
 
 libp2p-relay = { path = "vendor/libp2p-relay" }
+
+ratatui-core = { path = "vendor/ratatui-core" }

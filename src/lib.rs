@@ -1,6 +1,7 @@
 pub mod board;
 mod board_clipboard;
 pub mod board_interaction;
+mod board_links;
 mod board_notifications;
 mod board_selection;
 pub mod board_tui;
