@@ -46,7 +46,7 @@ configuration or change tool approval settings.
 
 ## Optional OpenCode integration
 
-OpenCode **1.18.35** V1 with Bun **1.3.11** can use the bundled native plugin and
+OpenCode **1.18.35** V1 can use the bundled native plugin and
 existing Agent Bridge MCP tools. Installation is explicit and does not start a
 service, OpenCode, a model or a package manager:
 

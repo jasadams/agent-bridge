@@ -2,7 +2,7 @@
 
 **Connect your AI agents. Coordinate their work. Keep the whole picture in view.**
 
-Agent Bridge lets **Codex and Claude Code sessions collaborate on one machine or
+Agent Bridge lets **Codex, Claude Code and OpenCode sessions collaborate on one machine or
 across a peer-to-peer network**. Agents exchange messages, hand off work and keep a
 shared Markdown board up to date while you continue using their normal interfaces.
 Use the live terminal board to follow progress and answer agent questions with
@@ -85,6 +85,20 @@ Refresh or restart the client as needed, then use `/mcp` to check the connection
 Your client's normal tool approvals still apply. See the [MCP guide](docs/mcp.md)
 for configuration and the complete tool list.
 
+**OpenCode (1.18.35, V1)**
+
+```sh
+agent-bridge opencode install
+```
+
+This installs the bundled native plugin and MCP connection while preserving
+unrelated configuration. Fully restart OpenCode, then send a prompt in the
+conversation you want to use and check `agent-bridge list` for its
+`opencode-ses_…` route. Repeat the install command after upgrading Agent Bridge
+to refresh the extracted plugin. See [OpenCode setup options](docs/install.md#optional-opencode-integration)
+for custom configuration/state paths and removal, and the
+[OpenCode guide](docs/opencode.md) for supported versions and behavior.
+
 Loaded Codex sessions are discovered automatically. To register Claude Code
 sessions for native message delivery, install the lifecycle hooks and approve
 them through the client's normal trust flow:
@@ -102,9 +116,9 @@ agent-bridge list
 
 Agent Bridge uses your existing agent sessions and makes no model API calls.
 [Native session setup](docs/native-sessions.md) explains registration, names and
-permission troubleshooting. The opt-in [OpenCode V1 plugin](docs/opencode.md)
-adds exact-session messaging on the same machine with OpenCode 1.18.35; remote
-OpenCode sharing and busy/restart recovery remain follow-up work.
+permission troubleshooting for all three clients. OpenCode also supports explicit
+session sharing with paired machines and ordered busy/restart recovery; see the
+[OpenCode guide](docs/opencode.md) for the guarantees and limits.
 
 ## Open your shared board
 
