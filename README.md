@@ -107,6 +107,9 @@ OpenCode sharing and busy/restart recovery remain follow-up work.
 
 ```sh
 agent-bridge board
+agent-bridge board --create streamr
+agent-bridge board streamr
+agent-bridge board --list
 ```
 
 Then ask your agents:
@@ -116,6 +119,11 @@ Then ask your agents:
 > own row when work changes and preserve other agents' entries.
 
 Agents use `read_board` and `update_board` to apply atomic, revision-checked edits.
+Their optional `board` defaults to `main`; use `create_board` explicitly for other
+boards and `list_boards` for compact metadata. Names are lowercase ASCII slugs
+with letters, digits, `_` and `-` (1–64 characters, starting with a letter or digit).
+Press `b` outside the terminal text editor to pick a board. Each board has its
+own content, revisions and subscriptions; boards stay local to the selected broker.
 The TUI renders the document live, including Markdown tables. Use arrow keys or
 `j`/`k` to scroll, `w` to toggle wrapping, and `q` to quit.
 

@@ -1,6 +1,6 @@
 //! A live Markdown view with revision-checked checkbox and text-field editing.
 use crate::{
-    board::{Edit, MAX_BOARD_BYTES, Snapshot},
+    board::{Edit, MAX_BOARD_BYTES, Name, Snapshot, Summary},
     board_interaction::{self, Control, Kind},
     board_selection::{Selection, Viewport},
     broker,
@@ -122,6 +122,7 @@ fn rendered_markdown(markdown: &str, width: u16) -> (Text<'static>, bool) {
 
 #[derive(Clone)]
 struct Save {
+    generation: u64,
     base: Snapshot,
     markdown: String,
     text: bool,
@@ -222,6 +223,10 @@ impl Editor {
 }
 
 struct View {
+    board: Name,
+    generation: u64,
+    picker: Option<(Vec<Summary>, usize)>,
+    pick_requested: bool,
     snapshot: Option<Snapshot>,
     error: Option<String>,
     rendered: Text<'static>,
@@ -244,6 +249,10 @@ struct View {
 impl Default for View {
     fn default() -> Self {
         Self {
+            board: Name::default(),
+            generation: 0,
+            picker: None,
+            pick_requested: false,
             snapshot: None,
             error: None,
             rendered: Text::default(),
@@ -266,6 +275,38 @@ impl Default for View {
     }
 }
 impl View {
+    fn switch(&mut self, board: Name) -> bool {
+        if self.editor.is_some() || self.saving || self.pending.is_some() {
+            return false;
+        }
+        if self.board == board {
+            self.picker = None;
+            return false;
+        }
+        let generation = self.generation.wrapping_add(1);
+        let update_notice = self.update_notice.take();
+        let mouse_enabled = self.mouse_enabled;
+        *self = Self {
+            board,
+            generation,
+            update_notice,
+            mouse_enabled,
+            ..Self::default()
+        };
+        true
+    }
+    fn read_result(&mut self, board: &Name, generation: u64, result: Result<Snapshot>) -> bool {
+        if &self.board != board || self.generation != generation {
+            return false;
+        }
+        if result
+            .as_ref()
+            .is_ok_and(|snapshot| snapshot.name != self.board.as_str())
+        {
+            return self.update(Err(anyhow::anyhow!("Broker returned a different board")));
+        }
+        self.update(result)
+    }
     fn update_release_notice(&mut self, notice: Option<String>) -> bool {
         let changed = self.update_notice != notice;
         self.update_notice = notice;
@@ -343,7 +384,7 @@ impl View {
                     snapshot.revision.chars().take(12).collect::<String>(),
                 )
             })
-            .unwrap_or_else(|| ("main".into(), "connecting".into()));
+            .unwrap_or_else(|| (self.board.to_string(), "connecting".into()));
         frame.render_widget(
             Paragraph::new(format!(
                 "Local shared board · {name} · {}",
@@ -352,6 +393,36 @@ impl View {
             .style(Style::default().fg(Color::Cyan)),
             header,
         );
+        if let Some((boards, selected)) = &self.picker {
+            let rows: Vec<Line> = boards
+                .iter()
+                .enumerate()
+                .map(|(i, board)| {
+                    Line::from(format!(
+                        "{} {}{}",
+                        if i == *selected { ">" } else { " " },
+                        board.name,
+                        if board.exists { "" } else { " (absent)" }
+                    ))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(rows)
+                    .scroll((
+                        selected.saturating_sub(usize::from(body.height.saturating_sub(3))) as u16,
+                        0,
+                    ))
+                    .block(
+                        Block::bordered().title("Boards · j/k select · Enter open · Esc cancel"),
+                    ),
+                body,
+            );
+            frame.render_widget(
+                Paragraph::new(safe_line(self.update_notice.as_deref().unwrap_or(""))),
+                footer,
+            );
+            return;
+        }
         let path = self
             .snapshot
             .as_ref()
@@ -401,7 +472,7 @@ impl View {
         }
         if let Some(editor) = &self.editor {
             let title = format!(
-                "Text response: {} · Ctrl-S save · Esc cancel · Ctrl-R review/rebase",
+                "Text response: {} · Ctrl-S save · Esc discard · save/discard before b switches · Ctrl-R rebase",
                 safe_line(&editor.control.label)
             );
             let block = Block::bordered().title(title);
@@ -500,7 +571,7 @@ impl View {
         };
         frame.render_widget(Paragraph::new(vec![
             Line::from(safe_line(&status)),
-            Line::from(if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc cancel · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · m native mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "m copy-on-select mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
+            Line::from(if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · m native mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "m copy-on-select mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
             Line::from(safe_line(self.update_notice.as_deref().unwrap_or("")))
                 .style(Style::default().fg(Color::Yellow)),
         ]), footer);
@@ -537,12 +608,31 @@ impl View {
             }
             return false;
         }
+        if self.picker.is_some() {
+            let (boards, selected) = self.picker.as_mut().unwrap();
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
+                KeyCode::Down | KeyCode::Char('j') if !boards.is_empty() => {
+                    *selected = (*selected + 1) % boards.len()
+                }
+                KeyCode::Up | KeyCode::Char('k') if !boards.is_empty() => {
+                    *selected = (*selected + boards.len() - 1) % boards.len()
+                }
+                KeyCode::Enter if !boards.is_empty() => {
+                    let board = boards[*selected].name.clone();
+                    self.switch(board);
+                }
+                _ => (),
+            }
+            return false;
+        }
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
             return true;
         }
         match key.code {
+            KeyCode::Char('b') if !self.saving => self.pick_requested = true,
             KeyCode::Char('m') => {
                 self.mouse_enabled = !self.mouse_enabled;
                 self.notice = Some(if self.mouse_enabled {
@@ -597,7 +687,7 @@ impl View {
         false
     }
     fn mouse(&mut self, event: MouseEvent) -> (bool, Option<String>) {
-        if !self.mouse_enabled {
+        if !self.mouse_enabled || self.picker.is_some() {
             return (false, None);
         }
         let point = Position::new(event.column, event.row);
@@ -673,6 +763,7 @@ impl View {
             match self.controls[index].replacement(&base.markdown, None) {
                 Ok(markdown) => {
                     self.pending = Some(Save {
+                        generation: self.generation,
                         base: base.clone(),
                         markdown,
                         text: false,
@@ -700,6 +791,7 @@ impl View {
         {
             Ok(markdown) => {
                 self.pending = Some(Save {
+                    generation: self.generation,
                     base: editor.base.clone(),
                     markdown,
                     text: true,
@@ -727,6 +819,16 @@ impl View {
         }
     }
     fn saved(&mut self, save: Save, result: Result<(Snapshot, bool)>) {
+        if save.generation != self.generation || save.base.name != self.board.as_str() {
+            return;
+        }
+        let result = result.and_then(|(snapshot, applied)| {
+            ensure!(
+                snapshot.name == self.board.as_str(),
+                "Broker returned a different board for a save"
+            );
+            Ok((snapshot, applied))
+        });
         self.saving = false;
         match result {
             Ok((snapshot, applied)) => {
@@ -795,9 +897,20 @@ fn cached_release_notice(state_dir: &Path) -> Option<String> {
 }
 
 pub async fn run(state_dir: PathBuf) -> Result<()> {
+    run_named(state_dir, Name::default()).await
+}
+
+pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
     ensure!(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "The board viewer needs an interactive terminal; use board --raw to print Markdown"
+    );
+    let initial: Snapshot =
+        serde_json::from_value(broker::rpc(&state_dir, &Request::board_read(board.clone())).await?)
+            .context("Invalid board snapshot from broker")?;
+    ensure!(
+        initial.name == board.as_str(),
+        "Broker returned a different board"
     );
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -808,8 +921,11 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     let mut events = EventStream::new();
     let (refresh, mut requests) = mpsc::channel(1);
     let (writes, mut write_requests) = mpsc::channel::<Save>(1);
+    let (selection, current_selection) = tokio::sync::watch::channel((board.clone(), 0u64));
+    let (lists, mut list_requests) = mpsc::channel::<()>(1);
     enum Update {
-        Read(Result<Snapshot>, Option<String>),
+        List(Name, u64, Result<Vec<Summary>>),
+        Read(Name, u64, Result<Snapshot>, Option<String>),
         Saved(Save, Result<(Snapshot, bool)>),
     }
     let (updates, mut results) = mpsc::channel(1);
@@ -821,27 +937,33 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
                 save = write_requests.recv() => {
                     let Some(save) = save else { break; };
                     let result = async {
-                        let value = broker::rpc(&state, &Request::BoardUpdate {
-                            expected_revision: save.base.revision.clone(),
-                            edits: vec![Edit::Set { markdown: save.markdown.clone() }],
-                            actor: None,
-                        }).await?;
+                        let name: Name = save.base.name.parse()?;
+                        let value = broker::rpc(&state, &Request::board_update(name, save.base.revision.clone(), vec![Edit::Set { markdown: save.markdown.clone() }], None)).await?;
                         let applied = value["applied"].as_bool().context("Invalid save response from broker")?;
                         let snapshot = serde_json::from_value::<Snapshot>(value["board"].clone()).context("Invalid saved board snapshot")?;
                         Ok((snapshot, applied))
                     }.await;
                     Update::Saved(save, result)
                 }
+                request = list_requests.recv() => {
+                    if request.is_none() { break; }
+                    let (board, generation) = current_selection.borrow().clone();
+                    Update::List(board, generation, async {
+                        let value = broker::rpc(&state, &Request::BoardList).await?;
+                        serde_json::from_value(value).context("Invalid board list from broker")
+                    }.await)
+                }
                 request = requests.recv() => {
                     if request.is_none() { break; }
+                    let (board, generation) = current_selection.borrow().clone();
                     let result = async {
-                        let value = broker::rpc(&state, &Request::BoardRead).await?;
+                        let value = broker::rpc(&state, &Request::board_read(board.clone())).await?;
                         serde_json::from_value::<Snapshot>(value).context("Invalid board snapshot from broker")
                     }.await;
                     // Availability is broker-owned cached metadata. Reading it
                     // never fetches a release or changes the board document.
                     let notice = cached_release_notice(&state);
-                    Update::Read(result, notice)
+                    Update::Read(board, generation, result, notice)
                 }
             };
             if updates.send(update).await.is_err() {
@@ -853,7 +975,11 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     let _ = refresh.try_send(());
     let mut fallback = tokio::time::interval(FALLBACK_REFRESH);
     fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut view = View::default();
+    let mut view = View {
+        board,
+        ..View::default()
+    };
+    view.update(Ok(initial));
     let mut watch: Option<FileWatch> = None;
     let mut dirty = true;
     loop {
@@ -866,8 +992,18 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
             _ = interrupt.recv() => break,
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) => {
+                    let previous_generation = view.generation;
                     let previous_mouse_mode = view.mouse_enabled;
                     if view.key(key, terminal.size()?.height.saturating_sub(5)) { break; }
+                    if view.pick_requested {
+                        view.pick_requested = false;
+                        let _ = lists.try_send(());
+                    }
+                    if previous_generation != view.generation {
+                        selection.send_replace((view.board.clone(), view.generation));
+                        watch = None;
+                        let _ = refresh.try_send(());
+                    }
                     if previous_mouse_mode != view.mouse_enabled {
                         if view.mouse_enabled {
                             crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
@@ -900,7 +1036,13 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
             _ = fallback.tick() => { let _ = refresh.try_send(()); },
             update = results.recv() => {
                 let Some(update) = update else { anyhow::bail!("Board refresh worker stopped"); };
-                let snapshot = match &update { Update::Read(Ok(snapshot), _) | Update::Saved(_, Ok((snapshot, _))) => Some(snapshot), _ => None };
+                let relevant = match &update {
+                    Update::Read(board, generation, ..) => board == &view.board && *generation == view.generation,
+                    Update::Saved(save, _) => save.generation == view.generation && save.base.name == view.board.as_str(),
+                    Update::List(board, generation, _) => board == &view.board && *generation == view.generation && view.editor.is_none() && !view.saving,
+                };
+                if !relevant { continue; }
+                let snapshot = match &update { Update::Read(_, _, Ok(snapshot), _) | Update::Saved(_, Ok((snapshot, _))) => Some(snapshot), _ => None };
                 if let Some(snapshot) = snapshot {
                     let root = snapshot.path.parent().filter(|parent| parent.is_dir()).unwrap_or(&state_dir);
                     if watch.as_ref().is_none_or(|watch| watch.root != root) {
@@ -910,9 +1052,20 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
                     }
                 }
                 match update {
-                    Update::Read(result, notice) => {
+                    Update::List(_, _, result) => {
+                        match result {
+                            Ok(mut boards) => {
+                                boards.sort_by(|a, b| a.name.cmp(&b.name));
+                                let selected = boards.iter().position(|board| board.name == view.board).unwrap_or(0);
+                                view.picker = Some((boards, selected));
+                            }
+                            Err(error) => view.notice = Some(format!("Cannot list boards; upgrade/reconnect the broker if needed: {error:#}")),
+                        }
+                        dirty = true;
+                    }
+                    Update::Read(board, generation, result, notice) => {
                         dirty |= view.update_release_notice(notice);
-                        dirty |= view.update(result);
+                        dirty |= view.read_result(&board, generation, result);
                     },
                     Update::Saved(save, result) => { view.saved(save, result); dirty = true; },
                 }
@@ -1316,6 +1469,131 @@ mod tests {
     fn field(value: &str) -> String {
         format!("# Question\n\n<!-- board-input: notes -->\n> {value}\n<!-- /board-input -->\n")
     }
+    #[test]
+    fn draft_requires_successful_save_or_explicit_discard_before_switching() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(&field("answer"), "one")));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(view.editor.as_ref().unwrap().draft, "answerb");
+        assert!(!view.pick_requested);
+        let other: Name = "project".parse().unwrap();
+        assert!(!view.switch(other.clone()));
+        press(&mut view, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let save = view.pending.take().unwrap();
+        view.saving = true;
+        assert!(!view.switch(other.clone()));
+        view.saved(save.clone(), Err(anyhow::anyhow!("connection lost")));
+        assert_eq!(view.editor.as_ref().unwrap().draft, "answerb");
+        assert!(view.notice.as_ref().unwrap().contains("uncertain"));
+        assert!(!view.switch(other.clone()));
+        view.saved(
+            save.clone(),
+            Ok((snapshot(&field("someone else"), "two"), false)),
+        );
+        assert_eq!(view.editor.as_ref().unwrap().draft, "answerb");
+        assert!(!view.switch(other.clone()));
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(view.switch(other));
+        assert!(view.editor.is_none());
+
+        let mut view = View::default();
+        view.update(Ok(snapshot(&field("answer"), "one")));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let save = view.pending.take().unwrap();
+        view.saved(save, Ok((snapshot(&field("answer"), "two"), true)));
+        assert!(view.editor.is_none());
+        assert!(view.switch("project".parse().unwrap()));
+    }
+
+    #[test]
+    fn picker_cancel_preserves_board_and_switch_resets_board_state() {
+        let mut view = View::default();
+        view.update(Ok(snapshot("- [ ] answer", "one")));
+        view.selected = Some(0);
+        view.scroll = (4, 6);
+        view.error = Some("old error".into());
+        view.notice = Some("old notice".into());
+        view.update_notice = Some("release notice".into());
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let viewport = view.viewport.clone().unwrap();
+        view.selection = Selection::start(viewport, Position::new(2, 2));
+        view.picker = Some((
+            vec![Summary {
+                name: "project".parse().unwrap(),
+                exists: true,
+                revision: "two".into(),
+            }],
+            0,
+        ));
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        // Escape first clears an active selection, retaining the picker.
+        if view.picker.is_some() {
+            press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        }
+        assert_eq!(view.board, Name::default());
+        assert_eq!(view.selected, Some(0));
+        view.picker = Some((
+            vec![Summary {
+                name: "project".parse().unwrap(),
+                exists: true,
+                revision: "two".into(),
+            }],
+            0,
+        ));
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(view.board.as_str(), "project");
+        assert_eq!(view.generation, 1);
+        assert!(view.snapshot.is_none());
+        assert!(view.controls.is_empty());
+        assert!(view.selected.is_none());
+        assert!(view.selection.is_none());
+        assert!(view.viewport.is_none());
+        assert!(view.error.is_none());
+        assert!(view.notice.is_none());
+        assert_eq!(view.scroll, (0, 0));
+        assert_eq!(view.update_notice.as_deref(), Some("release notice"));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(buffer_text(&terminal).contains("project"));
+    }
+
+    #[test]
+    fn stale_reads_errors_and_save_conflicts_are_ignored_even_after_returning_to_main() {
+        let mut view = View::default();
+        view.update(Ok(snapshot("- [ ] original", "one")));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char(' '), KeyModifiers::NONE);
+        let save = view.pending.take().unwrap();
+        assert!(view.switch("project".parse().unwrap()));
+        assert!(!view.read_result(&Name::default(), 0, Ok(snapshot("stale", "two"))));
+        assert!(!view.read_result(&Name::default(), 0, Err(anyhow::anyhow!("old outage"))));
+        assert!(view.snapshot.is_none());
+        assert!(view.error.is_none());
+        assert!(view.switch(Name::default()));
+        assert!(!view.read_result(&Name::default(), 0, Ok(snapshot("stale", "two"))));
+        view.saving = true;
+        view.saved(save, Ok((snapshot("old conflict", "two"), false)));
+        assert!(view.saving, "an old result must not clear a current save");
+        assert!(view.snapshot.is_none());
+        assert!(view.notice.is_none());
+        view.saved(
+            Save {
+                generation: 0,
+                base: snapshot("old", "one"),
+                markdown: "old".into(),
+                text: false,
+            },
+            Err(anyhow::anyhow!("old uncertain write")),
+        );
+        assert!(view.notice.is_none());
+        assert!(view.read_result(&Name::default(), 2, Ok(snapshot("current", "three"))));
+        assert_eq!(view.snapshot.as_ref().unwrap().markdown, "current");
+    }
+
     #[test]
     fn controls_toggle_exact_snapshot_and_refresh_clears_focus() {
         let source = "# Review\n\n- [ ] same\n- [ ] same\n";

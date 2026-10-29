@@ -1097,7 +1097,7 @@ async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
                 json!({"expected_revision":revision,"edits":[{"op":"set","markdown":body}]}),
             )
             .await;
-        assert_eq!(structured(&updated)["result"].as_object().unwrap().len(), 1);
+        assert_eq!(structured(&updated)["result"].as_object().unwrap().len(), 2);
         revision = structured(&updated)["result"]["revision"].clone();
         board_sizes.push(updated["result"].to_string().len());
         assert!(updated.to_string().len() < 400);
@@ -1106,7 +1106,7 @@ async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
             .await;
         assert_eq!(
             structured(&unchanged)["result"],
-            json!({"revision":revision,"unchanged":true})
+            json!({"name":"main","revision":revision,"unchanged":true})
         );
         let changed = mcp.call("read_board", json!({"if_revision":"stale"})).await;
         assert_eq!(structured(&changed)["result"]["markdown"], body);
@@ -1198,4 +1198,105 @@ async fn incremental_message_reads_reuse_cursors_without_repeating_bodies() {
     let legacy = mcp.call("list_messages", json!({"agent":"bob"})).await;
     assert_eq!(structured(&legacy)["result"].as_array().unwrap().len(), 2);
     mcp.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_boards_keep_mcp_revisions_results_and_writes_isolated() {
+    let root = root();
+    let state = root.path().join("state");
+    let _running = Running::start(&state);
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let initial = mcp.call("list_boards", json!({})).await;
+    assert_eq!(structured(&initial)["result"].as_array().unwrap().len(), 1);
+    assert_eq!(structured(&initial)["result"][0]["name"], "main");
+    assert_eq!(structured(&initial)["result"][0]["exists"], false);
+    let mut revisions = Vec::new();
+    for name in ["alpha", "beta"] {
+        let created = mcp.call("create_board", json!({"board":name})).await;
+        let snapshot = &structured(&created)["result"];
+        assert_eq!(snapshot["name"], name);
+        assert_eq!(snapshot["exists"], true);
+        let revision = snapshot["revision"].clone();
+        let updated = mcp.call("update_board", json!({"board":name,"expected_revision":revision,"edits":[{"op":"set","markdown":"same content"}]})).await;
+        let receipt = &structured(&updated)["result"];
+        assert_eq!(receipt["board"], name);
+        assert!(receipt.get("markdown").is_none());
+        revisions.push(receipt["revision"].clone());
+    }
+    let native = Native::start(&_running, &root.path().join("native"), "named-owner");
+    for name in ["alpha", "beta"] {
+        let subscribed = mcp
+            .call("subscribe_board", json!({"board":name,"agent":native.name}))
+            .await;
+        assert_eq!(structured(&subscribed)["result"]["board"], name);
+        assert_eq!(structured(&subscribed)["result"]["subscribed"], true);
+    }
+    let unsubscribed = mcp
+        .call(
+            "unsubscribe_board",
+            json!({"board":"alpha","agent":native.name}),
+        )
+        .await;
+    assert_eq!(structured(&unsubscribed)["result"]["board"], "alpha");
+    assert_eq!(structured(&unsubscribed)["result"]["subscribed"], false);
+    assert_ne!(revisions[0], revisions[1]);
+    let wrong_cache = mcp
+        .call(
+            "read_board",
+            json!({"board":"beta","if_revision":revisions[0]}),
+        )
+        .await;
+    assert_eq!(
+        structured(&wrong_cache)["result"]["markdown"],
+        "same content"
+    );
+    let unchanged = mcp
+        .call(
+            "read_board",
+            json!({"board":"beta","if_revision":revisions[1]}),
+        )
+        .await;
+    assert_eq!(
+        structured(&unchanged)["result"],
+        json!({"name":"beta","revision":revisions[1],"unchanged":true})
+    );
+    let conflict = mcp.call("update_board", json!({"board":"beta","expected_revision":revisions[0],"edits":[{"op":"set","markdown":"wrong board"}]})).await;
+    assert_eq!(conflict["result"]["isError"], true);
+    assert_eq!(
+        conflict["result"]["structuredContent"]["result"]["board"]["name"],
+        "beta"
+    );
+    assert_eq!(
+        conflict["result"]["structuredContent"]["result"]["board"]["markdown"],
+        "same content"
+    );
+    for arguments in [
+        json!({}),
+        json!({"board":"../main"}),
+        json!({"board":"Alpha"}),
+        json!({"board":"alpha"}),
+    ] {
+        let rejected = mcp.call("create_board", arguments).await;
+        assert!(
+            rejected.get("error").is_some() || rejected["result"]["isError"] == true,
+            "{rejected}"
+        );
+    }
+    let missing = mcp.call("update_board", json!({"board":"missing","expected_revision":revisions[0],"edits":[{"op":"set","markdown":"must not create"}]})).await;
+    assert_eq!(missing["result"]["isError"], true);
+    let list = mcp.call("list_boards", json!({})).await;
+    let names: Vec<_> = structured(&list)["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            assert!(row.get("markdown").is_none());
+            row["name"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(names, ["alpha", "beta", "main"]);
+    let main = mcp.call("read_board", json!({})).await;
+    assert_eq!(structured(&main)["result"]["exists"], false);
+    assert_eq!(structured(&main)["result"]["markdown"], "");
 }
