@@ -181,19 +181,28 @@ authenticated approval: agents can also edit this shared document.
 ## Subscribe to changes
 
 Notifications are off by default. An enabled local Codex, Claude or OpenCode session can
-opt in with the `subscribe_board` MCP tool, selecting its exact registration:
+opt in with the generic `subscribe` MCP tool, selecting its exact registration
+and an explicit board selector:
 
 ```json
-{"board":"streamr","agent":"codex-<this-session-UUID>"}
+{"agent":"codex-<this-session-UUID>","events":[{"event":"board.changed","board":"streamr"}]}
 ```
 
-Use the real registration name supplied in the session's native context. The
-`unsubscribe_board` tool takes the same argument and cancels pending notices.
-A session can watch several boards independently. Unsubscribing with
-`{"board":"streamr","agent":"<exact-registration>"}` removes only that watch.
-Omitting `board` always selects `main`; there is no active-board setting or
-working-directory routing. Subscriptions end when the session ends, is disabled/replaced, or the broker
-restarts. They do not enable networking or share the board with other machines.
+Use the real exact route supplied in the session's native context. `subscribe`
+adds selectors idempotently and returns the effective `events`. `unsubscribe`
+with the same selectors removes only those watches and their pending notices,
+preserving other watches and their work. Removing an absent selector changes
+nothing. Omit `events` to remove all subscriptions and pending notices. An explicit empty list is invalid. Each
+`board.changed` selector requires an existing local board name, including explicit
+`main`; there is no implicit board, wildcard or active-board routing.
+Subscriptions end when the session becomes unavailable or the broker restarts;
+reopening requires explicit opt-in again. They do not enable networking or share
+boards with other machines. Both terminal responses and web-board responses use
+the same selected-board revision updates and event delivery. Neither view needs
+a subscription control: the receiving agent opts in through CLI or MCP.
+
+The same API supports local `agent.opened` and `agent.closed` selectors. See
+[event subscriptions](mcp.md#event-subscriptions) for snapshots and recovery.
 
 The broker permits at most 64 watches globally and 8 concurrent delivery workers.
 It polls at most one watched board every 250 ms in fair round-robin order;
@@ -211,9 +220,21 @@ retried; the board remains available through `read_board`.
 
 OpenCode notices use its durable native admission and receipt path: busy or
 permission-waiting work can delay insertion, pause holds delivery, and an
-uncertain native attempt is not resubmitted. Unsubscribe cancels pending notices;
-close, lease expiry or registration replacement removes the subscription. A
-notice is local board guidance, never an owner pairing or permission response.
+uncertain native attempt is not resubmitted. Unsubscribe prevents pending notices
+for the removed selectors from starting native delivery; close, lease expiry or
+registration replacement removes the subscription. Broker restart invalidates
+pending notices too. Native I/O already admitted before cancellation may finish;
+unsubscribe does not cancel that I/O or retained selectors' work. A notice is
+local board guidance, never an owner pairing or permission response.
+
+OpenCode subscribe/unsubscribe receipts can report attempted hidden controls in
+`recovery`, even after a watch is removed. A current snapshot does not prove the
+native delivery queue is unblocked. Inspect the bounded recovery IDs and, when
+appropriate, explicitly run `agent-bridge --state-dir "/same/private/state" retry
+CONTROL_ID` against the same broker. Attempted OpenCode controls reconcile
+read-only; they never insert a second prompt. Missing proof stays uncertain and
+may continue blocking later notices. See [event recovery diagnostics](mcp.md#event-subscriptions)
+for fields and limits. Reading diagnostics does not start native work.
 
 To avoid being notified of its own writes, an agent supplies its own registered
 name in the optional `agent` field of `update_board`. Unattributed updates,
@@ -242,8 +263,8 @@ approval.
 
 `read_board` returns `markdown`, `revision`, `name`, `path` and `exists`.
 `update_board` requires that exact revision and an ordered array of edits.
-All four read/update/subscribe/unsubscribe tools accept optional `board`, default
-`main`; `create_board` requires it. Named-board revisions bind the board identity
+`read_board` and `update_board` accept optional `board`, default `main`;
+`create_board` requires it. Event subscriptions require explicit board selectors. Named-board revisions bind the board identity
 as well as content, so a revision from another board cannot authorize a write.
 Compact write receipts include `board`; conflict snapshots and unchanged reads
 include the selected identity. Keep conditional-read revisions scoped by board.
@@ -303,9 +324,10 @@ network resources.
 
 Legacy clients keep using `main` against a new broker. Named-board operations use
 distinct protocol requests: an older broker rejects them before changing any
-board or subscription. Upgrade the broker and reconnect/restart the MCP client
-if named-board tools are unavailable or rejected. Main-only calls retain their
-legacy request forms where supported. Boards remain local to the selected broker;
+board. Upgrade the broker and reconnect/restart the MCP client
+if named-board tools are unavailable or rejected. Main-only read/update calls retain their
+legacy request forms where supported. Event subscriptions use only the generic
+`subscribe` and `unsubscribe` operations; old board-specific operations are removed. Boards remain local to the selected broker;
 this adds no network access or cross-machine sharing.
 
 For an isolated terminal smoke test, start a broker with a fresh temporary

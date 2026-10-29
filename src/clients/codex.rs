@@ -130,7 +130,7 @@ async fn prepare(path: &Path, home: &Path, session: &str) -> Result<(Socket, boo
 }
 #[cfg(test)]
 async fn deliver_at(paths: Vec<PathBuf>, home: &Path, msg: &Message, text: &str) -> Outcome {
-    deliver_at_tracking(paths, home, msg, text, &AtomicBool::new(false)).await
+    deliver_at_tracking(paths, home, msg, text, &AtomicBool::new(false), None).await
 }
 async fn deliver_at_tracking(
     paths: Vec<PathBuf>,
@@ -138,6 +138,7 @@ async fn deliver_at_tracking(
     msg: &Message,
     text: &str,
     attempted: &AtomicBool,
+    guard: Option<&super::NoticeGuard>,
 ) -> Outcome {
     if validate_session(&msg.recipient_session).is_err() {
         return Outcome::failed("Invalid Codex session UUID");
@@ -204,6 +205,11 @@ async fn deliver_at_tracking(
             json!({"threadId":msg.recipient_session,"clientUserMessageId":msg.id,"input":input}),
         )
     };
+    if let Some(guard) = guard
+        && let Err(error) = guard()
+    {
+        return Outcome::failed(error);
+    }
     attempted.store(true, Ordering::Relaxed);
     match rpc(&mut socket, 100, method, params).await {
         Ok(value) if turn.as_ref().is_some_and(|turn| value["turnId"] == *turn) => {
@@ -241,24 +247,34 @@ async fn deliver_at_tracking(
 }
 
 pub(crate) async fn deliver(msg: &Message, text: &str) -> Outcome {
+    deliver_guarded(msg, text, None).await
+}
+
+pub(crate) async fn deliver_guarded(
+    msg: &Message,
+    text: &str,
+    guard: Option<super::NoticeGuard>,
+) -> Outcome {
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| crate::service::home().ok().map(|v| v.join(".codex")));
     let Some(home) = home else {
         return Outcome::failed("Cannot locate Codex home");
     };
-    deliver_until(
+    deliver_until_guarded(
         super::codex_discovery::socket_paths(),
         &home,
         msg,
         text,
         tokio::time::sleep(Duration::from_secs(20)),
+        guard,
     )
     .await
 }
 
 // The deadline future starts with the exchange in production. Tests can gate it
 // on the fixture's exact read/write boundary without relying on setup timing.
+#[cfg(test)]
 async fn deliver_until(
     paths: Vec<PathBuf>,
     home: &Path,
@@ -266,9 +282,20 @@ async fn deliver_until(
     text: &str,
     deadline: impl std::future::Future<Output = ()>,
 ) -> Outcome {
+    deliver_until_guarded(paths, home, msg, text, deadline, None).await
+}
+
+async fn deliver_until_guarded(
+    paths: Vec<PathBuf>,
+    home: &Path,
+    msg: &Message,
+    text: &str,
+    deadline: impl std::future::Future<Output = ()>,
+    guard: Option<super::NoticeGuard>,
+) -> Outcome {
     let attempted = AtomicBool::new(false);
     tokio::select! {
-        result=deliver_at_tracking(paths, home, msg, text, &attempted)=>result,
+        result=deliver_at_tracking(paths, home, msg, text, &attempted, guard.as_ref())=>result,
         _=deadline=>if attempted.load(Ordering::Relaxed) {
             Outcome::uncertain("Native input timed out after this submission attempt; inspect native conversation before explicitly retrying")
         } else {
@@ -487,6 +514,35 @@ mod tests {
             updated: 0,
         }
     }
+    #[tokio::test]
+    async fn event_authorization_refreshes_after_native_preflight_before_any_write() {
+        let (_root, path, home, task, _ready) = fixture("ok").await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let guard: super::super::NoticeGuard = std::sync::Arc::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("subscription expired while native metadata was read")
+        });
+        let outcome = deliver_until_guarded(
+            vec![path],
+            &home,
+            &message(),
+            "typed event",
+            tokio::time::sleep(Duration::from_secs(5)),
+            Some(guard),
+        )
+        .await;
+        assert_eq!(outcome.state, "failed");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let requests = task.await.unwrap();
+        assert!(requests.iter().any(|r| r["method"] == "thread/read"));
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["method"] == "thread/queue/add" || r["method"] == "turn/steer")
+        );
+    }
+
     #[tokio::test]
     async fn private_queue_uses_exact_session_and_id_without_start_resume_or_process() {
         let (_root, path, home, task, _ready) = fixture("ok").await;

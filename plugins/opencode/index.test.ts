@@ -654,7 +654,7 @@ describe("V1 session context without peer transcript setup", () => {
     const context = first[1]!;
     expect(context).toContain(`identity is opencode-${A}`);
     expect(context).toContain(JSON.stringify(s.directory));
-    for (const instruction of ["connection_status", "acknowledge_message", "send_message", "parent=the received message ID", "read_board/update_board", "current task, status, blocker or needed user action", "revise an existing entry", "detailed logs and reasoning in the native terminal", "explicitly choose subscribe_board", "not owner approval", "Existing permissions remain under owner control"]) expect(context).toContain(instruction);
+    for (const instruction of ["connection_status", "acknowledge_message", "send_message", "parent=the received message ID", "read_board/update_board", "current task, status, blocker or needed user action", "revise an existing entry", "detailed logs and reasoning in the native terminal", "explicitly choose subscribe", 'events=[{"event":"board.changed","board":"main"}]', "require no acknowledgement", "not owner approval", "Existing permissions remain under owner control"]) expect(context).toContain(instruction);
     expect(await systemContext(s, A)).toEqual(first);
     expect(await systemContext(s, A, first)).toEqual(["native system", context]);
     expect(s.requests).toHaveLength(requests); expect(s.prompts).toHaveLength(0);

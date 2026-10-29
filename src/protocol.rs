@@ -39,6 +39,20 @@ impl Provider {
     }
 }
 
+/// Explicit, bounded local event interests; selector-specific fields are strict.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(tag = "event", deny_unknown_fields)]
+pub enum EventSelector {
+    #[serde(rename = "board.changed")]
+    BoardChanged { board: crate::board::Name },
+    #[serde(rename = "agent.opened")]
+    AgentOpened {},
+    #[serde(rename = "agent.closed")]
+    AgentClosed {},
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub name: String,
@@ -105,16 +119,26 @@ pub enum Request {
         id: String,
         recipient: String,
         content: String,
+        #[serde(default)]
+        event_token: Option<String>,
     },
     CodexNotice {
         id: String,
         recipient: String,
         session: String,
         content: String,
+        #[serde(default)]
+        event_token: Option<String>,
     },
     Unregister {
         name: String,
         session: String,
+    },
+    /// A native SessionEnd retires every alias of the verified exact session.
+    SessionClose {
+        name: String,
+        session: String,
+        endpoint: String,
     },
     List {
         #[serde(default)]
@@ -175,13 +199,14 @@ pub enum Request {
         #[serde(default)]
         actor: Option<String>,
     },
-    NamedBoardSubscribe {
-        board: crate::board::Name,
+    Subscribe {
         agent: String,
+        events: Vec<EventSelector>,
     },
-    NamedBoardUnsubscribe {
-        board: crate::board::Name,
+    Unsubscribe {
         agent: String,
+        #[serde(default)]
+        events: Option<Vec<EventSelector>>,
     },
     BoardRead,
     BoardUpdate {
@@ -189,12 +214,6 @@ pub enum Request {
         edits: Vec<crate::board::Edit>,
         #[serde(default)]
         actor: Option<String>,
-    },
-    BoardSubscribe {
-        agent: String,
-    },
-    BoardUnsubscribe {
-        agent: String,
     },
     Status,
     MonitorEnable {
@@ -357,20 +376,6 @@ impl Request {
             }
         }
     }
-    pub fn board_subscribe(board: crate::board::Name, agent: String) -> Self {
-        if board.is_main() {
-            Self::BoardSubscribe { agent }
-        } else {
-            Self::NamedBoardSubscribe { board, agent }
-        }
-    }
-    pub fn board_unsubscribe(board: crate::board::Name, agent: String) -> Self {
-        if board.is_main() {
-            Self::BoardUnsubscribe { agent }
-        } else {
-            Self::NamedBoardUnsubscribe { board, agent }
-        }
-    }
 }
 
 fn history_limit() -> usize {
@@ -421,10 +426,6 @@ mod board_compatibility_tests {
             #[serde(default)]
             actor: Option<String>,
         },
-        #[serde(rename = "board_subscribe")]
-        Subscribe { agent: String },
-        #[serde(rename = "board_unsubscribe")]
-        Unsubscribe { agent: String },
     }
     fn old_accepts(value: serde_json::Value) -> bool {
         // Consume fields as an old handler would, without executing any side effects.
@@ -435,9 +436,6 @@ mod board_compatibility_tests {
                 edits,
                 actor,
             }) => !expected_revision.is_empty() && !edits.is_empty() && actor.is_none(),
-            Ok(OldBoardRequest::Subscribe { agent } | OldBoardRequest::Unsubscribe { agent }) => {
-                !agent.is_empty()
-            }
             Err(_) => false,
         }
     }
@@ -459,14 +457,6 @@ mod board_compatibility_tests {
                 ),
                 json!({"op":"board_update","expected_revision":revision,"edits":[{"op":"append","text":"x"}],"actor":null}),
             ),
-            (
-                Request::board_subscribe(main.clone(), "agent".into()),
-                json!({"op":"board_subscribe","agent":"agent"}),
-            ),
-            (
-                Request::board_unsubscribe(main, "agent".into()),
-                json!({"op":"board_unsubscribe","agent":"agent"}),
-            ),
         ];
         for (request, fixture) in fixtures {
             assert_eq!(serde_json::to_value(request).unwrap(), fixture);
@@ -487,8 +477,6 @@ mod board_compatibility_tests {
                 }],
                 None,
             ),
-            Request::board_subscribe(name.clone(), "agent".into()),
-            Request::board_unsubscribe(name.clone(), "agent".into()),
             Request::BoardCreate { board: name },
             Request::BoardList,
         ] {

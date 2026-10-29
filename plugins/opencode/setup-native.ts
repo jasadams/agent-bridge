@@ -59,7 +59,7 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const transcript = JSON.stringify(body.messages.filter((m: any) => m.role !== "system"));
     let call: any;
     const invoke = (suffix: string, args: unknown, id: string) => {
-      const tool = tools.find((t: any) => t.function?.name.endsWith(suffix));
+      const tool = tools.find((t: any) => (t.function?.name === suffix || t.function?.name.endsWith(`_${suffix}`)));
       assert(tool, `Missing installed MCP tool ${suffix}`);
       return { id, type: "function", function: { name: tool.function.name, arguments: JSON.stringify(args) } };
     };
@@ -74,15 +74,15 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
         }
         if (stage === 2) call = invoke("send_message", { from: selected, to: "native-probe", body: `Reply ${marker}`, id: replyID, parent: incoming }, "setup_reply");
         if (stage === 3) call = invoke("read_board", {}, "setup_read");
-        if (stage === 4) call = invoke("subscribe_board", { agent: selected }, "setup_subscribe");
+        if (stage === 4) call = invoke("subscribe", { agent: selected, events: [{ event: "board.changed", board: "main" }] }, "setup_subscribe");
         if (stage === 5) call = invoke("update_board", { agent: selected, expected_revision: readToolResult(body, "setup_read").revision, edits: [{ op: "set", markdown: ownBoard }] }, "setup_update");
       } else if (phase === "pairing" && stage === 0) call = invoke("open_pairing", { agent: selected, seconds: 30 }, "setup_pairing_denied");
       else if (phase === "pairing" && stage === 1) {
         const result = body.messages.findLast((m: any) => m.role === "tool" && m.tool_call_id === "setup_pairing_denied");
         assert(result && JSON.stringify(result.content).includes("unavailable"), "MCP pairing must report unavailable owner input");
         pairingDenied = true;
-      } else if (phase === "unsubscribe" && stage === 0) call = invoke("unsubscribe_board", { agent: selected }, "setup_unsubscribe");
-      else if (phase === "subscribe" && stage === 0) call = invoke("subscribe_board", { agent: selected }, "setup_resubscribe");
+      } else if (phase === "unsubscribe" && stage === 0) call = invoke("unsubscribe", { agent: selected }, "setup_unsubscribe");
+      else if (phase === "subscribe" && stage === 0) call = invoke("subscribe", { agent: selected, events: [{ event: "board.changed", board: "main" }] }, "setup_resubscribe");
       else if (phase === "notice" && stage === 0) call = invoke("read_board", {}, "setup_notice_read");
       if (call) stage++;
     }

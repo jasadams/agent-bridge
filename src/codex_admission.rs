@@ -43,12 +43,24 @@ pub(crate) fn check(
 }
 
 impl Db {
+    #[cfg(test)]
     pub(crate) fn codex_notice(
         &self,
         id: &str,
         recipient: &str,
         session: &str,
         content: &str,
+    ) -> Result<Message> {
+        self.codex_event_notice(id, recipient, session, content, None)
+    }
+
+    pub(crate) fn codex_event_notice(
+        &self,
+        id: &str,
+        recipient: &str,
+        session: &str,
+        content: &str,
+        token: Option<&str>,
     ) -> Result<Message> {
         let agent = self.agent(recipient)?;
         ensure!(
@@ -65,6 +77,9 @@ impl Db {
         }
         let message = self.send(id, "user", recipient, content, &None)?;
         tx.execute("INSERT OR IGNORE INTO codex_notices VALUES(?)", [id])?;
+        if let Some(token) = token {
+            self.event_control_record(id, token)?;
+        }
         tx.commit()?;
         Ok(message)
     }
@@ -166,6 +181,84 @@ mod tests {
             .unwrap();
         assert_eq!(db.retry(&fresh.id, false).unwrap().state, "queued");
     }
+    #[test]
+    fn event_controls_are_not_peer_history_and_restart_never_replays_them() {
+        let (root, mut db, one, _) = setup();
+        let peer = send(&db, &one);
+        let event = db
+            .codex_notice(
+                &uuid::Uuid::new_v4().to_string(),
+                &one.name,
+                &one.session,
+                "event control",
+            )
+            .unwrap();
+        db.event_control_record(&event.id, "broker-one/subscription-one")
+            .unwrap();
+        assert!(db.event_control_record(&event.id, "replacement").is_err());
+        assert_eq!(
+            db.event_controls().unwrap(),
+            vec![(event.id.clone(), "broker-one/subscription-one".into())]
+        );
+        assert_eq!(
+            db.history(&None, 100)
+                .unwrap()
+                .iter()
+                .map(|m| &m.id)
+                .collect::<Vec<_>>(),
+            vec![&peer.id]
+        );
+        let page = db.history_since(&None, None, 1).unwrap();
+        assert_eq!(page.messages[0].id, peer.id);
+        assert!(!page.has_more);
+        assert!(
+            db.history_since(&None, Some(&page.cursor), 1)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        let admitted = db
+            .codex_notice(
+                &uuid::Uuid::new_v4().to_string(),
+                &one.name,
+                &one.session,
+                "already attempted",
+            )
+            .unwrap();
+        db.event_control_record(&admitted.id, "broker-one/subscription-one")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE messages SET state='sending' WHERE id=?",
+                [&admitted.id],
+            )
+            .unwrap();
+        db.event_control_revoke(&admitted.id).unwrap();
+        assert_eq!(db.get(&admitted.id).unwrap().state, "sending");
+        drop(db);
+        db = Db::open(&root.path().join("bridge.db")).unwrap();
+        assert_eq!(db.get(&event.id).unwrap().state, "failed");
+        assert_eq!(db.get(&admitted.id).unwrap().state, "uncertain");
+        assert_eq!(db.claim().unwrap().unwrap().0.id, peer.id);
+        assert!(db.claim().unwrap().is_none());
+    }
+
+    #[test]
+    fn ordinary_alias_unregister_does_not_close_canonical_session_or_accept_stale_native_close() {
+        let (_root, db, one, two) = setup();
+        db.unregister(&one.name, &one.session).unwrap();
+        assert!(!db.agent(&one.name).unwrap().enabled);
+        assert!(db.agent(&two.name).unwrap().enabled);
+        assert!(
+            db.close_native(&two.name, "wrong-session", &two.endpoint)
+                .is_err()
+        );
+        assert!(db.agent(&two.name).unwrap().enabled);
+        db.close_native(&two.name, &two.session, &two.endpoint)
+            .unwrap();
+        assert!(!db.agent(&two.name).unwrap().enabled);
+    }
+
     #[test]
     fn typed_controls_keep_no_ack_semantics_but_pending_controls_are_bounded() {
         let (_root, mut db, one, two) = setup();

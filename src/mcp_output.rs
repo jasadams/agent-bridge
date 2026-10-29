@@ -37,7 +37,7 @@ pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value
 
     let names: &[&str] = match tool {
         "send_message" | "acknowledge_message" => &["id", "state"],
-        "subscribe_board" | "unsubscribe_board" => &["board", "subscribed", "agent", "revision"],
+        "subscribe" | "unsubscribe" => &["agent", "events", "agents", "persistent", "recovery"],
         "open_pairing" => &["open", "valid_for_seconds", "notifications"],
         "create_invite" => &[
             "link",
@@ -232,27 +232,14 @@ mod tests {
 
     #[test]
     fn subscriptions_and_simple_write_tools_keep_action_receipts() {
-        assert_eq!(
-            write_result(
-                "subscribe_board",
-                json!({
-                    "subscribed":true,"agent":"agent","revision":"revision","board":"main",
-                    "debounce_seconds":3,"max_delay_seconds":10,"persistent":false
-                }),
-                false
-            ),
-            json!({"board":"main","subscribed":true,"agent":"agent","revision":"revision"})
-        );
-        assert_eq!(
-            write_result(
-                "unsubscribe_board",
-                json!({
-                    "subscribed":false,"agent":"agent","board":"main"
-                }),
-                false
-            ),
-            json!({"board":"main","subscribed":false,"agent":"agent"})
-        );
+        for tool in ["subscribe", "unsubscribe"] {
+            let receipt = json!({"agent":"agent","events":[{"event":"agent.opened"}],
+                "agents":[{"provider":"claude","session":"session","route":"route","display_name":"Agent"}],
+                "persistent":false,"recovery":{"total":0,"truncated":false,"items":[]}});
+            let mut full = receipt.clone();
+            full["internal"] = json!("omit");
+            assert_eq!(write_result(tool, full, false), receipt);
+        }
         for (tool, value) in [
             ("cancel_pairing", json!({"cancelled":true,"id":"exchange"})),
             ("close_pairing", json!({"open":false})),
@@ -262,6 +249,21 @@ mod tests {
             ),
         ] {
             assert_eq!(write_result(tool, value.clone(), false), value);
+        }
+    }
+
+    #[test]
+    fn compact_event_receipts_keep_nonempty_recovery_diagnostics() {
+        let recovery = json!({"total":17,"truncated":true,"items":(0..16).map(|index| {
+            json!({"id":format!("control-{index}"),"state":"uncertain",
+                "reconciliation_pending":false,"route_matches":true,"lease_available":false})
+        }).collect::<Vec<_>>(),"instruction":"Inspect the ID and explicitly reconcile through the same broker."});
+        for tool in ["subscribe", "unsubscribe"] {
+            let full = json!({"agent":"route","events":[],"agents":[],"persistent":false,
+                "recovery":recovery,"internal":"omit"});
+            let compact = write_result(tool, full, false);
+            assert_eq!(compact["recovery"], recovery);
+            assert!(compact.get("internal").is_none());
         }
     }
 

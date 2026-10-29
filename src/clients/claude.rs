@@ -234,6 +234,15 @@ fn closing_envelope_name(suffix: &str) -> bool {
 }
 
 pub(crate) async fn deliver(agent: &Agent, msg: &Message, content: &str) -> Outcome {
+    deliver_guarded(agent, msg, content, None).await
+}
+
+pub(crate) async fn deliver_guarded(
+    agent: &Agent,
+    msg: &Message,
+    content: &str,
+    guard: Option<&super::NoticeGuard>,
+) -> Outcome {
     let path = match validate_socket(Path::new(&agent.endpoint)) {
         Ok(p) => p,
         Err(e) => return Outcome::failed(e),
@@ -244,6 +253,11 @@ pub(crate) async fn deliver(agent: &Agent, msg: &Message, content: &str) -> Outc
         Err(e) => return Outcome::failed(e),
     };
     if let Err(error) = crate::delivery::validate_peer(&stream, unsafe { libc::geteuid() }) {
+        return Outcome::failed(error);
+    }
+    if let Some(guard) = guard
+        && let Err(error) = guard()
+    {
         return Outcome::failed(error);
     }
     let frame = frame(msg, content);
@@ -282,6 +296,33 @@ pub(crate) async fn deliver(agent: &Agent, msg: &Message, content: &str) -> Outc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn event_guard_refreshes_after_connect_and_prevents_native_frame() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("native.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let agent = Agent {
+            name: "claude-test".into(),
+            provider: crate::protocol::Provider::Claude,
+            session: "123e4567-e89b-12d3-a456-426614174000".into(),
+            endpoint: path.to_string_lossy().into_owned(),
+            enabled: true,
+        };
+        let guard: super::super::NoticeGuard =
+            std::sync::Arc::new(|| anyhow::bail!("subscription revoked"));
+        let outcome =
+            deliver_guarded(&agent, &message("typed event"), "typed event", Some(&guard)).await;
+        assert_eq!(outcome.state, "failed");
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
+    }
 
     #[test]
     fn liveness_checks_listener_not_just_socket_file() {

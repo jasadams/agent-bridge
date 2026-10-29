@@ -16,6 +16,8 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 type Socket = WebSocketStream<UnixStream>;
+const MAX_LOADED_SESSIONS: usize = 4096;
+const MAX_LOADED_PAGES: usize = 64;
 
 /// Socket layout is isolated here because native daemon layout can change between Codex versions.
 pub fn socket_paths() -> Vec<PathBuf> {
@@ -83,6 +85,10 @@ async fn request_read(
     {
         return Ok(());
     }
+    ensure!(
+        pending.len() < MAX_LOADED_SESSIONS,
+        "Native discovery has too many pending sessions"
+    );
     let request = *next;
     *next += 1;
     pending.insert(request, Pending::Read(id.into()));
@@ -125,7 +131,10 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
         break;
     }
     send(&mut socket, json!({"method":"initialized"})).await?;
-    broker.codex_offline(None)?;
+    let mut loaded = HashSet::new();
+    let mut closed_during_scan = HashSet::new();
+    let mut cursors = HashSet::new();
+    let mut initial_scan = true;
     let mut pending = HashMap::from([(2, Pending::Loaded)]);
     let mut next = 3;
     let mut observed = HashSet::new();
@@ -154,23 +163,58 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
             }
             match request {
                 Pending::Loaded => {
-                    for id in value["result"]["data"]
+                    let data = value["result"]["data"]
                         .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                    {
-                        request_read(&mut socket, id, &mut next, &mut pending).await?;
+                        .context("Native loaded-session page is missing its data array")?;
+                    for id in data {
+                        let id = id
+                            .as_str()
+                            .context("Native loaded-session page contains an invalid identity")?;
+                        uuid::Uuid::parse_str(id)
+                            .context("Native loaded-session ID is not a UUID")?;
+                        if !closed_during_scan.contains(id) {
+                            loaded.insert(id.to_owned());
+                            ensure!(
+                                loaded.len() <= MAX_LOADED_SESSIONS,
+                                "Native loaded-session scan exceeds 4096 identities"
+                            );
+                            request_read(&mut socket, id, &mut next, &mut pending).await?;
+                        }
                     }
-                    if let Some(cursor) = value["result"]["nextCursor"].as_str() {
+                    let cursor = &value["result"]["nextCursor"];
+                    ensure!(
+                        cursor.is_null() || cursor.is_string(),
+                        "Native loaded-session page has an invalid cursor"
+                    );
+                    if let Some(cursor) = cursor.as_str() {
+                        ensure!(
+                            cursors.len() < MAX_LOADED_PAGES && cursors.insert(cursor.to_owned()),
+                            "Native loaded-session pagination exceeded its bound or repeated a cursor"
+                        );
                         let id = next;
                         next += 1;
                         pending.insert(id, Pending::Loaded);
                         send(&mut socket,json!({"id":id,"method":"thread/loaded/list","params":{"cursor":cursor}})).await?;
+                    } else {
+                        broker.reconcile_codex_loaded(&loaded)?;
+                        initial_scan = false;
+                        closed_during_scan.clear();
                     }
                 }
                 Pending::Read(session) => {
-                    broker.observe_codex(&value["result"]["thread"])?;
+                    let thread = &value["result"]["thread"];
+                    ensure!(
+                        thread["id"] == session && thread["status"]["type"].is_string(),
+                        "Native thread/read returned a mismatched or incomplete identity"
+                    );
+                    if initial_scan && thread["status"]["type"] != "notLoaded" {
+                        loaded.insert(session.clone());
+                        ensure!(
+                            loaded.len() <= MAX_LOADED_SESSIONS,
+                            "Native loaded-session scan exceeds 4096 identities"
+                        );
+                    }
+                    broker.observe_codex(thread)?;
                     observed.insert(session);
                     broker.discovery_status(json!({"state":"connected","socket":path,"observed_sessions":observed.len()}));
                 }
@@ -182,20 +226,50 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
         match method {
             "thread/started" => {
                 if let Some(id) = params["thread"]["id"].as_str() {
+                    if initial_scan {
+                        loaded.insert(id.to_owned());
+                        closed_during_scan.remove(id);
+                        ensure!(
+                            loaded.len() <= MAX_LOADED_SESSIONS,
+                            "Native loaded-session scan exceeds 4096 identities"
+                        );
+                    }
                     request_read(&mut socket, id, &mut next, &mut pending).await?;
                 }
             }
             "thread/name/updated" | "thread/status/changed" | "thread/unarchived" => {
                 if let Some(id) = params["threadId"].as_str() {
                     if params["status"]["type"] == "notLoaded" {
+                        pending.retain(
+                            |_, request| !matches!(request,Pending::Read(session) if session==id),
+                        );
+                        if initial_scan {
+                            loaded.remove(id);
+                            closed_during_scan.insert(id.to_owned());
+                        }
                         broker.codex_offline(Some(id))?;
                     } else {
+                        if initial_scan {
+                            loaded.insert(id.to_owned());
+                            closed_during_scan.remove(id);
+                            ensure!(
+                                loaded.len() <= MAX_LOADED_SESSIONS,
+                                "Native loaded-session scan exceeds 4096 identities"
+                            );
+                        }
                         request_read(&mut socket, id, &mut next, &mut pending).await?;
                     }
                 }
             }
             "thread/closed" | "thread/archived" | "thread/deleted" => {
                 if let Some(id) = params["threadId"].as_str() {
+                    pending.retain(
+                        |_, request| !matches!(request,Pending::Read(session) if session==id),
+                    );
+                    if initial_scan {
+                        loaded.remove(id);
+                        closed_during_scan.insert(id.to_owned());
+                    }
                     broker.codex_offline(Some(id))?;
                     observed.remove(id);
                 }

@@ -632,8 +632,8 @@ async fn http_response_notifies_only_the_selected_boards_native_subscriber() {
             .unwrap();
         running
             .broker
-            .request(Request::NamedBoardSubscribe {
-                board,
+            .request(Request::Subscribe {
+                events: vec![agent_bridge::protocol::EventSelector::BoardChanged { board }],
                 agent: name.into(),
             })
             .unwrap();

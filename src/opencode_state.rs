@@ -41,12 +41,39 @@ impl Db {
         );
         Ok(())
     }
+    /// Hidden typed controls retain ordinary native uncertainty barriers. Expose
+    /// bounded recovery handles without turning them into peer-message history.
+    pub(crate) fn event_recovery(&self, agent: Option<&Agent>) -> Result<Value> {
+        const LIMIT: usize = 16;
+        let Some(agent) = agent.filter(|agent| agent.provider == Provider::OpenCode) else {
+            return Ok(json!({"total":0,"truncated":false,"items":[]}));
+        };
+        let predicate = "FROM messages m JOIN opencode_deliveries d ON d.id=m.id JOIN message_context c ON c.id=m.id WHERE d.session=?1 AND json_extract(c.destination,'$.provider')='opencode' AND d.phase<>'queued' AND m.state IN('queued','sending','uncertain') AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL OR d.content=m.body)";
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT count(*) {predicate}"),
+            [&agent.session],
+            |row| row.get(0),
+        )?;
+        let mut query=self.conn.prepare(&format!("SELECT m.id,m.state,(d.phase='reconcile' AND m.state IN('queued','sending')),EXISTS(SELECT 1 FROM agents a WHERE a.name=m.recipient AND a.provider='opencode' AND a.session=d.session),EXISTS(SELECT 1 FROM agents a JOIN opencode_leases l ON l.session=a.session WHERE a.name=m.recipient AND a.provider='opencode' AND a.session=d.session AND a.enabled=1 AND a.endpoint=l.endpoint AND l.expires>?2) {predicate} ORDER BY m.rowid LIMIT ?3"))?;
+        let items=query.query_map(params![agent.session,now(),LIMIT as i64],|row| {
+            Ok(json!({"id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?,"reconciliation_pending":row.get::<_,bool>(2)?,"route_matches":row.get::<_,bool>(3)?,"lease_available":row.get::<_,bool>(4)?}))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut recovery = json!({"total":total,"truncated":total>LIMIT as i64,"items":items});
+        if total > 0 {
+            recovery["instruction"] = json!(
+                "Delivery may remain blocked by uncertain native insertion. Inspect each ID, then explicitly run agent-bridge --state-dir SAME_BROKER_STATE_DIR retry ID (default allow_duplicate=false). Retry reads existing native proof only; missing proof remains uncertain. Queued reconciliation has not necessarily run; after restart or lease change, explicitly retry the same ID again if it remains queued. Route or lease mismatches may require restoring the original exact session registration before retry."
+            );
+        }
+        Ok(recovery)
+    }
+
     pub(crate) fn opencode_notice_content(&self, id: &str, content: &str) -> Result<()> {
         let changed = self.conn.execute("UPDATE opencode_deliveries SET content=?1 WHERE id=?2 AND phase='queued' AND (content IS NULL OR content=?1)",params![content,id])?;
         ensure!(
             changed == 1,
             "OpenCode notice ID already belongs to another delivery"
         );
+        self.conn.execute("UPDATE message_context SET destination=json_set(destination,'$.control_notice',1) WHERE id=?", [id])?;
         Ok(())
     }
     pub(crate) fn opencode_tick(&self, time: i64) -> Result<()> {
@@ -59,8 +86,17 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn opencode_observe(&mut self, agent: &Agent, ready: bool) -> Result<Value> {
-        let time = now();
+        self.opencode_observe_at(agent, ready, now())
+    }
+
+    pub(crate) fn opencode_observe_at(
+        &mut self,
+        agent: &Agent,
+        ready: bool,
+        time: i64,
+    ) -> Result<Value> {
         self.opencode_tick(time)?;
         let instance =
             crate::clients::opencode::endpoint_instance(std::path::Path::new(&agent.endpoint))?;
@@ -276,7 +312,8 @@ impl Db {
         };
         let msg = self.get(id)?;
         ensure!(
-            ["failed", "blocked", "uncertain", "submitted"].contains(&msg.state.as_str()),
+            ["failed", "blocked", "uncertain", "submitted"].contains(&msg.state.as_str())
+                || (msg.state == "queued" && phase == "reconcile"),
             "OpenCode delivery cannot be retried in its current state"
         );
         let agent = self.agent(&msg.recipient)?;
@@ -284,6 +321,9 @@ impl Db {
             agent.provider == Provider::OpenCode && agent.session == session,
             "OpenCode recipient identity changed; create a new message"
         );
+        // An explicitly queued read-only reconciliation can refresh a replaced
+        // lease after restart. Its immutable native ID/content and reconcile phase
+        // remain intact; a sending attempt cannot be rebound or started twice.
         let generation: String = self
             .conn
             .query_row(
@@ -347,6 +387,84 @@ mod tests {
             .unwrap();
         (msg, dispatch)
     }
+    #[test]
+    fn hidden_control_recovery_is_bounded_canonical_and_reports_original_route_mismatch() {
+        let (_root, mut db, agent, _generation) = setup();
+        let alias = Agent {
+            name: "manual-alias".into(),
+            ..agent.clone()
+        };
+        db.register(&alias, false).unwrap();
+        for index in 0..18 {
+            let recipient = if index % 2 == 0 {
+                &agent.name
+            } else {
+                &alias.name
+            };
+            let id = uuid::Uuid::new_v4().to_string();
+            db.send(
+                &id,
+                "user",
+                recipient,
+                "sensitive native control content",
+                &None,
+            )
+            .unwrap();
+            db.opencode_notice_content(&id, "sensitive native control content")
+                .unwrap();
+            db.event_control_record(&id, "retired-subscription")
+                .unwrap();
+            // Historic attempted records exercise the bounded diagnostic query;
+            // this storage fixture makes no native submission/success claim.
+            db.conn
+                .execute("UPDATE messages SET state='uncertain' WHERE id=?", [&id])
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE opencode_deliveries SET phase='uncertain' WHERE id=?",
+                    [&id],
+                )
+                .unwrap();
+        }
+        let recovery = db.event_recovery(Some(&agent)).unwrap();
+        assert_eq!(recovery["total"], 18);
+        assert_eq!(recovery["truncated"], true);
+        assert_eq!(recovery["items"].as_array().unwrap().len(), 16);
+        assert!(
+            recovery["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["route_matches"] == true && item["lease_available"] == true)
+        );
+        assert!(
+            !recovery
+                .to_string()
+                .contains("sensitive native control content")
+        );
+        assert!(recovery.to_string().len() < 8192);
+        db.register(
+            &Agent {
+                provider: Provider::Inbox,
+                session: "replacement".into(),
+                endpoint: String::new(),
+                ..alias
+            },
+            true,
+        )
+        .unwrap();
+        let recovery = db.event_recovery(Some(&agent)).unwrap();
+        assert_eq!(recovery["total"], 18);
+        assert!(
+            recovery["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["route_matches"] == false && item["lease_available"] == false)
+        );
+        assert!(db.history(&None, 100).unwrap().is_empty());
+    }
+
     #[test]
     fn canonical_alias_fifo_deferred_and_uncertain_heads_remain_barriers() {
         let (_root, mut db, agent, generation) = setup();
@@ -612,6 +730,31 @@ mod tests {
         .unwrap();
         assert_eq!(db.get(&first.id).unwrap().state, "submitted");
     }
+    #[test]
+    fn ordinary_native_rendered_content_stays_in_history_but_typed_controls_do_not() {
+        let (_root, mut db, agent, _) = setup();
+        let peer = send(&db, &agent.name);
+        let (claimed, dispatch) = dispatch(&mut db);
+        assert_eq!(claimed.id, peer.id);
+        assert_ne!(dispatch.frame["content"], peer.body);
+        let notice = send(&db, &agent.name);
+        db.opencode_notice_content(&notice.id, "raw typed notice")
+            .unwrap();
+        assert_eq!(
+            db.history(&None, 100)
+                .unwrap()
+                .iter()
+                .map(|m| &m.id)
+                .collect::<Vec<_>>(),
+            vec![&peer.id]
+        );
+        let page = db.history_since(&None, None, 100).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].id, peer.id);
+        // Delivery durability remains available internally, without inventing an ack.
+        assert_eq!(db.get(&notice.id).unwrap().state, "queued");
+    }
+
     #[test]
     fn typed_notices_share_canonical_fifo_pause_and_admission() {
         let (_root, mut db, agent, _) = setup();

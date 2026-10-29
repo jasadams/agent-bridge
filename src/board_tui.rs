@@ -2411,6 +2411,125 @@ mod tests {
         assert_eq!(view.snapshot.as_ref().unwrap().markdown, "current");
     }
 
+    #[tokio::test]
+    async fn terminal_response_save_delivers_generic_named_board_event() {
+        use crate::protocol::{Agent, EventSelector, Provider};
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::{io::AsyncReadExt, net::UnixListener, time::timeout};
+
+        let root = tempfile::Builder::new()
+            .prefix("ab-tui-events-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let bound = broker::Broker::bind(root.path().into(), "/missing/codex".into()).unwrap();
+        let broker = bound.broker.clone();
+        let service = tokio::spawn(broker::serve(bound));
+        let board: Name = "terminal".parse().unwrap();
+        broker
+            .request(Request::BoardCreate {
+                board: board.clone(),
+            })
+            .unwrap();
+        let initial = crate::board::read_named(root.path(), &board).unwrap();
+        let seeded = broker
+            .request(Request::board_update(
+                board.clone(),
+                initial.revision,
+                vec![Edit::Set {
+                    markdown: "- [ ] Review terminal response\n".into(),
+                }],
+                None,
+            ))
+            .unwrap();
+        let socket_path = root.path().join("native.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        broker
+            .request(Request::Register {
+                agent: Agent {
+                    name: "terminal-watcher".into(),
+                    provider: Provider::Claude,
+                    session: uuid::Uuid::new_v4().to_string(),
+                    endpoint: socket_path.to_string_lossy().into(),
+                    enabled: true,
+                },
+                replace: false,
+            })
+            .unwrap();
+        let (captured, mut received) = mpsc::channel(8);
+        let receiver = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                socket.read_to_end(&mut bytes).await.unwrap();
+                if !bytes.is_empty() {
+                    captured.send(bytes).await.unwrap();
+                }
+            }
+        });
+        broker
+            .request(Request::Subscribe {
+                agent: "terminal-watcher".into(),
+                events: vec![EventSelector::BoardChanged {
+                    board: board.clone(),
+                }],
+            })
+            .unwrap();
+        let mut view = View::default();
+        assert!(view.switch(board.clone()));
+        view.update(Ok(serde_json::from_value(seeded["board"].clone()).unwrap()));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char(' '), KeyModifiers::NONE);
+        let save = view.pending.take().unwrap();
+        assert_eq!(save.base.name, "terminal");
+        // Same revision-checked request emitted by the terminal worker.
+        let result = broker::rpc(
+            root.path(),
+            &Request::board_update(
+                board.clone(),
+                save.base.revision.clone(),
+                vec![Edit::Set {
+                    markdown: save.markdown.clone(),
+                }],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        view.saved(
+            save,
+            Ok((
+                serde_json::from_value(result["board"].clone()).unwrap(),
+                true,
+            )),
+        );
+        assert!(view.snapshot.as_ref().unwrap().markdown.contains("[x]"));
+        assert_eq!(crate::board::read(root.path()).unwrap().markdown, "");
+        let bytes = timeout(Duration::from_secs(8), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let notice: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let text = notice["message"]["content"].as_str().unwrap();
+        assert!(text.contains("\"board\":\"terminal\""), "{text}");
+        assert!(
+            text.contains(&view.snapshot.as_ref().unwrap().revision),
+            "{text}"
+        );
+        assert!(text.contains("not user approval"));
+        assert_eq!(
+            broker
+                .request(Request::History {
+                    agent: None,
+                    limit: 100
+                })
+                .unwrap(),
+            serde_json::json!([])
+        );
+        receiver.abort();
+        service.abort();
+    }
+
     #[test]
     fn controls_toggle_exact_snapshot_and_refresh_clears_focus() {
         let source = "# Review\n\n- [ ] same\n- [ ] same\n";
