@@ -30,9 +30,11 @@ agent-bridge status
 agent-bridge monitor enable
 ```
 
-Open the monitor's loopback URL and paste its separate access token. Tokens are
-not embedded in URLs. Peer networking and monitor access remain independently
-controlled. A fresh installation enables neither peer networking nor the monitor.
+Open the monitor's private `access_url` to unlock automatically, or open the plain
+loopback `url` and paste its separate access token. The private link uses a fragment
+that the page immediately removes; treat the complete link like a password. See
+[monitor access](local-monitor.md#browser-access). Peer networking and monitor
+access remain independently controlled. A fresh installation enables neither peer networking nor the monitor.
 Open an existing Codex or Claude session to use native delivery. Claude registration
 hooks can be installed separately with `agent-bridge hooks install`; hook trust and
 native permissions remain your choices.

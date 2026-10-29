@@ -100,6 +100,8 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         path = "/api/boards/" + name + ("/responses" if method == "POST" else "")
         target.evaluate("spec => { window.__boardGate = {...spec, armed:true, waiting:false}; }",
                         {"path": path, "method": method})
+        if method == "GET":
+            target.locator("#board-refresh").click()
 
     def gate_wait(target=page):
         deadline = time.monotonic() + 15
@@ -132,6 +134,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#boards-tab").click()
         expect(page.locator("#selected-board-name")).to_have_text("main")
         expect(page.locator("#board-document")).to_contain_text("has not been written")
+        expect(page.locator(".board-responses")).to_be_hidden()
         names = page.locator("#board-selector option").all_text_contents()
         assert names == sorted(names) and names == ["alpha", "beta", "main"]
         pick("alpha")
@@ -150,6 +153,54 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             assert read(name) == before[name], "Loading or rendering wrote the board"
         record("boards list virtual main and named documents deterministically; safe Markdown/raw/control metadata render without writes/resources")
 
+        # Read-only documents should have the same space as editable boards,
+        # without reserving a column or displaying an empty Responses panel.
+        write("main", "# Ticket board\n\n| Ticket | Status |\n| --- | --- |\n| AGB-12 | Done |\n")
+        page.locator("#board-selector").select_option("main")
+        expect(page.locator("#board-document h1")).to_have_text("Ticket board")
+        expect(page.locator(".board-responses")).to_be_hidden()
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        page.evaluate("window.scrollTo(0, 0)")
+        document = page.locator(".board-document-panel").bounding_box()
+        board_view = page.locator("#boards-view").bounding_box()
+        assert document and board_view
+        assert document["y"] < 230, "Board content is pushed below excessive header space"
+        assert abs(document["width"] - board_view["width"]) <= 2, "Board loses width to an unused sidebar"
+        page.screenshot(path=str(output / "boards-read-only-desktop.png"), full_page=True)
+        pick("alpha")
+        expect(page.locator(".board-responses")).to_be_visible()
+        record("read-only board opens near the top at full content width without empty response chrome; editable controls return on navigation")
+
+        snapshot_reads = []
+        page.on("request", lambda request: snapshot_reads.append(request.url)
+                if request.method == "GET" and urlsplit(request.url).path == "/api/boards/alpha" else None)
+        page.wait_for_timeout(1000)
+        idle_count = len(snapshot_reads)
+        page.wait_for_timeout(1800)
+        assert len(snapshot_reads) == idle_count, "Idle board still polls snapshots"
+        page.evaluate("""() => {
+          window.__stableHeading = document.querySelector('#board-document h1');
+          window.__stableControl = document.querySelector('#board-controls input');
+        }""")
+        write("alpha", alpha.replace("| native | ready |", "| native | live push |"))
+        expect(page.locator("#board-document table")).to_contain_text("live push")
+        assert page.evaluate("window.__stableHeading === document.querySelector('#board-document h1')")
+        assert page.evaluate("window.__stableControl === document.querySelector('#board-controls input')")
+        write("alpha", alpha)
+        expect(page.locator("#board-document table")).to_contain_text("ready")
+        page.evaluate("""() => {
+          const range = document.createRange(); range.selectNodeContents(document.querySelector('#board-document h1'));
+          const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+        }""")
+        write("alpha", alpha.replace("| native | ready |", "| native | transient |"))
+        expect(page.locator("#board-newer")).to_be_visible()
+        write("alpha", alpha)
+        expect(page.locator("#board-newer")).to_be_hidden()
+        page.evaluate("getSelection().removeAllRanges()")
+        expect(page.locator("#board-document table")).to_contain_text("ready")
+        assert "transient" not in page.locator("#board-document table").inner_text()
+        record("board push stream stays idle without snapshot polling, patches changed cells, preserves controls and drops reverted deferred snapshots")
+
         checkbox = page.locator('#board-controls input[type="checkbox"]')
         checkbox.check()
         wait("desired checkbox checked", lambda: "- [x] Checkbox alpha" in read("alpha")["markdown"])
@@ -164,6 +215,9 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         # All application-controlled exits offer an explicit draft decision.
         for destination in ("board", "messages", "lock"):
             edit("keep draft " + destination)
+            page.evaluate("location.hash = 'access_token=' + 'x'.repeat(43)")
+            wait("active-session fragment cleared", lambda: not urlsplit(page.url).fragment)
+            expect(page.locator("#response-text")).to_have_value("keep draft " + destination)
             if destination == "board": page.locator("#board-selector").select_option("beta")
             elif destination == "messages": page.locator("#messages-tab").click()
             else: page.locator("#lock-button").click()
@@ -296,9 +350,13 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         assert not page.locator("#board-raw").text_content() and not page.locator("#board-controls").text_content()
         assert not page.locator("#response-text").input_value()
         page.locator("#access-token").fill(token); page.locator("#login-form button[type=submit]").click()
-        expect(page.locator("#messages-view")).to_be_visible()
+        expect(page.locator("#boards-view")).to_be_visible()
+        expect(page.locator("#selected-board-name")).to_have_text("main")
+        expect(page.locator("#board-document h1")).to_have_text("Ticket board")
         release_gate(); page.wait_for_timeout(150)
-        assert not page.locator("#board-raw").text_content() and not page.locator("#board-controls").text_content()
+        expect(page.locator("#board-document h1")).to_have_text("Ticket board")
+        assert "Beta" not in page.locator("#board-raw").text_content()
+        assert not page.locator("#board-controls .board-control").count()
         record("late decoded snapshots are fenced across board switches and lock/new authentication generations")
 
         pick("alpha")
@@ -319,7 +377,16 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#response-cancel").click()
         for width, height, filename in ((1440, 1000, "boards-desktop.png"), (320, 844, "boards-mobile.png")):
             page.set_viewport_size({"width": width, "height": height})
+            page.evaluate("window.scrollTo(0, 0)")
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1"), "Page overflow hides response controls"
+            document = page.locator(".board-document-panel").bounding_box()
+            responses = page.locator(".board-responses").bounding_box()
+            board_view = page.locator("#boards-view").bounding_box()
+            assert document and responses and board_view
+            assert abs(document["width"] - board_view["width"]) <= 2, "Editable board reserves document width for responses"
+            assert responses["y"] >= document["y"] + document["height"] - 1, "Responses displace the board into a sidebar layout"
+            if width >= 1000:
+                assert document["y"] < 230, "Editable board content is pushed below excessive header space"
             page.screenshot(path=str(output / filename), full_page=True)
         assert page.evaluate("localStorage.length + sessionStorage.length") == 0
         assert context.cookies() == []

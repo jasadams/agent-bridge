@@ -1,14 +1,17 @@
 "use strict";
 // No credentials, private drafts or board snapshots leave this tab's memory.
-window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
+window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) => {
   const $ = id => document.getElementById(id);
   const tags = new Set("p h1 h2 h3 h4 h5 h6 blockquote ul ol li pre code em strong del table thead tbody tr th td hr br a span".split(" "));
   let active = false, authEpoch = 0, boardEpoch = 0, sequence = 0;
   let board = "main", shown = null, latest = null, draft = null, saving = false;
   let timer = null, readAbort = null, reading = false, backoff = 1000, raw = false, leaveChoice = null;
+  let liveAbort = null, liveSequence = 0, refreshRequested = false;
+  const controlRows = new Map();
   const node = (tag, text, className) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = String(text); if (className) n.className = className; return n; };
-  const status = text => { $("board-status").textContent = text; };
-  const error = text => { $("board-error").textContent = text || ""; $("board-error").hidden = !text; };
+  const text = (element, value) => { if (element.textContent !== value) element.textContent = value; };
+  const status = value => { text($("board-status"), value); };
+  const error = value => { text($("board-error"), value || ""); $("board-error").hidden = !value; };
   const capture = () => ({ auth: authEpoch, epoch: boardEpoch, name: board });
   const current = c => authenticated() && c.auth === authEpoch && c.epoch === boardEpoch && c.name === board;
   const validName = name => typeof name === "string" && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(name);
@@ -18,8 +21,64 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
     const selection = window.getSelection();
     return !!selection && !selection.isCollapsed && ["board-document", "board-raw", "board-controls"].some(id => $(id).contains(selection.anchorNode) || $(id).contains(selection.focusNode));
   }
-  function stopPoll() { clearTimeout(timer); timer = null; readAbort?.abort(); readAbort = null; sequence++; reading = false; }
-  function schedule() { clearTimeout(timer); if (active && authenticated() && !saving) timer = setTimeout(() => refresh(), backoff); }
+  function stopRead() { readAbort?.abort(); readAbort = null; sequence++; reading = false; refreshRequested = false; }
+  function stopLive() { clearTimeout(timer); timer = null; liveSequence++; liveAbort?.abort(); liveAbort = null; }
+  function stop() { stopLive(); stopRead(); }
+  function reconnect() {
+    stopLive(); refreshRequested = false;
+    if (!active || !authenticated()) return;
+    backoff = Math.min(backoff * 2, 30000);
+    timer = setTimeout(() => { timer = null; void startLive(); }, backoff);
+  }
+  function flushRefresh() {
+    if (refreshRequested && active && authenticated() && !reading && !saving) {
+      refreshRequested = false;
+      void refresh();
+    }
+  }
+  async function startLive() {
+    if (!active || !authenticated()) return;
+    stopLive();
+    const c = capture(), id = liveSequence, controller = new AbortController();
+    liveAbort = controller;
+    const live = () => current(c) && active && id === liveSequence && !controller.signal.aborted;
+    try {
+      const response = await connect(`/api/boards/${encodeURIComponent(c.name)}/events`, { signal: controller.signal });
+      if (!live()) { await response.body?.cancel(); return; }
+      if (!response.ok || !response.body) throw new Error("Board live connection unavailable");
+      // Catch changes between the initial snapshot and connecting, including reconnect gaps.
+      await refresh();
+      if (!live()) { await response.body.cancel(); return; }
+      const reader = response.body.getReader(), decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (!live()) { await reader.cancel(); return; }
+        if (done) throw new Error("Board live connection ended");
+        buffer += decoder.decode(value, { stream: true });
+        buffer = buffer.replace(/\r\n/g, "\n");
+        if (buffer.length > 65536) throw new Error("Invalid board event stream");
+        let end;
+        while ((end = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+          const lines = frame.split("\n");
+          if (!lines.includes("event: board-revision")) continue;
+          const data = JSON.parse(lines.filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n"));
+          if (data.name !== c.name || typeof data.revision !== "string" || !/^[a-f0-9]{64}$/.test(data.revision)) throw new Error("Invalid board revision event");
+          backoff = 1000;
+          if (data.revision !== (latest?.revision || shown?.revision)) {
+            refreshRequested = true;
+            flushRefresh();
+          }
+        }
+      }
+    } catch (e) {
+      if (live() && e.name !== "AbortError") {
+        error("The live board connection was interrupted. Your last content is kept; reconnecting.");
+        status("Stale · reconnecting"); reconnect();
+      }
+    }
+  }
   function renderNodes(nodes) {
     let work = 0;
     function build(value, depth) {
@@ -43,36 +102,76 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
     for (const value of nodes) fragment.append(build(value, 0));
     return fragment;
   }
+  // Reconcile safe, locally constructed nodes so an updated table cell does not
+  // replace its unchanged table, paragraphs or links.
+  function reconcile(parent, next) {
+    const children = Array.from(next.childNodes);
+    for (let index = 0; index < children.length; index++) {
+      const desired = children[index], existing = parent.childNodes[index];
+      if (!existing) { parent.append(desired); continue; }
+      if (existing.isEqualNode(desired)) continue;
+      if (existing.nodeType !== desired.nodeType || existing.nodeName !== desired.nodeName) { existing.replaceWith(desired); continue; }
+      if (existing.nodeType === Node.TEXT_NODE) { existing.nodeValue = desired.nodeValue; continue; }
+      for (const attribute of Array.from(existing.attributes)) if (!desired.hasAttribute(attribute.name)) existing.removeAttribute(attribute.name);
+      for (const attribute of Array.from(desired.attributes)) if (existing.getAttribute(attribute.name) !== attribute.value) existing.setAttribute(attribute.name, attribute.value);
+      reconcile(existing, desired);
+    }
+    while (parent.childNodes.length > children.length) parent.lastChild.remove();
+  }
   function renderDocument(view) {
-    $("selected-board-name").textContent = view.name;
-    $("board-raw").textContent = view.markdown;
-    try { $("board-document").replaceChildren(renderNodes(view.nodes)); }
-    catch { $("board-document").replaceChildren(node("pre", view.markdown, "board-render-fallback")); }
-    if (!view.markdown) $("board-document").append(node("p", view.exists ? "This board is empty." : "main has not been written yet.", "help"));
-    if (view.render_notice) $("board-document").prepend(node("p", view.render_notice, "help notice"));
+    text($("selected-board-name"), view.name);
+    text($("board-raw"), view.markdown);
+    let document;
+    try { document = renderNodes(view.nodes); }
+    catch { document = window.document.createDocumentFragment(); document.append(node("pre", view.markdown, "board-render-fallback")); }
+    if (!view.markdown) document.append(node("p", view.exists ? "This board is empty." : "main has not been written yet.", "help"));
+    if (view.render_notice) document.prepend(node("p", view.render_notice, "help notice"));
+    reconcile($("board-document"), document);
     $("board-document").hidden = raw; $("board-raw").hidden = !raw;
   }
   function controls(view) {
-    if (view.controls.length > 4096) { $("board-controls").replaceChildren(node("p", "Too many response controls to display safely.", "error")); return; }
-    const fragment = document.createDocumentFragment();
+    document.querySelector(".board-responses").hidden = !view.controls.length && !draft;
+    if (view.controls.length > 4096) { controlRows.clear(); $("board-controls").replaceChildren(node("p", "Too many response controls to display safely.", "error")); return; }
+    const retained = new Set();
+    let index = 0;
     for (const control of view.controls) {
       if (!control || typeof control.id !== "string" || typeof control.label !== "string" || !["text", "checkbox"].includes(control.kind)) continue;
-      const row = node("div", undefined, "board-control"); row.dataset.controlId = control.id;
-      const label = `${control.label || "Response"} (line ${Number(control.line)})`;
-      if (control.kind === "checkbox" && typeof control.checked === "boolean") {
-        const wrapper = node("label"), input = node("input"); input.type = "checkbox"; input.checked = control.checked;
-        input.setAttribute("aria-label", label); input.disabled = saving || !!draft;
-        input.addEventListener("change", () => { const checked = input.checked; input.checked = control.checked; draft = makeDraft(control, checked); renderEditor(); void saveDraft(); });
-        wrapper.append(input, document.createTextNode(label)); row.append(wrapper);
-      } else if (control.kind === "text" && typeof control.value === "string" && typeof control.rebase_key === "string" && typeof control.field_id === "string") {
-        row.append(node("p", label, "response-name"), node("p", control.value || "(No response)", "response-value"));
-        const edit = node("button", `Respond: ${control.label || "Text field"}`); edit.type = "button"; edit.disabled = saving || !!draft;
-        edit.addEventListener("click", () => { draft = makeDraft(control, control.value); renderEditor(); controls(shown); $("response-text").focus(); }); row.append(edit);
+      if (control.kind === "checkbox" && typeof control.checked !== "boolean") continue;
+      if (control.kind === "text" && (typeof control.value !== "string" || typeof control.rebase_key !== "string" || typeof control.field_id !== "string")) continue;
+      const key = JSON.stringify([control.kind, control.field_id || control.line, control.label]);
+      let row = controlRows.get(key);
+      if (!row) {
+        row = node("div", undefined, "board-control");
+        if (control.kind === "checkbox") {
+          const wrapper = node("label"), input = node("input"), caption = node("span"); input.type = "checkbox";
+          input.addEventListener("change", () => { const target = row.control, checked = input.checked; draft = makeDraft(target, checked); renderEditor(); void saveDraft(); });
+          wrapper.append(input, caption); row.append(wrapper);
+        } else {
+          const edit = node("button"); edit.type = "button";
+          edit.addEventListener("click", () => { draft = makeDraft(row.control, row.control.value); renderEditor(); controls(shown); $("response-text").focus(); });
+          row.append(node("p", "", "response-name"), node("p", "", "response-value"), edit);
+        }
+        controlRows.set(key, row);
       }
-      fragment.append(row);
+      row.control = control; row.dataset.controlId = control.id;
+      const label = `${control.label || "Response"} (line ${Number(control.line)})`;
+      if (control.kind === "checkbox") {
+        const input = row.querySelector("input"); input.checked = draft?.kind === "checkbox" && draft.id === control.id ? draft.value : control.checked; input.disabled = saving || !!draft; input.setAttribute("aria-label", label);
+        text(row.querySelector("span"), label);
+      } else {
+        text(row.querySelector(".response-name"), label); text(row.querySelector(".response-value"), control.value || "(No response)");
+        const edit = row.querySelector("button"); text(edit, `Respond: ${control.label || "Text field"}`); edit.disabled = saving || !!draft;
+      }
+      const existing = $("board-controls").childNodes[index++];
+      if (existing !== row) $("board-controls").insertBefore(row, existing || null);
+      retained.add(key);
     }
-    if (!fragment.childNodes.length) fragment.append(node("p", "This board has no editable response fields.", "help"));
-    $("board-controls").replaceChildren(fragment);
+    for (const [key, row] of controlRows) if (!retained.has(key)) { row.remove(); controlRows.delete(key); }
+    if (!retained.size) {
+      if (!$("board-controls").querySelector(".help")) $("board-controls").replaceChildren(node("p", "This board has no editable response fields.", "help"));
+    } else {
+      for (const child of Array.from($("board-controls").children)) if (!child.classList.contains("board-control")) child.remove();
+    }
   }
   function show(view) { shown = view; renderDocument(view); controls(view); $("board-newer").hidden = !latest; }
   function makeDraft(control, value) {
@@ -84,6 +183,7 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
     return found.length === 1 ? found[0] : null;
   }
   function renderEditor() {
+    document.querySelector(".board-responses").hidden = !draft && !shown?.controls.length;
     $("response-editor").hidden = !draft;
     if (!draft) { $("response-text").value = ""; $("response-feedback").textContent = ""; return; }
     $("response-heading").textContent = draft.label || "Edit response";
@@ -102,7 +202,7 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
   }
   async function readSnapshot(force = false) {
     if (!active || !authenticated() || saving) return null;
-    if (reading) { if (!force) return null; stopPoll(); }
+    if (reading) { if (!force) { refreshRequested = true; return null; } stopRead(); }
     const c = capture(), id = ++sequence; readAbort = new AbortController(); reading = true;
     const revision = latest?.revision || shown?.revision;
     const conditional = !force && revision ? `?if_revision=${encodeURIComponent(revision)}` : "";
@@ -111,8 +211,18 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
       if (!current(c) || id !== sequence || !active) return null;
       if (result.name !== c.name) throw new Error("Mismatched board snapshot");
       backoff = 1000; error("");
-      if (result.unchanged) { status(draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return latest || shown; }
+      if (result.unchanged) { status(latest && latest.revision !== shown?.revision ? "Live · newer content is available" : draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return latest || shown; }
       if (!validView(result, c.name)) throw new Error("Invalid board snapshot");
+      if (result.revision === shown?.revision) {
+        // An external edit may have returned byte-for-byte to the visible version.
+        // Do not apply a superseded intermediate snapshot after selection ends.
+        if (latest && latest.revision !== result.revision) {
+          latest = null; $("board-newer").hidden = true;
+          if (draft && draft.reviewed && draft.reviewed !== result.revision) { draft.reviewed = false; renderEditor(); }
+        }
+        status(draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return shown;
+      }
+      if (result.revision === latest?.revision) { status("Live · newer content is available"); return latest; }
       if (shown && (draft || selectionHeld())) {
         latest = result;
         if (draft && draft.reviewed !== result.revision) { draft.reviewed = false; renderEditor(); }
@@ -121,12 +231,13 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
       else { latest = null; show(result); status("Live · up to date"); }
       return result;
     } catch (e) {
-      if (current(c) && id === sequence && e.name !== "AbortError") { backoff = Math.min(backoff * 2, 30000); error("The board could not be refreshed. Your last content is kept; reconnecting."); status("Stale · reconnecting"); }
+      if (current(c) && id === sequence && e.name !== "AbortError") { error("The board could not be refreshed. Your last content is kept; reconnecting."); status("Stale · reconnecting"); reconnect(); }
       return null;
-    } finally { if (current(c) && id === sequence) { reading = false; readAbort = null; schedule(); } }
+    } finally { if (current(c) && id === sequence) { reading = false; readAbort = null; flushRefresh(); } }
   }
   async function refresh() {
     if (!active || !authenticated()) return;
+    if (saving) { refreshRequested = true; return; }
     if (latest && !draft && !selectionHeld()) { const next = latest; latest = null; show(next); }
     await readSnapshot();
   }
@@ -140,7 +251,7 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
   }
   async function saveDraft() {
     if (!draft || saving || draft.state !== "editing" || !shown || !active) return false;
-    const d = draft, c = capture(); stopPoll(); saving = true; controls(shown); renderEditor(); error("");
+    const d = draft, c = capture(); stopRead(); saving = true; controls(shown); renderEditor(); error("");
     try {
       const result = await request(`/api/boards/${encodeURIComponent(d.name)}/responses`, { method: "POST", body: JSON.stringify({ board: d.name, expected_revision: d.revision, control_id: d.id, value: d.kind === "text" ? { type: "text", text: d.value } : { type: "checkbox", checked: d.value } }) });
       if (!current(c) || draft !== d || !active) return false;
@@ -152,7 +263,7 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
       else if (e.status && e.status < 500 && e.status !== 429 && !e.data?.uncertain) { error(e.data?.error || "This response could not be saved. Review it before trying again."); }
       else { d.state = "uncertain"; latest = null; }
       d.reviewed = false; renderEditor(); return false;
-    } finally { if (current(c) && draft === d || current(c) && !draft) { saving = false; if (shown) controls(shown); renderEditor(); schedule(); } }
+    } finally { if (current(c) && draft === d || current(c) && !draft) { saving = false; if (shown) controls(shown); renderEditor(); flushRefresh(); } }
   }
   function discard() { draft = null; saving = false; renderEditor(); if (latest) { const view = latest; latest = null; show(view); } else if (shown) controls(shown); }
   async function allowLeave() {
@@ -168,10 +279,12 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
     if (!validName(name) || name === board) return;
     const c = capture();
     if (!await allowLeave() || !current(c)) return;
-    stopPoll(); boardEpoch++; board = name; shown = null; latest = null; draft = null; backoff = 1000;
+    stop(); boardEpoch++; board = name; shown = null; latest = null; draft = null; backoff = 1000;
     $("selected-board-name").textContent = board; $("board-selector").value = board;
-    $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); renderEditor(); error(""); status("Loading board…");
+    $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); renderEditor(); error(""); status("Loading board…");
+    const selected = capture();
     await refresh();
+    if (active && current(selected)) void startLive();
   }
   async function open() {
     if (active) return;
@@ -185,13 +298,14 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
       $("board-selector").replaceChildren(...names.map(name => { const option = node("option", name); option.value = name; return option; }));
       $("board-selector").value = board;
       await refresh();
+      if (current(c) && active) void startLive();
     } catch (e) { if (current(c) && active && e.name !== "AbortError") { error("The board list could not be loaded. Refresh or return to Messages and try again."); status("Stale · reconnecting"); } }
   }
-  async function leave(action) { const c = capture(); if (await allowLeave() && current(c)) { active = false; stopPoll(); boardEpoch++; action(); } }
+  async function leave(action) { const c = capture(); if (await allowLeave() && current(c)) { active = false; stop(); boardEpoch++; action(); } }
   function clear() {
-    active = false; authEpoch++; boardEpoch++; stopPoll(); finishChoice(false);
+    active = false; authEpoch++; boardEpoch++; stop(); finishChoice(false);
     board = "main"; shown = null; latest = null; draft = null; saving = false; raw = false; backoff = 1000;
-    $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); $("board-selector").replaceChildren();
+    $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); $("board-selector").replaceChildren();
     $("selected-board-name").textContent = "main"; $("response-heading").textContent = "Edit response"; $("response-intent").textContent = "";
     $("board-newer").hidden = true; $("board-raw-toggle").setAttribute("aria-pressed", "false"); renderEditor(); error(""); status("Choose Boards to load main.");
   }
@@ -208,6 +322,9 @@ window.createBoardMonitor = ({ request, authenticated, onViewChange }) => {
   $("unsaved-discard").addEventListener("click", () => { discard(); finishChoice(true); });
   $("unsaved-cancel").addEventListener("click", () => finishChoice(false));
   $("unsaved-dialog").addEventListener("cancel", e => { e.preventDefault(); finishChoice(false); });
+  document.addEventListener("selectionchange", () => {
+    if (active && latest && !draft && !saving && !selectionHeld()) { const view = latest; latest = null; show(view); status("Live · up to date"); }
+  });
   window.addEventListener("beforeunload", e => { if (dirty() || saving) { e.preventDefault(); e.returnValue = ""; } });
   return { open, leave, clear, hasDraft: dirty };
 };

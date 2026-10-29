@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="referrer" content="no-referrer">
-  <title>Agent Bridge · Message monitor</title>
+  <title>Agent Bridge · Boards</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/boards.js" defer></script>
   <script src="/app.js" defer></script>
@@ -19,19 +19,19 @@
   </header>
   <main>
     <section id="login" class="login-card" aria-labelledby="login-heading">
-      <span class="eyebrow">Your local message traffic</span>
-      <h1 id="login-heading">A window into the conversation.</h1>
-      <p>Follow messages between your agents, inspect delivery, and trace replies. Messages stay read only. Open Boards to read local Markdown and save existing response fields.</p>
+      <span class="eyebrow">Your local boards and messages</span>
+      <h1 id="login-heading">Open your shared boards.</h1>
+      <p>Read your boards and answer existing response fields. Switch to Messages to follow agent conversations and inspect delivery.</p>
       <form id="login-form" method="post" action="/">
         <label for="access-token">Monitor access token</label>
         <div class="unlock-row"><input id="access-token" name="token" type="password" maxlength="256" autocomplete="off" autocapitalize="off" spellcheck="false" required aria-describedby="token-help"><button class="primary" type="submit">Unlock monitor <span aria-hidden="true">→</span></button></div>
-        <p id="token-help" class="help">Use the token shown by the local <code>agent-bridge monitor</code> command. It stays in this tab’s memory and is forgotten when you lock or reload.</p>
+        <p id="token-help" class="help">Open the private access link from <code>agent-bridge monitor</code>, or enter its token here. It stays in this tab’s memory and is forgotten when you lock or reload.</p>
         <p id="login-error" class="error" role="alert" hidden></p>
       </form>
     </section>
     <section id="workspace" aria-label="Local monitor" hidden>
-      <nav class="view-navigation" aria-label="Monitor views"><button id="messages-tab" type="button" aria-pressed="true">Messages</button><button id="boards-tab" type="button" aria-pressed="false">Boards</button></nav>
-      <div id="messages-view">
+      <nav class="view-navigation" aria-label="Monitor views"><button id="boards-tab" type="button" aria-pressed="true">Boards</button><button id="messages-tab" type="button" aria-pressed="false">Messages</button></nav>
+      <div id="messages-view" hidden>
       <div class="page-heading"><div><span class="eyebrow">Local observability</span><h1>Message activity<span class="live-tag">Live</span></h1><p>Every hop, with the context to follow it.</p></div><div class="machine-card"><span class="caption">This machine</span><strong id="local-machine">Local bridge</strong><span id="last-updated" class="help">Waiting for messages</span></div></div>
       <form id="filters" class="filters" aria-label="Filter messages">
         <div class="filter-field"><label for="machine-filter">Machine</label><input id="machine-filter" name="machine" type="search" placeholder="Name or peer ID" maxlength="256" autocomplete="off"></div>
@@ -56,15 +56,19 @@
         </aside>
       </div>
       </div>
-      <section id="boards-view" aria-labelledby="boards-heading" hidden>
-        <div class="page-heading"><div><span class="eyebrow">Local shared Markdown</span><h1 id="boards-heading">Board <span id="selected-board-name">main</span></h1><p>Read the board and answer its existing response fields.</p></div></div>
-        <div class="board-toolbar"><label for="board-selector">Board</label><select id="board-selector" aria-label="Choose board"></select><button id="board-refresh" type="button">Refresh</button><button id="board-raw-toggle" type="button" aria-pressed="false">Raw Markdown</button></div>
-        <p id="board-status" class="help notice" role="status" aria-live="polite">Choose Boards to load main.</p>
+      <section id="boards-view" aria-labelledby="boards-heading">
+        <div class="board-toolbar">
+          <h1 id="boards-heading">Board <span id="selected-board-name">main</span></h1>
+          <select id="board-selector" aria-label="Choose board"></select>
+          <button id="board-refresh" type="button">Refresh</button>
+          <button id="board-raw-toggle" type="button" aria-pressed="false">Raw Markdown</button>
+          <span id="board-status" class="help" role="status" aria-live="polite">Loading boards…</span>
+        </div>
         <p id="board-error" class="error notice" role="alert" hidden></p>
         <div id="board-newer" class="notice" hidden><span>Newer content is available. Your draft or text selection is being kept.</span> <button id="board-review-refresh" type="button">Review latest</button></div>
         <div class="board-layout">
           <section class="board-document-panel" aria-label="Board document"><div id="board-document" class="board-document"></div><pre id="board-raw" class="board-raw" aria-label="Exact raw Markdown" hidden></pre></section>
-          <section class="board-responses" aria-labelledby="responses-heading"><h2 id="responses-heading">Responses</h2><p class="help">Responses are shared board data, not owner approval.</p><div id="board-controls"></div>
+          <section class="board-responses" hidden aria-labelledby="responses-heading"><h2 id="responses-heading">Responses</h2><p class="help">Responses are shared board data, not owner approval.</p><div id="board-controls"></div>
             <section id="response-editor" aria-labelledby="response-heading" hidden><h3 id="response-heading">Edit response</h3><label id="response-label" for="response-text">Response</label><textarea id="response-text" rows="5" maxlength="65536"></textarea><p id="response-intent" class="help" hidden></p><p id="response-feedback" role="status" aria-live="polite"></p><div class="response-actions"><button id="response-save" class="primary" type="button">Save response</button><button id="response-cancel" type="button">Cancel response</button><button id="response-review" type="button" hidden>Review current board</button><button id="response-rebase" type="button" hidden>Rebase unchanged field</button></div></section>
           </section>
         </div>

@@ -12,8 +12,15 @@ With the broker running, enable it:
 agent-bridge monitor enable
 ```
 
-The command returns a loopback `url` and a separate `access_token`. Open that URL
-in a browser and paste the token into the access field. The default chooses an
+The command returns a clickable `access_url` that opens Boards and unlocks the
+monitor automatically. The link carries the access token in a URL fragment
+(`#access_token=…`), which is not sent in HTTP requests. The page immediately
+removes it from the address bar and current history entry before authenticating.
+A plain loopback `url` and separate `access_token` remain available for manual
+entry. Treat the complete access link like a password: anyone with it can read
+messages and edit existing board responses while the monitor is enabled. Browser
+extensions, copied links, bookmarks and browser history/sync may expose it; removing
+the current entry cannot guarantee erasure from browser records. The default chooses an
 available port; use `monitor enable --port 44002` for a fixed one. It binds only
 `127.0.0.1`, including when a fixed port is chosen. There is no remote bind option.
 
@@ -52,7 +59,9 @@ monitoring does not establish that a model ran or completed a task.
 
 ## Browse and answer boards
 
-Choose Boards, then select a board from the visible selector. The first selection
+Unlocking opens Boards first. Select a board from the compact toolbar, or switch
+to Messages using the navigation. The document fills the available width; response
+controls appear below it only when present. The first selection
 is `main`, including its empty virtual entry before a file exists. Lists are in
 name order. Board names, existence and revisions come from the same broker used
 by CLI/MCP; unknown names never fall back or create documents. Create boards and
@@ -92,22 +101,34 @@ response or durability failure may mean the change applied: read back and review
 the current board before retrying. Saves are never retried automatically, and
 duplicate submissions are disabled while one is in flight.
 
-Only the selected board is refreshed, independently of message activity, using
-conditional reads with at most one read in flight. Normal refresh is about once
-per second; failures back off to at most 30 seconds between attempts. External
-file edits are visible through the same revision check. A temporary failure keeps
-the last content with a stale/reconnecting indicator. Leaving Boards or locking
-stops its refresh work. Selection in the browser never changes terminal/MCP board
-selection.
+Only the selected board has a persistent authenticated event stream. The server
+checks its revision about twice per second, including external file edits, and
+pushes a small board-name/revision event only when it changes. The browser reads
+the document on connection/reconnection, on change, or on explicit Refresh; an
+idle board does not poll for snapshots. Reads coalesce while another read or save
+is in flight. Unchanged content keeps its DOM nodes; changed table cells and text
+are patched in place, preserving unaffected content and response controls.
+A temporary failure keeps the last content with a stale/reconnecting indicator;
+reconnections back off to at most 30 seconds. Leaving Boards or locking closes
+that board's stream and cancels pending reads. Selection in the browser never
+changes terminal/MCP board selection.
+
+Messages also uses a persistent event stream. Live refresh retains existing rows
+and selected message content, updates changed fields in place, and preserves
+selection instead of flashing a loading placeholder. Message refresh work pauses
+while Boards is visible and catches up when switching back.
 
 ## Browser access
 
 API requests carry a random access token in an Authorization header. The page
 keeps it only in memory; locking the monitor clears message/board views, raw source,
 controls, drafts, pending requests and the token,
-and closing/reloading the page requires access again. Tokens do not appear in URLs,
-query strings, cookies, referrers or browser storage. Static login assets contain
-no message history or credentials.
+and closing/reloading the cleaned page requires access again. Reopening the private
+access link unlocks it again while that credential remains valid. Tokens in access
+links use only the fragment, never the query string. After consuming the fragment,
+requests use only Authorization headers. Tokens are not stored in cookies,
+referrers or browser storage. Static login assets contain no message history or
+credentials.
 
 Exact Host validation, Origin and browser fetch-metadata checks reject DNS rebinding
 and cross-origin requests. The server supplies no CORS permission, uses restrictive
@@ -123,8 +144,8 @@ later commits. An admitted change can finish before revocation completes.
 Board JSON bodies are limited to 512 KiB with a five-second read deadline; decoded
 text and the resulting document are each bounded by 64 KiB. There are at most
 eight board read jobs, four active writes and ten writes per second, within the
-global limits of 32 connections, 100 requests per second and eight message event
-streams. Aborting a browser request does not
+global limits of 32 connections, 100 requests per second and eight event
+streams shared by message and selected-board connections. Aborting a browser request does not
 release a queued worker's budget or authorize it after revocation. The server
 logs neither board/message bodies, responses nor HTTP access tokens.
 
