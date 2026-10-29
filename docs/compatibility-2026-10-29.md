@@ -8,13 +8,16 @@ commands and boundaries. The checked-in [native evidence](diagnostics/native-com
 pins the executable, source, harness hashes, exact native artifacts, synthetic
 message/session references, observations and cleanup.
 
-Executable source: `a00d963ab1782192b53c290d3779ac7f0906a6f5`.
-Binary SHA-256: `da7473d0fdd6f44374123fc4a20a14b118399f12b8c8b59eea1a1858959b9bf8`.
+Executable source: `343fed4028e8a349af418f89c712d602b0cd05eb`.
+Binary SHA-256: `1d2d3a458dffbdde16a02af9b4c665b0ec4115d7c35669d92ea61c260b064ab1`.
 The source commit identifies the built executable; qualification files were
 uncommitted when measured and are identified by their recorded hashes. The
 production source was clean. Earlier `7cc4cfe`/`e7347b4` inventories were retained as intermediate evidence.
 After the named-board merge, the executable was rebuilt at `a00d963` and both the
 combined matrix and separate native/setup harnesses were run against that source.
+After the CI cleanup repair, all three native harnesses passed again against the
+rebuilt `343fed4` executable. Its Rust/plugin source trees are identical to `a00d963`;
+the new hashes identify the repaired qualification code.
 
 | Check | Observed result |
 | --- | --- |
@@ -28,7 +31,7 @@ combined matrix and separate native/setup harnesses were run against that source
 | Rust gates | Formatting, all-target check and Clippy, full package `--no-fail-fast` each exited 0; 390 tests passed, three multicast-LAN scenarios remained intentionally ignored |
 | Plugin gates | Frozen install, TypeScript and 52 Bun tests passed |
 | Installer/package/release | Shell syntax, 21 installer tests, seven packaging tests and release tests exited 0 |
-| Harness safety | Six CI-safe Python tests passed: credential isolation, route identity, startup filesystem failure, exited-leader descendant cleanup, teardown-failure nonpass and HTTP/process cleanup |
+| Harness safety | Nine CI-safe Python tests passed, including credential isolation, route identity, startup filesystem failure, exited-leader descendant cleanup, teardown-failure nonpass, HTTP/process cleanup and Darwin zombie/live/unverifiable group permission cases |
 | Real published Linux package smoke | Current `install.sh --version v0.2.2 --no-service --bin-dir DISPOSABLE/bin` exited 0 and installed executable reported `agent-bridge 0.2.2`; published artifact source is `3a928340bb735e642c02ad53d4e2e9d0a7230ef0`, separately from current-source native qualification |
 
 The native runner's provider responses were scripted on localhost. Actual
@@ -82,6 +85,18 @@ targets and installer/package checks passed unchanged with `TMPDIR=/var/tmp`.
 The final matrix wrote its passing evidence to disk. A subsequent full package run also exited 0 with disk temporary storage. The
 initial nonzero results and bounded reruns are included in the manifest, rather
 than overwritten.
+
+The first PR CI attempt passed both Linux jobs. Both macOS jobs completed the
+preceding Rust/vendor/installer/package/release checks, then failed the new
+exited-parent cleanup test with an unreaped parent. [Apple's group-signalling
+implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c)
+excludes zombie members and can return `EPERM` for a zombie-only group. This is a
+supported diagnosis rather than a retained errno from that first attempt. Cleanup
+now always attempts bounded parent reaping. A Darwin `EPERM` is accepted only when
+the reserved owned group is verified to contain the zombie leader and no live
+members; genuine permission failures and unavailable membership checks still
+fail. Three regressions cover those branches, and the original descendant-dead
+and exited-parent assertions remain intact.
 
 Native macOS/ARM clients, physical cross-machine/router paths, actual managed
 systemd/launchd installation, optimized tagged packaging/signing, interactive

@@ -2,6 +2,7 @@
 """CI-safe isolation and failure-cleanup checks; no native clients or credentials."""
 import os
 import asyncio
+import errno
 from pathlib import Path
 import sys
 import subprocess
@@ -10,12 +11,48 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from qualification_native import Fixture, Processes, Qualification, private_env
 
 
 class Isolation(unittest.TestCase):
+    def test_darwin_zombie_only_group_permission_error_still_reaps_leader(self):
+        processes = Processes(Path("/unused"))
+        child = Mock(pid=12345, returncode=None)
+        def wait(**kwargs):
+            child.returncode = 0
+            return 0
+        child.wait.side_effect = wait
+        with patch("qualification_native.sys.platform", "darwin"), patch("qualification_native.os.killpg", side_effect=[None, PermissionError(errno.EPERM, "zombies")]), patch("qualification_native.time.sleep"), patch.object(processes, "group_members", return_value=[(12345, "Z"), (12346, "Z+")]):
+            processes.stop(child)
+        child.wait.assert_called_once_with(timeout=5)
+        self.assertEqual(child.returncode, 0)
+        self.assertIn(child, processes.stopped)
+
+    def test_darwin_live_member_permission_error_fails_and_reaps_leader(self):
+        processes = Processes(Path("/unused"))
+        child = Mock(pid=12345, returncode=None)
+        child.wait.side_effect = lambda **kwargs: setattr(child, "returncode", 0)
+        processes.children = [("denied", child)]
+        with patch("qualification_native.sys.platform", "darwin"), patch("qualification_native.os.killpg", side_effect=PermissionError(errno.EPERM, "live member")), patch("qualification_native.time.sleep"), patch.object(processes, "group_members", return_value=[(12345, "Z"), (12346, "S")]):
+            processes.close()
+        child.wait.assert_called_once_with(timeout=5)
+        self.assertEqual(child.returncode, 0)
+        self.assertTrue(processes.cleanup_errors)
+        self.assertIn("denied: pid=12345 signal=SIGTERM PermissionError errno=1", processes.cleanup_errors[0])
+        self.assertIn("signal=SIGKILL", processes.cleanup_errors[0])
+
+    def test_unverified_darwin_permission_error_fails_closed_and_reaps(self):
+        processes = Processes(Path("/unused"))
+        child = Mock(pid=12345, returncode=None)
+        child.wait.side_effect = lambda **kwargs: setattr(child, "returncode", 0)
+        with patch("qualification_native.sys.platform", "darwin"), patch("qualification_native.os.killpg", side_effect=PermissionError(errno.EPERM, "unknown")), patch("qualification_native.time.sleep"), patch.object(processes, "group_members", side_effect=RuntimeError("ps unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "membership: ps unavailable"):
+                processes.stop(child)
+        child.wait.assert_called_once_with(timeout=5)
+        self.assertEqual(child.returncode, 0)
+
     def test_filesystem_startup_failures_do_not_start_a_fixture_thread(self):
         with patch("qualification_native.tempfile.mkdtemp", side_effect=OSError("quota")), patch("qualification_native.Fixture") as fixture:
             with self.assertRaises(OSError):
@@ -46,6 +83,7 @@ class Isolation(unittest.TestCase):
                 time.sleep(.2)
             finally:
                 processes.close()
+            self.assertFalse(processes.cleanup_errors, processes.cleanup_errors)
             self.assertEqual(parent.returncode, 0)
             status = subprocess.run(["ps", "-o", "stat=", "-p", str(int(pidfile.read_text()))], capture_output=True, text=True, check=False).stdout.strip()
             self.assertTrue(not status or status.startswith("Z"), f"Owned descendant still running: {status}")
@@ -61,7 +99,7 @@ class Isolation(unittest.TestCase):
                 processes.children = [(name, type("Child", (), {"returncode": 0})()) for name, _ in processes.children]
                 processes.close()
             self.assertEqual(stop.call_count, 2)
-            self.assertEqual(processes.cleanup_errors, ["injected stop failure"])
+            self.assertEqual(processes.cleanup_errors, ["first: injected stop failure"])
             harness = Qualification.__new__(Qualification)
             harness.evidence = {"result": "passed"}
             harness.fixture = Fixture()

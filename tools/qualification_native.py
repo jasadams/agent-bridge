@@ -7,6 +7,7 @@ docs/compatibility.md for the evidence boundary and build commands.
 """
 import argparse
 import asyncio
+import errno
 import hashlib
 import http.server
 import json
@@ -19,6 +20,7 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -84,22 +86,57 @@ class Processes:
         # Signal before reaping, including when the leader already exited. Its
         # unreaped PID reserves our group ID throughout cleanup. Never poll/wait
         # these tracked children elsewhere, or signal a group twice after reaping.
+        errors = []
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(child.pid, sig)
             except ProcessLookupError:
                 pass
+            except OSError as error:
+                # Darwin excludes zombies from killpg's target count and can
+                # return EPERM for a zombie-only group. Never suppress EPERM
+                # while a live member exists or membership cannot be verified.
+                # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c
+                benign = False
+                if error.errno == errno.EPERM and sys.platform == "darwin":
+                    try:
+                        members = self.group_members(child.pid)
+                        benign = any(pid == child.pid and state.startswith("Z") for pid, state in members) and all(state.startswith("Z") for _, state in members)
+                    except Exception as inspect_error:
+                        errors.append(f"pid={child.pid} membership: {inspect_error}")
+                if not benign:
+                    errors.append(f"pid={child.pid} signal={sig.name} {type(error).__name__} errno={error.errno}")
             if sig == signal.SIGTERM:
                 time.sleep(1)
-        child.wait(timeout=5)
-        self.stopped.add(child)
+        try:
+            child.wait(timeout=5)
+            self.stopped.add(child)
+        except Exception as error:
+            errors.append(f"pid={child.pid} wait: {type(error).__name__}: {error}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    @staticmethod
+    def group_members(group):
+        # Metadata only, with a fixed system PATH; no process arguments or owner
+        # configuration. The unreaped leader still reserves this exact group ID.
+        result = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="], env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+                                capture_output=True, text=True, timeout=5, check=True)
+        members = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            require(len(fields) == 3, "Cannot parse process-group membership")
+            pid, pgid = int(fields[0]), int(fields[1])
+            if pgid == group:
+                members.append((pid, fields[2]))
+        return members
 
     def close(self):
-        for _, child in reversed(self.children):
+        for label, child in reversed(self.children):
             try:
                 self.stop(child)
             except Exception as error:
-                self.cleanup_errors.append(str(error))
+                self.cleanup_errors.append(f"{label}: {error}")
         for log in self.logs:
             try:
                 log.close()
