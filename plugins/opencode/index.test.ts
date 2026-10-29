@@ -355,20 +355,35 @@ describe("V1 supplied-client plugin with real private Unix sockets", () => {
     expect(s.journalState()).toEqual([]); expect(s.prompts).toHaveLength(0);
     expect(s.requests.filter(request => request.op === "opencode_admit")).toHaveLength(0);
   });
-  test("native busy and permission waits defer without future hidden submission", async () => {
+  test("native active and permission input preserves owner selection without overrides", async () => {
     const s = await setup(); await s.created();
-    const delivery = { op: "deliver", session: A, id: ID, content: "wait" };
+    Object.assign(s.sessions.get(A), { agent: "owner-specialist", model: { id: "owner-model", providerID: "owner-provider", variant: "default" }, tools: { bash: false }, permission: [{ action: "deny" }] });
     s.statuses.set(A, { type: "busy" });
-    expect((await frame(s.endpoint(), delivery)).status).toBe("deferred");
-    expect(s.journalState()).toEqual([]);
-    s.statuses.delete(A);
     await s.event("permission.updated", { id: "permission1", sessionID: A });
-    expect((await frame(s.endpoint(), delivery)).status).toBe("deferred");
-    await s.event("permission.replied", { permissionID: "permission1", sessionID: A });
-    await new Promise<void>(resolve => setImmediate(resolve));
-    expect(s.prompts).toHaveLength(0);
+    expect(s.requests.filter(request => request.op === "opencode_heartbeat").at(-1).ready).toBe(true);
+    const delivery = { op: "deliver", session: A, id: ID, content: "peer input during owner work" };
     expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
-    expect(s.prompts).toHaveLength(1);
+    expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
+    expect(s.prompts).toEqual([{ session: A, body: { agent: "owner-specialist", model: { modelID: "owner-model", providerID: "owner-provider" }, variant: "default", messageID: NATIVE, parts: [{ type: "text", text: delivery.content }] } }]);
+    expect(s.sdkReads.every(path => !path.includes("permission"))).toBe(true);
+  });
+  test("missing or malformed active selection defers before attempt and selection races cannot switch owner context", async () => {
+    for (const selection of [{}, { agent: "owner", model: { id: "model", providerID: 1 } }, { agent: "owner", model: { id: "model", providerID: "provider", variant: {} } }]) {
+      const s = await setup(); await s.created();
+      Object.assign(s.sessions.get(A), selection); s.statuses.set(A, { type: "busy" });
+      expect((await frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "no guessed selection" })).status).toBe("deferred");
+      expect(s.prompts).toHaveLength(0); expect(s.journalState()).toEqual([]);
+    }
+    const s = await setup(); await s.created();
+    Object.assign(s.sessions.get(A), { agent: "owner", model: { id: "model", providerID: "provider", variant: "deep" } });
+    const gate = s.blockAdmission();
+    const delivery = frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "selection race" });
+    await gate.entered;
+    s.sessions.get(A).agent = "changed-owner";
+    await s.event("session.updated", { info: s.sessions.get(A) });
+    gate.release();
+    expect((await delivery).status).toBe("deferred");
+    expect(s.prompts).toHaveLength(0);
   });
   test("old generation cannot deliver after reopening the same native session", async () => {
     const s = await setup(); await s.created();
@@ -451,7 +466,7 @@ describe("V1 supplied-client plugin with real private Unix sockets", () => {
     const reads = s.sdkReads.length;
     await s.event("session.status", { sessionID: A, status: { type: "busy" } });
     expect(s.sdkReads).toHaveLength(reads);
-    expect(s.requests.filter(request => request.op === "opencode_heartbeat").at(-1).ready).toBe(false);
+    expect(s.requests.filter(request => request.op === "opencode_heartbeat").at(-1).ready).toBe(true);
     const now = Date.now;
     try {
       Date.now = () => now() + 20001;

@@ -28,6 +28,20 @@ function parseFrame(input: unknown): Frame {
   return f as Frame;
 }
 
+// Pinned 1.18.35 Session.Info includes selection fields omitted by the V1
+// generated SDK type. Copy only validated native selection, never policy/tools.
+function nativeSelection(info: Session, active: boolean) {
+  const value = info as Session & { agent?: unknown; model?: unknown };
+  if (value.agent === undefined && value.model === undefined && !active) return {};
+  const text = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 1024;
+  if (!text(value.agent) || !value.model || typeof value.model !== "object" || Array.isArray(value.model)) throw new Error("Native selection is unavailable");
+  const model = value.model as { id?: unknown; providerID?: unknown; variant?: unknown };
+  if (!text(model.id) || !text(model.providerID) || model.variant !== undefined && !text(model.variant)) throw new Error("Invalid native model selection");
+  // Explicit default prevents an agent's configured variant from replacing the
+  // owner's native default selection. OpenCode stores this sentinel itself.
+  return { agent: value.agent, model: { modelID: model.id, providerID: model.providerID }, variant: model.variant ?? "default" };
+}
+
 // V1: only the supplied SDK client is authoritative; serverUrl may have no listener.
 const AgentBridge: Plugin = async (input, options = {}) => {
   const state = options.stateDir ?? process.env.AGENT_BRIDGE_STATE_DIR;
@@ -40,7 +54,6 @@ const AgentBridge: Plugin = async (input, options = {}) => {
   const active = new Set<Promise<unknown>>();
   const deliveries = new Map<string, { fingerprint: string; pending: ReturnType<typeof handle> }>();
   let disposed = false, events = Promise.resolve();
-  const ready = (entry: Live) => !entry.busy && entry.permissions.size === 0;
   function guard(session: string, frame?: Delivery): Live {
     const entry = live.get(session);
     if (disposed || !entry || entry.expires <= Date.now() || frame && (entry.generation !== frame.generation || entry.namespace !== frame.namespace)) throw new Error("Stale session generation or lease");
@@ -65,7 +78,7 @@ const AgentBridge: Plugin = async (input, options = {}) => {
     const entry = old && old.expires > Date.now() ? old : { generation: "", namespace: "", expires: Date.now() + LEASE_MS, busy: false, revision: 0, permissions: new Set<string>() };
     live.set(session, entry); // Probe can validate provisional membership, never delivery.
     try {
-      const result = await brokerRpc(state as string, { op: "opencode_observe", session, endpoint, title: info.title, ready: ready(entry) }) as { generation?: unknown; namespace?: unknown };
+      const result = await brokerRpc(state as string, { op: "opencode_observe", session, endpoint, title: info.title, ready: true }) as { generation?: unknown; namespace?: unknown };
       if (typeof result.generation !== "string" || !UUID.test(result.generation) || typeof result.namespace !== "string" || !UUID.test(result.namespace)) throw new Error("Invalid registration generation");
       if (disposed || live.get(session) !== entry) {
         await brokerRpc(state as string, { op: "opencode_close", session, endpoint, generation: result.generation });
@@ -78,7 +91,7 @@ const AgentBridge: Plugin = async (input, options = {}) => {
     if (guard(session) !== entry) throw new Error("Heartbeat belongs to an ended lifecycle");
     const generation = entry.generation;
     try {
-      await brokerRpc(state as string, { op: "opencode_heartbeat", session, endpoint, generation, ready: ready(entry) });
+      await brokerRpc(state as string, { op: "opencode_heartbeat", session, endpoint, generation, ready: true });
       if (disposed || live.get(session) !== entry || entry.generation !== generation) throw new Error("Replaced heartbeat generation");
       entry.expires = Date.now() + LEASE_MS;
     } catch (error) { if (live.get(session) === entry) live.delete(session); throw error; }
@@ -190,8 +203,15 @@ For ${identity}, preserve unresolved peer message IDs, exact sender/recipient ro
     const status = await input.client.session.status();
     guard(frame.session, frame);
     if (status.error || !status.data || entry.revision !== revision) return deferred(frame);
-    entry.busy = status.data[frame.session]?.type !== undefined && status.data[frame.session]?.type !== "idle";
-    if (!ready(entry)) return deferred(frame);
+    const nativeStatus = status.data[frame.session]?.type;
+    if (nativeStatus !== undefined && !["idle", "busy", "retry"].includes(nativeStatus)) return deferred(frame);
+    entry.busy = nativeStatus !== undefined && nativeStatus !== "idle";
+    let selection: ReturnType<typeof nativeSelection>;
+    try {
+      selection = nativeSelection(await verified(frame.session), entry.busy || entry.permissions.size > 0);
+    } catch { return deferred(frame, "Current native agent/model selection is unavailable; no native attempt was made"); }
+    guard(frame.session, frame);
+    if (entry.revision !== revision) return deferred(frame);
     try { row = journal.prepare(frame); }
     catch (error) {
       if (error instanceof JournalCapacityError) return deferred(frame, "Receipt journal capacity reached; no native attempt was made");
@@ -208,11 +228,11 @@ For ${identity}, preserve unresolved peer message IDs, exact sender/recipient ro
       return deferred(frame, "Broker admission was unavailable; no native attempt was made", true);
     }
     guard(frame.session, frame);
-    if (!ready(entry)) return deferred(frame);
+    if (entry.revision !== revision) return deferred(frame);
     // FULL-sync CAS and the SDK invocation share this JS turn: no await or
     // background queue can cross a deferred result or lose the generation guard.
     if (!journal.attempt(frame)) return receipt(frame, true);
-    const result = await input.client.session.promptAsync({ path: { id: frame.session }, body: { messageID: frame.native_message_id, parts: [{ type: "text", text: frame.content }] } });
+    const result = await input.client.session.promptAsync({ path: { id: frame.session }, body: { ...selection, messageID: frame.native_message_id, parts: [{ type: "text", text: frame.content }] } });
     guard(frame.session, frame);
     if (result.error) return response(frame, "uncertain");
     return receipt(frame, false);
@@ -314,7 +334,11 @@ For ${identity}, preserve unresolved peer message IDs, exact sender/recipient ro
           else await observe(properties.sessionID);
         } else if (["session.created", "session.updated"].includes(value.type)) {
           const id = (properties.info as { id?: unknown } | undefined)?.id;
-          if (typeof id === "string" && (value.type === "session.created" || live.has(id))) await observe(id);
+          if (typeof id === "string" && (value.type === "session.created" || live.has(id))) {
+            const entry = live.get(id);
+            if (entry) entry.revision++; // Native agent/model selection may change.
+            await observe(id);
+          }
         } else if (value.type === "tui.session.select" && typeof properties.sessionID === "string") await observe(properties.sessionID);
       });
     },
