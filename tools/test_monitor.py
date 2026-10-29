@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Disposable M7 acceptance: same-binary HTTP monitor, real local/P2P inbox traffic.
+"""Disposable local monitor acceptance: messages, boards and local/P2P traffic.
 
 Creates private temporary broker state only. No native sessions, model calls, SSH,
 service installation, or changes to host networking/browser profiles. --browser
 uses an already installed Python Playwright/browser; no downloads are performed.
 """
 import argparse
+from contextlib import ExitStack
 import hashlib
 import http.client as http_client
 import json
 import os
 from pathlib import Path
+import selectors
 import shutil
 import socket
 import subprocess
@@ -50,7 +52,7 @@ def main():
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     results = {"scope": "isolated local brokers and real loopback P2P; no model calls",
                "binary_sha256": digest, "checks": [], "browser_requested": args.browser}
-    processes, files = [], []
+    processes, files, environments = [], [], {}
 
     def record(name, **details):
         results["checks"].append({"check": name, "passed": True, **details})
@@ -70,11 +72,27 @@ def main():
     def start(name):
         state = output / name
         state.mkdir(mode=0o700)
+        home = output / (name + "-home")
+        home.mkdir(mode=0o700)
+        environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                       "HOME": str(home), "LANG": "C.UTF-8"}
+        for variable, relative in [("XDG_CONFIG_HOME", ".config"),
+                                   ("XDG_DATA_HOME", ".local/share"),
+                                   ("XDG_CACHE_HOME", ".cache"),
+                                   ("XDG_STATE_HOME", ".local/state"),
+                                   ("CODEX_HOME", "codex"),
+                                   ("CLAUDE_CONFIG_DIR", "claude"),
+                                   ("OPENCODE_CONFIG_DIR", "opencode")]:
+            directory = home / relative
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            environment[variable] = str(directory)
+        environments[name] = environment
         log = (output / f"{name}.log").open("wb")
         files.append(log)
         process = subprocess.Popen([str(binary), "--state-dir", str(state), "serve",
                                     "--no-discovery", "--codex-bin", "/missing/codex"],
-                                   cwd=output, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+                                   cwd=output, env=environment, stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=log)
         processes.append(process)
         wait(f"{name} broker", lambda: rpc(state, "status"))
         return state
@@ -132,6 +150,71 @@ def main():
             else:
                 lines.append(line)
 
+    def board_readback(state, name):
+        """Observe the browser's persisted result through real CLI and MCP paths."""
+        expected = rpc(state, "named_board_read", board=name)
+        raw = subprocess.run([str(binary), "--state-dir", str(state), "board", name, "--raw"],
+                             cwd=output, env=environments[state.name], capture_output=True, timeout=10)
+        assert raw.returncode == 0, "CLI board read failed"
+        assert raw.stdout == expected["markdown"].encode("utf-8"), "CLI board source differs"
+        with (output / "board-mcp.stderr").open("wb") as log:
+            child = subprocess.Popen([str(binary), "--state-dir", str(state), "mcp"],
+                                     cwd=output, env=environments[state.name], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=log)
+            selector = selectors.DefaultSelector()
+            os.set_blocking(child.stdout.fileno(), False)
+            selector.register(child.stdout, selectors.EVENT_READ)
+            pending = bytearray()
+            try:
+                def write(frame):
+                    child.stdin.write(json.dumps(frame).encode() + b"\n")
+                    child.stdin.flush()
+
+                def request(identifier, method, params):
+                    write({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params})
+                    deadline = time.monotonic() + 10
+                    for _ in range(64):
+                        while b"\n" not in pending:
+                            remaining = deadline - time.monotonic()
+                            assert remaining > 0 and selector.select(remaining), "MCP read timed out"
+                            try:
+                                chunk = os.read(child.stdout.fileno(), 65536)
+                            except BlockingIOError:
+                                continue
+                            assert chunk, "MCP closed before a complete response"
+                            pending.extend(chunk)
+                            assert len(pending) <= 2 * 1024 * 1024, "MCP response exceeded bound"
+                        line, _, rest = pending.partition(b"\n")
+                        pending[:] = rest
+                        response = json.loads(line)
+                        if type(response.get("id")) is int and response["id"] == identifier:
+                            assert "error" not in response, "MCP request failed"
+                            return response["result"]
+                        assert response.get("id") is None, "Uncorrelated MCP response"
+                    raise AssertionError("MCP notification budget exceeded")
+
+                request(1, "initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                                           "clientInfo": {"name": "monitor-board-acceptance", "version": "1"}})
+                write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                result = request(2, "tools/call", {"name": "read_board", "arguments": {"board": name}})
+                assert not result.get("isError"), "MCP board tool failed"
+                observed = result["structuredContent"]["result"]
+                assert observed["name"] == name and observed["revision"] == expected["revision"]
+                assert observed["markdown"] == expected["markdown"], "MCP board source differs"
+            finally:
+                selector.close()
+                child.stdin.close()
+                try:
+                    code = child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+                    raise AssertionError("MCP process did not exit after EOF")
+                finally:
+                    child.stdout.close()
+                assert code == 0, "MCP process exited unsuccessfully"
+        record("browser response source and revision are identical through actual CLI and persistent MCP read_board")
+
     try:
         a, b = start("a"), start("b")
         assert not rpc(a, "monitor_status")["enabled"]
@@ -167,11 +250,12 @@ def main():
             assert http(url, "/api/messages", token, method=method)[0] in (403, 405)
         for query in ["limit=101", "limit=0", "unknown=1", "since=no", "before=bad"]:
             assert http(url, "/api/messages?" + query, token)[0] == 400, query
-        record("embedded assets and authenticated read-only API reject foreign Host/origin/site, URL secrets and invalid queries")
+        record("embedded assets and authenticated message API reject foreign Host/origin/site, URL secrets and invalid queries")
 
         # A request addressed to the machine's non-loopback IP cannot reach the listener.
-        route = subprocess.run(["ip", "-j", "route", "get", "192.0.2.1"], capture_output=True, text=True)
-        if route.returncode == 0:
+        route = (subprocess.run(["ip", "-j", "route", "get", "192.0.2.1"],
+                                capture_output=True, text=True) if shutil.which("ip") else None)
+        if route is not None and route.returncode == 0:
             host_ip = json.loads(route.stdout)[0].get("prefsrc")
             if host_ip and not host_ip.startswith("127."):
                 try:
@@ -254,9 +338,17 @@ def main():
 
         if args.browser:
             from playwright.sync_api import sync_playwright
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
-                page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            from monitor_board_qa import board_browser_checks
+            with sync_playwright() as playwright, ExitStack() as cleanup:
+                browser_home = output / "browser-home"
+                browser_home.mkdir(mode=0o700)
+                browser = playwright.chromium.launch(headless=True, env={
+                    "HOME": str(browser_home), "TMPDIR": str(browser_home),
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"})
+                cleanup.callback(browser.close)
+                context = browser.new_context(viewport={"width": 1440, "height": 1000})
+                cleanup.callback(context.close)
+                page = context.new_page()
                 external_requests, errors = [], []
                 page.on("request", lambda request: external_requests.append(request.url)
                         if not request.url.startswith(url.rstrip("/")) else None)
@@ -292,13 +384,16 @@ def main():
                 page.screenshot(path=str(output / "monitor-desktop.png"), full_page=True)
                 page.set_viewport_size({"width": 390, "height": 844})
                 page.screenshot(path=str(output / "monitor-mobile.png"), full_page=True)
+                board_browser_checks(page=page, browser=browser, context=context,
+                                     rpc=rpc, state=a, second_state=b, url=url,
+                                     token=token, record=record, output=output)
+                board_readback(a, "alpha")
                 page.locator("#lock-button").click()
                 page.locator("#access-token").wait_for(state="visible")
                 assert not page.locator("#workspace").is_visible()
                 assert page.locator("#access-token").input_value() == ""
                 assert not external_requests, external_requests
                 assert not errors, errors
-                browser.close()
             record("real browser login/live update/full history/session pinning/reply navigation/filter/logout work safely with embedded assets and memory-only auth")
 
         stream, response = opened_stream(url, token)

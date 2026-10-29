@@ -1,8 +1,10 @@
-# Local message monitor
+# Local monitor
 
 The same `agent-bridge` executable contains the HTTP server and all HTML, CSS and
 JavaScript. It reads the running broker's existing message database; there is no
-separate web process, Node.js runtime, CDN, asset download or model call.
+separate web process, Node.js runtime, CDN, asset download or model call. Messages
+shows delivery history; Boards reads local named boards and accepts only changes
+to their existing checkbox and marked text response controls.
 
 With the broker running, enable it:
 
@@ -44,24 +46,91 @@ destination session, but historical source sessions were not recorded and appear
 as unknown. Remote machine aliases/names are display labels, not proof of human
 identity. The monitor never creates a peer identity just to display local messages.
 
-All views are read-only. There are no browser send, acknowledge, retry, cancel,
-pairing or grant controls. Receipt/submission states have their existing meaning;
+Message views remain read-only. There are no browser send, acknowledge, retry,
+cancel, pairing or grant controls. Receipt/submission states have their existing meaning;
 monitoring does not establish that a model ran or completed a task.
+
+## Browse and answer boards
+
+Choose Boards, then select a board from the visible selector. The first selection
+is `main`, including its empty virtual entry before a file exists. Lists are in
+name order. Board names, existence and revisions come from the same broker used
+by CLI/MCP; unknown names never fall back or create documents. Create boards and
+perform general edits through [the CLI/MCP board tools](board.md).
+
+The view renders headings, tables, lists and code, with bounded wrapping/overflow
+and a readable source fallback for complex Markdown. Raw Markdown shows the exact
+source. HTML and scripts do not execute, images do not fetch resources, and safe
+external links require an explicit click. Board layout is user-authored; no task
+table schema is required.
+
+The Responses pane uses the terminal's Rust control parser and source mapping.
+Code examples, ordinary bracket text, malformed/nested/duplicate marked fields
+and response contents never create controls. A checkbox save sends its intended
+checked state. Text responses have Save and Cancel. Changes preserve bytes
+outside that response and use the same revision checks and notification behavior
+as the terminal. Browser writes are unattributed user-interface changes, so the
+appropriate board's subscribers can receive a change notice. Reading never
+subscribes a native agent or changes a board.
+
+Drafts stay in memory and remain pinned to their board, control and revision.
+Switching boards, leaving Boards or explicitly locking with an unsaved response
+offers Save and continue, Discard and continue, or Cancel navigation. Saving must
+succeed before continuing; a save already in flight must finish first. Closing
+or reloading uses the browser's best-effort unsaved-change prompt, not a guarantee
+that the browser will keep the page open. Nothing stores drafts in browser storage.
+
+Newer content raises a notice while you edit or select rendered text; it does not
+replace your draft or selection. Review the current board explicitly. An unchanged
+uniquely named text field can then be explicitly rebased and saved. If the field
+changed or disappeared, cancel the draft and reopen the intended control. A newer
+revision after review requires another review. Reordered checkboxes require
+reselection rather than a blind retry.
+
+Save feedback distinguishes success, conflict and uncertain results. A lost
+response or durability failure may mean the change applied: read back and review
+the current board before retrying. Saves are never retried automatically, and
+duplicate submissions are disabled while one is in flight.
+
+Only the selected board is refreshed, independently of message activity, using
+conditional reads with at most one read in flight. Normal refresh is about once
+per second; failures back off to at most 30 seconds between attempts. External
+file edits are visible through the same revision check. A temporary failure keeps
+the last content with a stale/reconnecting indicator. Leaving Boards or locking
+stops its refresh work. Selection in the browser never changes terminal/MCP board
+selection.
 
 ## Browser access
 
 API requests carry a random access token in an Authorization header. The page
-keeps it only in memory; locking the monitor clears its message views and token,
+keeps it only in memory; locking the monitor clears message/board views, raw source,
+controls, drafts, pending requests and the token,
 and closing/reloading the page requires access again. Tokens do not appear in URLs,
 query strings, cookies, referrers or browser storage. Static login assets contain
 no message history or credentials.
 
 Exact Host validation, Origin and browser fetch-metadata checks reject DNS rebinding
-and cross-origin requests. The server supplies no CORS permission, rejects write
-methods, uses restrictive content-security/frame/referrer policies and disables
-caching. Message text renders as text, including HTML-like content. The server
-logs neither message bodies nor HTTP requests/access tokens. Connection, header,
-query, result-page and live-stream budgets constrain resource use.
+and cross-origin requests. The server supplies no CORS permission, uses restrictive
+content-security/frame/referrer policies and disables caching. Message text
+renders as text, including HTML-like content. The only write route is authenticated
+`POST /api/boards/{name}/responses`; other non-GET routes remain rejected. That
+route requires exact same-origin mutation context and accepts only an existing
+control identity, expected revision and typed desired value, never a path,
+replacement document, attribution or arbitrary broker command. Access generation
+is checked again at the shared transaction boundary; completed revocation prevents
+later commits. An admitted change can finish before revocation completes.
+
+Board JSON bodies are limited to 512 KiB with a five-second read deadline; decoded
+text and the resulting document are each bounded by 64 KiB. There are at most
+eight board read jobs, four active writes and ten writes per second, within the
+global limits of 32 connections, 100 requests per second and eight message event
+streams. Aborting a browser request does not
+release a queued worker's budget or authorize it after revocation. The server
+logs neither board/message bodies, responses nor HTTP access tokens.
+
+Board responses remain shared data, not authenticated owner approval or executable
+commands. Browser access adds no machine pairing, session grants or native tool
+permissions.
 
 This boundary does not protect against another process running as your OS user,
 an administrator, or a privileged browser extension. Such processes may already
@@ -88,3 +157,7 @@ python3 tools/test_monitor.py --binary ./target/debug/agent-bridge --browser
 
 Omit `--browser` when Playwright and its matching browser are unavailable; that run
 has no browser acceptance claim. No browser is downloaded by the harness.
+The extended harness also exercises named-board navigation, response writes,
+conflicts/drafts, live refresh, untrusted Markdown and late-callback/lock behavior
+against the built executable. Its private brokers/browser contexts are disposable;
+do not point it at a running owner service or saved profile.

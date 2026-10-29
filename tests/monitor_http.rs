@@ -241,3 +241,398 @@ async fn occupied_port_reports_failure_without_disrupting_the_broker() {
     running.broker.request(Request::MonitorDisable).unwrap();
     assert!(running.enable(0).await["url"].is_string());
 }
+
+fn json_body(response: &str) -> Value {
+    serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+}
+async fn post(access: &Value, path: &str, headers: &str, body: &str) -> String {
+    let mut socket = TcpStream::connect(host(access)).await.unwrap();
+    socket
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {}\r\n{}Content-Length: {}\r\n{headers}\r\n{body}",
+                host(access),
+                auth(access),
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(7), socket.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+fn post_headers(access: &Value) -> String {
+    format!(
+        "Origin: {}\r\nContent-Type: application/json\r\n",
+        access["url"].as_str().unwrap()
+    )
+}
+#[tokio::test]
+async fn board_http_reads_controls_save_conditional_conflict_and_narrow_security() {
+    use agent_bridge::{board, protocol::Request};
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let empty = json_body(&get(&access, "/api/boards/main", &auth(&access)).await);
+    assert_eq!(empty["exists"], false);
+    assert!(!root.path().join("boards").exists());
+    for name in ["alpha", "beta"] {
+        running
+            .broker
+            .request(Request::BoardCreate {
+                board: name.parse().unwrap(),
+            })
+            .unwrap();
+    }
+    let alpha: board::Name = "alpha".parse().unwrap();
+    let before = board::read_named(root.path(), &alpha).unwrap();
+    running.broker.request(Request::NamedBoardUpdate { board: alpha.clone(), expected_revision: before.revision, edits: vec![board::Edit::Set { markdown: "# Title\n- [ ] task\n\n<!-- board-input: answer -->\n> old\n<!-- /board-input -->\nTail\n".into() }], actor: None }).unwrap();
+    let listed = json_body(&get(&access, "/api/boards", &auth(&access)).await);
+    assert_eq!(
+        listed["boards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta", "main"]
+    );
+    let view = json_body(&get(&access, "/api/boards/alpha", &auth(&access)).await);
+    assert_eq!(view["controls"].as_array().unwrap().len(), 2);
+    let conditional = json_body(
+        &get(
+            &access,
+            &format!(
+                "/api/boards/alpha?if_revision={}",
+                view["revision"].as_str().unwrap()
+            ),
+            &auth(&access),
+        )
+        .await,
+    );
+    assert_eq!(conditional["unchanged"], true);
+    assert!(conditional.get("markdown").is_none());
+    let dto = serde_json::json!({"board":"alpha","expected_revision":view["revision"],"control_id":view["controls"][0]["id"],"value":{"type":"checkbox","checked":true}}).to_string();
+    for (headers, status) in [
+        ("Content-Type: application/json\r\n".into(), 403),
+        (
+            "Origin: null\r\nContent-Type: application/json\r\n".into(),
+            403,
+        ),
+        (
+            format!(
+                "Origin: {}\r\nContent-Type: text/plain\r\n",
+                access["url"].as_str().unwrap()
+            ),
+            415,
+        ),
+        (
+            format!("{}Content-Encoding: gzip\r\n", post_headers(&access)),
+            415,
+        ),
+        (
+            format!(
+                "{}Origin: {}\r\n",
+                post_headers(&access),
+                access["url"].as_str().unwrap()
+            ),
+            403,
+        ),
+        (
+            format!(
+                "{}Content-Type: application/json\r\n",
+                post_headers(&access)
+            ),
+            415,
+        ),
+    ] {
+        assert!(
+            post(&access, "/api/boards/alpha/responses", &headers, &dto)
+                .await
+                .starts_with(&format!("HTTP/1.1 {status}"))
+        );
+    }
+    let valid = post(
+        &access,
+        "/api/boards/alpha/responses",
+        &post_headers(&access),
+        &dto,
+    )
+    .await;
+    assert!(valid.starts_with("HTTP/1.1 200"), "{valid}");
+    assert!(
+        board::read_named(root.path(), &alpha)
+            .unwrap()
+            .markdown
+            .contains("[x] task")
+    );
+    let stale = post(
+        &access,
+        "/api/boards/alpha/responses",
+        &post_headers(&access),
+        &dto,
+    )
+    .await;
+    assert!(stale.starts_with("HTTP/1.1 409"));
+    assert_eq!(json_body(&stale)["board"]["name"], "alpha");
+    assert!(
+        post(&access, "/api/messages", &post_headers(&access), "{}")
+            .await
+            .starts_with("HTTP/1.1 405")
+    );
+    assert!(
+        get(&access, "/api/boards/no-such-board", &auth(&access))
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+    assert!(
+        get(&access, "/api/boards/ALPHA", &auth(&access))
+            .await
+            .starts_with("HTTP/1.1 400")
+    );
+    assert!(
+        get(&access, "/api/boards/alpha?unknown=1", &auth(&access))
+            .await
+            .starts_with("HTTP/1.1 400")
+    );
+    assert!(
+        get(&access, "/api/boards/alpha", "")
+            .await
+            .starts_with("HTTP/1.1 401")
+    );
+}
+
+#[tokio::test]
+async fn body_bounds_malformed_unknown_fields_and_revocation_never_change_board() {
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    for body in ["{", "{\"board\":\"main\",\"extra\":true}"] {
+        assert!(
+            post(
+                &access,
+                "/api/boards/main/responses",
+                &post_headers(&access),
+                body
+            )
+            .await
+            .starts_with("HTTP/1.1 400")
+        );
+    }
+    let mut socket = TcpStream::connect(host(&access)).await.unwrap();
+    socket.write_all(format!("POST /api/boards/main/responses HTTP/1.1\r\nHost: {}\r\n{}{}Content-Length: 524289\r\n\r\n", host(&access), auth(&access), post_headers(&access)).as_bytes()).await.unwrap();
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(2), socket.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(bytes.starts_with(b"HTTP/1.1 413"));
+    let mut body = TcpStream::connect(host(&access)).await.unwrap();
+    body.write_all(format!("POST /api/boards/main/responses HTTP/1.1\r\nHost: {}\r\n{}{}Content-Length: 1000\r\n\r\n{{", host(&access), auth(&access), post_headers(&access)).as_bytes()).await.unwrap();
+    running.broker.request(Request::MonitorDisable).unwrap();
+    let _ = body.write_all(&[b' '; 999]).await;
+    let mut rest = Vec::new();
+    let _ = timeout(Duration::from_secs(2), body.read_to_end(&mut rest)).await;
+    assert!(!root.path().join("boards").exists());
+}
+
+#[tokio::test]
+async fn http_response_notifies_only_the_selected_boards_native_subscriber() {
+    use agent_bridge::{
+        board,
+        protocol::{Agent, Provider},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::Builder::new()
+        .prefix("ab-http-notice-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let mut listeners = Vec::new();
+    for name in ["alpha", "beta"] {
+        let board: board::Name = name.parse().unwrap();
+        running
+            .broker
+            .request(Request::BoardCreate {
+                board: board.clone(),
+            })
+            .unwrap();
+        let snapshot = board::read_named(root.path(), &board).unwrap();
+        running
+            .broker
+            .request(Request::NamedBoardUpdate {
+                board: board.clone(),
+                expected_revision: snapshot.revision,
+                edits: vec![board::Edit::Set {
+                    markdown: "- [ ] native notice\n".into(),
+                }],
+                actor: None,
+            })
+            .unwrap();
+        let path = root.path().join(format!("{name}.sock"));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        running
+            .broker
+            .request(Request::Register {
+                agent: Agent {
+                    name: name.into(),
+                    provider: Provider::Claude,
+                    session: uuid::Uuid::new_v4().to_string(),
+                    endpoint: path.to_str().unwrap().into(),
+                    enabled: true,
+                },
+                replace: false,
+            })
+            .unwrap();
+        running
+            .broker
+            .request(Request::NamedBoardSubscribe {
+                board,
+                agent: name.into(),
+            })
+            .unwrap();
+        listeners.push(listener);
+    }
+    let alpha = json_body(&get(&access, "/api/boards/alpha", &auth(&access)).await);
+    // Reads and an already-desired checkbox state generate no native notice.
+    let noop = serde_json::json!({"board":"alpha","expected_revision":alpha["revision"],"control_id":alpha["controls"][0]["id"],"value":{"type":"checkbox","checked":false}}).to_string();
+    let response = post(
+        &access,
+        "/api/boards/alpha/responses",
+        &post_headers(&access),
+        &noop,
+    )
+    .await;
+    assert_eq!(json_body(&response)["unchanged"], true);
+    assert!(
+        timeout(Duration::from_millis(500), listeners[0].accept())
+            .await
+            .is_err()
+    );
+    let save = noop.replace("\"checked\":false", "\"checked\":true");
+    assert!(
+        post(
+            &access,
+            "/api/boards/alpha/responses",
+            &post_headers(&access),
+            &save
+        )
+        .await
+        .starts_with("HTTP/1.1 200")
+    );
+    let (mut socket, _) = timeout(Duration::from_secs(8), listeners[0].accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(2), socket.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let notice: Value = serde_json::from_slice(&bytes).unwrap();
+    let text = notice["message"]["content"].as_str().unwrap();
+    assert!(text.contains("local board changed, not user approval"));
+    assert!(text.contains("\"board\":\"alpha\""));
+    assert!(!text.contains("cross-session-message"));
+    assert!(
+        timeout(Duration::from_millis(300), listeners[1].accept())
+            .await
+            .is_err()
+    );
+    assert!(
+        timeout(Duration::from_millis(300), listeners[0].accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn slow_bodies_have_a_deadline_and_share_a_bounded_write_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let mut sockets = Vec::new();
+    for _ in 0..5 {
+        let mut socket = TcpStream::connect(host(&access)).await.unwrap();
+        socket.write_all(format!("POST /api/boards/main/responses HTTP/1.1\r\nHost: {}\r\n{}{}Content-Length: 1000\r\n\r\n{{", host(&access), auth(&access), post_headers(&access)).as_bytes()).await.unwrap();
+        sockets.push(socket);
+    }
+    // This read must remain responsive while response bodies are incomplete.
+    assert!(
+        get(&access, "/api/status", &auth(&access))
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    let mut timed_out = 0;
+    let mut denied = 0;
+    for mut socket in sockets {
+        let mut bytes = Vec::new();
+        timeout(Duration::from_secs(7), socket.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        if bytes.starts_with(b"HTTP/1.1 408") {
+            timed_out += 1;
+        } else {
+            assert!(bytes.starts_with(b"HTTP/1.1 429"));
+            denied += 1;
+        }
+    }
+    assert_eq!((timed_out, denied), (4, 1));
+    assert!(!root.path().join("boards").exists());
+}
+
+#[tokio::test]
+async fn decoded_text_byte_limit_is_enforced_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let oversized = serde_json::json!({"board":"main","expected_revision":"a".repeat(64),"control_id":"b".repeat(64),"value":{"type":"text","text":"界".repeat(21846)}}).to_string();
+    assert!(
+        post(
+            &access,
+            "/api/boards/main/responses",
+            &post_headers(&access),
+            &oversized
+        )
+        .await
+        .starts_with("HTTP/1.1 413")
+    );
+    assert!(!root.path().join("boards").exists());
+}
+
+#[tokio::test]
+async fn chunked_body_without_length_is_still_bounded() {
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let mut socket = TcpStream::connect(host(&access)).await.unwrap();
+    socket.write_all(format!("POST /api/boards/main/responses HTTP/1.1\r\nHost: {}\r\n{}{}Transfer-Encoding: chunked\r\n\r\n", host(&access), auth(&access), post_headers(&access)).as_bytes()).await.unwrap();
+    let chunk = vec![b' '; 65536];
+    for _ in 0..8 {
+        socket.write_all(b"10000\r\n").await.unwrap();
+        socket.write_all(&chunk).await.unwrap();
+        socket.write_all(b"\r\n").await.unwrap();
+    }
+    socket.write_all(b"1\r\nx\r\n0\r\n\r\n").await.unwrap();
+    let mut bytes = Vec::new();
+    let result = timeout(Duration::from_secs(3), socket.read_to_end(&mut bytes))
+        .await
+        .unwrap();
+    if let Err(error) = result {
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+    assert!(
+        bytes.starts_with(b"HTTP/1.1 413"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(!root.path().join("boards").exists());
+}

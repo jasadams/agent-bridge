@@ -523,25 +523,8 @@ impl Broker {
                     actor.as_ref().is_none_or(|agent| agent.enabled),
                     "Board writer must be an enabled local registration"
                 );
-                // Observe external file changes before attributing this edit,
-                // otherwise an agent writing on top of a manual edit could
-                // accidentally suppress that earlier change for itself.
-                let before = crate::board::read_named(&self.state_dir, &name)?;
-                self.board_notifications.lock().unwrap().observe_named(
-                    &name,
-                    &before.revision,
-                    None,
-                    std::time::Instant::now(),
-                );
-                match crate::board::update_named(&self.state_dir, &name, &expected_revision, &edits)
-                {
+                match self.update_board_locked(&name, &expected_revision, &edits, actor.as_ref()) {
                     Ok(board) => {
-                        self.board_notifications.lock().unwrap().observe_named(
-                            &name,
-                            &board.revision,
-                            actor.as_ref(),
-                            std::time::Instant::now(),
-                        );
                         json!({"applied":true,"board":board})
                     }
                     Err(error) => {
@@ -1374,6 +1357,32 @@ impl Broker {
             self.claude_wake.notify_one();
         }
         Ok(result)
+    }
+
+    /// Caller holds the local DB administration mutex. HTTP additionally retains
+    /// its monitor generation guard through this update and both observations.
+    pub(crate) fn update_board_locked(
+        &self,
+        name: &crate::board::Name,
+        expected: &str,
+        edits: &[crate::board::Edit],
+        actor: Option<&crate::protocol::Agent>,
+    ) -> Result<crate::board::Snapshot> {
+        let before = crate::board::read_named(&self.state_dir, name)?;
+        self.board_notifications.lock().unwrap().observe_named(
+            name,
+            &before.revision,
+            None,
+            std::time::Instant::now(),
+        );
+        let board = crate::board::update_named(&self.state_dir, name, expected, edits)?;
+        self.board_notifications.lock().unwrap().observe_named(
+            name,
+            &board.revision,
+            actor,
+            std::time::Instant::now(),
+        );
+        Ok(board)
     }
 
     pub fn claude_sessions(&self) -> Result<Vec<String>> {

@@ -5,6 +5,13 @@
   const workspace = $("workspace");
   const list = $("message-list");
   let token = null;
+  let boards = null;
+  function view(name) {
+    $("messages-view").hidden = name !== "messages";
+    $("boards-view").hidden = name !== "boards";
+    $("messages-tab").setAttribute("aria-pressed", String(name === "messages"));
+    $("boards-tab").setAttribute("aria-pressed", String(name === "boards"));
+  }
   let generation = 0;
   let sessionAbort = null;
   let streamAbort = null;
@@ -36,6 +43,8 @@
   function lock(message = "") {
     generation += 1;
     token = null;
+    boards?.clear();
+    view("messages");
     sessionAbort?.abort();
     streamAbort?.abort();
     clearTimeout(reconnectTimer);
@@ -51,6 +60,7 @@
     $("detail-placeholder").hidden = false;
     $("close-detail").hidden = true;
     $("access-token").value = "";
+    $("login-form").querySelector("button[type=submit]").disabled = false;
     workspace.hidden = true;
     login.hidden = false;
     $("lock-button").hidden = true;
@@ -58,26 +68,31 @@
     showError("login-error", message);
   }
   class ApiError extends Error {
-    constructor(status) {
+    constructor(status, data = null) {
       super(status === 404 ? "This message is no longer available." : status === 400 ? "The filter values could not be accepted. Check the fields and try again." : "The local bridge could not complete this request. Try refreshing.");
       this.status = status;
+      this.data = data;
     }
   }
-  async function api(path, current = generation) {
+  async function api(path, current = generation, options = {}) {
     const response = await fetch(path, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      method: options.method || "GET",
+      body: options.body,
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}) },
       credentials: "omit",
       cache: "no-store",
       referrerPolicy: "no-referrer",
-      signal: sessionAbort.signal,
+      signal: options.signal ? AbortSignal.any([sessionAbort.signal, options.signal]) : sessionAbort.signal,
     });
     if (current !== generation) throw new DOMException("Session changed", "AbortError");
     if (response.status === 401 || response.status === 403) {
       lock("Access was refused. Use the current token from the local monitor command.");
       throw new DOMException("Monitor locked", "AbortError");
     }
-    if (!response.ok) throw new ApiError(response.status);
-    return response.json();
+    const data = await response.json();
+    if (current !== generation) throw new DOMException("Session changed", "AbortError");
+    if (!response.ok) throw new ApiError(response.status, data);
+    return data;
   }
   function endpointName(endpoint) {
     if (!endpoint) return "Unknown agent";
@@ -320,10 +335,17 @@
     } catch (error) {
       if (error.name !== "AbortError" && current === generation) lock("The local bridge could not be reached. Check that the monitor is enabled, then try again.");
     } finally {
-      submit.disabled = false;
+      if (current === generation) submit.disabled = false;
     }
   });
-  $("lock-button").addEventListener("click", () => { lock(); $("access-token").focus(); });
+  boards = window.createBoardMonitor({
+    request: (path, options) => api(path, generation, options),
+    authenticated: () => !!token,
+    onViewChange: view,
+  });
+  $("messages-tab").addEventListener("click", () => { void boards.leave(() => view("messages")); });
+  $("boards-tab").addEventListener("click", () => { void boards.open(); });
+  $("lock-button").addEventListener("click", () => { void boards.leave(() => { lock(); $("access-token").focus(); }); });
   $("filters").addEventListener("submit", (event) => {
     event.preventDefault();
     const next = new URLSearchParams();

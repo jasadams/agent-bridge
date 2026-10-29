@@ -123,6 +123,25 @@ acceptance checks. Vendored source was unchanged during security remediation;
 its patches were included in source review. Machine-specific artifacts and logs
 are not published.
 
+## Local browser board-response boundary
+
+The local monitor now includes a narrow authenticated write route for existing
+board checkbox/text response controls. Message endpoints remain read-only; there
+are no browser messaging, pairing, grant, general Markdown-edit or filesystem-path
+operations. This extends the historical GET-only monitor surface described by the
+earlier acceptance work above.
+
+Response writes use the shared Rust control parser, exact board/revision identity,
+private filesystem operations and broker transaction/notification logic. Monitor
+access generation is fenced at the commit boundary; input body/time and worker
+budgets remain bounded even when an HTTP request is aborted. Post-replacement
+failures are treated as uncertain and are not automatically retried. Browser
+credentials/drafts remain in memory, lock clears private views, and untrusted
+Markdown renders through structural DOM data without executable HTML or automatic
+resource fetching. See [the monitor boundary and validation](local-monitor.md).
+These controls do not change the same-UID/administrator trust boundary or turn a
+board response into owner consent. This addition is not an external security audit.
+
 ## Remaining acceptance limits
 
 The three scoped reviewers approved the remediations with no remaining confirmed
