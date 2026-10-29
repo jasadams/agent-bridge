@@ -42,9 +42,13 @@ const AgentBridge: Plugin = async (input, options = {}) => {
   let events = Promise.resolve();
   const name = (session: string) => `opencode-${session}`;
 
+  function requireLive(session: string) {
+    if (disposed || !live.has(session)) throw new Error("Unknown, stale or disposed session");
+  }
   async function verified(session: string): Promise<Session> {
     if (disposed || !SESSION.test(session) || session.length > 200) throw new Error("Invalid or disposed session");
     const result = await input.client.session.get({ path: { id: session } });
+    if (disposed) throw new Error("Plugin disposed during session lookup");
     if (result.error || !result.data || result.data.id !== session || resolve(result.data.directory) !== resolve(input.directory)) throw new Error("Session does not belong to this plugin instance");
     const time = result.data.time as Session["time"] & { archived?: number };
     if (time.archived) throw new Error("Session is archived");
@@ -66,7 +70,9 @@ const AgentBridge: Plugin = async (input, options = {}) => {
   async function receipt(frame: Extract<Frame, { op: "deliver" }>, item: Submission): Promise<Receipt> {
     const deadline = Date.now() + RECEIPT_MS;
     do {
+      requireLive(frame.session);
       const result = await input.client.session.message({ path: { id: frame.session, messageID: item.native } });
+      requireLive(frame.session);
       if (result.data) {
         const { info, parts } = result.data;
         const text = parts.filter(p => p.type === "text").map(p => p.text).join("");
@@ -80,9 +86,10 @@ const AgentBridge: Plugin = async (input, options = {}) => {
     throw new Error("Native insertion is unconfirmed; API acceptance is not a receipt");
   }
   async function handle(frame: Frame): Promise<Receipt> {
-    if (!live.has(frame.session)) throw new Error("Unknown or stale session");
+    requireLive(frame.session);
     try { await verified(frame.session); }
-    catch (error) { await unregister(frame.session); throw error; }
+    catch (error) { if (live.has(frame.session)) await unregister(frame.session); throw error; }
+    requireLive(frame.session);
     if (frame.op === "probe") return { ok: true, instance, session: frame.session };
     const fingerprint = createHash("sha256").update(frame.session).update("\0").update(frame.content).digest("hex");
     let item = submissions.get(frame.id.toLowerCase());
@@ -99,9 +106,12 @@ const AgentBridge: Plugin = async (input, options = {}) => {
     item.pending = (async () => {
       // Check for the stable native ID before submitting, without rewriting it.
       const existing = await input.client.session.message({ path: { id: frame.session, messageID: submission.native } });
+      requireLive(frame.session);
       if (!existing.data) {
         if (existing.response.status !== 404) throw new Error("Cannot establish native message absence");
+        requireLive(frame.session);
         const result = await input.client.session.promptAsync({ path: { id: frame.session }, body: { messageID: submission.native, parts: [{ type: "text", text: frame.content }] } });
+        requireLive(frame.session);
         if (result.error) throw new Error("Native prompt submission failed; insertion is unconfirmed");
       }
       return receipt(frame, submission);

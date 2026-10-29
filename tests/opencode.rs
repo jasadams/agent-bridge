@@ -38,7 +38,20 @@ impl PluginSocket {
                     .read_line(&mut line)
                     .unwrap();
                 let frame = serde_json::from_str(&line).unwrap();
-                writeln!(stream, "{}", response(frame, &instance)).unwrap();
+                let bytes = format!("{}\n", response(frame, &instance));
+                if let Err(error) = stream.write_all(bytes.as_bytes()) {
+                    // Oversized-receipt tests intentionally make the client close
+                    // at its frame bound, before the fixture finishes writing.
+                    assert!(
+                        bytes.len() > agent_bridge::protocol::MAX_FRAME
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                            ),
+                        "Unexpected fixture write failure: {error}"
+                    );
+                }
             }
         });
         Self { root, path, worker }

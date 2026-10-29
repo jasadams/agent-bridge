@@ -48,12 +48,34 @@ async function setup(tmpOverride?: string) {
   const native = new Map<string, any>();
   const prompts: any[] = [];
   let defer = false, wrongIdentity = false, lookupFailure = false;
+  let blocked: { kind: "get" | "message"; skip: number; enter: () => void; release: Promise<void>; returned: () => void } | undefined;
+  function blockNext(kind: "get" | "message", skip = 0) {
+    let enter!: () => void, release!: () => void, returned!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const blockedUntilRelease = new Promise<void>(resolve => { release = resolve; });
+    const lookupReturned = new Promise<void>(resolve => { returned = resolve; });
+    blocked = { kind, skip, enter, release: blockedUntilRelease, returned };
+    return { entered, release, settled: async () => {
+      await lookupReturned;
+      // The fake fetch's SDK decoding and the handler continuations run as
+      // microtasks. This event-loop barrier drains them before assertions.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }};
+  }
   const client = createOpencodeClient({ baseUrl: "http://in-process-only.invalid", fetch: async (request) => {
     const req = request as Request;
     const url = new URL(req.url);
     const components = url.pathname.split("/").filter(Boolean);
     const id = components[1]!;
     if (components[0] !== "session") throw new Error("Unexpected SDK request");
+    const kind = components.length === 2 ? "get" : components[2] === "message" ? "message" : undefined;
+    if (blocked && blocked.kind === kind && blocked.skip-- === 0) {
+      const gate = blocked;
+      blocked = undefined;
+      gate.enter();
+      await gate.release;
+      gate.returned();
+    }
     if (components.length === 2) {
       const session = sessions.get(id);
       return Response.json(session ? { ...session, ...(wrongIdentity ? { id: B } : {}) } : { error: "missing" }, { status: session ? 200 : 404 });
@@ -80,7 +102,7 @@ async function setup(tmpOverride?: string) {
   const event = async (type: string, properties: any) => hooks.event?.({ event: { type, properties } as any });
   const created = async (id = A) => event("session.created", { info: sessions.get(id) });
   const endpoint = () => registrations.get(A)?.endpoint ?? registrations.get(B)?.endpoint;
-  return { directory, registrations, requests, sessions, native, prompts, hooks, event, created, endpoint, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; }, lookupFailure: () => { lookupFailure = true; } };
+  return { directory, registrations, requests, sessions, native, prompts, hooks, event, created, endpoint, blockNext, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; }, lookupFailure: () => { lookupFailure = true; } };
 }
 
 describe("V1 supplied-client plugin with real private Unix sockets", () => {
@@ -182,6 +204,55 @@ describe("V1 supplied-client plugin with real private Unix sockets", () => {
     // A missing exact session is an observation failure, not a native chat error.
     s.sessions.delete(B);
     await expect(s.hooks["chat.message"]!({ sessionID: B }, { message: {} as any, parts: [] })).resolves.toBeUndefined();
+  });
+  for (const kind of ["get", "message"] as const) {
+    test(`dispose cancels delivery blocked in native ${kind} lookup`, async () => {
+      const s = await setup(); await s.created();
+      const gate = s.blockNext(kind);
+      // Disposal deliberately closes the socket before the blocked native
+      // lookup resumes. Consume that expected close, then await continuation.
+      const delivery = frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "after-dispose" }).catch(() => undefined);
+      await gate.entered;
+      await s.hooks.dispose?.();
+      expect(s.registrations.size).toBe(0);
+      gate.release();
+      await gate.settled();
+      await delivery;
+      expect(s.prompts).toHaveLength(0);
+      expect(s.native.size).toBe(0);
+      expect(s.registrations.size).toBe(0);
+    });
+    test(`native delete cancels delivery blocked in native ${kind} lookup`, async () => {
+      const s = await setup(); await s.created();
+      const gate = s.blockNext(kind);
+      const delivery = frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "after-delete" });
+      await gate.entered;
+      await s.event("session.deleted", { info: s.sessions.get(A) });
+      expect(s.registrations.size).toBe(0);
+      gate.release();
+      await gate.settled();
+      expect((await delivery).ok).toBe(false);
+      expect(s.prompts).toHaveLength(0);
+      expect(s.native.size).toBe(0);
+      expect(s.registrations.size).toBe(0);
+    });
+  }
+  test("native deletion suppresses a late insertion receipt without rewriting history", async () => {
+    const s = await setup(); await s.created();
+    // Skip the initial native-ID absence lookup and block the receipt lookup
+    // after promptAsync has already inserted the exact native user message.
+    const gate = s.blockNext("message", 1);
+    const delivery = frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "before-delete" });
+    await gate.entered;
+    expect(s.prompts).toHaveLength(1);
+    expect(s.native.size).toBe(1);
+    await s.event("session.deleted", { info: s.sessions.get(A) });
+    gate.release();
+    await gate.settled();
+    expect((await delivery).ok).toBe(false);
+    expect(s.registrations.size).toBe(0);
+    expect(s.prompts).toHaveLength(1);
+    expect(s.native.size).toBe(1);
   });
   test("dispose waits for a queued chat observation and leaves no registration", async () => {
     const s = await setup();

@@ -77,7 +77,7 @@ try {
   await waitFor("broker startup", async () => brokerRpc(state, { op: "status" }));
   const baseUrl = `http://127.0.0.1:${port}`;
   await waitFor("native server startup", async () => (await fetch(baseUrl + "/global/health", { signal: AbortSignal.timeout(2000) })).ok);
-  const client = createOpencodeClient({ baseUrl, directory: workspace, fetch: (request) => fetch(request, { signal: AbortSignal.timeout(15000) }) });
+  const client = createOpencodeClient({ baseUrl, directory: workspace, fetch: (request) => fetch(request, { signal: AbortSignal.timeout(60000) }) });
   const created = await client.session.create({ body: { title: "Disposable AGB-3 idle probe" } });
   if (created.error || !created.data) throw new Error("Cannot create disposable native session");
   const session = created.data.id;
