@@ -28,11 +28,11 @@ pub fn validate_session(session: &str) -> Result<()> {
 
 pub fn validate_endpoint(endpoint: &str) -> Result<PathBuf> {
     let path = super::claude::validate_socket(Path::new(endpoint))?;
-    instance(&path)?;
+    endpoint_instance(&path)?;
     Ok(path)
 }
 
-fn instance(path: &Path) -> Result<String> {
+pub(crate) fn endpoint_instance(path: &Path) -> Result<String> {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -54,6 +54,15 @@ fn instance(path: &Path) -> Result<String> {
 #[serde(deny_unknown_fields)]
 struct Receipt {
     ok: bool,
+    protocol: u32,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    generation: Option<String>,
+    #[serde(default)]
+    attempt: Option<String>,
     #[serde(default)]
     session: Option<String>,
     #[serde(default)]
@@ -91,18 +100,35 @@ async fn exchange(path: &Path, frame: &Value, written: &mut bool) -> Result<Rece
     );
     let receipt: Receipt = serde_json::from_slice(&response).context("Invalid OpenCode receipt")?;
     ensure!(
-        receipt.ok,
-        "OpenCode rejected request: {}",
-        receipt.error.as_deref().unwrap_or("unspecified")
+        receipt.protocol == 2,
+        "OpenCode plugin protocol version mismatch"
     );
     ensure!(
         receipt.session.as_deref() == frame.get("session").and_then(Value::as_str),
         "OpenCode receipt session mismatch"
     );
     ensure!(
-        receipt.instance.as_deref() == Some(instance(path)?.as_str()),
+        receipt.instance.as_deref() == Some(endpoint_instance(path)?.as_str()),
         "OpenCode receipt instance mismatch"
     );
+    for key in [
+        "id",
+        "namespace",
+        "generation",
+        "attempt",
+        "native_message_id",
+    ] {
+        if let Some(expected) = frame.get(key).and_then(Value::as_str) {
+            let actual = match key {
+                "id" => receipt.id.as_deref(),
+                "namespace" => receipt.namespace.as_deref(),
+                "generation" => receipt.generation.as_deref(),
+                "attempt" => receipt.attempt.as_deref(),
+                _ => receipt.native_message_id.as_deref(),
+            };
+            ensure!(actual == Some(expected), "OpenCode receipt {key} mismatch");
+        }
+    }
     Ok(receipt)
 }
 
@@ -116,7 +142,7 @@ pub(crate) fn verify_registration(agent: &Agent) -> Result<()> {
         .build()?
         .block_on(async {
             let mut written = false;
-            timeout(
+            let receipt = timeout(
                 Duration::from_secs(5),
                 exchange(
                     &path,
@@ -125,51 +151,55 @@ pub(crate) fn verify_registration(agent: &Agent) -> Result<()> {
                 ),
             )
             .await??;
+            ensure!(receipt.ok, "OpenCode exact-session probe rejected");
             Ok(())
         })
 }
 
-pub(crate) async fn deliver(agent: &Agent, msg: &Message, content: &str) -> Outcome {
-    if let Err(error) = validate_session(&agent.session).and_then(|_| {
-        ensure!(
-            agent.session == msg.recipient_session,
-            "OpenCode delivery session mismatch"
-        );
-        uuid::Uuid::parse_str(&msg.id).context("Invalid broker message ID")?;
-        Ok(())
-    }) {
-        return Outcome::failed(error);
-    }
+pub(crate) async fn deliver(_agent: &Agent, _msg: &Message, _content: &str) -> Outcome {
+    Outcome::failed(
+        "OpenCode delivery requires the broker's durable lease, queue and admission context",
+    )
+}
+
+pub(crate) async fn deliver_dispatch(
+    agent: &Agent,
+    dispatch: &crate::opencode_state::Dispatch,
+) -> Outcome {
     let path = match validate_endpoint(&agent.endpoint) {
         Ok(path) => path,
-        Err(error) => return Outcome::failed(error),
+        Err(error) => return Outcome::uncertain(error),
     };
     let mut written = false;
-    let frame = json!({"op":"deliver","session":agent.session,"id":msg.id,"content":content});
     let result = timeout(
         Duration::from_secs(15),
-        exchange(&path, &frame, &mut written),
+        exchange(&path, &dispatch.frame, &mut written),
     )
     .await;
     match result {
-        Ok(Ok(receipt)) => {
-            let native = format!("msg_{}", msg.id.replace('-', "").to_ascii_lowercase());
-            if receipt.id.as_deref() != Some(msg.id.as_str())
-                || receipt.native_message_id.as_deref() != Some(native.as_str())
-            {
-                return Outcome::uncertain("OpenCode receipt message identity mismatch");
-            }
+        Ok(Ok(receipt)) if receipt.ok && receipt.status.as_deref() == Some("inserted") => {
             Outcome::submitted(
-                "OpenCode plugin verified native user-message insertion; model execution and acknowledgement remain unconfirmed",
+                "OpenCode native insertion verified by exact readback; model acknowledgement and completion remain unconfirmed",
             )
         }
-        error => {
-            let detail = format!("OpenCode delivery receipt failed: {error:?}");
-            if written {
-                Outcome::uncertain(detail)
-            } else {
-                Outcome::failed(detail)
+        Ok(Ok(receipt))
+            if !receipt.ok
+                && receipt.status.as_deref() == Some("deferred")
+                && dispatch.frame["op"] == "deliver" =>
+        {
+            Outcome {
+                state: "queued",
+                detail: format!(
+                    "OpenCode deferred before insertion: {}",
+                    receipt
+                        .error
+                        .as_deref()
+                        .unwrap_or("busy or admission unavailable")
+                ),
             }
         }
+        other => Outcome::uncertain(format!(
+            "OpenCode insertion requires read-only reconciliation: {other:?}"
+        )),
     }
 }

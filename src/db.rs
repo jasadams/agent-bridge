@@ -85,6 +85,12 @@ impl Db {
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(3))?;
         crate::migrations::migrate(&mut conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES('opencode_namespace',?)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
+        conn.execute("UPDATE opencode_deliveries SET namespace=(SELECT value FROM settings WHERE key='opencode_namespace') WHERE namespace='legacy'", [])?;
+        conn.execute("UPDATE agents SET enabled=0 WHERE provider='opencode'", [])?;
         conn.execute("UPDATE messages SET state='uncertain', detail='Service stopped during delivery; inspect the native conversation before retrying.' WHERE state='sending' AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=messages.id)", [])?;
         Ok(Self { conn })
     }
@@ -235,7 +241,7 @@ impl Db {
         tx.execute("UPDATE peers SET revoked=1 WHERE peer_id=?", [&peer_id])?;
         tx.execute("DELETE FROM peer_grants WHERE peer_id=?", [&peer_id])?;
         tx.execute("DELETE FROM remote_agents WHERE peer_id=?", [&peer_id])?;
-        tx.execute("UPDATE messages SET state='blocked',detail='Peer was revoked',updated=? WHERE state='queued' AND (id IN (SELECT local_id FROM inbound_transfers WHERE peer_id=?) OR id IN (SELECT id FROM outbound_transfers WHERE peer_id=? AND state IN ('pending','awaiting_receipt')))", params![now(),peer_id,peer_id])?;
+        tx.execute("UPDATE messages SET state=CASE WHEN EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued') THEN 'uncertain' ELSE 'blocked' END,detail='Peer was revoked',updated=? WHERE state='queued' AND (id IN (SELECT local_id FROM inbound_transfers WHERE peer_id=?) OR id IN (SELECT id FROM outbound_transfers WHERE peer_id=? AND state IN ('pending','awaiting_receipt')))", params![now(),peer_id,peer_id])?;
         tx.execute("UPDATE outbound_transfers SET state='blocked',detail='Peer was revoked' WHERE peer_id=? AND state IN ('pending','awaiting_receipt')", [&peer_id])?;
         tx.commit()?;
         Ok(())
@@ -320,6 +326,7 @@ impl Db {
                 replace,
                 "Name already belongs to another session; choose another name or explicitly use --replace"
             );
+            tx.execute("UPDATE messages SET state='uncertain',detail='Recipient registration changed during attempted OpenCode reconciliation',updated=? WHERE recipient=? AND state='queued' AND id IN(SELECT id FROM opencode_deliveries WHERE phase<>'queued')",params![now(),agent.name])?;
             tx.execute("UPDATE messages SET state='failed',detail='Recipient registration was replaced',updated=? WHERE recipient=? AND state='queued'", params![now(), agent.name])?;
         }
         tx.execute("INSERT INTO agents VALUES(?1,?2,?3,?4,?5) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider,session=excluded.session,endpoint=excluded.endpoint,enabled=excluded.enabled",params![agent.name, agent.provider.label(), agent.session, agent.endpoint, agent.enabled])?;
@@ -548,7 +555,8 @@ impl Db {
             return Ok(None);
         }
         self.block_revoked_inbound()?;
-        let id:Option<String> = self.conn.query_row("SELECT m.id FROM messages m JOIN agents a ON a.name=m.recipient AND a.session=m.recipient_session AND a.enabled=1 WHERE m.state='queued' AND NOT EXISTS(SELECT 1 FROM messages busy WHERE busy.recipient=m.recipient AND busy.state='sending') ORDER BY m.rowid LIMIT 1",[],|r|r.get(0)).optional()?;
+        self.opencode_tick(now())?;
+        let id:Option<String> = self.conn.query_row("SELECT m.id FROM messages m JOIN agents a ON a.name=m.recipient AND a.session=m.recipient_session AND a.enabled=1 WHERE (m.state='queued' OR (a.provider='opencode' AND m.state='uncertain' AND EXISTS(SELECT 1 FROM opencode_deliveries requested WHERE requested.id=m.id AND requested.phase='reconcile'))) AND NOT EXISTS(SELECT 1 FROM messages busy WHERE busy.recipient=m.recipient AND busy.state='sending') AND (a.provider<>'opencode' OR (EXISTS(SELECT 1 FROM opencode_deliveries d JOIN opencode_leases l ON l.session=d.session WHERE d.id=m.id AND d.generation=l.generation AND l.endpoint=a.endpoint AND l.expires>?1 AND (l.ready=1 OR d.phase='reconcile')) AND (EXISTS(SELECT 1 FROM opencode_deliveries current WHERE current.id=m.id AND current.phase='reconcile') OR NOT EXISTS(SELECT 1 FROM opencode_deliveries head JOIN messages h ON h.id=head.id WHERE head.session=m.recipient_session AND h.id<>m.id AND (h.state='sending' OR h.state='uncertain' OR (h.state='queued' AND (h.rowid<m.rowid OR head.phase<>'queued'))))))) ORDER BY m.rowid LIMIT 1",[now()],|r|r.get(0)).optional()?;
         let Some(id) = id else { return Ok(None) };
         self.conn.execute(
             "UPDATE messages SET state='sending',updated=? WHERE id=?",
@@ -590,6 +598,9 @@ impl Db {
         if let Some(message) = self.retry_transfer(id)? {
             return Ok(message);
         }
+        if let Some(message) = self.opencode_retry(id)? {
+            return Ok(message);
+        }
         let m = self.get(id)?;
         ensure!(
             ["failed", "blocked"].contains(&m.state.as_str())
@@ -611,6 +622,7 @@ impl Db {
         if let Some(message) = self.cancel_transfer(id)? {
             return Ok(message);
         }
+        self.opencode_cancel_admission(id)?;
         ensure!(
             self.get(id)?.state == "queued",
             "Only queued messages can be cancelled"

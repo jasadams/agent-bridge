@@ -76,6 +76,35 @@ pub enum Request {
         session: String,
         endpoint: String,
         title: Option<String>,
+        #[serde(default)]
+        ready: bool,
+    },
+    #[serde(rename = "opencode_heartbeat")]
+    OpenCodeHeartbeat {
+        session: String,
+        endpoint: String,
+        generation: String,
+        ready: bool,
+    },
+    #[serde(rename = "opencode_close")]
+    OpenCodeClose {
+        session: String,
+        endpoint: String,
+        generation: String,
+    },
+    #[serde(rename = "opencode_admit")]
+    OpenCodeAdmit {
+        id: String,
+        session: String,
+        generation: String,
+        instance: String,
+        attempt: String,
+    },
+    #[serde(rename = "opencode_notice")]
+    OpenCodeNotice {
+        id: String,
+        recipient: String,
+        content: String,
     },
     Unregister {
         name: String,

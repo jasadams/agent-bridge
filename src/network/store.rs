@@ -717,7 +717,7 @@ impl Db {
     }
 
     pub(crate) fn block_revoked_inbound(&self) -> Result<()> {
-        self.conn.execute("UPDATE messages SET state='blocked',detail='Remote receiving policy or destination changed',updated=? WHERE state='queued' AND id IN (SELECT t.local_id FROM inbound_transfers t WHERE NOT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON g.peer_id=p.peer_id WHERE p.peer_id=t.peer_id AND p.revoked=0 AND g.provider=t.provider AND g.session=t.session AND g.permission='receive' AND EXISTS(SELECT 1 FROM agents a WHERE a.name=messages.recipient AND a.provider=t.provider AND a.session=t.session AND a.enabled=1)))", [now()])?;
+        self.conn.execute("UPDATE messages SET state=CASE WHEN EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued') THEN 'uncertain' ELSE 'blocked' END,detail='Remote receiving policy or destination changed',updated=? WHERE state='queued' AND id IN (SELECT t.local_id FROM inbound_transfers t WHERE NOT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON g.peer_id=p.peer_id WHERE p.peer_id=t.peer_id AND p.revoked=0 AND g.provider=t.provider AND g.session=t.session AND g.permission='receive' AND EXISTS(SELECT 1 FROM agents a WHERE a.name=messages.recipient AND a.provider=t.provider AND a.session=t.session AND a.enabled=1)))", [now()])?;
         Ok(())
     }
 

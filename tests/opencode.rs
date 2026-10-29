@@ -73,16 +73,16 @@ fn receipt(frame: Value, instance: &str) -> Value {
     if frame["session"] != SESSION {
         return json!({"ok":false,"error":"unknown session"});
     }
-    let mut value = json!({"ok":true,"session":SESSION,"instance":instance});
+    let mut value = json!({"ok":true,"protocol":2,"session":SESSION,"instance":instance});
     if frame["op"] == "deliver" {
         assert!(!frame["content"].as_str().unwrap().is_empty());
         assert!(frame.get("permissions").is_none());
         assert!(frame.get("tools").is_none());
         value["id"] = frame["id"].clone();
-        value["native_message_id"] = json!(format!(
-            "msg_{}",
-            frame["id"].as_str().unwrap().replace('-', "")
-        ));
+        for key in ["native_message_id", "namespace", "generation", "attempt"] {
+            value[key] = frame[key].clone();
+        }
+        value["status"] = json!("inserted");
     }
     value
 }
@@ -102,42 +102,79 @@ fn message() -> Message {
     }
 }
 
+async fn broker_delivery(plugin: &PluginSocket) -> Message {
+    let state = plugin.root.path().join("delivery-state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    let agent = plugin.agent();
+    broker::rpc(
+        &state,
+        &Request::OpenCodeObserve {
+            session: SESSION.into(),
+            endpoint: agent.endpoint,
+            title: Some("Delivery".into()),
+            ready: true,
+        },
+    )
+    .await
+    .unwrap();
+    broker::rpc(
+        &state,
+        &Request::Send {
+            id: ID.into(),
+            sender: "user".into(),
+            recipient: agent.name,
+            body: "test".into(),
+            parent: None,
+        },
+    )
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let value = broker::rpc(&state, &Request::Get { id: ID.into() })
+                .await
+                .unwrap();
+            let msg: Message = serde_json::from_value(value).unwrap();
+            if !["queued", "sending"].contains(&msg.state.as_str()) {
+                break msg;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+    result
+}
+
 #[tokio::test]
 async fn exact_session_receipts_bind_native_and_broker_ids() {
     let plugin = PluginSocket::start(2, receipt);
-    for _ in 0..2 {
-        let outcome = delivery::deliver(
-            &plugin.agent(),
-            &message(),
-            std::path::Path::new("unused"),
-            plugin.root.path(),
-        )
-        .await;
-        assert_eq!(outcome.state, "submitted", "{}", outcome.detail);
-        assert!(
-            outcome
-                .detail
-                .contains("acknowledgement remain unconfirmed")
-        );
-    }
+    let outcome = broker_delivery(&plugin).await;
+    assert_eq!(outcome.state, "submitted", "{:?}", outcome.detail);
+    assert!(
+        outcome
+            .detail
+            .unwrap()
+            .contains("acknowledgement and completion remain unconfirmed")
+    );
     plugin.finish();
 }
 
 #[tokio::test]
 async fn wrong_instance_session_and_message_receipts_never_submit() {
     for field in ["instance", "session", "id", "native_message_id"] {
-        let plugin = PluginSocket::start(1, move |frame, instance| {
+        let plugin = PluginSocket::start(2, move |frame, instance| {
+            if frame["op"] == "probe" {
+                return receipt(frame, instance);
+            }
             let mut value = receipt(frame, instance);
             value[field] = json!("wrong");
             value
         });
-        let outcome = delivery::deliver(
-            &plugin.agent(),
-            &message(),
-            std::path::Path::new("unused"),
-            plugin.root.path(),
-        )
-        .await;
+        let outcome = broker_delivery(&plugin).await;
         assert_eq!(outcome.state, "uncertain");
         plugin.finish();
     }
@@ -172,6 +209,7 @@ async fn live_registration_titles_disposal_and_endpoint_conflicts_use_shared_reg
                 session: SESSION.into(),
                 endpoint: agent.endpoint.clone(),
                 title: Some(title.into()),
+                ready: true,
             },
         )
         .await
@@ -193,7 +231,8 @@ async fn live_registration_titles_disposal_and_endpoint_conflicts_use_shared_reg
             &Request::OpenCodeObserve {
                 session: OTHER.into(),
                 endpoint: agent.endpoint.clone(),
-                title: None
+                title: None,
+                ready: true,
             }
         )
         .await
@@ -206,7 +245,8 @@ async fn live_registration_titles_disposal_and_endpoint_conflicts_use_shared_reg
             &Request::OpenCodeObserve {
                 session: SESSION.into(),
                 endpoint: other.agent().endpoint,
-                title: None
+                title: None,
+                ready: true,
             }
         )
         .await
@@ -266,24 +306,23 @@ fn native_identity_and_remote_boundary_are_provider_specific() {
 #[tokio::test]
 async fn rejected_oversized_and_extra_field_receipts_fail_closed() {
     for variant in 0..3 {
-        let plugin = PluginSocket::start(1, move |frame, instance| match variant {
-            0 => {
-                json!({"ok":false,"instance":instance,"session":SESSION,"id":ID,"uncertain":false,"error":"unknown or stale"})
+        let plugin = PluginSocket::start(2, move |frame, instance| {
+            if frame["op"] == "probe" {
+                return receipt(frame, instance);
             }
-            1 => json!({"ok":false,"error":"x".repeat(agent_bridge::protocol::MAX_FRAME + 1)}),
-            _ => {
-                let mut value = receipt(frame, instance);
-                value["unexpected"] = json!(true);
-                value
+            match variant {
+                0 => {
+                    json!({"ok":false,"instance":instance,"session":SESSION,"id":ID,"uncertain":false,"error":"unknown or stale"})
+                }
+                1 => json!({"ok":false,"error":"x".repeat(agent_bridge::protocol::MAX_FRAME + 1)}),
+                _ => {
+                    let mut value = receipt(frame, instance);
+                    value["unexpected"] = json!(true);
+                    value
+                }
             }
         });
-        let outcome = delivery::deliver(
-            &plugin.agent(),
-            &message(),
-            std::path::Path::new("unused"),
-            plugin.root.path(),
-        )
-        .await;
+        let outcome = broker_delivery(&plugin).await;
         assert_eq!(outcome.state, "uncertain");
         plugin.finish();
     }
@@ -305,5 +344,69 @@ fn opencode_endpoint_requires_private_socket_and_canonical_instance() {
     std::fs::set_permissions(plugin.root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(clients::opencode::validate_endpoint(plugin.path.to_str().unwrap()).is_err());
     std::fs::set_permissions(plugin.root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    plugin.finish();
+}
+
+#[tokio::test]
+async fn paused_broker_expires_crashed_leases_and_queued_deadlines_without_native_events() {
+    let plugin = PluginSocket::start(1, receipt);
+    let state = plugin.root.path().join("expiry-state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    let agent = plugin.agent();
+    broker::rpc(
+        &state,
+        &Request::OpenCodeObserve {
+            session: SESSION.into(),
+            endpoint: agent.endpoint.clone(),
+            title: None,
+            ready: true,
+        },
+    )
+    .await
+    .unwrap();
+    broker::rpc(&state, &Request::Pause { paused: true })
+        .await
+        .unwrap();
+    broker::rpc(
+        &state,
+        &Request::Send {
+            id: ID.into(),
+            sender: "user".into(),
+            recipient: agent.name.clone(),
+            body: "still queued".into(),
+            parent: None,
+        },
+    )
+    .await
+    .unwrap();
+    let conn = rusqlite::Connection::open(state.join("messages.sqlite3")).unwrap();
+    conn.execute("UPDATE opencode_leases SET expires=0", [])
+        .unwrap();
+    conn.execute("UPDATE opencode_deliveries SET deadline=0", [])
+        .unwrap();
+    // No broker requests or native events can supply the expiry observation.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let enabled: bool = conn
+                .query_row(
+                    "SELECT enabled FROM agents WHERE name=?",
+                    [&agent.name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let status: String = conn
+                .query_row("SELECT state FROM messages WHERE id=?", [ID], |r| r.get(0))
+                .unwrap();
+            if !enabled && status == "failed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+    let _ = server.await;
     plugin.finish();
 }

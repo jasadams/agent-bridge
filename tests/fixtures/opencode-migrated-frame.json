@@ -1,0 +1,10 @@
+{
+  "op": "reconcile",
+  "session": "ses_0123456789abcdefghijklmnop",
+  "id": "12345678-1234-4234-8234-123456789abc",
+  "content": "stable rendered envelope",
+  "namespace": "aabbccdd-1234-4234-8234-123456789abc",
+  "generation": "bb345678-1234-4234-8234-123456789abc",
+  "attempt": "aa345678-1234-4234-8234-123456789abc",
+  "native_message_id": "msg_12345678123442348234123456789abc"
+}

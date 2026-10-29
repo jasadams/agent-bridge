@@ -1,11 +1,12 @@
 # OpenCode V1 plugin
 
 Supported baseline: OpenCode **1.18.35**, `@opencode-ai/plugin` and
-`@opencode-ai/sdk` **1.18.35**, Bun **1.3.11**. This is a V1 server plugin;
-it never constructs a client from `serverUrl`. The supplied SDK client may only
-work inside OpenCode's process.
+`@opencode-ai/sdk` **1.18.35**. Development checks use Bun **1.3.11**;
+the installed OpenCode executable embeds Bun **1.3.14**. These are separate
+runtimes: the native harness records its embedded version. This is a V1 server
+plugin using only its supplied SDK client. `serverUrl` may have no listener.
 
-Install development dependencies and validate reproducibly from the repo root:
+From the repository root:
 
 ```sh
 bun install --cwd plugins/opencode --frozen-lockfile
@@ -13,8 +14,7 @@ bun run --cwd plugins/opencode typecheck
 bun run --cwd plugins/opencode test
 ```
 
-The plugin is opt-in. A disposable project's `opencode.json` can load its absolute
-file URL and select an existing private broker state directory:
+A disposable project's `opencode.json` can opt into an existing private broker:
 
 ```json
 {
@@ -24,68 +24,105 @@ file URL and select an existing private broker state directory:
 }
 ```
 
-Alternatively set `AGENT_BRIDGE_STATE_DIR` in that OpenCode process. Loading does
-not scan history, start sessions, change permission rules, or share sessions.
-The installer and the owner's native configuration are outside this ticket.
+Alternatively set `AGENT_BRIDGE_STATE_DIR` in that OpenCode process. Loading
+never scans history, starts sessions, grants remote access or modifies native
+permissions. Owner configuration and service installation remain separate work.
 
-Registrations cover sessions observed live within this server/plugin directory,
-not only the currently displayed TUI conversation. Session creation, native
-`tui.session.select`, `session.status` activity and `chat.message` verify the exact
-session through the supplied client. A title update only updates an already-live
-session. Selecting a TUI session through a UI path that emits no server event is
-observed on its next native prompt/activity; the V1 server plugin has no reliable
-active-TUI-selection feed. The route is `opencode-<native session ID>`; build/plan
-mode never becomes a routing identity. Delete/archive/stale-session observation
-removes the registration; normal disposal unregisters and removes the socket.
-An abrupt native crash can leave a visible stale route: delivery fails against its
-dead private endpoint, and restart replacement/reconciliation is deferred to AGB-4.
+## Scope and leases
 
-Each plugin instance atomically creates a 0700 directory under `/tmp` (independent
-of a potentially long macOS `TMPDIR`) and a 0600 Unix socket named
-`<instance UUID>.sock`. Same-user connected peers are checked using Linux
-`SO_PEERCRED` or macOS `getpeereid`; a missing/changed Bun socket descriptor fails
-closed. One bounded UTF-8 newline JSON frame is accepted per connection:
+The plugin registers verified live sessions within its server directory, rather
+than claiming to follow one selected TUI tab. Creation, `chat.message`, native
+activity/status and `tui.session.select` activate an exact existing session.
+A title update only updates an already-live session. V1 UI selection paths without
+a server event are observed on the next native prompt/activity. Build/plan mode
+never becomes a routing identity. Stable routes are `opencode-<session ID>`.
 
-```json
-{"op":"probe","session":"ses_0123456789abcdefghijklmnop"}
-{"op":"deliver","session":"ses_0123456789abcdefghijklmnop","id":"12345678-1234-4234-8234-123456789abc","content":"peer envelope"}
-```
+Each plugin instance atomically creates a 0700 directory under `/tmp` and a 0600
+socket named `<instance UUID>.sock`. The short path avoids macOS `TMPDIR` length
+limits. Linux `SO_PEERCRED` or macOS `getpeereid` verifies connected same-user
+peers; unavailable Bun descriptors fail closed. Frames are strict bounded UTF-8
+newline JSON, one per connection; at most 64 socket/native handlers are active.
 
-Replies bind the exact instance and session. Delivery receipts also bind `id` and
-`native_message_id`. Unknown fields, unknown/stale sessions, other directories,
-wrong native identities, oversized frames and invalid payloads fail closed.
-The socket authenticates the local user, not arbitrary remote peers; shared broker
-permissions remain authoritative.
+Registration returns a broker namespace and exact session generation. Heartbeats
+every five seconds renew a 20-second lease and report event-cached readiness;
+they never poll the native model/session API. Every delivery and asynchronous
+continuation checks generation, membership and lease. Close/delete/archive and
+normal disposal close the exact generation. Crashes expire; another instance may
+take over after expiry. A persisted conversation alone never proves liveness.
+Stale heartbeats, closes and late callbacks cannot authorize a replacement.
 
-The native ID is `msg_` followed by the lowercase broker UUID without hyphens.
-Concurrent/repeated ordinary retries share the same submission; an ID reused with
-another session or payload is rejected. Receipt records are retained for this
-plugin lifetime, with a bounded capacity that rejects new IDs rather than evicts
-deduplication state. A pre-existing exact native message is verified rather than
-rewritten. The plugin supplies only `messageID` and a text part to
-`session.promptAsync`; no tools, permission fields, model or agent override.
+## Durable receipt protocol
 
-In 1.18.35 the HTTP prompt-async handler forks prompt processing and returns 204.
-That response is not durable insertion evidence. The plugin polls the exact native
-message and validates its user role, session, ID and text before returning success.
-A successful socket receipt means **submitted**, never model acknowledgement,
-completion or permission approval. An ambiguous insertion retains its ID and never
-replays the API call automatically. The memory receipt contract does not provide
-crash durability, ordered busy-session handling or restart recovery; these are
-AGB-4. Remote sharing/UI presentation remains AGB-6.
+Probe frames are `{op:"probe",session}`. Successful probe replies bind `protocol:2`,
+instance and exact session. Delivery/reconciliation frames additionally carry
+`id`, `content`, `namespace`, `generation`, `attempt` and `native_message_id`.
+Namespaces, generations, attempts and broker IDs are UUIDs. The native ID is
+`msg_` plus SHA-256 of `namespace + NUL + exactSession + NUL + lowercaseBrokerUUID`.
+Reply identities echo these fences. Status is `inserted`, `deferred` or `uncertain`.
 
-Run the isolated native check with a locally built binary:
+The private `stateDir/opencode-receipts.sqlite3` journal uses SQLite WAL with
+FULL synchronous commits. Immutable namespace/ID/session/content/native-ID
+mappings progress through `prepared`, `attempting`, and `inserted`. Only the winner
+of a committed cross-process `prepared`→`attempting` compare-and-set can call
+`promptAsync`. The broker also admits that exact in-flight claim immediately
+before the fence, checking pause/cancel/current generation. No asynchronous queue
+continues submission after a deferred result. A rejected or lost broker admission
+response defers only while the durable mapping is still `prepared`; an existing
+attempt fence always requires read-only reconciliation.
+
+Mappings/tombstones are never evicted. A write transaction enforces 65,536 rows
+and 64 MiB of UTF-8 content across all namespaces; at capacity, new IDs defer
+before any native attempt with an explicit capacity error, while existing
+mappings remain available. Native insertion already observed without a journal
+row remains uncertain at capacity and can be proved by read-only reconciliation. Capacity is not permission to
+delete the journal or reuse an attempted ID. There is no automatic journal
+compaction; preserve it with the matching broker state.
+
+A 204 response only accepts background native work. The plugin verifies the exact
+native user message's ID, role, session and complete text before committing
+`inserted` and returning success. This means **submitted**, never model
+acknowledgement, completion or permission approval. The agent explicitly uses
+existing broker MCP tools to acknowledge and reply with the broker ID as parent.
+
+Reconciliation is strictly read-only: no admission, journal transition or prompt
+call, including ordinary retries and `--allow-duplicate`. Exact native readback can prove insertion, including after a missing journal
+mapping or legacy migration. This never creates or mutates a journal row.
+An existing mapping must still match the immutable identity/content. Corrupt
+journals, missing native messages or mismatched text remain uncertain; none
+proves no attempt. A crash after the attempt fence but before insertion may therefore
+require manual inspection/acknowledgement. Legacy UUID-based native IDs are
+accepted only for read-only reconciliation; absent legacy mappings require exact native proof or remain
+uncertain. No same-ID replay repairs an unknown result.
+
+## Busy and permission behavior
+
+FIFO, bounded queuing/deadlines, pause/cancel and uncertain ordering barriers are
+broker-owned. The plugin refreshes native status once per fresh delivery and
+uses cached busy/permission events. Known busy work or pending permission defers
+before the attempt fence. An idle/readiness event lets the broker reconsider its
+existing queue; the plugin does not retain hidden submission work.
+
+Status checking cannot atomically reserve OpenCode's runner. In 1.18.35 the
+native prompt creates a user message before `ensureRunning` joins existing work.
+A user can start work after the idle snapshot: insertion may occur during that
+work and be processed by the existing run. The integration never cancels work,
+answers a permission prompt, supplies API `tools`/permissions fields, or replays
+an uncertain prompt. A receipt proves insertion, not processing order inside a
+native run. See [the recovery contract](../../docs/opencode-recovery.md).
+
+## Disposable native validation
 
 ```sh
 tools/opencode-native.sh /absolute/path/to/agent-bridge /absolute/path/to/opencode
 ```
 
-This creates disposable HOME/XDG/config/session/broker state, starts the actual
-pinned native runtime and loads this plugin. A scripted localhost OpenAI-compatible
-model fixture invokes the actual native MCP acknowledgement and correlated reply
-tools, and the harness checks the exact native user-message ID and broker parent.
-It requires no owner credentials or external model key and cleans up child
-processes and state. It validates native execution and tool wiring with synthetic
-model responses, **not** independent language-model judgement, human approval,
-physical-network behavior or busy/restart recovery. Dependency installation may
-need registry access; all generated native configuration is temporary.
+The harness uses isolated HOME/XDG/config/session/broker state and a scripted
+localhost OpenAI-compatible model fixture. It exercises the actual pinned native
+runtime, plugin, broker and MCP acknowledgement/reply path, blocking native tool
+work, pending native permission, and the residual idle-to-busy race. Temporary
+fixture policy is initial test configuration; no target session's permission
+rules are changed and no native permission response/cancel API is called.
+All children and temporary state are cleaned up. Registry access may be needed
+for native dependency initialization. Synthetic model responses validate real
+execution/tool wiring, not independent language-model judgement, production
+owner settings or physical-network behavior.

@@ -83,14 +83,18 @@ impl Native {
                 };
                 let frame = read_native_frame(&stream);
                 assert_eq!(frame["session"], session);
-                let mut receipt = json!({"ok":true,"session":session,"instance":instance});
+                let mut receipt =
+                    json!({"ok":true,"protocol":2,"session":session,"instance":instance});
                 if frame["op"] == "deliver" {
                     assert!(frame.get("permissions").is_none());
                     assert!(frame.get("tools").is_none());
                     let id = frame["id"].as_str().unwrap();
                     uuid::Uuid::parse_str(id).unwrap();
                     receipt["id"] = json!(id);
-                    receipt["native_message_id"] = json!(format!("msg_{}", id.replace('-', "")));
+                    for key in ["native_message_id", "namespace", "generation", "attempt"] {
+                        receipt[key] = frame[key].clone();
+                    }
+                    receipt["status"] = json!("inserted");
                     received.lock().unwrap().push(frame);
                     if lose_receipt {
                         continue;
@@ -118,6 +122,7 @@ impl Native {
             session: self.session.into(),
             endpoint: self.path.to_str().unwrap().into(),
             title: Some(title.into()),
+            ready: true,
         });
     }
     fn frames(&self) -> Vec<Value> {
@@ -468,6 +473,9 @@ async fn replacing_the_shared_route_does_not_transfer_native_provider_or_session
         setup(&a, &b, &na, &nb);
         connect(&a, &b).await;
         directory(&a, B).await;
+        if provider == Provider::OpenCode {
+            replacement.observe(&b, "Explicitly opened replacement session");
+        }
         b.request(Request::Register {
             agent: Agent {
                 name: nb.name(),
@@ -547,6 +555,7 @@ async fn queued_opencode_survives_origin_restart_and_destination_offline_recover
     );
     a.stop().await;
     let a = Running::start(&ap);
+    na.observe(&a, "Origin live after broker restart");
     assert_eq!(
         a.request(Request::Get { id: id.clone() })["transfer"]["state"],
         "pending"
@@ -556,6 +565,7 @@ async fn queued_opencode_survives_origin_restart_and_destination_offline_recover
         listen: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
     });
     let b = Running::start(&bp);
+    nb.observe(&b, "Destination live after broker restart");
     assert_eq!(b.listening().await, address);
     b.request(Request::PeerAddress {
         peer: "alice".into(),

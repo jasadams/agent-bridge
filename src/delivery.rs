@@ -85,9 +85,26 @@ pub async fn deliver_with_machines(
 pub(crate) async fn deliver_control_notice(
     agent: &Agent,
     msg: &Message,
-    _state_dir: &Path,
+    state_dir: &Path,
     notice: crate::clients::ControlNotice<'_>,
 ) -> Outcome {
+    if agent.provider == Provider::OpenCode {
+        return match crate::broker::rpc(
+            state_dir,
+            &crate::protocol::Request::OpenCodeNotice {
+                id: msg.id.clone(),
+                recipient: agent.name.clone(),
+                content: notice.text().to_owned(),
+            },
+        )
+        .await
+        {
+            Ok(_) => Outcome::submitted(
+                "OpenCode typed notice durably queued; native insertion and acknowledgement are unconfirmed",
+            ),
+            Err(error) => Outcome::failed(error),
+        };
+    }
     crate::clients::deliver_notice(agent, msg, notice).await
 }
 

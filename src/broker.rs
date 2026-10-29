@@ -304,7 +304,7 @@ impl Broker {
     }
     pub async fn request_async(&self, req: Request) -> Result<Value> {
         match req {
-            req @ Request::OpenCodeObserve { .. } => {
+            req @ (Request::OpenCodeObserve { .. } | Request::OpenCodeHeartbeat { .. }) => {
                 let broker = self.clone();
                 tokio::task::spawn_blocking(move || broker.request(req)).await?
             }
@@ -424,6 +424,9 @@ impl Broker {
             }
             Request::OpenCodeObserve {
                 session, endpoint, ..
+            }
+            | Request::OpenCodeHeartbeat {
+                session, endpoint, ..
             } => Some(crate::protocol::Agent {
                 name: crate::clients::lifecycle::routing_name(&Provider::OpenCode, session),
                 provider: Provider::OpenCode,
@@ -441,6 +444,7 @@ impl Broker {
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("Database lock poisoned"))?;
+        db.opencode_tick(crate::db::now())?;
         let registration = matches!(
             &req,
             Request::Register { .. } | Request::OpenCodeObserve { .. }
@@ -500,6 +504,9 @@ impl Broker {
             }
             Request::Register { mut agent, replace } => {
                 crate::clients::validate_registration(&mut agent)?;
+                if agent.provider == Provider::OpenCode {
+                    db.opencode_alias_admission(&agent)?;
+                }
                 db.register(&agent, replace)?;
                 json!(agent)
             }
@@ -507,6 +514,7 @@ impl Broker {
                 session,
                 endpoint,
                 title,
+                ready,
             } => {
                 ensure!(
                     title
@@ -522,9 +530,59 @@ impl Broker {
                     enabled: true,
                 };
                 crate::clients::validate_registration(&mut agent)?;
-                db.register(&agent, false)?;
+                let result = db.opencode_observe(&agent, ready)?;
                 db.observe_session_name(&agent.provider, &agent.session, title.as_deref())?;
-                json!(agent)
+                result
+            }
+            Request::OpenCodeHeartbeat {
+                session,
+                endpoint,
+                generation,
+                ready,
+            } => {
+                let endpoint = crate::clients::opencode::validate_endpoint(&endpoint)?
+                    .to_string_lossy()
+                    .into_owned();
+                db.opencode_heartbeat(&session, &endpoint, &generation, ready)?
+            }
+            Request::OpenCodeClose {
+                session,
+                endpoint,
+                generation,
+            } => {
+                let path = std::path::Path::new(&endpoint);
+                let endpoint = path
+                    .parent()
+                    .context("Missing OpenCode endpoint directory")?
+                    .canonicalize()?
+                    .join(
+                        path.file_name()
+                            .context("Missing OpenCode endpoint filename")?,
+                    )
+                    .to_string_lossy()
+                    .into_owned();
+                db.opencode_close(&session, &endpoint, &generation)?
+            }
+            Request::OpenCodeAdmit {
+                id,
+                session,
+                generation,
+                instance,
+                attempt,
+            } => db.opencode_admit(&id, &session, &generation, &instance, &attempt)?,
+            Request::OpenCodeNotice {
+                id,
+                recipient,
+                content,
+            } => {
+                let agent = db.resolve_agent(&recipient)?;
+                ensure!(
+                    agent.provider == Provider::OpenCode && agent.enabled,
+                    "Typed OpenCode notice requires an enabled exact local session"
+                );
+                let message = db.send(&id, "user", &agent.name, &content, &None)?;
+                db.opencode_notice_content(&id, &content)?;
+                json!({"queued":true,"message":message,"acknowledged":false})
             }
             Request::Unregister { name, session } => {
                 // SessionEnd can race a disconnect, so exact names remain usable while disabled.
@@ -1271,6 +1329,7 @@ impl Broker {
     async fn dispatch(&self) -> Result<()> {
         let mut workers = JoinSet::new();
         loop {
+            self.db.lock().unwrap().opencode_tick(crate::db::now())?;
             // Construct and enable before querying so arrivals cannot be lost between query and wait.
             let notified = self.wake.notified();
             tokio::pin!(notified);
@@ -1280,27 +1339,43 @@ impl Broker {
                     let mut db = self.db.lock().unwrap();
                     db.claim()?.map(|(msg, agent)| {
                         let machines = json!({"source_machine":self.message_machine(&db, &msg.sender)?,"destination_machine":self.message_machine(&db, &msg.recipient)?,"sender_name":self.message_sender_name(&db, &msg.sender)});
-                        Ok::<_, anyhow::Error>((msg, agent, machines))
-                    }).transpose()?
+                        let dispatch = if agent.provider==Provider::OpenCode {
+                            let content = crate::clients::Adapter::OpenCode.message_content(&msg,&self.state_dir,&machines);
+                            match db.opencode_dispatch(&msg,&agent,&content) {
+                                Ok(dispatch) => Some(dispatch),
+                                Err(error) => {
+                                    db.opencode_dispatch_failed(&msg.id,&error.to_string())?;
+                                    return Ok(None);
+                                }
+                            }
+                        } else { None };
+                        Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch)))
+                    }).transpose()?.flatten()
                 };
-                let Some((msg, agent, machines)) = next else {
+                let Some((msg, agent, machines, dispatch)) = next else {
                     break;
                 };
                 let this = self.clone();
                 workers.spawn(async move {
-                    let outcome = delivery::deliver_with_machines(
-                        &agent,
-                        &msg,
-                        &this.codex_bin,
-                        &this.state_dir,
-                        &machines,
-                    )
-                    .await;
-                    let result =
-                        this.db
-                            .lock()
-                            .unwrap()
-                            .finish(&msg.id, outcome.state, &outcome.detail);
+                    let outcome = if let Some(dispatch) = &dispatch {
+                        crate::clients::opencode::deliver_dispatch(&agent, dispatch).await
+                    } else {
+                        delivery::deliver_with_machines(
+                            &agent,
+                            &msg,
+                            &this.codex_bin,
+                            &this.state_dir,
+                            &machines,
+                        )
+                        .await
+                    };
+                    let db = this.db.lock().unwrap();
+                    let result = if let Some(dispatch) = &dispatch {
+                        db.opencode_finish(&msg.id, dispatch, outcome.state, &outcome.detail)
+                    } else {
+                        db.finish(&msg.id, outcome.state, &outcome.detail)
+                    };
+                    drop(db);
                     if let Err(e) = result {
                         eprintln!("Could not persist delivery outcome {}: {e:#}", msg.id);
                     }
@@ -1310,6 +1385,7 @@ impl Broker {
             }
             tokio::select! {
                 _=&mut notified=>{},
+                _=tokio::time::sleep(Duration::from_secs(1))=>{},
                 Some(result)=workers.join_next(),if !workers.is_empty()=>{result.context("Delivery task panicked")?;},
             }
         }
@@ -1557,5 +1633,120 @@ mod machine_tests {
             .unwrap();
         assert_eq!(paired["alias"], "machine-b");
         assert_eq!(paired["machine_name"], "renamed");
+    }
+}
+
+#[cfg(test)]
+mod opencode_admission_tests {
+    use super::*;
+    use crate::{
+        network::wire::{Envelope, RemoteAgent},
+        protocol::Agent,
+    };
+    #[tokio::test]
+    async fn remote_policy_is_rechecked_through_actual_admission_request_after_claim() {
+        for revoke in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
+            let broker = &bound.broker;
+            let origin = libp2p_identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id()
+                .to_string();
+            let local = broker.request(Request::Identity).unwrap()["peer_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let agent = Agent {
+                name: "native".into(),
+                provider: Provider::OpenCode,
+                session: "ses_0123456789abcdefghijklmnop".into(),
+                endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
+                enabled: true,
+            };
+            let (message, dispatch) = {
+                let mut db = broker.db.lock().unwrap();
+                // Inject a verified-live database fixture; native probes have
+                // separate real-socket coverage. No dispatcher runs in this test.
+                db.opencode_observe(&agent, true).unwrap();
+                db.pair_peer(&origin, &origin, Some("origin")).unwrap();
+                db.share_peer_session(&origin, &agent.name, true).unwrap();
+                let envelope = Envelope {
+                    origin_peer: origin.clone(),
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source: RemoteAgent {
+                        name: "source".into(),
+                        provider: Provider::Inbox,
+                        session: "source".into(),
+                    },
+                    destination_peer: local.clone(),
+                    destination: RemoteAgent {
+                        name: agent.name.clone(),
+                        provider: agent.provider.clone(),
+                        session: agent.session.clone(),
+                    },
+                    body: "Gate after native delivery claim".into(),
+                    parent: None,
+                    hops: 0,
+                };
+                db.accept_remote(&local, &origin, &envelope).unwrap();
+                let (msg, target) = db.claim().unwrap().unwrap();
+                let frame = db
+                    .opencode_dispatch(&msg, &target, "durable peer content")
+                    .unwrap();
+                (msg, frame)
+            };
+            // This is the deterministic gate after receiving the delivery frame,
+            // before the plugin invokes the real privileged admission operation.
+            assert_eq!(dispatch.frame["op"], "deliver");
+            let instance =
+                crate::clients::opencode::endpoint_instance(Path::new(&agent.endpoint)).unwrap();
+            let admission = || Request::OpenCodeAdmit {
+                id: message.id.clone(),
+                session: agent.session.clone(),
+                generation: dispatch.generation.clone(),
+                instance: instance.clone(),
+                attempt: dispatch.attempt.clone(),
+            };
+            broker.request(admission()).expect("Positive control: the current remote Receive grant admits this valid claimed frame");
+            if revoke {
+                broker
+                    .request(Request::PeerRevoke {
+                        peer: origin.clone(),
+                    })
+                    .unwrap();
+            } else {
+                broker
+                    .request(Request::PeerShare {
+                        peer: origin.clone(),
+                        agent: agent.name.clone(),
+                        shared: false,
+                    })
+                    .unwrap();
+            }
+            let denied = broker.request(admission());
+            assert!(
+                denied.is_err(),
+                "Revoked/unshared receiving policy must deny an already claimed frame"
+            );
+            let db = broker.db.lock().unwrap();
+            let phase: String = db
+                .conn
+                .query_row(
+                    "SELECT phase FROM opencode_deliveries WHERE id=?",
+                    [&message.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(phase, "dispatched"); // No insertion receipt or admission authority.
+            db.opencode_finish(
+                &message.id,
+                &dispatch,
+                "queued",
+                "plugin deferred denied admission before native invocation",
+            )
+            .unwrap();
+            assert_eq!(db.get(&message.id).unwrap().state, "queued");
+        }
     }
 }

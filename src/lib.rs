@@ -9,6 +9,7 @@ pub mod clients;
 pub use clients::claude_discovery;
 pub mod db;
 pub mod delivery;
+mod opencode_state;
 pub use clients::codex_discovery as discovery;
 pub use clients::lifecycle as hook;
 pub mod mcp;

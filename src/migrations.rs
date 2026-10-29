@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -159,6 +159,26 @@ ALTER TABLE peer_grants_v12 RENAME TO peer_grants;",
             tx.execute_batch(&sql)?;
         }
         tx.pragma_update(None, "user_version", 12)?;
+    }
+    if version < 13 {
+        tx.execute_batch("CREATE TABLE opencode_leases(session TEXT PRIMARY KEY,generation TEXT NOT NULL,instance TEXT NOT NULL,endpoint TEXT NOT NULL,expires INTEGER NOT NULL,ready INTEGER NOT NULL);
+CREATE TABLE opencode_deliveries(id TEXT PRIMARY KEY REFERENCES messages(id),session TEXT NOT NULL,generation TEXT NOT NULL,namespace TEXT NOT NULL,native_id TEXT NOT NULL,content TEXT,attempt TEXT,phase TEXT NOT NULL,deadline INTEGER NOT NULL);
+CREATE INDEX opencode_delivery_session ON opencode_deliveries(session);
+CREATE TRIGGER opencode_enqueue_bound BEFORE INSERT ON messages WHEN NEW.state='queued' AND (SELECT provider FROM agents WHERE name=NEW.recipient)='opencode' BEGIN
+ SELECT CASE WHEN (SELECT count(*) FROM messages WHERE state='queued')>=1000 THEN RAISE(ABORT,'Queue is full (1000 pending messages)') END;
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM opencode_leases l WHERE l.session=NEW.recipient_session AND l.expires>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)) THEN RAISE(ABORT,'OpenCode live lease required') END;
+ SELECT CASE WHEN (SELECT count(*) FROM messages m JOIN opencode_deliveries d ON d.id=m.id WHERE d.session=NEW.recipient_session AND m.state IN ('queued','sending','uncertain'))>=64 THEN RAISE(ABORT,'OpenCode session queue is full (64 pending messages)') END;
+END;
+CREATE TRIGGER opencode_retry_bound BEFORE UPDATE OF state ON messages WHEN NEW.state='queued' AND OLD.state<>'queued' AND EXISTS(SELECT 1 FROM opencode_deliveries WHERE id=NEW.id) BEGIN
+ SELECT CASE WHEN (SELECT count(*) FROM messages WHERE state='queued' AND id<>NEW.id)>=1000 THEN RAISE(ABORT,'Queue is full (1000 pending messages)') END;
+ SELECT CASE WHEN (SELECT count(*) FROM messages m JOIN opencode_deliveries d ON d.id=m.id WHERE d.session=NEW.recipient_session AND m.id<>NEW.id AND m.state IN ('queued','sending','uncertain'))>=64 THEN RAISE(ABORT,'OpenCode session queue is full (64 pending messages)') END;
+END;
+CREATE TRIGGER opencode_enqueue_binding AFTER INSERT ON messages WHEN (SELECT provider FROM agents WHERE name=NEW.recipient)='opencode' BEGIN
+ INSERT INTO opencode_deliveries SELECT NEW.id,NEW.recipient_session,COALESCE((SELECT generation FROM opencode_leases WHERE session=NEW.recipient_session),'unleased'),(SELECT value FROM settings WHERE key='opencode_namespace'),'pending',NULL,NULL,'queued',NEW.created+120000;
+END;
+INSERT INTO opencode_deliveries SELECT m.id,m.recipient_session,'legacy','legacy','msg_'||replace(lower(m.id),'-',''),NULL,NULL,'legacy',m.created+120000 FROM messages m JOIN message_context c ON c.id=m.id WHERE json_extract(c.destination,'$.provider')='opencode';
+UPDATE messages SET state='uncertain',detail='Legacy OpenCode queue has no durable attempt provenance; only read-only reconciliation is safe' WHERE state IN('queued','sending') AND id IN(SELECT id FROM opencode_deliveries);")?;
+        tx.pragma_update(None, "user_version", 13)?;
     }
     tx.commit()?;
     Ok(())

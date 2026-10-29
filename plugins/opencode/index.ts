@@ -2,189 +2,295 @@ import type { Plugin, Hooks } from "@opencode-ai/plugin";
 import type { Session } from "@opencode-ai/sdk";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { brokerRpc, MAX_FRAME } from "./rpc.ts";
 import { sameUser } from "./peer.ts";
+import { Journal, JournalCapacityError, nativeID, type Identity } from "./journal.ts";
 
 const SESSION = /^ses_[a-zA-Z0-9]{26}$/;
 const UUID = /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/;
-const RECEIPT_MS = 3000;
-const MAX_PENDING = 4096;
-type Frame = { op: "probe"; session: string } | { op: "deliver"; session: string; id: string; content: string };
+const LEASE_MS = 20000, HEARTBEAT_MS = 5000, RECEIPT_MS = 3000;
+type Delivery = Identity & { op: "deliver" | "reconcile"; generation: string; attempt: string };
+type Reply = { ok: boolean; instance: string; protocol: number; session: string; id?: string; namespace?: string; generation?: string; attempt?: string; native_message_id?: string; status?: "inserted" | "deferred" | "uncertain"; error?: string };
+type Frame = { op: "probe"; session: string } | Delivery;
+type Live = { generation: string; namespace: string; expires: number; busy: boolean; revision: number; permissions: Set<string> };
 type Data = { buffer: Buffer; handled: boolean; timer?: ReturnType<typeof setTimeout> };
-type Receipt = { ok: true; instance: string; session: string; id?: string; native_message_id?: string };
-type Submission = { fingerprint: string; native: string; session: string; content: string; pending?: Promise<Receipt>; receipt?: Receipt };
 
 function parseFrame(input: unknown): Frame {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid frame");
   const f = input as Record<string, unknown>;
-  const fields = f.op === "probe" ? ["op", "session"] : f.op === "deliver" ? ["op", "session", "id", "content"] : [];
-  if (!fields.length || Object.keys(f).length !== fields.length || Object.keys(f).some(k => !fields.includes(k)) || typeof f.session !== "string" || !SESSION.test(f.session) || f.session.length > 200) throw new Error("Invalid frame identity");
-  if (f.op === "deliver" && (typeof f.id !== "string" || !UUID.test(f.id) || typeof f.content !== "string" || !f.content.length || Buffer.byteLength(f.content) > MAX_FRAME - 1024 || f.content.includes("\0"))) throw new Error("Invalid delivery payload");
+  const fields = f.op === "probe" ? ["op", "session"] : f.op === "deliver" || f.op === "reconcile" ? ["op", "session", "id", "content", "namespace", "generation", "attempt", "native_message_id"] : [];
+  if (!fields.length || Object.keys(f).length !== fields.length || Object.keys(f).some(k => !fields.includes(k)) || typeof f.session !== "string" || !SESSION.test(f.session)) throw new Error("Invalid frame identity");
+  if (f.op !== "probe") {
+    for (const key of ["id", "namespace", "generation", "attempt"]) if (typeof f[key] !== "string" || !UUID.test(f[key] as string)) throw new Error("Invalid dispatch fence");
+    if (typeof f.content !== "string" || !f.content.length || Buffer.byteLength(f.content) > MAX_FRAME - 2048 || f.content.includes("\0") || (f.native_message_id !== nativeID(f.namespace as string, f.session, f.id as string) && !(f.op === "reconcile" && f.native_message_id === "msg_" + (f.id as string).replaceAll("-", "").toLowerCase()))) throw new Error("Invalid delivery mapping");
+  }
   return f as Frame;
 }
 
-// A V1 server plugin, using only its supplied SDK client. serverUrl may describe
-// no listener at all: it is deliberately never used to construct another client.
+// V1: only the supplied SDK client is authoritative; serverUrl may have no listener.
 const AgentBridge: Plugin = async (input, options = {}) => {
   const state = options.stateDir ?? process.env.AGENT_BRIDGE_STATE_DIR;
-  if (typeof state !== "string" || !isAbsolute(state)) throw new Error("Agent Bridge plugin requires an absolute stateDir option or AGENT_BRIDGE_STATE_DIR");
-  const instance = randomUUID();
-  // macOS TMPDIR commonly exceeds sockaddr_un limits once UUID.sock is added.
-  // /tmp is shared, but mkdtemp atomically creates this owner-private directory.
-  const directory = await mkdtemp("/tmp/aboc-");
+  if (typeof state !== "string" || !isAbsolute(state)) throw new Error("Agent Bridge plugin requires an absolute stateDir");
+  const journal = await Journal.open(state);
+  const instance = randomUUID(), directory = await mkdtemp("/tmp/aboc-");
   await chmod(directory, 0o700);
   const endpoint = join(directory, instance + ".sock");
-  const live = new Set<string>();
-  const submissions = new Map<string, Submission>();
-  const connections = new Set<Bun.Socket<Data>>();
-  let disposed = false;
-  let events = Promise.resolve();
-  const name = (session: string) => `opencode-${session}`;
-
-  function requireLive(session: string) {
-    if (disposed || !live.has(session)) throw new Error("Unknown, stale or disposed session");
+  const live = new Map<string, Live>(), connections = new Set<Bun.Socket<Data>>();
+  const active = new Set<Promise<unknown>>();
+  const deliveries = new Map<string, { fingerprint: string; pending: ReturnType<typeof handle> }>();
+  let disposed = false, events = Promise.resolve();
+  const ready = (entry: Live) => !entry.busy && entry.permissions.size === 0;
+  function guard(session: string, frame?: Delivery): Live {
+    const entry = live.get(session);
+    if (disposed || !entry || entry.expires <= Date.now() || frame && (entry.generation !== frame.generation || entry.namespace !== frame.namespace)) throw new Error("Stale session generation or lease");
+    return entry;
   }
   async function verified(session: string): Promise<Session> {
-    if (disposed || !SESSION.test(session) || session.length > 200) throw new Error("Invalid or disposed session");
+    if (disposed || !SESSION.test(session)) throw new Error("Invalid or disposed session");
     const result = await input.client.session.get({ path: { id: session } });
-    if (disposed) throw new Error("Plugin disposed during session lookup");
-    if (result.error || !result.data || result.data.id !== session || resolve(result.data.directory) !== resolve(input.directory)) throw new Error("Session does not belong to this plugin instance");
-    const time = result.data.time as Session["time"] & { archived?: number };
-    if (time.archived) throw new Error("Session is archived");
+    if (disposed || result.error || !result.data || result.data.id !== session || resolve(result.data.directory) !== resolve(input.directory) || (result.data.time as Session["time"] & { archived?: number }).archived) throw new Error("Native session is unavailable");
     return result.data;
   }
-  async function unregister(session: string) {
+  async function close(session: string) {
+    const entry = live.get(session);
     live.delete(session);
-    await brokerRpc(state as string, { op: "unregister", name: name(session), session });
+    if (entry?.generation) await brokerRpc(state as string, { op: "opencode_close", session, endpoint, generation: entry.generation });
   }
   async function observe(session: string) {
+    const old = live.get(session);
     let info: Session;
-    try { info = await verified(session); }
-    catch (error) { if (live.has(session)) await unregister(session); throw error; }
-    live.add(session); // Probe during registration must see this exact identity.
+    try { info = await verified(session); } catch (error) { if (old && live.get(session) === old) await close(session); throw error; }
+    if (disposed || live.get(session) !== old) throw new Error("Observation belongs to an ended lifecycle");
+    const entry = old && old.expires > Date.now() ? old : { generation: "", namespace: "", expires: Date.now() + LEASE_MS, busy: false, revision: 0, permissions: new Set<string>() };
+    live.set(session, entry); // Probe can validate provisional membership, never delivery.
     try {
-      await brokerRpc(state as string, { op: "opencode_observe", session, endpoint, title: info.title });
-    } catch (error) { live.delete(session); throw error; }
+      const result = await brokerRpc(state as string, { op: "opencode_observe", session, endpoint, title: info.title, ready: ready(entry) }) as { generation?: unknown; namespace?: unknown };
+      if (typeof result.generation !== "string" || !UUID.test(result.generation) || typeof result.namespace !== "string" || !UUID.test(result.namespace)) throw new Error("Invalid registration generation");
+      if (disposed || live.get(session) !== entry) {
+        await brokerRpc(state as string, { op: "opencode_close", session, endpoint, generation: result.generation });
+        throw new Error("Registration completed after its lifecycle ended");
+      }
+      entry.generation = result.generation; entry.namespace = result.namespace; entry.expires = Date.now() + LEASE_MS;
+    } catch (error) { if (live.get(session) === entry) live.delete(session); throw error; }
   }
-  async function receipt(frame: Extract<Frame, { op: "deliver" }>, item: Submission): Promise<Receipt> {
-    const deadline = Date.now() + RECEIPT_MS;
+  async function heartbeat(session: string, entry: Live) {
+    if (guard(session) !== entry) throw new Error("Heartbeat belongs to an ended lifecycle");
+    const generation = entry.generation;
+    try {
+      await brokerRpc(state as string, { op: "opencode_heartbeat", session, endpoint, generation, ready: ready(entry) });
+      if (disposed || live.get(session) !== entry || entry.generation !== generation) throw new Error("Replaced heartbeat generation");
+      entry.expires = Date.now() + LEASE_MS;
+    } catch (error) { if (live.get(session) === entry) live.delete(session); throw error; }
+  }
+  function response(frame: Frame, status?: "inserted" | "deferred" | "uncertain"): Reply {
+    return frame.op === "probe" ? { ok: true, instance, protocol: 2, session: frame.session } : { ok: status === "inserted", instance, protocol: 2, session: frame.session, id: frame.id, namespace: frame.namespace, generation: frame.generation, attempt: frame.attempt, native_message_id: frame.native_message_id, status };
+  }
+  function deferred(frame: Delivery, detail?: string, requirePrepared = false): Reply {
+    try {
+      guard(frame.session, frame);
+      const current = journal.find(frame);
+      if (current && current.state !== "prepared" || requirePrepared && !current) return response(frame, "uncertain");
+      // No await follows this fresh durable-state check. A deferral must never
+      // downgrade an attempt fence observed after an earlier idle snapshot.
+      return { ...response(frame, "deferred"), ...(detail ? { error: detail } : {}) };
+    } catch { return { ...response(frame, "uncertain"), error: "Cannot establish an untouched native attempt fence" }; }
+  }
+  function matches(value: NonNullable<Awaited<ReturnType<typeof input.client.session.message>>["data"]>, frame: Delivery) {
+    const { info, parts } = value;
+    const text = parts.filter(part => part.type === "text").map(part => part.text).join("");
+    if (info.id !== frame.native_message_id || info.sessionID !== frame.session || info.role !== "user" || text !== frame.content) throw new Error("Native receipt identity or text mismatch");
+  }
+  async function receipt(frame: Delivery, readonly: boolean) {
+    const deadline = Date.now() + (readonly ? 0 : RECEIPT_MS);
     do {
-      requireLive(frame.session);
-      const result = await input.client.session.message({ path: { id: frame.session, messageID: item.native } });
-      requireLive(frame.session);
+      guard(frame.session, frame);
+      const result = await input.client.session.message({ path: { id: frame.session, messageID: frame.native_message_id } });
+      guard(frame.session, frame);
       if (result.data) {
-        const { info, parts } = result.data;
-        const text = parts.filter(p => p.type === "text").map(p => p.text).join("");
-        if (info.id !== item.native || info.sessionID !== frame.session || info.role !== "user" || text !== item.content) throw new Error("Native message identity or payload mismatch");
-        const reply: Receipt = { ok: true, instance, session: frame.session, id: frame.id, native_message_id: item.native };
-        item.receipt = reply;
-        return reply;
+        matches(result.data, frame);
+        if (!readonly) journal.inserted(frame);
+        return response(frame, "inserted");
       }
+      if (result.response.status !== 404) throw new Error("Cannot read native insertion");
+      if (readonly) break;
       await Bun.sleep(25);
-    } while (Date.now() < deadline && !disposed);
-    throw new Error("Native insertion is unconfirmed; API acceptance is not a receipt");
+    } while (Date.now() < deadline);
+    return response(frame, "uncertain");
   }
-  async function handle(frame: Frame): Promise<Receipt> {
-    requireLive(frame.session);
+  async function handle(frame: Frame) {
+    const initial = guard(frame.session, frame.op === "probe" ? undefined : frame);
     try { await verified(frame.session); }
-    catch (error) { if (live.has(frame.session)) await unregister(frame.session); throw error; }
-    requireLive(frame.session);
-    if (frame.op === "probe") return { ok: true, instance, session: frame.session };
-    const fingerprint = createHash("sha256").update(frame.session).update("\0").update(frame.content).digest("hex");
-    let item = submissions.get(frame.id.toLowerCase());
-    if (item) {
-      if (item.fingerprint !== fingerprint) throw new Error("Broker message ID reused for a different payload");
-      if (item.receipt) return { ...item.receipt, id: frame.id };
-      if (!item.pending) item.pending = receipt(frame, item).finally(() => { item!.pending = undefined; });
-      return item.pending.then(result => ({ ...result, id: frame.id }));
+    catch (error) {
+      if (live.get(frame.session) === initial && (frame.op === "probe" || initial.generation === frame.generation)) await close(frame.session);
+      throw error;
     }
-    if (submissions.size >= MAX_PENDING) throw new Error("Plugin receipt capacity reached; restart recovery is unsupported");
-    item = { fingerprint, native: `msg_${frame.id.replaceAll("-", "").toLowerCase()}`, session: frame.session, content: frame.content };
-    submissions.set(frame.id.toLowerCase(), item);
-    const submission = item;
-    item.pending = (async () => {
-      // Check for the stable native ID before submitting, without rewriting it.
-      const existing = await input.client.session.message({ path: { id: frame.session, messageID: submission.native } });
-      requireLive(frame.session);
-      if (!existing.data) {
-        if (existing.response.status !== 404) throw new Error("Cannot establish native message absence");
-        requireLive(frame.session);
-        const result = await input.client.session.promptAsync({ path: { id: frame.session }, body: { messageID: submission.native, parts: [{ type: "text", text: frame.content }] } });
-        requireLive(frame.session);
-        if (result.error) throw new Error("Native prompt submission failed; insertion is unconfirmed");
-      }
-      return receipt(frame, submission);
-    })().finally(() => { submission.pending = undefined; });
+    const entry = guard(frame.session, frame.op === "probe" ? undefined : frame);
+    if (entry !== initial) throw new Error("Native lookup belongs to an ended lifecycle");
+    if (frame.op === "probe") return response(frame);
+    let row = journal.find(frame);
+    if (frame.op === "reconcile") {
+      // A missing mapping cannot prove absence, but exact native readback can
+      // prove insertion without creating a journal row or authorizing replay.
+      return receipt(frame, true); // No journal mutation, admission or prompt API.
+    }
+    // Every native lookup has a generation guard on its return.
+    const existing = await input.client.session.message({ path: { id: frame.session, messageID: frame.native_message_id } });
+    guard(frame.session, frame);
+    if (existing.data) {
+      matches(existing.data, frame);
+      journal.prepare(frame); journal.inserted(frame);
+      return response(frame, "inserted");
+    }
+    if (existing.response.status !== 404) throw new Error("Cannot establish native absence");
+    if (row && row.state !== "prepared") return response(frame, "uncertain");
+    const revision = entry.revision;
+    const status = await input.client.session.status();
+    guard(frame.session, frame);
+    if (status.error || !status.data || entry.revision !== revision) return deferred(frame);
+    entry.busy = status.data[frame.session]?.type !== undefined && status.data[frame.session]?.type !== "idle";
+    if (!ready(entry)) return deferred(frame);
+    try { row = journal.prepare(frame); }
+    catch (error) {
+      if (error instanceof JournalCapacityError) return deferred(frame, "Receipt journal capacity reached; no native attempt was made");
+      throw error;
+    }
+    if (row.state !== "prepared") return response(frame, "uncertain");
+    try {
+      await brokerRpc(state as string, { op: "opencode_admit", id: frame.id, session: frame.session, generation: frame.generation, instance, attempt: frame.attempt });
+    } catch {
+      guard(frame.session, frame);
+      // Broker denial/lost admission response is safe to defer only while the
+      // durable native-attempt fence is still untouched. Another CAS winner
+      // requires exact readback and can never be downgraded to deferred.
+      return deferred(frame, "Broker admission was unavailable; no native attempt was made", true);
+    }
+    guard(frame.session, frame);
+    if (!ready(entry)) return deferred(frame);
+    // FULL-sync CAS and the SDK invocation share this JS turn: no await or
+    // background queue can cross a deferred result or lose the generation guard.
+    if (!journal.attempt(frame)) return receipt(frame, true);
+    const result = await input.client.session.promptAsync({ path: { id: frame.session }, body: { messageID: frame.native_message_id, parts: [{ type: "text", text: frame.content }] } });
+    guard(frame.session, frame);
+    if (result.error) return response(frame, "uncertain");
+    return receipt(frame, false);
+  }
+
+  function dispatch(frame: Frame): ReturnType<typeof handle> {
+    if (frame.op !== "deliver") return handle(frame); // Reconciliation never joins submission work.
+    const key = frame.namespace + "\0" + frame.id.toLowerCase();
+    const fingerprint = JSON.stringify([frame.op, frame.session, frame.id.toLowerCase(), frame.namespace, frame.content, frame.native_message_id, frame.generation, frame.attempt]);
+    const existing = deliveries.get(key);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) return Promise.reject(new Error("In-flight broker ID identity or payload changed"));
+      return existing.pending.then(result => ({ ...result, id: frame.id }));
+    }
+    // JS cannot interleave another socket callback before this map insertion.
+    // Keep the entire handler, including admission and receipt verification,
+    // shared until it settles; duplicate callers cannot independently defer
+    // while a sibling handler retains an admitted native submission.
+    const item = { fingerprint, pending: handle(frame) };
+    item.pending = item.pending.finally(() => { if (deliveries.get(key) === item) deliveries.delete(key); });
+    deliveries.set(key, item);
     return item.pending.then(result => ({ ...result, id: frame.id }));
   }
 
-  const listener = Bun.listen<Data>({ unix: endpoint, socket: {
-    open(socket) {
-      if (disposed || !sameUser(socket)) { socket.terminate(); return; }
-      socket.data = { buffer: Buffer.alloc(0), handled: false };
-      connections.add(socket);
-      socket.data.timer = setTimeout(() => socket.terminate(), 6000);
-    },
-    data(socket, chunk) {
-      const data = socket.data;
-      if (!data || data.handled) { socket.terminate(); return; }
-      data.buffer = Buffer.concat([data.buffer, chunk]);
-      if (data.buffer.length > MAX_FRAME) { socket.end(JSON.stringify({ ok: false, instance, error: "Frame exceeds limit" }) + "\n"); return; }
-      const newline = data.buffer.indexOf(10);
-      if (newline < 0) return;
-      data.handled = true;
-      if (newline !== data.buffer.length - 1) { socket.end(JSON.stringify({ ok: false, instance, error: "Expected exactly one frame" }) + "\n"); return; }
-      let frame: Frame;
-      try { frame = parseFrame(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data.buffer.subarray(0, newline)))); }
-      catch { socket.end(JSON.stringify({ ok: false, instance, error: "Invalid frame" }) + "\n"); return; }
-      void handle(frame).then(
-        result => socket.end(JSON.stringify(result) + "\n"),
-        () => socket.end(JSON.stringify({ ok: false, instance, session: frame.session, ...(frame.op === "deliver" ? { id: frame.id, uncertain: submissions.has(frame.id.toLowerCase()) } : {}), error: "Session unavailable or native insertion unconfirmed" }) + "\n"),
-      );
-    },
-    close(socket) { if (socket.data?.timer) clearTimeout(socket.data.timer); connections.delete(socket); },
-    error(socket) { socket.terminate(); },
-  }});
-  try { await chmod(endpoint, 0o600); }
-  catch (error) { listener.stop(true); await rm(directory, { recursive: true, force: true }); throw error; }
-  const hooks: Hooks = {
+  let listener: Bun.SocketListener<Data>;
+  try {
+    listener = Bun.listen<Data>({ unix: endpoint, socket: {
+      open(socket) {
+        if (disposed || connections.size >= 64 || active.size >= 64 || !sameUser(socket)) { socket.terminate(); return; }
+        socket.data = { buffer: Buffer.alloc(0), handled: false };
+        connections.add(socket);
+        socket.data.timer = setTimeout(() => socket.terminate(), 10000);
+      },
+      data(socket, chunk) {
+        const data = socket.data;
+        if (!data || data.handled) { socket.terminate(); return; }
+        data.buffer = Buffer.concat([data.buffer, chunk]);
+        if (data.buffer.length > MAX_FRAME) { socket.end(JSON.stringify({ ok: false, instance, protocol: 2, error: "Frame exceeds limit" }) + "\n"); return; }
+        const newline = data.buffer.indexOf(10);
+        if (newline < 0) return;
+        data.handled = true;
+        let frame: Frame;
+        try {
+          if (newline !== data.buffer.length - 1) throw new Error("Expected exactly one frame");
+          frame = parseFrame(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data.buffer.subarray(0, newline))));
+        } catch { socket.end(JSON.stringify({ ok: false, instance, protocol: 2, error: "Invalid frame" }) + "\n"); return; }
+        const pending = dispatch(frame).then(
+          result => socket.end(JSON.stringify(result) + "\n"),
+          error => socket.end(JSON.stringify({ ...response(frame, "uncertain"), ok: false, error: error instanceof JournalCapacityError ? "Receipt journal capacity reached; existing native insertion requires reconciliation" : "Native session, lease or insertion unconfirmed" }) + "\n"),
+        );
+        active.add(pending); void pending.finally(() => active.delete(pending));
+      },
+      close(socket) { if (socket.data?.timer) clearTimeout(socket.data.timer); connections.delete(socket); },
+      error(socket) { socket.terminate(); },
+    }});
+    await chmod(endpoint, 0o600);
+  } catch (error) { journal.close(); await rm(directory, { recursive: true, force: true }); throw error; }
+  function enqueue(work: () => Promise<void>) {
+    events = events.catch(() => {}).then(work);
+    return events.catch(() => { console.error("Agent Bridge: native session registration is unavailable"); });
+  }
+  const timer = setInterval(() => {
+    void enqueue(async () => {
+      if (disposed) return;
+      for (const [session, entry] of live) {
+        if (entry.expires <= Date.now()) { live.delete(session); continue; }
+        await heartbeat(session, entry);
+      }
+    });
+  }, HEARTBEAT_MS);
+  timer.unref();
+  return {
     event: async ({ event }) => {
-      // v1.18.35 publishes tui.session.select but its generated V1 SDK union
-      // omits it. Validate the runtime frame instead of using the V2 SDK.
       const value = event as unknown as { type: string; properties: Record<string, unknown> };
-      const work = async () => {
+      const eventInfo = (value.properties.info ?? value.properties) as { id?: unknown; sessionID?: unknown };
+      const sourceSession = value.type.startsWith("session.") && ["session.created", "session.updated", "session.deleted"].includes(value.type) ? eventInfo.id : eventInfo.sessionID;
+      const sourceEntry = typeof sourceSession === "string" ? live.get(sourceSession) : undefined;
+      await enqueue(async () => {
         if (disposed) return;
+        const properties = value.properties;
+        if (typeof sourceSession === "string" && live.get(sourceSession) !== sourceEntry) return;
         if (value.type === "session.deleted") {
-          const info = value.properties.info as { id?: unknown } | undefined;
-          if (typeof info?.id === "string" && live.has(info.id)) await unregister(info.id);
-        } else if (value.type === "session.created" || value.type === "session.updated") {
-          const info = value.properties.info as { id?: unknown } | undefined;
-          if (typeof info?.id === "string" && (value.type === "session.created" || live.has(info.id))) await observe(info.id);
-        } else if (["tui.session.select", "session.status"].includes(value.type) && typeof value.properties.sessionID === "string") {
-          await observe(value.properties.sessionID);
-        }
-      };
-      events = events.catch(() => {}).then(work);
-      // Native dispatch does not await event hooks, so absorb errors here. Failed
-      // observations remove live membership and cannot enable a destination.
-      await events.catch(() => { console.error("Agent Bridge: native session registration is unavailable"); });
+          const id = (properties.info as { id?: unknown } | undefined)?.id;
+          if (typeof id === "string" && live.has(id)) await close(id);
+        } else if (["permission.updated", "permission.asked", "permission.replied"].includes(value.type)) {
+          const info = (properties.info ?? properties) as { sessionID?: unknown; id?: unknown; permissionID?: unknown };
+          if (typeof info.sessionID === "string") {
+            const entry = live.get(info.sessionID);
+            if (entry) {
+              const id = String(info.id ?? info.permissionID ?? "pending");
+              if (value.type === "permission.replied") entry.permissions.delete(id); else entry.permissions.add(id);
+              entry.revision++;
+              await heartbeat(info.sessionID, entry);
+            }
+          }
+        } else if (value.type === "session.status" && typeof properties.sessionID === "string") {
+          const entry = live.get(properties.sessionID);
+          if (entry) { entry.revision++; entry.busy = (properties.status as { type?: unknown })?.type !== "idle"; await heartbeat(properties.sessionID, entry); }
+          else await observe(properties.sessionID);
+        } else if (["session.created", "session.updated"].includes(value.type)) {
+          const id = (properties.info as { id?: unknown } | undefined)?.id;
+          if (typeof id === "string" && (value.type === "session.created" || live.has(id))) await observe(id);
+        } else if (value.type === "tui.session.select" && typeof properties.sessionID === "string") await observe(properties.sessionID);
+      });
     },
     "chat.message": async ({ sessionID }) => {
-      events = events.catch(() => {}).then(async () => { if (!disposed) await observe(sessionID); });
-      await events.catch(() => { console.error("Agent Bridge: native session registration is unavailable"); });
+      const entry = live.get(sessionID);
+      await enqueue(async () => { if (!disposed && live.get(sessionID) === entry) await observe(sessionID); });
     },
     dispose: async () => {
       if (disposed) return;
-      disposed = true;
-      listener.stop(true);
+      disposed = true; clearInterval(timer); listener.stop(true);
       for (const socket of connections) socket.terminate();
       await events.catch(() => {});
-      const results = await Promise.allSettled([...live].map(unregister));
-      await rm(directory, { recursive: true, force: true });
-      if (results.some(result => result.status === "rejected")) throw new Error("Some OpenCode registrations could not be removed; their dead endpoint rejects delivery");
+      const results = await Promise.allSettled([...live.keys()].map(close));
+      // Native calls may remain unresolved; their guards prevent journal access
+      // after disposal. Do not wait indefinitely or keep a model process alive.
+      journal.close(); await rm(directory, { recursive: true, force: true });
+      if (results.some(result => result.status === "rejected")) throw new Error("Some native leases could not be closed; expiry fences them");
     },
-  };
-  return hooks;
+  } satisfies Hooks;
 };
 export default AgentBridge;

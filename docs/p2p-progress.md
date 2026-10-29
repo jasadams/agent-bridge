@@ -90,5 +90,8 @@ A pinned OpenCode 1.18.35 V1 plugin and built-in local adapter register observed
 live sessions, retain shared native titles and submit peer messages to exact
 existing conversations with ordinary retry deduplication. Native insertion
 receipts remain distinct from model acknowledgements and correlated replies.
-Remote OpenCode sharing (AGB-6), busy ordering and restart recovery (AGB-4) remain
-separate. See [OpenCode integration](opencode.md) for scope and validation limits.
+Canonical FIFO, bounded busy/permission deferral, generation leases, durable
+receipt fences and read-only restart reconciliation are implemented. Real native
+fixtures cover busy tools, unanswered permissions, pause/cancel and the residual
+idle-to-busy race without cancellation or approval responses. OpenCode also uses
+explicit paired-peer provider/session grants and negotiated remote capabilities. See [OpenCode integration](opencode.md) for scope and validation limits.

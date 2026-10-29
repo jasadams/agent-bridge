@@ -2,8 +2,8 @@
 
 The built-in `opencode` provider targets an exact existing OpenCode session, not
 its build/plan mode. This integration supports OpenCode **1.18.35**, its **V1**
-`@opencode-ai/plugin` and `@opencode-ai/sdk` packages at **1.18.35**, and Bun
-**1.3.11**. The plugin package and lockfile are in `plugins/opencode/`.
+`@opencode-ai/plugin` and `@opencode-ai/sdk` packages at **1.18.35**. Native
+OpenCode embeds Bun **1.3.14**; standalone plugin tests use Bun **1.3.11**. The plugin package and lockfile are in `plugins/opencode/`.
 Installation into the owner's configuration is separate work; this ticket does
 not install a plugin, replace a service, or change native permissions.
 
@@ -29,10 +29,13 @@ identities. Routes are `opencode-SESSION_ID`; use `opencode:TITLE` for title loo
 Duplicate titles remain ambiguous.
 
 Deleting/archiving a session or disposing the plugin unregisters its live routes.
-An abrupt process exit can leave a stale enabled registration. Its socket cannot
-accept delivery, and a second enabled plugin endpoint for the same session is
-rejected. Explicitly unregister the stale exact route before replacing it.
-Automatic restart reconciliation and busy-session ordering belong to AGB-4.
+A crashed/closed instance expires through a 20-second lease, renewed every five
+seconds by the live plugin. Broker expiry also runs while paused and without
+native events. Stale generations cannot renew, close or update a replacement.
+A new verified live instance can reopen the same conversation after expiry;
+old queued work cannot silently follow its new generation. Explicit retry of
+provably unattempted work checks the original exact identity before rebinding.
+Attempted work only reconciles through native readback.
 
 ## Private transport and receipts
 
@@ -45,32 +48,60 @@ unavailable credential checks. It validates one bounded newline JSON frame per
 connection, payload fields, UUID message IDs and live session membership before
 calling the client. Unknown, archived and mismatched sessions fail closed.
 
-The local broker operation `opencode_observe` accepts `session`, `endpoint` and
-optional `title`; it probes that exact endpoint/session before registering the
-stable route and storing shared native title metadata. Ordinary explicit
-registration performs the same probe. Metadata alone cannot enable a session.
-The transport accepts `{op:"probe",session}` and
-`{op:"deliver",session,id,content}`. Successful receipts include `ok`, `session`
-and `instance`; delivery receipts additionally include the broker `id` and
-`native_message_id`. Frames are bounded to 256 KiB. Content is the shared peer
-envelope with explicit acknowledgement and correlated reply instructions.
+The local `opencode_observe` operation registers a verified live generation and
+returns its durable broker namespace. Heartbeats, readiness, close and native
+admission bind that exact generation and endpoint instance. Metadata alone cannot
+enable a session. Socket protocol **2** delivers bounded structured frames that
+bind session, broker message ID, namespace, generation, dispatch attempt, original
+rendered content and native message ID. Both plugin and broker must be upgraded
+together; protocol 1 cannot provide this recovery contract.
 
-A broker UUID maps deterministically to `msg_` plus the lowercase UUID without hyphens.
-The plugin retains each in-flight submission and checks the native message ID so
-ordinary retries cannot create a second prompt. It never treats an uncertain
-submission as permission to blindly repeat a prompt. This is ordinary retry
-idempotence within the supported process lifetime, not durable crash recovery.
+FIFO and bounded backpressure belong to the broker, keyed by provider and native
+session across aliases. At most 64 pending messages may target one OpenCode
+conversation; the shared 1000-message queued bound also applies to direct/remote
+enqueue and retries. A busy or permission-waiting session defers before any native
+attempt, leaving the message broker-owned, queued and cancellable. Pause is checked
+again at admission. The plugin has no hidden future-submission queue. A durable
+120-second busy window expires without native events; heartbeats and restart never
+extend it. Explicit operator retry of known unattempted work starts a new bounded
+window. A queued *reconciliation* of an earlier attempt cannot be cancelled as if
+it were unattempted work. Unresolved attempts remain barriers to fresh native
+submissions; read-only reconciliation can inspect multiple uncertain messages.
 
-`session.promptAsync` returning HTTP 204 is **not** evidence of durable insertion:
-the native handler starts a background prompt and returns before insertion can
-finish. The plugin verifies the exact native user message through
-`session.message` before emitting a successful application receipt. The broker
-records that as **submitted**, never acknowledged or complete. A missing,
-malformed, mismatched or lost receipt after writing is uncertain. A model must
-explicitly call the existing MCP/CLI acknowledgement and send a reply preserving
-the broker message ID as its parent; API acceptance never supplies that authority.
-AGB-4 must add durable receipts, restart reconciliation and ordered busy-session
-recovery without changing this distinction.
+A native ID is `msg_` plus a SHA-256 digest of the durable broker namespace, exact
+session and lowercase broker UUID, separated by NUL bytes. This avoids native ID
+collisions between brokers and conversations. The broker stores original rendered
+content before delivery. A private FULL-sync SQLite plugin journal retains
+immutable mappings and prepared/attempting/inserted tombstones. Its atomic
+prepared-to-attempting transition has one winner across plugin processes. Receipts
+are persisted before success. Durable limits (65,536 rows and 64 MiB of text)
+reject new mappings rather than evicting duplicate protection. No automatic journal
+pruning is provided.
+
+`session.promptAsync` returning HTTP 204 is **not** evidence of durable insertion.
+The plugin verifies exact native user-message ID, session, role and text before a
+successful receipt. The broker records **submitted**, never acknowledged or
+complete. A lost, malformed, mismatched or missing response after an attempted
+write is uncertain. `retry MESSAGE_ID` for attempted OpenCode work is **read-only
+reconciliation**, even with `--allow-duplicate`: exact existing native content can
+prove insertion, including when a journal mapping is missing; absence cannot prove
+no attempt, and never authorizes another prompt. Missing/corrupt journals do not
+create permission to repeat an attempt. All migrated legacy IDs reconcile read-only. An old broker's explicit retry could
+turn a submitted/uncertain message back into queued without preserving attempt
+provenance, so even migrated queued work is uncertain and blocks fresh submissions.
+Legacy absence cannot authorize a new prompt or a replacement namespaced ID;
+genuine unattempted legacy work is indistinguishable and requires conservative
+operator resolution. Only modern durable pre-attempt records can be retried as new
+submissions under the same message ID.
+
+The native idle check and submission are not atomic. Another native prompt can
+start after the final idle snapshot; the peer message may then become visible
+while native work is active. The supported runner joins that work rather than
+cancelling it; subsequent processing follows native behavior. Admission linearizes
+an in-flight submission: a later pause cannot recall it. No native cancellation or
+permission response is sent. A model must explicitly acknowledge and send a reply
+with the broker parent ID. There is no exactly-once model-processing or completion
+claim. See [recovery invariants](opencode-recovery.md) for crash transitions.
 
 ## Sharing with a paired machine
 
@@ -104,7 +135,9 @@ requires a successful legacy directory response. The strict legacy directory
 fixture is pinned to pre-OpenCode commit `8fde538`.
 
 Schema 12 extends the strict session grant provider constraint to OpenCode while
-preserving existing permissions. Older binaries reject this newer database schema;
+preserving existing permissions. Schema 13 adds local lease/generation and durable
+delivery binding tables with transactional enqueue/backpressure guards. Older
+binaries reject this newer database schema;
 a downgrade requires the matching pre-upgrade database backup and binary.
 
 No API `tools`/permissions fields, permission hooks, approval responses, automatic
@@ -120,8 +153,10 @@ isolated two-broker remote coverage are in `tests/opencode_store.rs` and
 `tests/opencode_network.rs`. These source checks do not establish live model
 reasoning, physical cross-machine delivery or macOS runtime acceptance.
 The deterministic native harness uses a local model fixture; it checks real
-OpenCode/plugin/broker execution and message correlation, not an external model's
-reasoning or the owner's production environment. Physical/native macOS runtime
+OpenCode/plugin/broker execution, acknowledgement/reply, read-only reconciliation,
+held native tools, queued pause/cancel, unanswered permission waits and the residual
+idle-to-busy race. It makes no native cancel/permission-response calls. It does not
+test an external model's reasoning or the owner's production environment. Physical/native macOS runtime
 acceptance remains separate from source checks and CI tests.
 
 Baseline API sources: [V1 plugin interface](https://github.com/anomalyco/opencode/blob/v1.18.35/packages/plugin/src/index.ts),
