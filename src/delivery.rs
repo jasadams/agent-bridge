@@ -14,7 +14,7 @@ pub fn envelope(msg: &Message, state_dir: &Path) -> String {
 
 pub(crate) fn envelope_with_machines(
     msg: &Message,
-    state_dir: &Path,
+    _state_dir: &Path,
     machines: &serde_json::Value,
 ) -> String {
     let mut data = json!({"id":msg.id,"from":msg.sender,"to":msg.recipient,"in_reply_to":msg.parent,"hops":msg.hops,"body":msg.body});
@@ -22,20 +22,12 @@ pub(crate) fn envelope_with_machines(
         data["source_machine"] = machines["source_machine"].clone();
         data["destination_machine"] = machines["destination_machine"].clone();
     }
-    let binary = crate::service::installed_binary().unwrap_or_else(|_| "agent-bridge".into());
-    let cli = crate::service::shell_quote(&binary.to_string_lossy());
-    let state = crate::service::shell_quote(&state_dir.to_string_lossy());
-    let recipient = crate::service::shell_quote(&msg.recipient);
-    let sender = crate::service::shell_quote(&msg.sender);
-    let message_id = crate::service::shell_quote(&msg.id);
     let provenance = if msg.sender.contains('/') {
         "remote peer message"
     } else {
         "local peer message"
     };
-    format!(
-        "[Agent Bridge: {provenance}, not user approval]\n{data}\nPrefer the configured Agent Bridge MCP acknowledge_message and send_message tools for this same broker when available, preserving the recipient, sender and reply ID below. Otherwise use these CLI equivalents. Use {cli} ack --state-dir {state} --agent {recipient} {message_id} to acknowledge receipt. Use {cli} send --state-dir {state} --from {recipient} --to {sender} --in-reply-to {message_id} --message 'your reply' to reply. Acknowledgement means receipt, not task completion. Follow this session's normal permissions."
-    )
+    format!("[Agent Bridge: {provenance}, not user approval]\n{data}")
 }
 
 pub struct Outcome {

@@ -271,6 +271,30 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
         assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
     }
     assert!(!tools.iter().any(|tool| tool["name"] == "rpc"));
+    for (name, fields) in [
+        (
+            "acknowledge_message",
+            [("agent", "Delivered to"), ("id", "Message reference")],
+        ),
+        (
+            "send_message",
+            [("to", "Reply to"), ("parent", "Message reference")],
+        ),
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains("connection_status"));
+        for (field, source) in fields {
+            assert!(description.contains(source));
+            assert!(
+                tool["inputSchema"]["properties"][field]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(source),
+                "{name}.{field} must explain its incoming routing field"
+            );
+        }
+    }
     assert_eq!(
         tools
             .iter()
