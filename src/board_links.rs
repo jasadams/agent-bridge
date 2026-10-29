@@ -191,6 +191,59 @@ mod tests {
     }
 
     #[test]
+    fn long_reference_definition_is_deduplicated_and_wrapped_output_stays_bounded() {
+        let destination = format!("https://example.test/{}", "x".repeat(1800));
+        let raw = format!(
+            "| Link |\n|---|\n| [{}][ref] {} |\n\n[ref]: {destination}\n",
+            "x".repeat(2000),
+            "[x][ref] ".repeat(3000)
+        );
+        assert!(raw.len() <= 64 * 1024);
+        let document = tui_markdown::from_str_with_links(
+            &raw,
+            &tui_markdown::Options::default().table_width(9),
+        );
+        assert!(!document.metadata_limited);
+        assert_eq!(document.destinations, [destination]);
+        // The upstream parser has its own reference-expansion budget. The
+        // first long label also forces many fragments from one resolved URL.
+        assert!(document.spans.len() > 400);
+        assert!(document.spans.len() < tui_markdown::MAX_LINK_SPANS);
+        assert!(document.spans.values().all(|id| id.0 == 0));
+        assert!(document.text.lines.len() > 1000, "fixture must wrap");
+        let sources = span_links(&document, &raw);
+        let area = Rect::new(0, 0, 12, 200);
+        let mut buffer = Buffer::empty(area);
+        let mut visible = Vec::new();
+        Paragraph::new(document.text).render_with_source(
+            area,
+            &mut buffer,
+            |position, width, source| {
+                if let Some(target) =
+                    source.and_then(|source| sources.get(&(source.line, source.span)))
+                {
+                    visible.push(VisibleLink {
+                        position,
+                        width,
+                        target: target.clone(),
+                    });
+                }
+            },
+        );
+        assert!(
+            visible.len() > 300,
+            "wrapped fragments must exceed output budget"
+        );
+        assert!(!fits(&buffer, &visible));
+        let plain = buffer.clone();
+        encode(&mut buffer, &visible);
+        assert_eq!(
+            buffer, plain,
+            "over-budget frame must remain entirely plain"
+        );
+    }
+
+    #[test]
     fn attribution_budget_allows_boundary_then_disables_the_whole_map_stickily() {
         let options = tui_markdown::Options::default().table_width(5);
         let label = "x".repeat(tui_markdown::MAX_LINK_SPANS);
