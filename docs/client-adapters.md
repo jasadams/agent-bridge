@@ -15,7 +15,9 @@ Direct adapter delivery without the broker's durable context fails closed. See
 OpenCode uses the same explicit paired-peer session grants as the other clients;
 see [OpenCode setup and limits](opencode.md).
 The Codex adapter owns private daemon initialization, loaded-session checks, and
-queue submission. Discovery observers and hook/context generation live in this
+queue submission. Its current queue-only path waits for a whole active Codex turn;
+see the [native delivery diagnosis and proposal](codex-delivery-diagnosis.md).
+Discovery observers and hook/context generation live in this
 module too. Discovery only observes existing sessions; it never starts or resumes
 a model session. Public `delivery`, `discovery`, `claude_discovery`, and `hook`
 entry points remain available for compatibility.

@@ -27,6 +27,11 @@ receiving messages do not depend on trusting the optional hooks. See the
 [official Codex documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 for MCP client configuration.
 
+On Codex 0.165.0, native queue acceptance can wait for the entire active turn to
+finish, including tool continuations; the native queue is limited to 100 entries.
+Acceptance is not model receipt. See the [delivery diagnosis and proposed active
+handoff path](codex-delivery-diagnosis.md) for reproducible evidence and limits.
+
 ## Claude Code
 
 Install lifecycle hooks, then start a new session or restart the relevant session:

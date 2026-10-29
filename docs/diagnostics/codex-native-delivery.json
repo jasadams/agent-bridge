@@ -1,0 +1,214 @@
+{
+  "versions": {
+    "platform": "Linux-7.0.9-204.fc44.x86_64-x86_64-with-glibc2.43",
+    "python": "3.14.4",
+    "websockets": "15.0.1",
+    "source_commit": "5cb93aa7b932c8bdeb84cc5c4b9c0257b327574c",
+    "broker": {
+      "path": "/home/jason/repos/agent-bridge-worktrees/agb-11-native-delivery-diagnosis-20261029/target/debug/agent-bridge",
+      "sha256": "941d9bfbf946cf6262de6d1908cbadc55456de119b9a64921a60e5bb1ae22763",
+      "version": "agent-bridge 0.2.0"
+    },
+    "codex": {
+      "path": "/home/jason/.codex/packages/standalone/releases/0.165.0-x86_64-unknown-linux-musl/bin/codex",
+      "sha256": "c06a67fd8ac76508dc78bd99ce20c9f317b8d568beda59485f3f4134df9962d5",
+      "version": "codex-cli 0.165.0"
+    }
+  },
+  "cases": [
+    {
+      "name": "idle",
+      "thread": "01a185e5-4c77-7980-b1f9-b76b9053a0c6",
+      "message_id": "501633de-711e-449b-a1fb-aef5e899448e",
+      "native_user_item": "01a185e5-4cae-7e90-9447-e4b9efaddf50",
+      "native_user_observed": "2026-10-29T04:22:39.535603+00:00",
+      "queue_request": "2026-10-29T04:22:39.504335+00:00",
+      "queue_response": "2026-10-29T04:22:39.512305+00:00",
+      "native_queue_id": "01a185e5-4c90-7282-b66f-14bf3a475517",
+      "model_received": "2026-10-29T04:22:39.561236+00:00",
+      "ack_and_reply_verified": "2026-10-29T04:22:39.649537+00:00"
+    },
+    {
+      "name": "generating",
+      "thread": "01a185e5-4d2a-7200-ae8e-824bf59e736e",
+      "message_id": "f65a27f1-3308-44d2-91b7-062c4e99a956",
+      "native_user_item": "01a185e5-5591-7bd0-8e24-e73f6e305647",
+      "native_user_observed": "2026-10-29T04:22:41.810715+00:00",
+      "queue_request": "2026-10-29T04:22:39.735057+00:00",
+      "queue_response": "2026-10-29T04:22:39.736393+00:00",
+      "native_queue_id": "01a185e5-4d77-7643-aa98-2079e9da3a35",
+      "model_received": "2026-10-29T04:22:41.827882+00:00",
+      "ack_and_reply_verified": "2026-10-29T04:22:41.906710+00:00",
+      "active_released": "2026-10-29T04:22:41.793723+00:00",
+      "original_turn_completed": "2026-10-29T04:22:41.804749+00:00"
+    },
+    {
+      "name": "held-tool",
+      "thread": "01a185e5-55f8-7d23-a4fb-ba499afe6edd",
+      "message_id": "d61875f0-08ab-4773-bf3e-9da5ec91f919",
+      "native_user_item": "01a185e5-6685-7bd3-aefa-cb48448a2718",
+      "native_user_observed": "2026-10-29T04:22:46.150545+00:00",
+      "queue_request": "2026-10-29T04:22:42.189570+00:00",
+      "queue_response": "2026-10-29T04:22:42.190720+00:00",
+      "native_queue_id": "01a185e5-570d-73a0-bcd8-fade89da8b7f",
+      "model_received": "2026-10-29T04:22:46.169809+00:00",
+      "ack_and_reply_verified": "2026-10-29T04:22:46.250557+00:00",
+      "active_released": "2026-10-29T04:22:44.253260+00:00",
+      "original_turn_completed": "2026-10-29T04:22:46.144455+00:00"
+    },
+    {
+      "name": "long-turn",
+      "thread": "01a185e5-66ef-7463-ab54-ab6d1dbbef6a",
+      "message_id": "4b9c2eb8-900e-479f-9f29-4ff331aaf7f9",
+      "native_user_item": "01a185e5-73ba-7ca2-80a3-25b88156e3d4",
+      "native_user_observed": "2026-10-29T04:22:49.532407+00:00",
+      "queue_request": "2026-10-29T04:22:47.433425+00:00",
+      "queue_response": "2026-10-29T04:22:47.434428+00:00",
+      "native_queue_id": "01a185e5-6b89-7c73-a6ac-d7feec547055",
+      "model_received": "2026-10-29T04:22:49.549391+00:00",
+      "ack_and_reply_verified": "2026-10-29T04:22:49.621462+00:00",
+      "active_released": "2026-10-29T04:22:49.498237+00:00",
+      "original_turn_completed": "2026-10-29T04:22:49.523488+00:00"
+    },
+    {
+      "name": "disconnected",
+      "thread": "01a185e5-741a-7563-aee2-7414b1bbf99a",
+      "message_id": "2bc34a65-1bd3-4c07-a049-81529d918215",
+      "native_user_item": "01a185e5-7c88-7232-be6b-af0a7efccf1e",
+      "native_user_observed": "2026-10-29T04:22:51.918788+00:00",
+      "queue_request": "2026-10-29T04:22:49.706413+00:00",
+      "queue_response": "2026-10-29T04:22:49.707609+00:00",
+      "native_queue_id": "01a185e5-746a-72e2-91a8-8f0074630a00",
+      "model_received": "2026-10-29T04:22:51.810515+00:00",
+      "ack_and_reply_verified": "2026-10-29T04:22:51.922983+00:00",
+      "active_released": "2026-10-29T04:22:51.763347+00:00"
+    },
+    {
+      "name": "saturation",
+      "thread": "01a185e5-7d19-7280-b225-604c74ab22d8",
+      "message_id": "8e0b9abe-3fe7-4c93-9589-14cc2f0a1fe1",
+      "queue_request": "2026-10-29T04:22:52.155644+00:00",
+      "queue_response": "2026-10-29T04:22:52.156386+00:00",
+      "error": {
+        "code": -32600,
+        "message": "queue cannot contain more than 100 submissions"
+      },
+      "accepted_count": 100
+    },
+    {
+      "name": "steer",
+      "thread": "01a185e5-8b2b-7aa2-8e3f-3c687a3397bc",
+      "message_id": "7efeed47-34fd-4559-9723-058a74574450",
+      "native_user_item": "01a185e5-8b7a-7461-ab80-51f32c0458af",
+      "native_user_observed": "2026-10-29T04:22:55.611270+00:00",
+      "accepted": "2026-10-29T04:22:55.606550+00:00",
+      "connection_closed": "2026-10-29T04:22:55.606981+00:00",
+      "model_received": "2026-10-29T04:22:55.626843+00:00",
+      "verified": "2026-10-29T04:22:55.639689+00:00"
+    },
+    {
+      "name": "steer-held-tool",
+      "thread": "01a185e5-8b9d-7500-bf20-06234f1fd069",
+      "message_id": "326aaca2-3c0e-4cb3-9668-f8e71117df16",
+      "native_user_item": "01a185e5-9bea-7ba1-b608-f20fff89c8a6",
+      "native_user_observed": "2026-10-29T04:22:59.820669+00:00",
+      "held_tool_completed": "2026-10-29T04:22:59.807855+00:00",
+      "accepted": "2026-10-29T04:22:55.922528+00:00",
+      "connection_closed": "2026-10-29T04:22:55.922983+00:00",
+      "model_received": "2026-10-29T04:22:59.854300+00:00",
+      "verified": "2026-10-29T04:22:59.869969+00:00"
+    }
+  ],
+  "ticket": "AGB-11",
+  "base_commit": "5cb93aa7b932c8bdeb84cc5c4b9c0257b327574c",
+  "harness_sha256": "79de89cc76d3a67c4f7d9c765505939b8ce733d3c3331658f356087c5d5d7717",
+  "artifact_root": "/tmp/agb11-codex-ybkph6le",
+  "raw_artifact_sha256": {
+    "events.json": "2b9079c54696f992af566cfdd4be6a0bd888058cb71af0da3584dbf5b39d67e1",
+    "results.json": "561a571adf6736510a48717ed4da6e26bd82c588e9ed50eb1e8c28c83765aaeb",
+    "versions.json": "e251e76a3f2059cc697f3b30966dbe5c2a2eac0501ead4553e4ba3f2ffa8db80"
+  },
+  "production_source_changes": false,
+  "instructions": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".claude/team.md",
+    ".claude/build-test.md",
+    "docs/CODING_STANDARDS.md",
+    "docs/native-sessions.md",
+    "docs/client-adapters.md"
+  ],
+  "validation": [
+    {
+      "command": "cargo +1.98.0 build --locked -p agent-bridge",
+      "exit": 0
+    },
+    {
+      "command": "python3 -m py_compile tools/codex-native-delivery.py",
+      "exit": 0
+    },
+    {
+      "command": "python3 tools/codex-native-delivery.py --help",
+      "exit": 0
+    },
+    {
+      "command": "python3 tools/codex-native-delivery.py --verify-artifacts /tmp/agb11-codex-ybkph6le",
+      "exit": 0,
+      "verified_cases": 8
+    },
+    {
+      "command": "python3 tools/codex-native-delivery.py --broker target/debug/agent-bridge",
+      "exit": 0,
+      "artifact_root": "/tmp/agb11-codex-ybkph6le",
+      "native_cases": 8
+    }
+  ],
+  "native_run_inventory": [
+    {
+      "artifacts": "/tmp/agb11-codex-rqi45py6",
+      "exit": 1,
+      "completed_cases": 2,
+      "failure": "harness awaited subscribed completion event on disconnected fresh metadata connection; actual MCP tools ran"
+    },
+    {
+      "artifacts": "/tmp/agb11-codex-mybjllb1",
+      "exit": 1,
+      "completed_cases": 5,
+      "failure": "harness default queue page size assumption25vs100; native capacity error already observed"
+    },
+    {
+      "artifacts": "/tmp/agb11-codex-kuiyf123",
+      "exit": 0,
+      "completed_cases": 2
+    },
+    {
+      "artifacts": "/tmp/agb11-codex-5qw4f5mx",
+      "exit": 0,
+      "completed_cases": 2
+    },
+    {
+      "artifacts": "/tmp/agb11-codex-zi697r4w",
+      "exit": 0,
+      "completed_cases": 8
+    },
+    {
+      "artifacts": "/tmp/agb11-codex-eqb5ogjh",
+      "exit": 0,
+      "completed_cases": 2
+    },
+    {
+      "artifacts": "/tmp/agb11-codex-ybkph6le",
+      "exit": 0,
+      "completed_cases": 8
+    }
+  ],
+  "post_native_run_refinements": [
+    "Bounded2second wait for owned non-zombie process-group descendants after SIGKILL, instead of immediate assertion.",
+    "Offline verifier additionally proves exact native userMessage.clientId/input equality and disconnected original+queued completed reads. Native request/fixture behavior unchanged; evidence reverified against final harness."
+  ],
+  "limits": [
+    "Deterministic localhost Responses fixture, no external model judgement.",
+    "Historical first-three native server errors not captured; saturation attribution remains inference.",
+    "No production active steering/backpressure implementation; no owner UI qualification."
+  ]
+}
