@@ -89,6 +89,9 @@ impl Native {
                 .await
                 .unwrap()
                 .unwrap();
+                if bytes.is_empty() {
+                    continue; // Payload-free liveness connection, no native submission.
+                }
                 let frame: Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(frame["type"], "user");
                 let _ = captured.try_send(frame);
@@ -283,6 +286,8 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
         true
     );
     assert!(!failed(&mcp.call("connection_status", json!({})).await));
+    let stale = mcp.call("list_agents", json!({"include_stale":true})).await;
+    assert!(!failed(&stale));
     let agents = mcp.call("list_agents", json!({})).await;
     assert!(
         structured(&agents)["result"]
@@ -331,6 +336,28 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     assert_eq!(structured(&ack)["result"]["state"], "acknowledged");
     assert_eq!(mcp.child.id(), pid);
     assert_eq!(running.request(Request::PeersList), json!([]));
+    running.request(Request::Unregister {
+        name: "alice".into(),
+        session: "inbox-alice".into(),
+    });
+    let available = mcp.call("list_agents", json!({})).await;
+    assert!(
+        !structured(&available)["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "alice")
+    );
+    let all = mcp.call("list_agents", json!({"include_stale":true})).await;
+    let data = structured(&all);
+    let row = data["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "alice")
+        .unwrap();
+    assert_eq!(row["stale_reason"], "disabled");
+    assert_eq!(row["enabled"], false);
     mcp.close().await;
 }
 
@@ -419,6 +446,18 @@ async fn list_agents_defaults_to_local_and_requires_one_explicit_trusted_remote_
         .find(|tool| tool["name"] == "list_agents")
         .unwrap();
     assert!(list["inputSchema"]["properties"].get("peer").is_some());
+    assert!(
+        list["inputSchema"]["properties"]
+            .get("include_stale")
+            .is_some()
+    );
+    assert!(failed(
+        &mcp.call(
+            "list_agents",
+            json!({"peer":"workstation", "include_stale":true})
+        )
+        .await
+    ));
     assert!(list["inputSchema"]["properties"].get("remote").is_none());
     for arguments in [json!({}), json!({"peer":null})] {
         let response = mcp.call("list_agents", arguments).await;

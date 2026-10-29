@@ -106,7 +106,9 @@ for the text-field syntax, debounce timing and concurrency behavior.
 ### Discover and share your session
 
 Sessions remain private by default, including sessions created after pairing.
-For local discovery call `list_agents({})`. Remote discovery requires a specific
+For local discovery call `list_agents({})`. Unreachable Claude sockets are hidden.
+Use `list_agents({"include_stale":true})` for all local registrations with
+`stale_reason` on hidden rows. This option cannot be combined with `peer`. Remote discovery requires a specific
 paired peer alias or peer ID:
 
 ```json

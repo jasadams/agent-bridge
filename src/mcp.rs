@@ -57,6 +57,9 @@ struct Agents {
     verbose: bool,
     /// Omit for local sessions. Select exactly one paired peer by alias or peer ID for remote sessions.
     peer: Option<String>,
+    /// Include disabled or unreachable local registrations with stale_reason. Local only.
+    #[serde(default)]
+    include_stale: bool,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -459,7 +462,7 @@ impl Bridge {
         self.result(async { Ok(json!({"status":self.rpc(Request::Status).await?,"connections":self.rpc(Request::PeerConnections).await?})) }, None).await
     }
     #[tool(
-        description = "List enabled local agents, or one explicitly selected paired peer's permitted directory. Empty remote results can mean no shared sessions. Compact routing fields by default; verbose includes metadata. Grants no access.",
+        description = "List available local agents (Claude sockets are checked), or one explicitly selected paired peer's permitted directory. Empty remote results can mean no shared sessions. Compact routing fields by default; verbose includes metadata. Grants no access.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -471,8 +474,16 @@ impl Bridge {
             async {
                 Ok(output::agents(
                     self.rpc(match args.peer {
-                        Some(peer) => Request::RemoteListPeer { peer },
-                        None => Request::List { all: false },
+                        Some(peer) => {
+                            ensure!(
+                                !args.include_stale,
+                                "include_stale is only supported for local sessions"
+                            );
+                            Request::RemoteListPeer { peer }
+                        }
+                        None => Request::List {
+                            all: args.include_stale,
+                        },
                     })
                     .await?,
                     args.verbose,

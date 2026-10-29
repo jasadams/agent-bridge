@@ -43,7 +43,11 @@ agent-bridge hooks install
 ```
 
 The startup hook registers the session's native inbox socket and the end hook
-disables its automatic registration. Hooks run through Claude Code's normal
+disables its automatic registration. Default local listings also check that the
+private native socket still accepts connections, hiding missing or refused sockets
+immediately. The broker checks enabled Claude registrations every minute and disables
+them after two consecutive failures; a successful check or registration clears the
+first failure. This repairs missed end hooks after crashes or disconnects. Hooks run through Claude Code's normal
 workspace trust flow. Check the client session's status if it does not expose an
 inbox socket.
 
@@ -69,7 +73,7 @@ when qualifying a new client version.
 
 ## Session names
 
-`agent-bridge list` shows enabled registrations, native display names and stable
+`agent-bridge list` shows available registrations, native display names and stable
 routing names. Automatically registered names use `codex-<thread-UUID>` or
 `claude-<session-UUID>`. Qualified display names such as `codex:reviewer` are also
 accepted for messaging. If a display name is ambiguous, use the stable name.
@@ -79,8 +83,20 @@ agent-bridge list --all
 agent-bridge send --to 'codex:reviewer' --message 'Ready for review.'
 ```
 
-An enabled session indicates transport availability. It does not establish that
-the model is currently working or that a message has been read. Manual aliases
+Use `list --all` or MCP `list_agents({"include_stale":true})` to inspect hidden local
+registrations. Stale rows include `stale_reason`: `disabled`, `socket_missing`,
+`socket_refused`, or `socket_invalid`. Socket checks send no message; inconclusive
+errors such as a full accept backlog do not retire a session. A disabled session
+needs native registration again to become enabled.
+
+Socket availability cannot distinguish a live background spare from an interactive
+session, or prove that a session behind a shared process socket is still open.
+Process kinds, stable restart aliases, activity timestamps and result pagination
+are not currently recorded by this check. Display names remain labels; use stable
+routing names when names collide.
+
+An available session indicates transport availability. It does not establish that
+the model is currently working or that a message has been read. Manual Claude aliases share the same socket checks; other manual aliases
 must be unregistered explicitly when no longer needed.
 
 ## Permissions and troubleshooting

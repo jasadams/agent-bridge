@@ -6,6 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
 use std::{
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -48,6 +49,73 @@ pub fn validate_socket(path: &Path) -> Result<PathBuf> {
         "Socket path is too long for macOS"
     );
     Ok(normalized)
+}
+
+/// Check the native listener without sending a frame or waiting for it to read.
+/// A busy listener or local resource exhaustion is inconclusive, not proof that
+/// the session exited. Keep those sessions visible rather than retiring them.
+pub fn stale_reason(path: &Path) -> Option<String> {
+    let path = match validate_socket(path) {
+        Ok(path) => path,
+        Err(error) => {
+            return Some(
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    "socket_missing"
+                } else {
+                    "socket_invalid"
+                }
+                .into(),
+            );
+        }
+    };
+    // SOCK_NONBLOCK is not portable to macOS; set it before connect instead.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: socket returned a fresh descriptor, owned exclusively here.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    if unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+        || unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0
+    {
+        return None;
+    }
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Some("socket_invalid".into());
+    }
+    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *byte as libc::c_char;
+    }
+    let len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = len as u8;
+    }
+    // SAFETY: address is initialized and len includes only its family, path,
+    // and terminating NUL; the descriptor is nonblocking and stays owned here.
+    let connected = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            len,
+        )
+    };
+    if connected == 0 {
+        return None;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOENT) => Some("socket_missing".into()),
+        Some(libc::ECONNREFUSED) => Some("socket_refused".into()),
+        Some(libc::ENOTSOCK | libc::EACCES | libc::ENOTDIR) => Some("socket_invalid".into()),
+        _ => None,
+    }
 }
 
 pub fn claude_frame(msg: &Message, _state_dir: &Path) -> serde_json::Value {
@@ -214,6 +282,60 @@ pub(crate) async fn deliver(agent: &Agent, msg: &Message, content: &str) -> Outc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn liveness_checks_listener_not_just_socket_file() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("native.sock");
+        assert_eq!(stale_reason(&path).as_deref(), Some("socket_missing"));
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(stale_reason(&path), None);
+        let (mut accepted, _) = listener.accept().unwrap();
+        let mut bytes = [0; 1];
+        assert_eq!(std::io::Read::read(&mut accepted, &mut bytes).unwrap(), 0);
+        drop(listener);
+        assert!(path.exists());
+        assert_eq!(stale_reason(&path).as_deref(), Some("socket_refused"));
+    }
+
+    #[test]
+    fn liveness_rejects_invalid_or_public_endpoints() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("native.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        assert_eq!(stale_reason(&path).as_deref(), Some("socket_invalid"));
+        std::fs::remove_file(&path).unwrap();
+        let _listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(stale_reason(&path).as_deref(), Some("socket_invalid"));
+        assert_eq!(
+            stale_reason(Path::new("relative.sock")).as_deref(),
+            Some("socket_invalid")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_does_not_wait_for_a_full_listener_backlog() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("native.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        for _ in 0..4 {
+            assert_eq!(stale_reason(&path), None);
+        }
+    }
 
     fn message(body: &str) -> Message {
         Message {

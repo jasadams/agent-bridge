@@ -75,6 +75,7 @@ pub struct Broker {
     pub(crate) pairing_generation: Arc<AtomicU64>,
     pub(crate) contact_routes: Arc<Mutex<std::collections::BTreeMap<String, (String, String)>>>,
     pub claude_wake: Arc<Notify>,
+    claude_failures: Arc<Mutex<std::collections::HashMap<String, (String, String)>>>,
     pub state_dir: PathBuf,
     codex_bin: PathBuf,
     discovery_status: Arc<Mutex<Value>>,
@@ -238,6 +239,7 @@ impl Broker {
             pairing_generation: Arc::new(AtomicU64::new(0)),
             contact_routes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             claude_wake: Arc::new(Notify::new()),
+            claude_failures: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_dir,
             codex_bin,
             discovery_status: Arc::new(Mutex::new(json!({"state":"disabled"}))),
@@ -562,6 +564,7 @@ impl Broker {
                     db.opencode_alias_admission(&agent)?;
                 }
                 db.register(&agent, replace)?;
+                self.claude_failures.lock().unwrap().remove(&agent.name);
                 json!(agent)
             }
             Request::OpenCodeObserve {
@@ -656,8 +659,21 @@ impl Broker {
                 let mut agents = Vec::new();
                 let machine = self.local_machine(&db)?;
                 for agent in db.listed_agents(all)? {
+                    let stale_reason = if !agent.enabled {
+                        Some("disabled".to_owned())
+                    } else if agent.provider == Provider::Claude {
+                        crate::clients::claude::stale_reason(Path::new(&agent.endpoint))
+                    } else {
+                        None
+                    };
+                    if !all && stale_reason.is_some() {
+                        continue;
+                    }
                     let display = db.display_name(&agent.provider, &agent.session)?;
                     let mut value = json!(agent);
+                    if let Some(reason) = stale_reason {
+                        value["stale_reason"] = json!(reason);
+                    }
                     value["machine_name"] = machine["machine_name"].clone();
                     value["peer_id"] = machine["peer_id"].clone();
                     value["machine_display_name"] = machine["display_name"].clone();
@@ -1385,6 +1401,45 @@ impl Broker {
         Ok(board)
     }
 
+    /// Retire missed Claude SessionEnd registrations only after two consecutive
+    /// sweeps fail. A successful probe or a fresh registration resets suspicion.
+    pub fn reap_claude_sessions(&self) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        let mut previous = self.claude_failures.lock().unwrap();
+        let mut failed = std::collections::HashMap::new();
+        for agent in db.listed_agents(false)? {
+            if agent.provider != Provider::Claude
+                || crate::clients::claude::stale_reason(Path::new(&agent.endpoint)).is_none()
+            {
+                continue;
+            }
+            let identity = (agent.session.clone(), agent.endpoint.clone());
+            if previous.get(&agent.name) == Some(&identity) {
+                db.unregister(&agent.name, &agent.session)?;
+            } else {
+                failed.insert(agent.name, identity);
+            }
+        }
+        *previous = failed;
+        self.board_notifications
+            .lock()
+            .unwrap()
+            .prune(|name| db.agent(name).ok());
+        drop(db);
+        self.network_wake.notify_one();
+        Ok(())
+    }
+
+    async fn reap_claude_loop(&self) -> Result<()> {
+        let period = Duration::from_secs(60);
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            self.reap_claude_sessions()?;
+        }
+    }
+
     pub fn claude_sessions(&self) -> Result<Vec<String>> {
         Ok(self
             .db
@@ -1547,6 +1602,8 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     let broker = bound.broker.clone();
     let dispatcher = broker.dispatch();
     tokio::pin!(dispatcher);
+    let claude_reaper = broker.reap_claude_loop();
+    tokio::pin!(claude_reaper);
     let monitoring = crate::monitor::run(broker.clone());
     tokio::pin!(monitoring);
     let pairing_notifications = crate::pairing_notifications::run(broker.clone());
@@ -1576,6 +1633,7 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
             },
             Some(_)=connections.join_next(),if !connections.is_empty()=>{},
             res=&mut dispatcher=>break res,
+            res=&mut claude_reaper=>break res,
             _=&mut monitoring=>unreachable!("Monitor worker runs until shutdown"),
             res=&mut pairing_notifications=>break res,
             res=&mut board_notifications=>break res,
