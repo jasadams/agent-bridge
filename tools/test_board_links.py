@@ -3,6 +3,7 @@
 import argparse
 import base64
 import codecs
+import errno
 import fcntl
 import json
 import os
@@ -112,15 +113,34 @@ class Screen:
         return "\n".join("".join(self.cells.get((x, y), (" ", None))[0] for x in range(self.columns)) for y in range(self.rows))
 
 
-def stop(process):
-    """Reap only this fixture child, including signal-resistant PTY readers."""
+def stop(process, output=None):
+    """Reap a fixture child while draining its PTY, including after SIGKILL."""
+    def wait():
+        nonlocal output
+        end = time.monotonic() + 5
+        while process.poll() is None:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, 5)
+            try:
+                process.wait(timeout=min(.05, remaining))
+            except subprocess.TimeoutExpired:
+                if output is not None and select.select([output], [], [], 0)[0]:
+                    try:
+                        if not os.read(output, 65536):
+                            output = None
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        output = None
+
     if process.poll() is None:
         process.terminate()
     try:
-        process.wait(timeout=5)
+        wait()
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(timeout=5)
+        wait()
 
 
 class Viewer:
@@ -136,7 +156,11 @@ class Viewer:
         env.pop("NO_TERM_HYPERLINKS", None)
         if disabled:
             env["NO_TERM_HYPERLINKS"] = "1"
-        self.process = subprocess.Popen([str(binary), "--state-dir", str(state), "board", board], stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, preexec_fn=controlling_terminal)
+        try:
+            self.process = subprocess.Popen([str(binary), "--state-dir", str(state), "board", board], stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, preexec_fn=controlling_terminal)
+        finally:
+            os.close(self.slave)
+            self.slave = None
 
     def pump(self, duration=.1):
         end = time.monotonic() + duration
@@ -159,7 +183,13 @@ class Viewer:
 
     def close(self):
         try:
-            stop(self.process)
+            try:
+                stop(self.process, self.master)
+            except subprocess.TimeoutExpired:
+                # Closing the master releases any remaining terminal I/O wait.
+                os.close(self.master)
+                self.master = None
+                self.process.wait(timeout=5)
         finally:
             for name in ("master", "slave"):
                 descriptor = getattr(self, name)
@@ -227,7 +257,7 @@ def run(binary):
                 viewer.keys(b"\x1b[H")
                 viewer.wait(lambda: has_target(latest))
                 viewer.screen.columns, viewer.screen.rows = 55, 22
-                fcntl.ioctl(viewer.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 22, 55, 0, 0))
+                fcntl.ioctl(viewer.master, termios.TIOCSWINSZ, struct.pack("HHHH", 22, 55, 0, 0))
                 viewer.process.send_signal(signal.SIGWINCH)
                 viewer.wait(lambda: has_target(latest))
                 viewer.keys(b"\t\r")
