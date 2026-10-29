@@ -1,7 +1,7 @@
 //! Loopback HTTP monitor with read-only messages and narrow board responses.
 //!
-//! The HTTP parser is Hyper. Credentials travel only in an Authorization header;
-//! neither cookies nor browser URLs carry access secrets. Same-user local code and
+//! The HTTP parser is Hyper. API credentials travel in an Authorization header;
+//! a bootstrap URL fragment is consumed and cleared by the browser. Same-user local code and
 //! administrators remain inside the endpoint's existing trust boundary.
 use crate::broker::Broker;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -77,6 +77,12 @@ impl Control {
     pub fn credentials(&self) -> Value {
         let mut value = self.status();
         value["access_token"] = json!(self.token);
+        value["access_url"] = json!(
+            self.url
+                .as_ref()
+                .zip(self.token.as_ref())
+                .map(|(url, token)| format!("{url}/#access_token={token}"))
+        );
         value
     }
     pub(crate) fn current(&self, generation: u64) -> bool {
@@ -336,6 +342,17 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                 Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Boards unavailable"),
             }
         }
+        _ if path.starts_with("/api/boards/") && path.ends_with("/events") => {
+            let name = path
+                .strip_prefix("/api/boards/")
+                .and_then(|name| name.strip_suffix("/events"))
+                .unwrap_or("")
+                .parse::<crate::board::Name>();
+            match name {
+                Ok(name) => board_events(app.clone(), name).await,
+                Err(_) => error(StatusCode::BAD_REQUEST, "Invalid board name"),
+            }
+        }
         _ if board_read => {
             let Ok(permit) = app.reads.clone().try_acquire_owned() else {
                 return Ok(error(
@@ -529,6 +546,112 @@ struct EventState {
     revision: Option<(u64, u64)>,
     heartbeat: Instant,
 }
+async fn read_board_revision(
+    app: &App,
+    name: &crate::board::Name,
+    permit: OwnedSemaphorePermit,
+) -> Result<String, Box<Response<Body>>> {
+    let broker = app.broker.clone();
+    let generation = app.generation;
+    let name = name.clone();
+    match tokio::task::spawn_blocking(move || {
+        // Keep capacity occupied even if the HTTP future is cancelled while
+        // this job waits for the shared broker lock.
+        let _permit = permit;
+        broker.monitor_board_revision(generation, &name)
+    })
+    .await
+    {
+        Ok(Ok(revision)) if app.current() => Ok(revision),
+        Ok(Ok(_)) => Err(Box::new(error(
+            StatusCode::UNAUTHORIZED,
+            "Monitor access expired",
+        ))),
+        Ok(Err(reply)) => Err(Box::new(board_reply(reply))),
+        Err(_) => Err(Box::new(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Board unavailable",
+        ))),
+    }
+}
+struct BoardEventState {
+    app: App,
+    name: crate::board::Name,
+    _permit: OwnedSemaphorePermit,
+    revision: String,
+    initial: bool,
+    heartbeat: Instant,
+}
+async fn board_events(app: App, name: crate::board::Name) -> Response<Body> {
+    let Ok(permit) = app.events.clone().try_acquire_owned() else {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Live monitor connection limit reached",
+        );
+    };
+    let Ok(read_permit) = app.reads.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "Board read limit reached");
+    };
+    let revision = match read_board_revision(&app, &name, read_permit).await {
+        Ok(revision) => revision,
+        Err(response) => return *response,
+    };
+    let state = BoardEventState {
+        app,
+        name,
+        _permit: permit,
+        revision,
+        initial: true,
+        heartbeat: Instant::now(),
+    };
+    let stream = stream::unfold(state, |mut state| async move {
+        loop {
+            if !state.app.current() {
+                return None;
+            }
+            if state.initial {
+                state.initial = false;
+                state.heartbeat = Instant::now();
+                let bytes = Bytes::from(format!(
+                    "event: board-revision\ndata: {}\n\n",
+                    json!({"name":state.name,"revision":state.revision})
+                ));
+                return Some((Ok::<_, Infallible>(Frame::data(bytes)), state));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !state.app.current() {
+                return None;
+            }
+            let Ok(permit) = state.app.reads.clone().try_acquire_owned() else {
+                continue;
+            };
+            let revision = match read_board_revision(&state.app, &state.name, permit).await {
+                Ok(revision) => revision,
+                Err(_) => return None,
+            };
+            if state.revision != revision {
+                state.revision = revision;
+                state.initial = true;
+                continue;
+            }
+            if state.heartbeat.elapsed() >= Duration::from_secs(15) {
+                state.heartbeat = Instant::now();
+                return Some((
+                    Ok(Frame::data(Bytes::from_static(b": heartbeat\n\n"))),
+                    state,
+                ));
+            }
+        }
+    })
+    .boxed();
+    let mut response = response(
+        StatusCode::OK,
+        "text/event-stream; charset=utf-8",
+        Bytes::new(),
+    );
+    *response.body_mut() = StreamBody::new(stream).boxed_unsync();
+    response
+}
 fn events(app: App) -> Response<Body> {
     let Ok(permit) = app.events.clone().try_acquire_owned() else {
         return error(
@@ -693,6 +816,42 @@ async fn serve_generation(
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_include_fragment_link_but_status_never_exposes_secrets() {
+        let mut control = Control::default();
+        let pending = control.enable(0);
+        assert!(pending["access_url"].is_null());
+        let token = pending["access_token"].as_str().unwrap();
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+
+        control.url = Some("http://127.0.0.1:44002".into());
+        let credentials = control.credentials();
+        assert_eq!(credentials["url"], "http://127.0.0.1:44002");
+        assert_eq!(credentials["access_token"], token);
+        assert_eq!(
+            credentials["access_url"],
+            format!("http://127.0.0.1:44002/#access_token={token}")
+        );
+        let status = control.status();
+        assert!(status.get("access_token").is_none());
+        assert!(status.get("access_url").is_none());
+        assert!(!status.to_string().contains(token));
+
+        control.disable();
+        let disabled = control.credentials();
+        assert!(disabled["access_token"].is_null());
+        assert!(disabled["access_url"].is_null());
+    }
 }
 
 #[cfg(test)]

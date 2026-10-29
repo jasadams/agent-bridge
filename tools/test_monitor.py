@@ -224,9 +224,12 @@ def main():
         assert urlsplit(url).hostname == "127.0.0.1"
         assert len(token) >= 40
         assert token not in url and "?" not in url and "#" not in url
-        assert "access_token" not in rpc(a, "monitor_status")
+        access_url = credentials["access_url"]
+        assert access_url == url.rstrip("/") + "/#access_token=" + token
+        monitor_status = rpc(a, "monitor_status")
+        assert "access_token" not in monitor_status and "access_url" not in monitor_status
         assert not rpc(a, "status")["network"]["enabled"]
-        record("monitor default-off and independent of peer networking; credentials stay out of URL/status")
+        record("monitor default-off and independent of peer networking; private access link uses a fragment; plain URL/status stay credential-free")
 
         for path in ["/", "/style.css", "/app.js"]:
             status, headers, body = http(url, path)
@@ -346,6 +349,33 @@ def main():
                     "HOME": str(browser_home), "TMPDIR": str(browser_home),
                     "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"})
                 cleanup.callback(browser.close)
+                # Exercise private-link bootstrap separately, retaining manual-login coverage.
+                with browser.new_context() as linked_context:
+                    linked_page = linked_context.new_page()
+                    link_requests = []
+                    linked_page.on("request", lambda request: link_requests.append(
+                        (request.url, request.headers.get("referer", ""))))
+                    linked_page.goto(access_url)
+                    linked_page.locator("#boards-view").wait_for(state="visible")
+                    linked_page.locator("#board-selector option").first.wait_for(state="attached")
+                    assert linked_page.url == url.rstrip("/") + "/"
+                    assert linked_page.locator("#access-token").input_value() == ""
+                    assert linked_page.evaluate("localStorage.length + sessionStorage.length") == 0
+                    assert linked_context.cookies() == []
+                    assert all(token not in target and token not in referrer
+                               for target, referrer in link_requests)
+                    linked_page.reload()
+                    linked_page.locator("#login").wait_for(state="visible")
+                    assert linked_page.locator("#workspace").is_hidden()
+                    linked_page.goto(url + "#access_token=" + "x" * 43)
+                    linked_page.locator("#login-error").wait_for(state="visible")
+                    assert linked_page.url == url.rstrip("/") + "/"
+                    assert linked_page.locator("#workspace").is_hidden()
+                    assert linked_page.locator("#access-token").input_value() == ""
+                    linked_page.goto(access_url)
+                    linked_page.locator("#boards-view").wait_for(state="visible")
+                    assert linked_page.url == url.rstrip("/") + "/"
+                record("private fragment link unlocks Boards, clears URL/input, avoids request/referrer/storage leaks; reload and invalid link stay locked")
                 context = browser.new_context(viewport={"width": 1440, "height": 1000})
                 cleanup.callback(context.close)
                 page = context.new_page()
@@ -357,6 +387,11 @@ def main():
                 page.locator("#access-token").fill(token)
                 page.locator("#login-form button[type=submit]").click()
                 page.locator("#workspace").wait_for(state="visible")
+                page.locator("#boards-view").wait_for(state="visible")
+                assert page.locator("#boards-tab").get_attribute("aria-pressed") == "true"
+                assert page.locator("#messages-view").is_hidden()
+                record("unlock opens Boards as the default page")
+                page.locator("#messages-tab").click()
                 page.get_by_text("LOCAL_MONITOR_OK", exact=False).first.wait_for()
                 assert page.evaluate("typeof window.monitorPwned") == "undefined"
                 assert page.evaluate("localStorage.length + sessionStorage.length") == 0
@@ -367,6 +402,52 @@ def main():
                 page.locator("#detail-content pre.body-text").get_by_text(local_body, exact=True).wait_for()
                 assert "listener-original" in page.locator("#detail-content").inner_text()
                 assert "listener-replaced" not in page.locator("#detail-content").inner_text()
+                page.evaluate("""id => {
+                  window.__stableMessage = document.querySelector(`.message-row[data-id="${id}"]`);
+                  window.__stableBody = document.querySelector('#detail-content pre.body-text');
+                  const range = document.createRange(); range.selectNodeContents(window.__stableBody);
+                  const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+                  window.__stableBodyText = selection.toString();
+                  window.__steadyMutations = [];
+                  window.__steadyObserver = new MutationObserver(records => window.__steadyMutations.push(...records));
+                  window.__steadyObserver.observe(document.getElementById('detail-content'), {childList:true,subtree:true});
+                }""", local_id)
+                send(a, "user", "STEADY_LIVE_UPDATE", sender="speaker")
+                page.get_by_text("STEADY_LIVE_UPDATE", exact=False).first.wait_for(timeout=15000)
+                page.wait_for_timeout(500)
+                assert page.evaluate('id => window.__stableMessage === document.querySelector(`.message-row[data-id="${id}"]`)', local_id)
+                assert page.evaluate("window.__stableBody === document.querySelector('#detail-content pre.body-text')")
+                assert page.evaluate("getSelection().toString() === window.__stableBodyText")
+                assert page.evaluate("window.__steadyMutations.length") == 0, "Unchanged detail was rebuilt during live refresh"
+                page.evaluate("() => { window.__steadyObserver.disconnect(); getSelection().removeAllRanges(); }")
+                state_id = send(a, "listener", "STEADY_STATE_CHANGE", sender="speaker")
+                state_row = page.locator(f'.message-row[data-id="{state_id}"]')
+                state_row.wait_for()
+                state_row.click()
+                page.locator("#detail-content pre.body-text").get_by_text("STEADY_STATE_CHANGE", exact=True).wait_for()
+                page.evaluate("""id => {
+                  window.__stateRow = document.querySelector(`.message-row[data-id="${id}"]`);
+                  window.__stateBody = document.querySelector('#detail-content pre.body-text');
+                  window.__stateRow.focus();
+                }""", state_id)
+                rpc(a, "ack", id=state_id, agent="listener")
+                state_row.locator(".state-badge.acknowledged").wait_for(timeout=15000)
+                page.locator("#detail-content .detail-header .state-badge.acknowledged").wait_for(timeout=15000)
+                assert page.evaluate("window.__stateRow === document.activeElement")
+                assert page.evaluate("window.__stateBody === document.querySelector('#detail-content pre.body-text')")
+                record("message push preserves unchanged DOM/selection and patches real delivery-state changes without losing body or focus")
+                page.locator("#boards-tab").click()
+                page.locator("#boards-view").wait_for(state="visible")
+                page.wait_for_timeout(500)
+                hidden_message_reads = []
+                page.on("request", lambda request: hidden_message_reads.append(request.url)
+                        if urlsplit(request.url).path == "/api/messages" else None)
+                send(a, "user", "HIDDEN_VIEW_CATCHUP", sender="speaker")
+                page.wait_for_timeout(1000)
+                assert not hidden_message_reads, "Hidden Messages still refreshes in the background"
+                page.locator("#messages-tab").click()
+                page.get_by_text("HIDDEN_VIEW_CATCHUP", exact=False).first.wait_for(timeout=15000)
+                record("Messages pauses hidden-view fetches and catches up when returning from Boards")
                 page.locator(f'.message-row[data-id="{outbound_id}"]').click()
                 page.locator("#detail-content pre.body-text").get_by_text("P2P_MONITOR_OUTBOUND", exact=True).wait_for()
                 page.locator("#detail-content .relation").filter(has_text=inbound_a["id"]).click()

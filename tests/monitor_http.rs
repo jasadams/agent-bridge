@@ -85,6 +85,145 @@ async fn first_event(stream: &mut TcpStream) -> String {
     .await
     .unwrap()
 }
+async fn board_event(stream: &mut TcpStream) -> Value {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0];
+        assert_ne!(stream.read(&mut byte).await.unwrap(), 0, "Board SSE closed");
+        bytes.push(byte[0]);
+        if bytes.ends_with(b"\n\n")
+            && bytes
+                .windows(21)
+                .any(|part| part == b"event: board-revision")
+        {
+            let event = String::from_utf8(bytes).unwrap();
+            let data = event
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            return serde_json::from_str(data).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn board_events_follow_only_selected_revision_including_external_edits_and_revoke() {
+    use agent_bridge::board;
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    for name in ["alpha", "beta"] {
+        running
+            .broker
+            .request(Request::BoardCreate {
+                board: name.parse().unwrap(),
+            })
+            .unwrap();
+    }
+    let alpha: board::Name = "alpha".parse().unwrap();
+    let beta: board::Name = "beta".parse().unwrap();
+    let access = running.enable(0).await;
+    let path = "/api/boards/alpha/events";
+    assert!(get(&access, path, "").await.starts_with("HTTP/1.1 401"));
+    for invalid in [
+        "/api/boards/ALPHA/events",
+        "/api/boards/alpha/events?token=secret",
+        "/api/boards/alpha/events/events",
+    ] {
+        assert!(
+            get(&access, invalid, &auth(&access))
+                .await
+                .starts_with("HTTP/1.1 400")
+        );
+    }
+    assert!(
+        get(&access, "/api/boards/missing/events", &auth(&access))
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+    assert!(
+        get(
+            &access,
+            path,
+            &format!("{}Origin: https://evil.example\r\n", auth(&access))
+        )
+        .await
+        .starts_with("HTTP/1.1 403")
+    );
+    let mut stream = connect(&access, path, &auth(&access)).await;
+    let first = timeout(Duration::from_secs(3), board_event(&mut stream))
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        serde_json::json!({"name":"alpha", "revision":board::read_named(root.path(), &alpha).unwrap().revision})
+    );
+    // Another board and unrelated broker activity must not invalidate alpha.
+    let before = board::read_named(root.path(), &beta).unwrap();
+    running
+        .broker
+        .request(Request::NamedBoardUpdate {
+            board: beta,
+            expected_revision: before.revision,
+            edits: vec![board::Edit::Set {
+                markdown: "# Other board secret\n".into(),
+            }],
+            actor: None,
+        })
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(1100), board_event(&mut stream))
+            .await
+            .is_err()
+    );
+    // Direct file edits bypass broker notifications and still reach the stream.
+    let current = board::read_named(root.path(), &alpha).unwrap();
+    std::fs::write(&current.path, "# Private external content\n").unwrap();
+    let changed = timeout(Duration::from_secs(3), board_event(&mut stream))
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        serde_json::json!({"name":"alpha", "revision":board::read_named(root.path(), &alpha).unwrap().revision})
+    );
+    assert_ne!(changed["revision"], first["revision"]);
+    assert!(!changed.to_string().contains("Private external content"));
+    assert!(!changed.to_string().contains(key(&access)));
+    assert!(
+        timeout(Duration::from_millis(1100), board_event(&mut stream))
+            .await
+            .is_err()
+    );
+    running.broker.request(Request::MonitorDisable).unwrap();
+    let mut rest = Vec::new();
+    timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn board_and_message_events_share_the_live_connection_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let mut board = connect(&access, "/api/boards/main/events", &auth(&access)).await;
+    timeout(Duration::from_secs(3), board_event(&mut board))
+        .await
+        .unwrap();
+    let mut streams = Vec::new();
+    for _ in 0..7 {
+        let mut stream = connect(&access, "/api/events", &auth(&access)).await;
+        first_event(&mut stream).await;
+        streams.push(stream);
+    }
+    for path in ["/api/events", "/api/boards/main/events"] {
+        assert!(
+            get(&access, path, &auth(&access))
+                .await
+                .starts_with("HTTP/1.1 429")
+        );
+    }
+}
 #[tokio::test]
 async fn monitor_requires_bearer_and_enforces_browser_boundaries_on_assets_and_api() {
     let root = tempfile::Builder::new()

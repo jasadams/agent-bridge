@@ -265,6 +265,26 @@ fn conflict(snapshot: &Snapshot) -> Reply {
     }
 }
 impl Broker {
+    pub(crate) fn monitor_board_revision(
+        &self,
+        generation: u64,
+        name: &Name,
+    ) -> Result<String, Reply> {
+        let _db = self.db.lock().unwrap();
+        let access = self.monitor_control.lock().unwrap();
+        if !access.current(generation) {
+            return Err(reply(401, "unauthorized", "Monitor access expired"));
+        }
+        board::read_named(&self.state_dir, name)
+            .map(|snapshot| snapshot.revision)
+            .map_err(|_| {
+                reply(
+                    404,
+                    "not_found",
+                    "Board unavailable; select an existing board",
+                )
+            })
+    }
     pub(crate) fn monitor_boards(&self, generation: u64) -> Reply {
         let _db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();

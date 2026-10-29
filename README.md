@@ -169,7 +169,8 @@ that explicit peer; without a peer, the tool lists local sessions only.
 agent-bridge monitor enable
 ```
 
-Open the printed local URL and enter the separate access token. Choose Messages
+Open the printed `access_url` to unlock automatically, or use the plain URL and
+enter the separate access token. Boards opens first; choose Messages
 for read-only message history or Boards to browse named local boards and answer
 their existing checkbox/text controls. It listens only on loopback and is enabled
 independently of peer networking. It cannot send messages, pair machines or edit

@@ -1,16 +1,31 @@
 "use strict";
 (() => {
+  // Consume the private link before making requests or displaying the workspace.
+  // Fragments never travel in HTTP requests; replace this history entry as well.
+  function takeAccessLink() {
+    if (!window.location.hash) return null;
+    const fragment = new URLSearchParams(window.location.hash.slice(1));
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    const candidate = fragment.get("access_token");
+    return candidate && /^[A-Za-z0-9_-]{43}$/.test(candidate) ? candidate : null;
+  }
+  let accessFromLink = takeAccessLink();
   const $ = (id) => document.getElementById(id);
   const login = $("login");
   const workspace = $("workspace");
   const list = $("message-list");
   let token = null;
   let boards = null;
+  let messagesDirty = true;
+  const rowNodes = new Map();
+  let detailSignature = null;
   function view(name) {
+    document.body.dataset.view = name;
     $("messages-view").hidden = name !== "messages";
     $("boards-view").hidden = name !== "boards";
     $("messages-tab").setAttribute("aria-pressed", String(name === "messages"));
     $("boards-tab").setAttribute("aria-pressed", String(name === "boards"));
+    if (name === "messages" && token && messagesDirty) scheduleRefresh();
   }
   let generation = 0;
   let sessionAbort = null;
@@ -33,7 +48,7 @@
     return node;
   }
   function showError(id, text) {
-    $(id).textContent = text || "";
+    if ($(id).textContent !== (text || "")) $(id).textContent = text || "";
     $(id).hidden = !text;
   }
   function connection(label, state = "") {
@@ -44,7 +59,7 @@
     generation += 1;
     token = null;
     boards?.clear();
-    view("messages");
+    view("locked");
     sessionAbort?.abort();
     streamAbort?.abort();
     clearTimeout(reconnectTimer);
@@ -55,6 +70,7 @@
     nextCursor = null;
     selectedId = null;
     list.replaceChildren();
+    rowNodes.clear(); detailSignature = null; messagesDirty = true;
     $("detail-content").replaceChildren();
     $("detail-content").hidden = true;
     $("detail-placeholder").hidden = false;
@@ -74,11 +90,11 @@
       this.data = data;
     }
   }
-  async function api(path, current = generation, options = {}) {
+  async function transport(path, current = generation, options = {}) {
     const response = await fetch(path, {
       method: options.method || "GET",
       body: options.body,
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}) },
+      headers: { Authorization: `Bearer ${token}`, Accept: options.accept || "application/json", ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}) },
       credentials: "omit",
       cache: "no-store",
       referrerPolicy: "no-referrer",
@@ -89,6 +105,10 @@
       lock("Access was refused. Use the current token from the local monitor command.");
       throw new DOMException("Monitor locked", "AbortError");
     }
+    return response;
+  }
+  async function api(path, current = generation, options = {}) {
+    const response = await transport(path, current, options);
     const data = await response.json();
     if (current !== generation) throw new DOMException("Session changed", "AbortError");
     if (!response.ok) throw new ApiError(response.status, data);
@@ -112,49 +132,85 @@
   function badge(state) {
     return element("span", `state-badge${states.has(state) ? ` ${state}` : ""}`, state || "unknown");
   }
+  function patchNode(current, next) {
+    const changedKey = current.nodeType === Node.ELEMENT_NODE && next.nodeType === Node.ELEMENT_NODE &&
+      current.dataset.messageId !== next.dataset.messageId;
+    if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName || changedKey) {
+      current.replaceWith(next); return;
+    }
+    if (current.nodeType === Node.TEXT_NODE) {
+      if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+      return;
+    }
+    if (current.nodeType === Node.ELEMENT_NODE) {
+      for (const attr of [...current.attributes]) if (!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+      for (const attr of next.attributes) if (current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);
+    }
+    const incoming = [...next.childNodes];
+    for (let i = 0; i < incoming.length; i++) {
+      if (current.childNodes[i]) patchNode(current.childNodes[i], incoming[i]);
+      else current.append(incoming[i]);
+    }
+    while (current.childNodes.length > incoming.length) current.lastChild.remove();
+  }
   function renderRows() {
-    list.replaceChildren();
-    $("message-count").textContent = rows.length;
+    const present = new Set(rows.map(row => row.id));
+    for (const [id, cached] of rowNodes) {
+      if (!present.has(id)) { cached.item.remove(); rowNodes.delete(id); }
+    }
+    if ($("message-count").textContent !== String(rows.length)) $("message-count").textContent = rows.length;
     $("empty-state").hidden = rows.length !== 0;
     const filtered = query.size > 0;
     $("empty-state").querySelector("h3").textContent = filtered ? "No matching messages" : "No messages yet";
     $("empty-state").querySelector("p").textContent = filtered ? "Try a broader time range or reset the filters to see all message activity." : "Messages will appear here as agents communicate. The monitor does not start a conversation.";
     $("older-button").hidden = !nextCursor || rows.length >= 500;
     $("page-label").textContent = rows.length >= 500 ? "Showing 500 messages. Narrow the filters for older history." : "Newest first · live updates refresh this page";
+    let position = list.firstElementChild;
     for (const row of rows) {
-      const item = element("li");
-      const button = element("button", `message-row${row.id === selectedId ? " selected" : ""}`);
-      button.type = "button";
-      button.dataset.id = row.id;
-      button.setAttribute("aria-pressed", row.id === selectedId ? "true" : "false");
-      const top = element("div", "row-top");
-      const route = element("span", "route");
-      route.append(element("span", "endpoint-name", endpointName(row.source)), element("span", "arrow", "→"), element("span", "endpoint-name", endpointName(row.destination)));
-      const time = element("time", "time", timeText(row.created));
-      const date = new Date(Number(row.created));
-      if (Number.isFinite(date.getTime())) time.dateTime = date.toISOString();
-      time.title = timestamp(row.created);
-      top.append(route, time);
-      const preview = element("p", "preview", row.body || "(Empty message)");
-      const meta = element("div", "row-meta");
-      meta.append(badge(row.state), element("span", "direction", row.direction || "local"));
-      if (row.parent) meta.append(element("span", "reply-hint", "↳ Reply"));
-      if (row.body_truncated) meta.append(element("span", "reply-hint", "Open for full message"));
-      button.append(top, preview, meta);
-      button.addEventListener("click", () => openDetail(row.id, true));
-      item.append(button);
-      list.append(item);
+      const signature = JSON.stringify(row);
+      const cached = rowNodes.get(row.id);
+      let item = cached?.item;
+      if (!cached || cached.signature !== signature) {
+        const next = element("li");
+        const button = element("button", `message-row${row.id === selectedId ? " selected" : ""}`);
+        button.type = "button";
+        button.dataset.id = row.id;
+        button.setAttribute("aria-pressed", row.id === selectedId ? "true" : "false");
+        const top = element("div", "row-top");
+        const route = element("span", "route");
+        route.append(element("span", "endpoint-name", endpointName(row.source)), element("span", "arrow", "→"), element("span", "endpoint-name", endpointName(row.destination)));
+        const time = element("time", "time", timeText(row.created));
+        const date = new Date(Number(row.created));
+        if (Number.isFinite(date.getTime())) time.dateTime = date.toISOString();
+        time.title = timestamp(row.created);
+        top.append(route, time);
+        const preview = element("p", "preview", row.body || "(Empty message)");
+        const meta = element("div", "row-meta");
+        meta.append(badge(row.state), element("span", "direction", row.direction || "local"));
+        if (row.parent) meta.append(element("span", "reply-hint", "↳ Reply"));
+        if (row.body_truncated) meta.append(element("span", "reply-hint", "Open for full message"));
+        button.append(top, preview, meta);
+        button.addEventListener("click", () => openDetail(row.id, true));
+        next.append(button);
+        if (item) patchNode(item, next); else item = next;
+        rowNodes.set(row.id, { item, signature });
+      }
+      const button = item.querySelector(".message-row");
+      button.classList.toggle("selected", row.id === selectedId);
+      const pressed = String(row.id === selectedId);
+      if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
+      if (item !== position) list.insertBefore(item, position);
+      position = item.nextElementSibling;
     }
   }
-  async function loadMessages(older = false) {
+  async function loadMessages(older = false, background = false) {
     if (!token) return;
     const current = generation;
     const request = ++listRequest;
     const params = new URLSearchParams(query);
     params.set("limit", "50");
     if (older && nextCursor) params.set("before", nextCursor);
-    $("refresh-button").disabled = true;
-    $("older-button").disabled = true;
+    if (!background) { $("refresh-button").disabled = true; $("older-button").disabled = true; }
     try {
       const data = await api(`/api/messages?${params}`, current);
       if (current !== generation || request !== listRequest) return;
@@ -167,6 +223,7 @@
       }
       nextCursor = typeof data.next_cursor === "string" ? data.next_cursor : null;
       renderRows();
+      if (document.body.dataset.view === "messages") messagesDirty = false;
       showError("activity-error", "");
       $("last-updated").textContent = `Updated ${timeText(Date.now())}`;
     } catch (error) {
@@ -204,13 +261,15 @@
   function relationButton(label, id) {
     const button = element("button", "relation", label);
     button.type = "button";
+    button.dataset.messageId = id;
     button.addEventListener("click", () => openDetail(id, true));
     return button;
   }
   function renderDetail(data) {
+    const signature = JSON.stringify(data);
+    if (signature === detailSignature) return;
     const row = data.message || data;
-    const container = $("detail-content");
-    container.replaceChildren();
+    const container = $("detail-content").cloneNode(false);
     const heading = element("div", "detail-header");
     heading.append(badge(row.state), element("h3", "mono", row.id));
     container.append(heading, endpointSection("Source", row.source), endpointSection("Destination", row.destination));
@@ -233,21 +292,26 @@
       }
       container.append(chain);
     }
+    patchNode($("detail-content"), container);
+    detailSignature = signature;
   }
   async function openDetail(id, focus = false) {
     if (!token || !id) return;
     const current = generation;
     const request = ++detailRequest;
+    const sameMessage = selectedId === id && detailSignature !== null;
     selectedId = id;
+    if (!sameMessage) detailSignature = null;
     renderRows();
     $("detail-placeholder").hidden = true;
     $("detail-content").hidden = false;
     $("close-detail").hidden = false;
-    $("detail-content").replaceChildren(element("p", "notice help", "Loading message…"));
+    if (!sameMessage) $("detail-content").replaceChildren(element("p", "notice help", "Loading message…"));
     try {
       const data = await api(`/api/messages/${encodeURIComponent(id)}`, current);
       if (current !== generation || request !== detailRequest) return;
       renderDetail(data);
+      showError("activity-error", "");
       if (focus) {
         const panel = $("detail-panel");
         panel.setAttribute("tabindex", "-1");
@@ -255,14 +319,20 @@
         if (window.matchMedia("(max-width: 780px)").matches) panel.scrollIntoView({ block: "start", behavior: "auto" });
       }
     } catch (error) {
-      if (error.name !== "AbortError" && current === generation && request === detailRequest) $("detail-content").replaceChildren(element("p", "notice error", error instanceof ApiError ? error.message : "The message could not be loaded. Try again when the bridge reconnects."));
+      if (error.name !== "AbortError" && current === generation && request === detailRequest) {
+        const message = error instanceof ApiError ? error.message : "The message could not be loaded. Try again when the bridge reconnects.";
+        if (sameMessage) showError("activity-error", message);
+        else $("detail-content").replaceChildren(element("p", "notice error", message));
+      }
     }
   }
   function scheduleRefresh() {
     clearTimeout(refreshTimer);
+    messagesDirty = true;
     refreshTimer = setTimeout(() => {
-      loadMessages();
-      if (selectedId) openDetail(selectedId);
+      if (document.body.dataset.view !== "messages") { messagesDirty = true; return; }
+      void loadMessages(false, true);
+      if (selectedId) void openDetail(selectedId);
     }, 180);
   }
   function handleEvent(frame) {
@@ -307,7 +377,7 @@
       if (error.name === "AbortError" || current !== generation || !token) return;
       streamAbort.abort();
       connection("Reconnecting", "offline");
-      reconnectTimer = setTimeout(() => { loadMessages(); stream(current); }, reconnectDelay);
+      reconnectTimer = setTimeout(() => { scheduleRefresh(); stream(current); }, reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 2, 30000);
     }
   }
@@ -330,7 +400,7 @@
       workspace.hidden = false;
       $("lock-button").hidden = false;
       showError("activity-error", "");
-      await loadMessages();
+      await boards.open();
       if (current === generation && token) stream(current);
     } catch (error) {
       if (error.name !== "AbortError" && current === generation) lock("The local bridge could not be reached. Check that the monitor is enabled, then try again.");
@@ -340,6 +410,12 @@
   });
   boards = window.createBoardMonitor({
     request: (path, options) => api(path, generation, options),
+    connect: async (path, options) => {
+      const current = generation;
+      const response = await transport(path, current, { ...options, accept: "text/event-stream" });
+      if (!response.ok || !response.body) throw new Error("Live connection unavailable");
+      return response;
+    },
     authenticated: () => !!token,
     onViewChange: view,
   });
@@ -370,6 +446,7 @@
   $("older-button").addEventListener("click", () => loadMessages(true));
   $("close-detail").addEventListener("click", () => {
     selectedId = null;
+    detailSignature = null;
     detailRequest += 1;
     $("detail-content").replaceChildren();
     $("detail-content").hidden = true;
@@ -378,4 +455,13 @@
     renderRows();
   });
   window.addEventListener("pagehide", () => lock());
+  function unlockFromLink(value) {
+    // A link must not replace an active session or discard its response draft.
+    if (!value || token) return;
+    $("access-token").value = value;
+    $("login-form").requestSubmit();
+  }
+  window.addEventListener("hashchange", () => unlockFromLink(takeAccessLink()));
+  unlockFromLink(accessFromLink);
+  accessFromLink = null;
 })();
