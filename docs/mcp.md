@@ -88,6 +88,16 @@ a server shared by several conversations must not guess which session owns a cal
 Local registration names are available through `list_agents` or native registration
 context. Pairing alone still shares no sessions.
 
+Codex peer deliveries contain a trust marker and JSON message data, without
+repeated tool instructions or shell commands. The MCP tool descriptions explain
+how to acknowledge and reply: use the incoming `to` as your local `agent` or
+`from`, its `id` as the acknowledgement `id` or reply `parent`, and its `from` as
+the reply `to`. Claude uses the equivalent `Delivered to`, `Message reference`,
+and `Reply to` fields. Preserve these exact routes rather than display names.
+Session startup supplies the broker state directory and CLI fallback once; check
+`connection_status` identifies that broker before using a configured MCP server.
+Acknowledgement confirms receipt, not task completion or permission.
+
 Board names are lowercase ASCII slugs matching `[a-z0-9][a-z0-9_-]{0,63}`.
 Call `create_board({"board":"streamr"})` before using a non-main board; duplicates
 never overwrite content and unknown names never fall back to main. `list_boards({})`

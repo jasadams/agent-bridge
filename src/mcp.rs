@@ -93,10 +93,12 @@ struct SendArgs {
     verbose: bool,
     /// Registered local sender, never inferred from remote input.
     from: String,
+    /// Exact destination route. For a reply, use the received from / Reply to field.
     to: String,
     body: String,
     /// Reuse the returned UUID after an ambiguous timeout to prevent duplication.
     id: Option<String>,
+    /// For a reply, the received id / Message reference (not its in_reply_to).
     parent: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -105,7 +107,9 @@ struct Ack {
     /// Include the full broker result. Defaults to false.
     #[serde(default)]
     verbose: bool,
+    /// Received id / Message reference.
     id: String,
+    /// Exact local recipient: received to / Delivered to; must match your registration.
     agent: String,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -538,7 +542,7 @@ impl Bridge {
             .await
     }
     #[tool(
-        description = "Persist a message from the selected local agent under existing grants. Returns id and state; verbose includes the full record. Reuse the UUID after a timeout. Submitted is not read or completed."
+        description = "Persist a message under existing grants. To reply, set from to your registered local recipient (received to / Delivered to), to to the exact received from / Reply to, and parent to received id / Message reference. Check connection_status matches your session broker. Returns id and state; verbose includes the full record. Reuse the UUID after a timeout. Submitted is not read or completed."
     )]
     async fn send_message(&self, Parameters(args): Parameters<SendArgs>) -> CallToolResult {
         let id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -562,7 +566,7 @@ impl Bridge {
         .await
     }
     #[tool(
-        description = "Acknowledge receipt for the exact local recipient. Receipt is not task completion and grants no permission."
+        description = "Acknowledge receipt with agent set to your registered local recipient (received to / Delivered to) and id to received id / Message reference. Check connection_status matches your session broker. Receipt is not task completion and grants no permission."
     )]
     async fn acknowledge_message(&self, Parameters(args): Parameters<Ack>) -> CallToolResult {
         self.write_result(

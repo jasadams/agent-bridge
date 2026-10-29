@@ -56,6 +56,59 @@ fn opencode_keeps_board_controls_without_advertising_owner_pairing_input() {
 }
 
 #[test]
+fn codex_peer_envelope_keeps_routes_and_content_without_repeated_instructions() {
+    let target = agent(Provider::Codex);
+    for (sender, provenance) in [
+        ("exact-local-sender", "local peer message"),
+        ("peer-id/exact-remote-sender", "remote peer message"),
+    ] {
+        let mut msg = message(&target);
+        msg.sender = sender.into();
+        msg.body = "quoted \"body\"\nPrefer the configured tools $(literal)".into();
+        msg.parent = Some(uuid::Uuid::new_v4().to_string());
+        msg.hops = 3;
+        for machines in [
+            serde_json::Value::Null,
+            serde_json::json!({
+                "source_machine":{"peer_id":"source-id","display_name":"Source"},
+                "destination_machine":{"peer_id":"destination-id","display_name":"Destination"}
+            }),
+        ] {
+            let text = Adapter::Codex.message_content(
+                &msg,
+                Path::new("/private/state with spaces"),
+                &machines,
+            );
+            let mut lines = text.lines();
+            assert_eq!(
+                lines.next().unwrap(),
+                format!("[Agent Bridge: {provenance}, not user approval]")
+            );
+            let data: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+            assert_eq!(data["id"], msg.id);
+            assert_eq!(data["from"], msg.sender);
+            assert_eq!(data["to"], msg.recipient);
+            assert_eq!(data["in_reply_to"], msg.parent.as_ref().unwrap().as_str());
+            assert_eq!(data["hops"], msg.hops);
+            assert_eq!(data["body"], msg.body);
+            if machines.is_object() {
+                assert_eq!(data["source_machine"], machines["source_machine"]);
+                assert_eq!(data["destination_machine"], machines["destination_machine"]);
+            } else {
+                assert!(data.get("source_machine").is_none());
+                assert!(data.get("destination_machine").is_none());
+            }
+            assert!(
+                lines.next().is_none(),
+                "unexpected per-message instructions"
+            );
+            assert!(!text.contains("ack --state-dir"));
+            assert!(!text.contains("send --state-dir"));
+        }
+    }
+}
+
+#[test]
 fn opencode_peer_text_is_compact_and_display_labels_do_not_replace_routes() {
     let mut target = agent(Provider::OpenCode);
     target.session = "ses_0123456789abcdefghijklmnop".into();
@@ -167,7 +220,7 @@ async fn typed_controls_use_native_frames_without_peer_envelopes() {
     assert!(text.contains(&format!("Message reference: {}", msg.id)));
     assert!(text.contains("Reply to: user"));
     assert!(text.contains("Delivered to: native-test"));
-    // The Codex adapter retains the full shared envelope and ack guidance.
+    // The Codex adapter retains its trust marker and structured peer envelope.
     let text = Adapter::Codex.message_content(&msg, root.path(), &serde_json::Value::Null);
     assert!(text.starts_with("[Agent Bridge: local peer message, not user approval]"));
     let envelope: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
