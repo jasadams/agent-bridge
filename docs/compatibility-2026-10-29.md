@@ -8,8 +8,8 @@ commands and boundaries. The checked-in [native evidence](diagnostics/native-com
 pins the executable, source, harness hashes, exact native artifacts, synthetic
 message/session references, observations and cleanup.
 
-Executable source: `07c2b3af68e253b15a47a732b8165b8dabd7d62a`.
-Binary SHA-256: `6a88ff69e72e6737ff7fb19d06d0da82b2ba305a4357e9188f8edbb1da087994`.
+Executable source: `91c4dffbf06e8af60c7f381b8e8c88293c06faa3`.
+Binary SHA-256: `2f9cbaa10a45783f05bb4e0f11c22d30aef46102404fe0d6bc0fa3c481387c42`.
 The source commit identifies the built executable; qualification files were
 uncommitted when measured and are identified by their recorded hashes. The
 production source was clean. Earlier `7cc4cfe`/`e7347b4` inventories were retained as intermediate evidence.
@@ -19,7 +19,9 @@ After the CI cleanup repair, all three native harnesses passed again against the
 rebuilt `343fed4` executable. After AGB-13 merged at `ccc11b4`, the executable
 was rebuilt at `07c2b3a`; the full local gates and all three native harnesses
 were repeated against the merged implementation. The recorded hashes identify
-the exact qualification code used for that run.
+the exact qualification code used for that run. After the updater lock fix
+merged at `465a97c`, the full gates and all three native harnesses were repeated
+against rebuilt source `91c4dff`; the header identifies that final measurement.
 
 | Check | Observed result |
 | --- | --- |
@@ -30,7 +32,7 @@ the exact qualification code used for that run.
 | Native lifecycle and durability | Rename, broker restart retaining identity/history/grants/pause, plugin close, inactive history lookup, explicit same-session resume, replacement generation, retained native user-message uniqueness and delete unregister passed |
 | Busy/permission/recovery native harness | Exit 0; nine scripted provider requests; explicit ack/reply, read-only reconciliation, busy-tool deferral, pause/cancel and unanswered permission wait passed; no cancel/permission-response calls |
 | Installed-asset native harness | Exit 0; 18 scripted provider requests; exact system context on 17 tool-bearing requests, actual MCP discovery/ack/reply/board read/update, compaction/reload, notice coalescing/own-write suppression/unsubscribe/delete cleanup passed |
-| Rust gates | Formatting, all-target check and Clippy, full package `--no-fail-fast` each exited 0; 407 tests passed, three multicast-LAN scenarios remained intentionally ignored |
+| Rust gates | Formatting, all-target check and Clippy, full package `--no-fail-fast` each exited 0; 410 tests passed, three multicast-LAN scenarios remained intentionally ignored |
 | Plugin gates | Frozen install, TypeScript and 52 Bun tests passed |
 | Installer/package/release | Shell syntax, 21 installer tests, seven packaging tests and release tests exited 0 |
 | Harness safety | Nine CI-safe Python tests passed, including credential isolation, route identity, startup filesystem failure, exited-leader descendant cleanup, teardown-failure nonpass, HTTP/process cleanup and Darwin zombie/live/unverifiable group permission cases |
@@ -121,6 +123,12 @@ pairing behavior was not inferred from those tests. The measured source includes
 the merged AGB-13 active-turn and saturation changes. This unheld-turn matrix
 does not independently repeat its held-turn/capacity scenarios; see the
 [delivery contract](codex-delivery.md) and [active-delivery proof](codex-active-delivery-regression.md).
+
+The first latest-base validation driver exited 143 (SIGTERM) during the full
+Rust suite, after formatting/check/Clippy passed. Its partial log and completed
+gates were retained; no leftover owned processes were found and the signal source
+was not established. One unchanged bounded full-suite rerun exited 0, followed by
+passing installer/package/release/safety checks and a metadata-bearing build.
 
 No release, publication, owner service replacement, private configuration,
 credentials or owner native-session changes were made. Only disposable broker
