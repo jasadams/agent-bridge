@@ -539,3 +539,102 @@ fn failed_grant_migration_rolls_back_and_retry_preserves_revoked_peer_denial() {
         original_audit
     );
 }
+
+#[test]
+fn replies_from_another_alias_of_the_same_native_session_preserve_parent_identity() {
+    for provider in [Provider::OpenCode, Provider::Claude, Provider::Codex] {
+        let mut p = Pair::new();
+        let source_session = if provider == Provider::OpenCode {
+            SESSION.into()
+        } else {
+            id()
+        };
+        let destination_session = if provider == Provider::OpenCode {
+            OTHER.into()
+        } else {
+            id()
+        };
+        let source = Agent {
+            provider: provider.clone(),
+            session: source_session,
+            ..agent(SESSION)
+        };
+        let manual = Agent {
+            name: "manual".into(),
+            provider: provider.clone(),
+            session: destination_session.clone(),
+            ..agent(OTHER)
+        };
+        let canonical = Agent {
+            name: format!("{}-{}", provider.label(), destination_session),
+            ..manual.clone()
+        };
+        p.a.register(&source, true).unwrap();
+        p.b.register(&manual, false).unwrap();
+        p.b.register(&canonical, false).unwrap();
+        p.a.register(
+            &Agent {
+                name: "origin-alias".into(),
+                ..source.clone()
+            },
+            false,
+        )
+        .unwrap();
+        p.a.share_peer_session(&p.bid, &source.name, true).unwrap();
+        p.b.share_peer_session(&p.aid, &manual.name, true).unwrap();
+        let destination = RemoteAgent {
+            name: manual.name.clone(),
+            provider: provider.clone(),
+            session: destination_session.clone(),
+        };
+        p.a.replace_remote_agents(&p.bid, std::slice::from_ref(&destination))
+            .unwrap();
+        let question_id = id();
+        p.a.send_remote(
+            &p.aid,
+            &question_id,
+            &source.name,
+            "bob/manual",
+            "question",
+            &None,
+        )
+        .unwrap();
+        let question = p.a.pending_transfers(&p.bid, 1).unwrap().pop().unwrap();
+        p.b.accept_remote(&p.bid, &p.aid, &question).unwrap();
+        let local_parent = p.b.history(&None, 1).unwrap()[0].id.clone();
+        // The plugin's canonical route and owner's manual alias name one session.
+        p.b.send_remote(
+            &p.bid,
+            &id(),
+            &canonical.name,
+            "alice/native",
+            "answer",
+            &Some(local_parent),
+        )
+        .unwrap();
+        let reply = p.b.pending_transfers(&p.aid, 1).unwrap().pop().unwrap();
+        assert_eq!(reply.source.name, canonical.name);
+        assert_eq!(reply.source.provider, destination.provider);
+        assert_eq!(reply.source.session, destination.session);
+        assert_eq!(reply.destination, question.source);
+        assert_eq!(reply.destination_peer, p.aid);
+        let reference = reply.parent.as_ref().unwrap();
+        assert_eq!(reference.id, question_id);
+        assert_eq!(reference.peer_id, p.aid);
+        assert_eq!(reply.hops, question.hops + 1);
+        p.a.accept_remote(&p.aid, &p.bid, &reply).unwrap();
+        let answer =
+            p.a.history(&None, 10)
+                .unwrap()
+                .into_iter()
+                .find(|m| m.parent.as_deref() == Some(question_id.as_str()))
+                .unwrap();
+        assert_eq!(answer.recipient, source.name);
+        assert_eq!(answer.recipient_session, source.session);
+        // A reply may change its source alias, never redirect the parent's destination.
+        let mut redirected = reply;
+        redirected.id = id();
+        redirected.destination.name = "origin-alias".into();
+        assert!(p.a.accept_remote(&p.aid, &p.bid, &redirected).is_err());
+    }
+}

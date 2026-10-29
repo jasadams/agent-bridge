@@ -88,7 +88,9 @@ provider and native `ses_` ID. A title rename keeps that identity; a replacement
 session cannot inherit it. The other owner independently shares their destination.
 Unshare/revocation and disabled/replaced registration checks apply before queued
 native submission. Replies pin both endpoints to the original provider/session,
-even if a cached directory changes. See [session sharing](session-sharing.md).
+even if a cached directory changes. The replying session may use its canonical
+route after receiving through a manual alias of the same provider/session; the
+reply still targets the original sender route. See [session sharing](session-sharing.md).
 
 Upgraded brokers negotiate provider support before dispatching an OpenCode source
 or destination. A peer that successfully answers only the legacy directory is

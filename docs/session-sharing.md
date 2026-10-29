@@ -50,7 +50,10 @@ three grant records exist, not that the session is currently enabled or online.
 
 Renaming retains the provider/session binding; replacing a name or creating another
 native session does not inherit permissions. Aliases for the same provider/session
-share the same policy. Revoking a peer clears every grant for that identity.
+share the same policy. A correlated reply may use another local alias for the
+same provider/session, including a native plugin's canonical route. Its destination
+remains the original sender route and provider/session; an alias cannot redirect
+the reply to another destination. Revoking a peer clears every grant for that identity.
 
 ## Inspect connections and pending requests
 

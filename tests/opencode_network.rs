@@ -6,7 +6,10 @@ use agent_bridge::{
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -18,6 +21,34 @@ use tokio::{task::JoinHandle, time::timeout};
 
 const A: &str = "ses_0123456789abcdefghijklmnop";
 const B: &str = "ses_0123456789abcdefghijklmnox";
+
+// Accepted sockets can inherit O_NONBLOCK on macOS. Only accept is polled;
+// each connected socket uses bounded blocking I/O for complete native frames.
+fn read_native_frame(stream: &UnixStream) -> Value {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn native_fixture_reads_delayed_frames_from_nonblocking_connections() {
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    // Reproduce inherited flags on every platform, including Linux where
+    // accept normally returns a blocking socket from a nonblocking listener.
+    reader.set_nonblocking(true).unwrap();
+    let worker = std::thread::spawn(move || read_native_frame(&reader));
+    std::thread::sleep(Duration::from_millis(50));
+    write!(writer, "{{\"op\":\"probe\",").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    writeln!(writer, "\"session\":\"{A}\"}}").unwrap();
+    assert_eq!(worker.join().unwrap(), json!({"op":"probe", "session":A}));
+}
 
 struct Native {
     _root: tempfile::TempDir,
@@ -50,14 +81,7 @@ impl Native {
                     }
                     Err(error) => panic!("native accept: {error}"),
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
-                let frame: Value = serde_json::from_str(&line).unwrap();
+                let frame = read_native_frame(&stream);
                 assert_eq!(frame["session"], session);
                 let mut receipt = json!({"ok":true,"session":session,"instance":instance});
                 if frame["op"] == "deliver" {
