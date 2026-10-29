@@ -465,8 +465,13 @@ impl View {
             frame.render_widget(block, responses);
             frame.render_widget(Paragraph::new(lines), inner);
         }
-        let status = if self.selection.is_some() {
+        let status = if self.selection.as_ref().is_some_and(Selection::is_dragging) {
             "Selecting text · view frozen · release mouse to copy · Esc cancels".into()
+        } else if self.selection.is_some() {
+            format!(
+                "{} · view frozen · Esc clears selection",
+                self.notice.as_deref().unwrap_or("Text selected")
+            )
         } else if self.saving {
             "Saving response…".into()
         } else if let Some(error) = &self.error {
@@ -600,7 +605,8 @@ impl View {
             MouseEventKind::Down(MouseButton::Left) => {
                 // A duplicate press while dragging cancels rather than selecting
                 // unseen data from a newly rendered revision behind the frozen view.
-                if self.selection.take().is_some() {
+                let previous = self.selection.take();
+                if previous.as_ref().is_some_and(Selection::is_dragging) {
                     return (true, None);
                 }
                 if let Some(viewport) = &self.viewport
@@ -611,6 +617,7 @@ impl View {
                     self.notice = None;
                     return (true, None);
                 }
+                return (previous.is_some(), None);
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(selection) = &mut self.selection {
@@ -618,8 +625,14 @@ impl View {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(selection) = self.selection.take() {
-                    return (true, selection.finish(point));
+                if let Some(selection) = &mut self.selection
+                    && selection.is_dragging()
+                {
+                    let text = selection.finish(point);
+                    if text.is_none() {
+                        self.selection = None;
+                    }
+                    return (true, text);
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -1039,11 +1052,79 @@ mod tests {
         assert_eq!(text.as_deref(), Some("COPY_ME"));
         assert!(view.pending.is_none(), "copying never edits Markdown");
         terminal.draw(|frame| view.draw(frame)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "A");
+        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "C");
+        assert_eq!(
+            terminal.backend().buffer()[(area.x, area.y)].bg,
+            Color::Yellow
+        );
+        assert!(!view.selection.as_ref().unwrap().is_dragging());
+        assert!(!buffer_text(&terminal).contains("release mouse to copy"));
+        assert_eq!(
+            view.mouse(mouse_event(MouseEventKind::Drag(MouseButton::Left), start)),
+            (false, None)
+        );
         assert_eq!(
             view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), end)),
             (false, None)
         );
+        assert!(!view.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(view.selection.is_none());
+        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "A");
+    }
+
+    #[test]
+    fn completed_selection_can_be_replaced_or_cleared_by_clicking() {
+        let mut view = View::default();
+        view.update(Ok(snapshot("first second", "one")));
+        let mut terminal = Terminal::new(TestBackend::new(70, 15)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let area = view.viewport.as_ref().unwrap().area();
+        let start = Position::new(area.x, area.y);
+        let end = Position::new(area.x + 4, area.y);
+        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), start));
+        assert_eq!(
+            view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), end)),
+            (true, Some("first".into()))
+        );
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let second = Position::new(area.x + 6, area.y);
+        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), second));
+        assert_eq!(
+            view.mouse(mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                Position::new(area.x + 11, area.y)
+            )),
+            (true, Some("second".into()))
+        );
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(start.x, start.y)].bg,
+            Color::Reset
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(second.x, second.y)].bg,
+            Color::Yellow
+        );
+        // Clicking the selected body clears it without copying again.
+        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), second));
+        assert_eq!(
+            view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), second)),
+            (true, None)
+        );
+        assert!(view.selection.is_none());
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), start));
+        view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), end));
+        // Clicking outside the document also clears the retained selection.
+        assert_eq!(
+            view.mouse(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                Position::new(0, 0)
+            )),
+            (true, None)
+        );
+        assert!(view.selection.is_none());
     }
 
     #[test]

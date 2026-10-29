@@ -61,10 +61,11 @@ line breaks and any selected table borders, rather than the raw Markdown source.
 It does not edit the document or notify board subscribers.
 
 The displayed document stays fixed during a drag so agents' updates cannot change
-what you are selecting. The live view resumes when you release or cancel the
-selection. Escape cancels a selection; scrolling, navigation or resizing also
-cancels it. Mouse selection applies to the rendered document, not the Responses
-pane or draft editor. Selections are limited to 64 KiB and are never silently
+what you are selecting. After release, the copied text stays highlighted and
+the displayed document stays fixed until you clear or replace the selection.
+Click to clear it or drag to select another region. Escape clears a selection;
+scrolling, navigation or resizing also clears it and resumes the live view. Mouse
+selection applies to the rendered document, not the Responses pane or draft editor. Selections are limited to 64 KiB and are never silently
 truncated.
 
 Copy uses the terminal's [OSC 52 clipboard support](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html),

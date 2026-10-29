@@ -39,6 +39,7 @@ pub(crate) struct Selection {
     viewport: Viewport,
     anchor: Position,
     end: Position,
+    dragging: bool,
 }
 impl Selection {
     pub(crate) fn start(viewport: Viewport, anchor: Position) -> Option<Self> {
@@ -49,6 +50,7 @@ impl Selection {
             viewport,
             anchor,
             end: anchor,
+            dragging: true,
         })
     }
 
@@ -56,7 +58,14 @@ impl Selection {
         self.viewport.area()
     }
 
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
     pub(crate) fn extend(&mut self, point: Position) -> bool {
+        if !self.dragging {
+            return false;
+        }
         let area = self.area();
         let next = Position::new(
             point.x.clamp(area.left(), area.right() - 1),
@@ -117,8 +126,12 @@ impl Selection {
     }
 
     /// Finishing a click or a drag returned to its anchor never changes a clipboard.
-    pub(crate) fn finish(mut self, point: Position) -> Option<String> {
+    pub(crate) fn finish(&mut self, point: Position) -> Option<String> {
+        if !self.dragging {
+            return None;
+        }
         self.extend(point);
+        self.dragging = false;
         if self.anchor == self.end {
             return None;
         }
@@ -182,7 +195,7 @@ mod tests {
     fn wide_and_combining_graphemes_are_never_split_or_duplicated() {
         let body = viewport(&["A地球 e\u{301} 👩‍💻 end"]);
         // Start on the continuation cell of 地, ending on the emoji's continuation.
-        let selection = Selection::start(body, Position::new(4, 3)).unwrap();
+        let mut selection = Selection::start(body, Position::new(4, 3)).unwrap();
         assert_eq!(
             selection.finish(Position::new(11, 3)).as_deref(),
             Some("地球 e\u{301} 👩‍💻")
