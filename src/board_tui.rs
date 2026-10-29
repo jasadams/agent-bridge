@@ -236,6 +236,7 @@ struct View {
     pending: Option<Save>,
     saving: bool,
     notice: Option<String>,
+    update_notice: Option<String>,
     viewport: Option<Viewport>,
     selection: Option<Selection>,
     mouse_enabled: bool,
@@ -257,6 +258,7 @@ impl Default for View {
             pending: None,
             saving: false,
             notice: None,
+            update_notice: None,
             viewport: None,
             selection: None,
             mouse_enabled: true,
@@ -264,6 +266,11 @@ impl Default for View {
     }
 }
 impl View {
+    fn update_release_notice(&mut self, notice: Option<String>) -> bool {
+        let changed = self.update_notice != notice;
+        self.update_notice = notice;
+        changed
+    }
     /// Return whether visible state changed, keeping native terminal selections
     /// intact during repeated healthy polls or the same repeated outage.
     fn update(&mut self, result: Result<Snapshot>) -> bool {
@@ -322,7 +329,9 @@ impl View {
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(response_height),
-            Constraint::Length(2),
+            // Reserve the release-notice line even before a check completes so
+            // availability changes never move the document or a mouse selection.
+            Constraint::Length(3),
         ])
         .areas(frame.area());
         let (name, revision) = self
@@ -487,6 +496,8 @@ impl View {
         frame.render_widget(Paragraph::new(vec![
             Line::from(safe_line(&status)),
             Line::from(if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc cancel · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · m native mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "m copy-on-select mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
+            Line::from(safe_line(self.update_notice.as_deref().unwrap_or("")))
+                .style(Style::default().fg(Color::Yellow)),
         ]), footer);
     }
     fn key(&mut self, key: KeyEvent, page: u16) -> bool {
@@ -760,6 +771,16 @@ fn file_watch(path: &Path, state_dir: &Path, refresh: mpsc::Sender<()>) -> Resul
     })
 }
 
+fn cached_release_notice(state_dir: &Path) -> Option<String> {
+    // A missing/unreadable optional cache must not interfere with board use.
+    let status = crate::update::cached_status(state_dir).ok()?;
+    let available = status.available_version?;
+    Some(format!(
+        "Update available: {} → {available} · run agent-bridge update",
+        status.current_version
+    ))
+}
+
 pub async fn run(state_dir: PathBuf) -> Result<()> {
     ensure!(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
@@ -775,7 +796,7 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     let (refresh, mut requests) = mpsc::channel(1);
     let (writes, mut write_requests) = mpsc::channel::<Save>(1);
     enum Update {
-        Read(Result<Snapshot>),
+        Read(Result<Snapshot>, Option<String>),
         Saved(Save, Result<(Snapshot, bool)>),
     }
     let (updates, mut results) = mpsc::channel(1);
@@ -804,7 +825,10 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
                         let value = broker::rpc(&state, &Request::BoardRead).await?;
                         serde_json::from_value::<Snapshot>(value).context("Invalid board snapshot from broker")
                     }.await;
-                    Update::Read(result)
+                    // Availability is broker-owned cached metadata. Reading it
+                    // never fetches a release or changes the board document.
+                    let notice = cached_release_notice(&state);
+                    Update::Read(result, notice)
                 }
             };
             if updates.send(update).await.is_err() {
@@ -830,7 +854,7 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) => {
                     let previous_mouse_mode = view.mouse_enabled;
-                    if view.key(key, terminal.size()?.height.saturating_sub(4)) { break; }
+                    if view.key(key, terminal.size()?.height.saturating_sub(5)) { break; }
                     if previous_mouse_mode != view.mouse_enabled {
                         if view.mouse_enabled {
                             crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
@@ -863,7 +887,7 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
             _ = fallback.tick() => { let _ = refresh.try_send(()); },
             update = results.recv() => {
                 let Some(update) = update else { anyhow::bail!("Board refresh worker stopped"); };
-                let snapshot = match &update { Update::Read(Ok(snapshot)) | Update::Saved(_, Ok((snapshot, _))) => Some(snapshot), _ => None };
+                let snapshot = match &update { Update::Read(Ok(snapshot), _) | Update::Saved(_, Ok((snapshot, _))) => Some(snapshot), _ => None };
                 if let Some(snapshot) = snapshot {
                     let root = snapshot.path.parent().filter(|parent| parent.is_dir()).unwrap_or(&state_dir);
                     if watch.as_ref().is_none_or(|watch| watch.root != root) {
@@ -873,7 +897,10 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
                     }
                 }
                 match update {
-                    Update::Read(result) => dirty |= view.update(result),
+                    Update::Read(result, notice) => {
+                        dirty |= view.update_release_notice(notice);
+                        dirty |= view.update(result);
+                    },
                     Update::Saved(save, result) => { view.saved(save, result); dirty = true; },
                 }
             }
@@ -912,6 +939,67 @@ mod tests {
             row: point.y,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn release_notice_is_separate_from_document_and_preserves_mouse_selection() {
+        let mut view = View::default();
+        let original = snapshot("COPY_ME original", "one");
+        view.update(Ok(original.clone()));
+        let mut terminal = Terminal::new(TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let area = view.viewport.as_ref().unwrap().area();
+        let start = Position::new(area.x, area.y);
+        let end = Position::new(area.x + 6, area.y);
+        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), start));
+        view.mouse(mouse_event(MouseEventKind::Drag(MouseButton::Left), end));
+
+        let notice = Some("Update available: 0.2.0 → 0.2.1 · run agent-bridge update".into());
+        assert!(view.update_release_notice(notice.clone()));
+        assert!(!view.update_release_notice(notice));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(buffer_text(&terminal).contains("Update available: 0.2.0 → 0.2.1"));
+        assert!(buffer_text(&terminal).contains("run agent-bridge update"));
+        assert_eq!(view.selection.as_ref().unwrap().area(), area);
+        assert_eq!(view.snapshot.as_ref().unwrap().markdown, original.markdown);
+        assert_eq!(view.snapshot.as_ref().unwrap().revision, original.revision);
+        assert!(view.pending.is_none());
+
+        assert!(view.update_release_notice(None));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(!buffer_text(&terminal).contains("Update available"));
+        assert_eq!(view.selection.as_ref().unwrap().area(), area);
+    }
+
+    #[test]
+    fn release_notice_preserves_draft_focus_and_scroll() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(&field("original"), "one")));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view.paste("draft");
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let draft = view.editor.as_ref().unwrap().draft.clone();
+        let selected = view.selected;
+        let scroll = view.scroll;
+
+        view.update_release_notice(Some(
+            "Update available: 0.2.0 → 0.2.1 · run agent-bridge update".into(),
+        ));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(buffer_text(&terminal).contains("Update available"));
+        assert_eq!(view.editor.as_ref().unwrap().draft, draft);
+        assert_eq!(view.selected, selected);
+        assert_eq!(view.scroll, scroll);
+        assert!(view.pending.is_none());
+    }
+
+    #[test]
+    fn missing_release_cache_does_not_create_files_or_a_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(cached_release_notice(temp.path()).is_none());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 
     #[test]

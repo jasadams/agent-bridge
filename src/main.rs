@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod update_install;
+
 #[derive(Parser)]
 #[command(
     version = agent_bridge::VERSION,
@@ -64,6 +66,18 @@ enum Commands {
         remote: bool,
     },
     Status,
+    /// Check for releases or update a managed installation after confirmation.
+    Update {
+        /// Refresh release availability without installing anything.
+        #[arg(long, conflicts_with_all = ["disable_checks", "enable_checks"])]
+        check: bool,
+        /// Disable automatic daily release checks (explicit --check still works).
+        #[arg(long, conflicts_with = "enable_checks")]
+        disable_checks: bool,
+        /// Enable automatic daily release checks.
+        #[arg(long)]
+        enable_checks: bool,
+    },
     /// Read-only browser monitor, embedded in this broker.
     Monitor {
         #[command(subcommand)]
@@ -460,6 +474,13 @@ async fn main() -> Result<()> {
         None => service::default_state_dir()?,
     };
     let req = match cli.command {
+        Commands::Update {
+            check,
+            disable_checks,
+            enable_checks,
+        } => {
+            return update_install::run(&state_dir, check, disable_checks, enable_checks);
+        }
         Commands::Mcp => return agent_bridge::mcp::run(state_dir).await,
         Commands::Board { raw } => {
             if raw {
@@ -868,4 +889,36 @@ fn pairing_token(token: Option<String>) -> Result<String> {
         "Invalid pairing token size"
     );
     Ok(token.to_owned())
+}
+
+#[cfg(test)]
+mod update_cli_tests {
+    use super::*;
+
+    #[test]
+    fn update_modes_are_explicit_and_mutually_exclusive() {
+        for option in ["--check", "--disable-checks", "--enable-checks"] {
+            assert!(Cli::try_parse_from(["agent-bridge", "update", option]).is_ok());
+        }
+        for options in [
+            ["--check", "--disable-checks"],
+            ["--check", "--enable-checks"],
+            ["--disable-checks", "--enable-checks"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["agent-bridge", "update", options[0], options[1]]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["agent-bridge", "update", "--yes"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["agent-bridge", "update"])
+                .unwrap()
+                .command,
+            Commands::Update {
+                check: false,
+                disable_checks: false,
+                enable_checks: false,
+            }
+        ));
+    }
 }

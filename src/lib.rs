@@ -16,6 +16,7 @@ pub mod migrations;
 pub mod network;
 pub mod protocol;
 pub mod service;
+pub mod update;
 
 pub mod monitor;
 mod monitor_data;

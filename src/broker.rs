@@ -535,7 +535,11 @@ impl Broker {
             Request::Status => {
                 let mut network = self.network_status.lock().unwrap().clone();
                 network["configured"] = json!(db.network_config()?);
-                json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.monitor_control.lock().unwrap().status(),"machine":self.local_machine(&db)?})
+                let updates = match crate::update::cached_status(&self.state_dir) {
+                    Ok(status) => json!(status),
+                    Err(error) => json!({"error": format!("{error:#}")}),
+                };
+                json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.monitor_control.lock().unwrap().status(),"machine":self.local_machine(&db)?,"updates":updates})
             }
             Request::RemoteList | Request::RemoteListPeer { .. } => {
                 let mut agents = match &req {
@@ -1296,6 +1300,8 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     tokio::pin!(networking);
     let observer = crate::clients::observe(bound.broker.clone(), codex_home);
     tokio::pin!(observer);
+    let update_checks = crate::update::run_checks(broker.state_dir.clone());
+    tokio::pin!(update_checks);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     eprintln!(
         "agent-bridge {} listening at {}",
@@ -1318,6 +1324,7 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
             res=&mut board_notifications=>break res,
             _=&mut networking=>unreachable!("Network worker runs until shutdown"),
             _=&mut observer=>unreachable!("Discovery observer runs until shutdown"),
+            _=&mut update_checks=>unreachable!("Update checker runs until shutdown"),
             _=tokio::signal::ctrl_c()=>break Ok(()),
             _=terminate.recv()=>break Ok(()),
         }

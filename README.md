@@ -185,7 +185,17 @@ receipt; task completion is communicated by a reply. See [delivery and trust](do
 
 ## Update
 
-Run the install command again. Managed updates back up the executable, service
+The board shows a quiet notice when a newer stable release is available. Agent
+Bridge checks once a day; it never installs an update automatically.
+
+```sh
+agent-bridge update --check
+agent-bridge update
+```
+
+The update command shows the versions and release-notes link, then asks for
+confirmation before restarting the managed service. You can also run the install
+command again. Managed updates back up the executable, service
 configuration and private state, preserving machine identity, message history and
 session grants. A failed startup restores the matching previous executable and
 state.

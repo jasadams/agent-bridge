@@ -31,6 +31,13 @@ Drag across the rendered board to select text; releasing the mouse sends the
 selection to the terminal clipboard. Outside the text editor, `m` toggles this
 mouse handling on or off.
 
+When a newer release is available, a quiet notice below the board shows the
+current and available versions and the `agent-bridge update` command. The broker
+checks in the background; the board only reads its cached result. The notice is
+separate from your Markdown, does not change its revision or notify agents, and
+does not interrupt drafts or text selection. See [update options](install.md#updates-backups-and-removal)
+for checking explicitly and disabling automatic checks.
+
 The broker must be running. Agents use the existing persistent MCP server and its
 `read_board` and `update_board` tools. There is no extra server or binary.
 

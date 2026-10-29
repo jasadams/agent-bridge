@@ -71,7 +71,40 @@ version; `status.build_commit` identifies its source revision.
 
 ## Updates, backups and removal
 
-Run the same command again to update. A managed upgrade stops the previous service,
+The broker checks GitHub for a newer stable release once a day, beginning about
+one minute after startup. Results and failed attempts are cached across restarts.
+Offline checks do not interrupt messaging or board use. The board TUI shows a
+quiet update notice outside the shared document; it never changes Markdown,
+revisions or agent board-change notifications. `agent-bridge status` includes
+cached availability under `updates` without making a network request.
+
+```sh
+# Check now, including when automatic checks are disabled; installs nothing.
+agent-bridge update --check
+
+# Show versions and a release-notes link, then confirm installation interactively.
+agent-bridge update
+
+# Persist the automatic-check preference for this state directory.
+agent-bridge update --disable-checks
+agent-bridge update --enable-checks
+```
+
+Use the global `--state-dir` option for a custom service state directory. Automatic
+checks contact GitHub's public release API and can be disabled with the command
+above; existing cached availability remains visible. Explicit checks still work
+when automatic checks are disabled. Detection alone never installs software or
+restarts the service, and notices are not sent into agent conversations.
+
+`agent-bridge update` supports managed Linux and macOS installations at
+`~/.local/bin/agent-bridge`. It requires a terminal and an affirmative response
+before installation; noninteractive calls cannot approve an update. It runs the
+installer bundled with the executable, pinned to the displayed release, reusing
+download verification and service backup/rollback. For source builds, custom
+binary paths or binary-only installs, rerun the original install command with the
+same options instead. You can also rerun that command to update a managed install.
+
+A managed upgrade stops the previous service,
 creates a private backup of its executable, service definition and complete state
 (including SQLite WAL/SHM and identity), replaces the executable atomically and
 checks readiness. If startup fails, it restores the old binary and matching state
