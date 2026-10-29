@@ -153,18 +153,131 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     text($("board-raw"), view.markdown);
     let document;
     try { document = renderNodes(view.nodes, !view.render_notice); }
-    catch { document = window.document.createDocumentFragment(); document.append(node("pre", view.markdown, "board-render-fallback")); }
+    catch { document = window.document.createDocumentFragment(); document.append(node("pre", typeof view.display_markdown === "string" ? view.display_markdown : "This document exceeds the rendering limit. Use Raw Markdown to inspect its exact source.", "board-render-fallback")); }
     if (!view.markdown) document.append(node("p", view.exists ? "This board is empty." : "main has not been written yet.", "help"));
     if (view.render_notice) document.prepend(node("p", view.render_notice, "help notice"));
     reconcile($("board-document"), document);
     $("board-document").hidden = raw; $("board-raw").hidden = !raw;
   }
+  const messageDrafts = new Map();
+  const messageDirty = () => Array.from(messageDrafts.values()).some(m => m.value || m.submission || m.pending);
+  const messagePending = () => Array.from(messageDrafts.values()).some(m => m.pending);
+  const messageIdentity = control => JSON.stringify([board, control.field_id, control.rebase_key]);
+  function renderMessage(m) {
+    m.row.hidden = m.name !== board;
+    m.input.readOnly = m.pending || m.state === "uncertain";
+    m.send.disabled = m.pending || (!m.submission && (!m.value.trim() || m.stale || !m.present));
+    text(m.send, m.submission ? "Retry same message" : "Send");
+    m.review.hidden = !m.stale || m.state === "uncertain";
+    m.review.disabled = m.pending;
+    m.discard.disabled = m.pending;
+    m.discard.hidden = !m.value && !m.submission;
+    const target = m.owner;
+    text(m.target, `To ${target.name} · ${target.provider} · session ${target.session}${target.endpoint ? ` · ${target.endpoint}` : ""}`);
+    text(m.feedback, m.pending ? "Sending to broker…" : m.feedbackText || (m.stale ? "The board or input changed. Your draft is kept. Review before sending." : "Enter sends · Shift+Enter adds a newline."));
+    $("board-messages").hidden = !Array.from(messageDrafts.values()).some(d => d.name === board);
+  }
+  function discardMessage(m) {
+    if (m.pending) return;
+    const uncertain = m.state === "uncertain";
+    m.value = ""; m.version++; m.submission = null; m.state = "editing"; m.input.value = "";
+    m.feedbackText = uncertain ? "Draft discarded. The prior submission may already have been accepted; inspect message history." : "Draft discarded.";
+    if (!m.present) { m.row.remove(); messageDrafts.delete(m.key); }
+    else { m.revision = m.currentRevision; m.controlId = m.control.id; m.stale = false; }
+    renderMessage(m);
+  }
+  async function reviewMessage(m) {
+    if (m.pending || m.state === "uncertain") return;
+    const c = capture(), view = await readSnapshot(true);
+    if (!current(c) || !active || !view || messageDrafts.get(m.key) !== m) return;
+    const found = view.controls.filter(control => control.kind === "message" && messageIdentity(control) === m.key);
+    if (found.length !== 1) { m.feedbackText = "This exact input is unavailable or changed. Your draft is kept; discard it only after inspecting the current target."; renderMessage(m); return; }
+    m.submission = null; m.state = "editing"; m.revision = view.revision; m.controlId = found[0].id; m.control = found[0]; m.present = true; m.stale = false;
+    m.feedbackText = "Current input reviewed. Check the target and press Enter to send."; renderMessage(m); m.input.focus();
+  }
+  async function sendMessage(m) {
+    if (m.pending || !active || !authenticated() || m.name !== board || messageDrafts.get(m.key) !== m) return;
+    if (!m.submission && (!m.value.trim() || m.stale || !m.present)) return;
+    if (!m.submission) m.submission = Object.freeze({ board: m.name, expected_revision: m.revision, control_id: m.controlId, id: crypto.randomUUID(), text: m.value });
+    const submission = m.submission, c = capture(), version = m.version;
+    const focusedHere = m.row.contains(document.activeElement);
+    m.pending = true; m.feedbackText = ""; renderMessage(m);
+    if (focusedHere) m.input.focus();
+    try {
+      const result = await request(`/api/boards/${encodeURIComponent(submission.board)}/messages`, { method: "POST", body: JSON.stringify(submission) });
+      if (!current(c) || !active || messageDrafts.get(m.key) !== m || m.submission !== submission) return;
+      if (result.accepted !== true || result.id !== submission.id || result.message?.id !== submission.id || result.message?.body !== submission.text || result.message?.sender !== "user" || result.message?.recipient !== m.owner.name || result.message?.recipient_session !== m.owner.session || typeof result.state !== "string") throw new Error("Unconfirmed message acceptance");
+      m.submission = null; m.state = "editing";
+      if (m.version === version) { m.value = ""; m.input.value = ""; }
+      m.feedbackText = `Broker accepted message (${result.state}). This does not mean the agent has read or completed it.`;
+      if (m.present && m.control) { m.revision = m.currentRevision; m.controlId = m.control.id; m.stale = false; }
+    } catch (e) {
+      if (!current(c) || !active || messageDrafts.get(m.key) !== m || m.submission !== submission) return;
+      if (e.data?.accepted === false && e.data?.code !== "uncertain") {
+        m.state = "rejected";
+        if (e.status === 409) m.submission = null;
+        m.feedbackText = e.data.error || "The broker rejected this message. Your draft is kept.";
+        if (e.status === 409) m.stale = true;
+      } else {
+        m.state = "uncertain";
+        m.feedbackText = "Acceptance is uncertain. Your exact draft and message ID are kept. Retry the same message explicitly, or inspect history before discarding.";
+      }
+    } finally {
+      if (current(c) && active && messageDrafts.get(m.key) === m) { const focused = document.activeElement;
+        const keepFocus = m.row.contains(focused);
+        m.pending = false; renderMessage(m);
+        if (keepFocus) m.input.focus(); }
+    }
+  }
+  function syncMessages(view) {
+    for (const m of messageDrafts.values()) if (m.name === board) m.present = false;
+    for (const control of view.controls) {
+      if (control.kind !== "message" || typeof control.field_id !== "string" || typeof control.rebase_key !== "string" || typeof control.id !== "string" || typeof control.label !== "string" || !control.owner || !["name", "provider", "session", "endpoint"].every(k => typeof control.owner[k] === "string")) continue;
+      const key = messageIdentity(control);
+      let m = messageDrafts.get(key);
+      if (!m) {
+        const row = node("section", undefined, "message-composer"), label = node("label", control.label), input = node("textarea"), target = node("p", "", "message-target help"), feedback = node("p", "", "message-feedback help"), actions = node("div", undefined, "response-actions"), send = node("button", "Send"), review = node("button", "Review current input"), discard = node("button", "Discard draft");
+        input.id = "message-" + crypto.randomUUID(); input.rows = 3; input.maxLength = 65536; label.htmlFor = input.id;
+        feedback.id = input.id + "-feedback"; feedback.setAttribute("role", "status"); feedback.setAttribute("aria-live", "polite"); input.setAttribute("aria-describedby", feedback.id);
+        for (const button of [send, review, discard]) button.type = "button";
+        actions.append(send, review, discard); row.append(label, target, input, feedback, actions); row.dataset.fieldId = control.field_id;
+        m = { key, name: board, owner: control.owner, value: "", version: 0, revision: view.revision, controlId: control.id, row, input, target, feedback, send, review, discard, state: "editing", pending: false, submission: null, composing: false };
+        const state = m;
+        input.addEventListener("compositionstart", () => { state.composing = true; });
+        input.addEventListener("compositionend", () => { state.composing = false; });
+        input.addEventListener("input", () => { if (!state.pending && state.state !== "uncertain") { state.value = input.value; state.version++; state.submission = null; state.feedbackText = ""; renderMessage(state); } });
+        input.addEventListener("keydown", e => {
+          if (e.key !== "Enter" || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || e.isComposing || state.composing || e.keyCode === 229) return;
+          e.preventDefault(); if (!e.repeat) void sendMessage(state);
+        });
+        send.addEventListener("click", () => { void sendMessage(state); });
+        review.addEventListener("click", () => { void reviewMessage(state); });
+        discard.addEventListener("click", () => discardMessage(state));
+        messageDrafts.set(key, m); $("message-controls").append(row);
+      }
+      m.present = true; m.control = control; m.currentRevision = view.revision;
+      if (m.revision !== view.revision) {
+        if (m.value || m.submission || m.pending) m.stale = true;
+        else { m.revision = view.revision; m.controlId = control.id; m.stale = false; }
+      }
+    }
+    for (const [key, m] of messageDrafts) {
+      if (m.name === board && !m.present) {
+        if (!m.value && !m.submission && !m.pending) { m.row.remove(); messageDrafts.delete(key); continue; }
+        m.stale = true;
+      }
+      renderMessage(m);
+    }
+    $("board-messages").hidden = !Array.from(messageDrafts.values()).some(m => m.name === board);
+  }
   function controls(view) {
-    document.querySelector(".board-responses").hidden = !view.controls.length && !draft;
+    syncMessages(view);
+    const responseControls = view.controls.filter(control => control.kind !== "message");
+    document.querySelector(".board-responses").hidden = !responseControls.length && !draft;
     if (view.controls.length > 4096) { controlRows.clear(); $("board-controls").replaceChildren(node("p", "Too many response controls to display safely.", "error")); return; }
     const retained = new Set();
     let index = 0;
-    for (const control of view.controls) {
+    for (const control of responseControls) {
       if (!control || typeof control.id !== "string" || typeof control.label !== "string" || !["text", "checkbox"].includes(control.kind)) continue;
       if (control.kind === "checkbox" && typeof control.checked !== "boolean") continue;
       if (control.kind === "text" && (typeof control.value !== "string" || typeof control.rebase_key !== "string" || typeof control.field_id !== "string")) continue;
@@ -213,7 +326,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     return found.length === 1 ? found[0] : null;
   }
   function renderEditor() {
-    document.querySelector(".board-responses").hidden = !draft && !shown?.controls.length;
+    document.querySelector(".board-responses").hidden = !draft && !shown?.controls.some(control => control.kind !== "message");
     $("response-editor").hidden = !draft;
     if (!draft) { $("response-text").value = ""; $("response-feedback").textContent = ""; return; }
     $("response-heading").textContent = draft.label || "Edit response";
@@ -296,11 +409,16 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     } finally { if (current(c) && draft === d || current(c) && !draft) { saving = false; if (shown) controls(shown); renderEditor(); flushRefresh(); } }
   }
   function discard() { draft = null; saving = false; renderEditor(); if (latest) { const view = latest; latest = null; show(view); } else if (shown) controls(shown); }
-  async function allowLeave() {
+  async function allowLeave(clearsPrivate = false) {
+    if (messagePending()) { status("Sending message. Wait for its outcome before leaving."); return false; }
     if (saving) { status("Saving response. Wait for its outcome before leaving."); return false; }
-    if (!dirty()) { discard(); return true; }
+    if (!dirty() && !messageDirty()) { discard(); return true; }
     if (leaveChoice) return false;
-    $("unsaved-save").disabled = draft.state !== "editing";
+    const messagesOnly = !dirty() && messageDirty();
+    $("unsaved-save").disabled = (clearsPrivate && messageDirty()) || (!messagesOnly && draft.state !== "editing");
+    text($("unsaved-save"), messagesOnly ? "Keep drafts and continue" : "Save and continue");
+    text($("unsaved-title"), messagesOnly ? "Keep your message drafts?" : "Keep your response?");
+    text($("unsaved-description"), messagesOnly ? (clearsPrivate ? "Locking clears private drafts. Discard drafts or cancel to stay. An uncertain submission may already have been accepted; inspect history." : "Keep drafts in this tab, discard them, or cancel. Continuing never sends a message. An uncertain submission may already have been accepted; inspect history.") : "Save the response before leaving, discard it, or cancel to keep editing.");
     const dialog = $("unsaved-dialog"); dialog.showModal(); $("unsaved-cancel").focus();
     return new Promise(resolve => { leaveChoice = resolve; });
   }
@@ -310,6 +428,8 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     const c = capture();
     if (!await allowLeave() || !current(c)) return;
     stop(); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; board = name; shown = null; latest = null; draft = null; backoff = 1000;
+    for (const m of messageDrafts.values()) m.row.hidden = true;
+    $("board-messages").hidden = true;
     $("selected-board-name").textContent = board; $("board-selector").value = board;
     $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); renderEditor(); error(""); status("Loading board…");
     const selected = capture();
@@ -318,7 +438,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   }
   async function open() {
     if (active) return;
-    const c = capture(); if (!await allowLeave() || !current(c)) return;
+    const c = capture(); if (active && !await allowLeave() || !current(c)) return;
     active = true; onViewChange("boards"); status("Loading boards…");
     try {
       const data = await request("/api/boards");
@@ -331,9 +451,10 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       if (current(c) && active) void startLive();
     } catch (e) { if (current(c) && active && e.name !== "AbortError") { error("The board list could not be loaded. Refresh or return to Messages and try again."); status("Stale · reconnecting"); } }
   }
-  async function leave(action) { const c = capture(); if (await allowLeave() && current(c)) { active = false; stop(); boardEpoch++; action(); } }
+  async function leave(action, clearsPrivate = false) { const c = capture(); if (await allowLeave(clearsPrivate) && current(c)) { active = false; stop(); boardEpoch++; action(); } }
   function clear() {
     active = false; authEpoch++; boardEpoch++; stop(); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
+    messageDrafts.clear(); $("message-controls").replaceChildren(); $("board-messages").hidden = true;
     board = "main"; shown = null; latest = null; draft = null; saving = false; raw = false; backoff = 1000;
     $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); $("board-selector").replaceChildren();
     $("selected-board-name").textContent = "main"; $("response-heading").textContent = "Edit response"; $("response-intent").textContent = "";
@@ -377,13 +498,13 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   $("response-cancel").addEventListener("click", () => { if (!saving) { discard(); status("Response cancelled; nothing was saved by Cancel."); } });
   $("response-review").addEventListener("click", () => { void review(); });
   $("response-rebase").addEventListener("click", () => { const candidate = rebaseCandidate(); if (!candidate || !draft) return; draft.id = candidate.id; draft.revision = latest.revision; draft.original = candidate.value; draft.state = "editing"; draft.reviewed = false; latest = null; $("board-newer").hidden = true; renderEditor(); status("Rebased unchanged field. Review your response, then Save explicitly."); });
-  $("unsaved-save").addEventListener("click", async () => { const resolve = leaveChoice; if (!resolve) return; if ($("unsaved-dialog").open) $("unsaved-dialog").close(); const saved = await saveDraft(); if (leaveChoice === resolve) finishChoice(saved); });
-  $("unsaved-discard").addEventListener("click", () => { discard(); finishChoice(true); });
+  $("unsaved-save").addEventListener("click", async () => { const resolve = leaveChoice; if (!resolve || $("unsaved-save").disabled) return; if (!dirty() && messageDirty()) { finishChoice(true); return; } if ($("unsaved-dialog").open) $("unsaved-dialog").close(); const saved = await saveDraft(); if (leaveChoice === resolve) finishChoice(saved); });
+  $("unsaved-discard").addEventListener("click", () => { for (const m of Array.from(messageDrafts.values())) discardMessage(m); discard(); finishChoice(true); });
   $("unsaved-cancel").addEventListener("click", () => finishChoice(false));
   $("unsaved-dialog").addEventListener("cancel", e => { e.preventDefault(); finishChoice(false); });
   document.addEventListener("selectionchange", () => {
     if (active && latest && !draft && !saving && !selectionHeld()) { const view = latest; latest = null; show(view); status("Live · up to date"); }
   });
-  window.addEventListener("beforeunload", e => { if (dirty() || saving) { e.preventDefault(); e.returnValue = ""; } });
-  return { open, leave, clear, hasDraft: dirty };
+  window.addEventListener("beforeunload", e => { if (dirty() || saving || messageDirty() || messagePending()) { e.preventDefault(); e.returnValue = ""; } });
+  return { open, leave, clear, hasDraft: () => dirty() || messageDirty() };
 };

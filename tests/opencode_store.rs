@@ -395,7 +395,7 @@ fn schema_eleven_grants(path: &std::path::Path) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(path).unwrap();
     // Recreate the exact pre-OpenCode grant constraint and numbered schema.
     conn.execute_batch(
-        "DROP TABLE codex_notices; DROP TRIGGER opencode_enqueue_bound;
+        "DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER opencode_enqueue_bound;
 DROP TRIGGER opencode_retry_bound;
 DROP TRIGGER opencode_enqueue_binding;
 DROP TABLE opencode_deliveries;

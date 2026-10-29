@@ -134,7 +134,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#boards-tab").click()
         expect(page.locator("#selected-board-name")).to_have_text("main")
         expect(page.locator("#board-document")).to_contain_text("has not been written")
-        expect(page.locator(".board-responses")).to_be_hidden()
+        expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_hidden()
         names = page.locator("#board-selector option").all_text_contents()
         assert names == sorted(names) and names == ["alpha", "beta", "main"]
         pick("alpha")
@@ -158,7 +158,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         write("main", "# Ticket board\n\n| Ticket | Status |\n| --- | --- |\n| AGB-12 | Done |\n")
         page.locator("#board-selector").select_option("main")
         expect(page.locator("#board-document h1")).to_have_text("Ticket board")
-        expect(page.locator(".board-responses")).to_be_hidden()
+        expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_hidden()
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.evaluate("window.scrollTo(0, 0)")
         document = page.locator(".board-document-panel").bounding_box()
@@ -168,7 +168,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         assert abs(document["width"] - board_view["width"]) <= 2, "Board loses width to an unused sidebar"
         page.screenshot(path=str(output / "boards-read-only-desktop.png"), full_page=True)
         pick("alpha")
-        expect(page.locator(".board-responses")).to_be_visible()
+        expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_visible()
         record("read-only board opens near the top at full content width without empty response chrome; editable controls return on navigation")
 
         snapshot_reads = []
@@ -380,7 +380,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             page.evaluate("window.scrollTo(0, 0)")
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1"), "Page overflow hides response controls"
             document = page.locator(".board-document-panel").bounding_box()
-            responses = page.locator(".board-responses").bounding_box()
+            responses = page.locator('.board-responses[aria-labelledby="responses-heading"]').bounding_box()
             board_view = page.locator("#boards-view").bounding_box()
             assert document and responses and board_view
             assert abs(document["width"] - board_view["width"]) <= 2, "Editable board reserves document width for responses"

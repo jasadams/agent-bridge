@@ -421,7 +421,7 @@
   });
   $("messages-tab").addEventListener("click", () => { void boards.leave(() => view("messages")); });
   $("boards-tab").addEventListener("click", () => { void boards.open(); });
-  $("lock-button").addEventListener("click", () => { void boards.leave(() => { lock(); $("access-token").focus(); }); });
+  $("lock-button").addEventListener("click", () => { void boards.leave(() => { lock(); $("access-token").focus(); }, true); });
   $("filters").addEventListener("submit", (event) => {
     event.preventDefault();
     const next = new URLSearchParams();

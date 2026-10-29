@@ -509,6 +509,61 @@ impl Broker {
             Ok(match req {
                 // Board edits share the broker's local administration mutex. No
                 // network request can invoke this API or select a filesystem path.
+                Request::BoardMessageSend { request } => {
+                    self.board_message_submit_locked(&db, &request).body
+                }
+                Request::AddBoardMessageInput {
+                    agent,
+                    board,
+                    expected_revision,
+                    id,
+                    label,
+                } => {
+                    let actor = db.agent(&agent)?;
+                    ensure!(actor.enabled, "Message input owner must be enabled");
+                    let marker = crate::board_messages::Marker {
+                        id,
+                        instance: uuid::Uuid::new_v4().to_string(),
+                        label,
+                        owner: crate::board_messages::Owner {
+                            name: actor.name.clone(),
+                            provider: actor.provider.clone(),
+                            session: actor.session.clone(),
+                            endpoint: actor.endpoint.clone(),
+                        },
+                    };
+                    ensure!(
+                        marker.valid(),
+                        "Invalid message input identity, ID or label"
+                    );
+                    let current = crate::board::read_named(&self.state_dir, &board)?;
+                    let text = format!(
+                        "{}<!-- board-message: {} -->\n",
+                        if current.markdown.ends_with('\n') || current.markdown.is_empty() {
+                            ""
+                        } else {
+                            "\n"
+                        },
+                        serde_json::to_string(&marker)?
+                    );
+                    let candidate = format!("{}{text}", current.markdown);
+                    ensure!(crate::board_interaction::controls(&candidate).iter().any(|control| matches!(&control.kind, crate::board_interaction::Kind::Message { id, instance, owner } if id == &marker.id && instance == &marker.instance && owner == &marker.owner) && control.label == marker.label), "Message input ID is duplicated or board controls are malformed");
+                    match self.update_board_locked(
+                        &board,
+                        &expected_revision,
+                        &[crate::board::Edit::Append { text }],
+                        Some(&actor),
+                    ) {
+                        Ok(board) => json!({"applied":true,"board":board}),
+                        Err(error) => {
+                            if let Some(conflict) = error.downcast_ref::<crate::board::Conflict>() {
+                                json!({"applied":false,"conflict":true,"board":conflict.current})
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
                 Request::BoardList => json!(crate::board::list(&self.state_dir)?),
                 Request::BoardCreate { board } => {
                     json!(crate::board::create(&self.state_dir, &board)?)
@@ -1556,6 +1611,109 @@ impl Broker {
             }
         }
         Ok(())
+    }
+
+    /// Shared explicit user submission path. The caller holds the DB mutex.
+    pub fn board_message_submit_locked(
+        &self,
+        db: &Db,
+        request: &crate::board_messages::Submission,
+    ) -> crate::board_messages::Reply {
+        use crate::board_messages::Reply;
+        if !request.valid() {
+            return Reply::error(400, "invalid", "Invalid board message submission");
+        }
+        match db.board_message_receipt(request) {
+            Ok(Some(mut receipt)) => {
+                receipt["duplicate"] = json!(true);
+                return Reply {
+                    status: 200,
+                    body: receipt,
+                };
+            }
+            Err(error) => {
+                return if error
+                    .downcast_ref::<crate::board_messages::IdConflict>()
+                    .is_some()
+                {
+                    Reply::error(409, "conflict", error)
+                } else {
+                    Reply::error(500, "uncertain", error)
+                };
+            }
+            Ok(None) => (),
+        }
+        let snapshot = match crate::board::read_named(&self.state_dir, &request.board) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Reply::error(503, "unavailable", error),
+        };
+        let conflict = |error: &str| {
+            let mut reply = Reply::error(409, "conflict", error);
+            reply.body["board"] = json!(snapshot);
+            reply
+        };
+        if snapshot.revision != request.expected_revision {
+            return conflict("Board changed; review the current control before sending");
+        }
+        let controls = crate::board_interaction::controls(&snapshot.markdown);
+        let Some(control) = controls.iter().find(|control| {
+            crate::board_interaction::control_id(&snapshot, control) == request.control_id
+        }) else {
+            return conflict("Message input is missing, duplicated or malformed");
+        };
+        let crate::board_interaction::Kind::Message { owner, .. } = &control.kind else {
+            return conflict("Selected control is not a message input");
+        };
+        let agent = match db.agent(&owner.name) {
+            Ok(agent) if owner.matches(&agent) => agent,
+            _ => {
+                return Reply::error(
+                    503,
+                    "unavailable",
+                    "Exact message input owner is closed, disabled or replaced",
+                );
+            }
+        };
+        if agent.provider == Provider::Claude
+            && let Some(reason) = crate::clients::claude::stale_reason(Path::new(&agent.endpoint))
+        {
+            return Reply::error(503, "unavailable", reason);
+        }
+        // The native admission checks and OpenCode durable lease/queue triggers in
+        // Db::send remain authoritative. No native conversation is started here.
+        let result = (|| -> Result<Value> {
+            let tx = db.conn.unchecked_transaction()?;
+            let message = db.send(&request.id, "user", &owner.name, &request.text, &None)?;
+            let receipt = json!({"accepted":true,"id":request.id,"message":self.message_value(db, &message)?,"state":message.state,"duplicate":false});
+            tx.execute("INSERT INTO board_message_receipts(id,submission,owner,receipt) VALUES(?1,?2,?3,?4)", rusqlite::params![request.id, serde_json::to_string(request)?, serde_json::to_string(owner)?, serde_json::to_string(&receipt)?])?;
+            tx.commit()?;
+            Ok(receipt)
+        })();
+        match result {
+            Ok(body) => {
+                self.wake.notify_one();
+                Reply { status: 200, body }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if error
+                    .downcast_ref::<crate::codex_admission::Capacity>()
+                    .is_some()
+                    || message.contains("Queue is full")
+                    || message.contains("queue is full")
+                {
+                    Reply::error(429, "rejected", error)
+                } else if message.contains("lease")
+                    || message.contains("admission")
+                    || message.contains("session")
+                    || message.contains("disabled")
+                {
+                    Reply::error(503, "unavailable", error)
+                } else {
+                    Reply::error(500, "uncertain", error)
+                }
+            }
+        }
     }
 
     /// Caller holds the local DB administration mutex. HTTP additionally retains

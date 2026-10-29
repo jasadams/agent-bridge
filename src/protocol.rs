@@ -185,6 +185,16 @@ pub enum Request {
     Pause {
         paused: bool,
     },
+    BoardMessageSend {
+        request: crate::board_messages::Submission,
+    },
+    AddBoardMessageInput {
+        agent: String,
+        board: crate::board::Name,
+        expected_revision: String,
+        id: String,
+        label: String,
+    },
     BoardList,
     BoardCreate {
         board: crate::board::Name,

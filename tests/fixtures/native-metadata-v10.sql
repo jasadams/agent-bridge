@@ -1,3 +1,5 @@
+-- Remove durable board composer receipts introduced after this fixture schema.
+DROP TABLE IF EXISTS board_message_receipts;
 -- Remove typed Codex control markers added after this fixture schema.
 DROP TABLE IF EXISTS codex_notices;
 -- Remove later local OpenCode recovery state when reconstructing a genuine v10 fixture.

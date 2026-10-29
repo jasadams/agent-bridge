@@ -569,6 +569,36 @@ impl Db {
         self.get(id)
     }
 
+    pub(crate) fn board_message_receipt(
+        &self,
+        request: &crate::board_messages::Submission,
+    ) -> Result<Option<serde_json::Value>> {
+        let old: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT submission,receipt FROM board_message_receipts WHERE id=?",
+                [&request.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((submission, receipt)) = old {
+            if submission != serde_json::to_string(request)? {
+                return Err(crate::board_messages::IdConflict(
+                    "Submission ID already belongs to a different board message",
+                )
+                .into());
+            }
+            return Ok(Some(serde_json::from_str(&receipt)?));
+        }
+        if self.get_optional(&request.id)?.is_some() {
+            return Err(crate::board_messages::IdConflict(
+                "Submission ID already belongs to another message",
+            )
+            .into());
+        }
+        Ok(None)
+    }
+
     pub fn get_optional(&self, id: &str) -> Result<Option<Message>> {
         Ok(self
             .conn

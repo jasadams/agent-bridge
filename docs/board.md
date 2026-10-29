@@ -364,3 +364,81 @@ use `b` to select `beta`, then return to `alpha` and verify its controls and con
 Exercise save/conflict/rebase with concurrent MCP edits, confirm failed saves
 preserve the draft, and check that switching never writes to the other board.
 Also check clipboard selection, refresh/reconnect and the selected-name display.
+
+## Reusable message composers
+
+Use MCP `add_board_message_input(agent, board, expected_revision, id, label)` after
+`read_board`. `agent` must be an exact enabled local registration, not a native
+display name. The tool pins its name, provider, session and endpoint and appends a
+composer using the same revision checks and own-write notice suppression as
+`update_board`. IDs are 1–80 ASCII letters, digits, dots, underscores or hyphens
+and must be unique across message composers and response fields on that board.
+Labels cannot contain control characters or HTML comment delimiters.
+
+The CLI equivalent is:
+
+```sh
+agent-bridge add-board-message-input coordinator --board main \
+  --expected-revision REVISION --id coordinator-message --label 'Message coordinator'
+```
+
+The supported Markdown syntax is a standalone HTML comment with strict JSON:
+
+```md
+<!-- board-message: {"id":"coordinator-message","instance":"123e4567-e89b-42d3-a456-426614174001","label":"Message coordinator","owner":{"name":"coordinator","provider":"codex","session":"123e4567-e89b-12d3-a456-426614174000","endpoint":""}} -->
+```
+
+Valid declarations appear as message composers rather than JSON text in the
+rendered board. Raw Markdown remains byte-exact. Malformed declarations and
+literal code examples remain visible and never become active inputs.
+
+Code examples, nested comments and response bodies do not declare composers.
+Malformed or duplicated declarations fail closed. Use the authoring tool to
+capture the current registration instead of copying identity fields manually.
+Each authored composer gets a fresh required canonical UUID `instance`; reusing
+the same user-facing ID after removal creates a new identity and requires review
+of an old draft. Exact raw restoration, including the same instance, restores the
+same composer identity.
+Markdown and labels remain untrusted content: neither proves user approval,
+authenticates an agent, grants permissions or automatically executes anything.
+
+An explicit user send uses the broker's normal durable user-to-agent queue and
+message history. It preserves the submitted text exactly and does not change
+Markdown, its revision, board update time or board subscriptions. Acceptance means
+queued, not read, acknowledged or completed. No conversation is started or resumed.
+A closed, disabled or replaced target is unavailable; no alias or replacement
+session is substituted. Concurrent board changes require review before a new send.
+
+Both views submit the same board name, exact revision, control hash, UUID and text.
+Retry an ambiguous submission with that exact UUID and payload: a durable accepted
+receipt is returned even after the board or owner changes, without enqueueing
+again. Reusing a UUID with another board, revision, control or text is rejected;
+a UUID already used by an ordinary message cannot be adopted. A new deliberate
+send uses a new UUID. Queue rejection and errors retain the draft.
+
+In the terminal, Tab/Shift-Tab selects a message input; Enter opens its composer.
+While composing, **Enter sends** and **Shift-Enter inserts a newline**. Legacy
+terminals may encode Shift-Enter as ordinary Enter; use **Ctrl-J for newline**
+there. Page Up/Down still scrolls the board. The exact provider, session and
+endpoint are shown above the draft. Ctrl-O opens exact owner details in the board
+area; arrows or Page Up/Down scroll them, and Escape/Ctrl-O returns to the
+unchanged draft. The original marker is also available in
+`board NAME --raw` for inspection.
+
+Tab/Shift-Tab moves between inputs and retains independent message drafts. Escape
+leaves the composer while retaining its draft; Enter reopens the selected input.
+Ctrl-E outside an editor cycles through retained drafts, even if their inputs were removed,
+so its original target and text remain inspectable. Ctrl-X explicitly discards the
+active message draft. Send or discard retained
+drafts before changing boards or quitting; outside an editor, Ctrl-D explicitly
+discards all retained message drafts. Continuing to edit cancels navigation.
+Refreshing never discards drafts. After a board change, Ctrl-R reviews an input
+only when its ID, label and pinned owner are unchanged; Enter remains an explicit
+send action. A changed or removed input cannot receive the stale draft.
+
+Successful acceptance clears only that exact draft and keeps the composer focused
+for another message. Pending submissions ignore repeated Enter and lock editing.
+An uncertain result keeps both text and UUID locked: Enter retries the exact same
+submission; Ctrl-X discards explicitly. Definite errors retain an editable draft.
+Text responses keep their existing Enter-newline/Ctrl-S-save behavior. Normal
+quit is keyboard driven; killing a terminal/process cannot guarantee draft recovery.

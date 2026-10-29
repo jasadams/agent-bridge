@@ -313,8 +313,10 @@ fn schema_thirteen_unknown_local_codex_queue_is_blocked_without_replay_and_is_id
         [&identifier],
     )
     .unwrap();
-    conn.execute_batch("DROP TABLE codex_notices; PRAGMA user_version=13;")
-        .unwrap();
+    conn.execute_batch(
+        "DROP TABLE board_message_receipts; DROP TABLE codex_notices; PRAGMA user_version=13;",
+    )
+    .unwrap();
     drop(conn);
     for _ in 0..2 {
         let mut db = Db::open(&path).unwrap();

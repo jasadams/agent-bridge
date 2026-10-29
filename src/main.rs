@@ -58,6 +58,18 @@ enum Commands {
         #[arg(long)]
         events: Option<String>,
     },
+    /// Append an input pinned to an exact enabled local agent registration.
+    AddBoardMessageInput {
+        agent: String,
+        #[arg(long, default_value = "main")]
+        board: Name,
+        #[arg(long)]
+        expected_revision: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        label: String,
+    },
     /// Run the background broker (launchd runs this command).
     Serve {
         #[arg(long)]
@@ -537,6 +549,27 @@ async fn main() -> Result<()> {
             );
         }
 
+        Commands::AddBoardMessageInput {
+            agent,
+            board,
+            expected_revision,
+            id,
+            label,
+        } => {
+            let value = broker::rpc(
+                &state_dir,
+                &Request::AddBoardMessageInput {
+                    agent,
+                    board,
+                    expected_revision,
+                    id,
+                    label,
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
         Commands::Board {
             name,
             raw,
