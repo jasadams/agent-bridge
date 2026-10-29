@@ -122,19 +122,26 @@ uncertain. No same-ID replay repairs an unknown result.
 
 ## Busy and permission behavior
 
-FIFO, bounded queuing/deadlines, pause/cancel and uncertain ordering barriers are
-broker-owned. The plugin refreshes native status once per fresh delivery and
-uses cached busy/permission events. Known busy work or pending permission defers
-before the attempt fence. An idle/readiness event lets the broker reconsider its
-existing queue; the plugin does not retain hidden submission work.
+FIFO, bounded queued work, pause/cancel and uncertain ordering barriers are
+broker-owned. Live unattempted work has no 120-second age expiry; lease loss or
+generation replacement still fails it. The updated plugin advertises readiness
+for native input admission during active model/tool work and pending permissions.
+It validates native status and current agent/model/variant before a fresh attempt;
+unavailable active selection safely defers. It copies no tools or policy fields.
 
-Status checking cannot atomically reserve OpenCode's runner. In 1.18.35 the
-native prompt creates a user message before `ensureRunning` joins existing work.
-A user can start work after the idle snapshot: insertion may occur during that
-work and be processed by the existing run. The integration never cancels work,
-answers a permission prompt, supplies API `tools`/permissions fields, or replays
-an uncertain prompt. A receipt proves insertion, not processing order inside a
-native run. See [the recovery contract](../../docs/opencode-recovery.md).
+In 1.18.35 `promptAsync` persists input before joining an existing runner without
+cancelling it. OpenCode owns that native input; a subsequent normal model request
+can see it at the next runner iteration. An in-flight request cannot. Appending
+input does not answer a pending permission. Native errors and early stops may
+leave inserted input unprocessed: `submitted` proves insertion, not processing,
+acknowledgement or completion, and never authorizes another prompt.
+
+Reinstall with `opencode install` and fully restart OpenCode to load this behavior.
+Protocol 2 is unchanged and does not itself advertise active support. An older
+loaded plugin remains idle-only; an older broker retains its age-expiry policy.
+The 64-per-session/1000-global bounds cover broker queued/sending/uncertain work,
+not submitted native records. Journal lifetime row/byte ceilings still apply.
+See [the recovery contract](../../docs/opencode-recovery.md).
 
 ## Disposable native validation
 
@@ -145,8 +152,10 @@ tools/opencode-setup-native.sh /absolute/path/to/agent-bridge /absolute/path/to/
 
 The harness uses isolated HOME/XDG/config/session/broker state and a scripted
 localhost OpenAI-compatible model fixture. It exercises the actual pinned native
-runtime, plugin, broker and MCP acknowledgement/reply path, blocking native tool
-work, pending native permission, and the residual idle-to-busy race. Temporary
+runtime, plugin, broker and MCP acknowledgement/reply path, insertion during held
+native tools/model streams, next-boundary model visibility, owner selection,
+alias FIFO, pause/cancel, a 125-second live wait, pending permission input and
+no replay after native stream error. Temporary
 fixture policy is initial test configuration; no target session's permission
 rules are changed and no native permission response/cancel API is called.
 All children and temporary state are cleaned up. Registry access may be needed

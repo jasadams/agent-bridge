@@ -24,9 +24,14 @@ Schema 13 follows the sharing grant migration 12 without changing its constraint
   a reconciliation request cannot create or reset an attempt. Tombstones are
   retained without eviction. Capacity exhaustion fails closed.
 * Deferred receipts occur only before a native attempt, with no asynchronous
-  retained work. The first busy deadline is durable and never extended by
-  heartbeats or restart. An explicit user retry of provably unattempted work may
-  establish a fresh bounded window. Lease expiry and busy deadlines run without native events.
+  retained work. Phase `queued` proves no native attempt, including a fenced
+  deferred receipt. Its wait has no native-work age limit: continuing heartbeats
+  from the exact live generation preserve queued work through tools and unanswered
+  permissions, and admission readiness enables automatic FIFO dispatch. Existing
+  per-session/global count and message byte limits bound retained work. Schema
+  13's deadline column remains compatibility metadata, not an expiry condition.
+  Lease expiry still runs without native events; restart never extends a lease.
+  Historical failed messages are never automatically resurrected.
 * Leases bind generation, instance and endpoint. Renewal, close, readiness and
   delivery outcomes are fenced against stale generations. Reopening after expiry
   requires verified live observation. Old queued work cannot silently cross a
@@ -34,16 +39,30 @@ Schema 13 follows the sharing grant migration 12 without changing its constraint
 * Native admission checks broker pause, claim, generation, liveness and current
   access immediately before the journal attempt. Admission is the linearization
   point: subsequent pause/cancel does not recall already admitted in-flight work.
-  The integration does not claim an atomic native idle-to-submit transaction.
+  Native status/selection reads do not reserve the runner or lock owner selection.
 
-The native source saves user content before joining the session runner. Its
-Running runner joins existing work; it does not cancel it. Busy and permission
-waits defer peer submissions. A native user may start work after the final idle
-check: that race can insert a peer user message while a run is active, and its
-processing timing follows native runner behavior. The plugin never cancels native
-work, changes permission rules, answers an approval, starts/resumes a conversation,
-or claims exactly-once model execution. Bounded status/message reads occur only
-for submission and explicit reconciliation; heartbeat liveness uses plugin events,
+The native source saves user content before joining the session runner. The
+Running runner joins existing work without cancelling it. Admission readiness
+means the exact live session may accept native input, including during native
+model/tool work and unanswered permissions. Status and native selection reads
+remain guarded against lifecycle/revision races. The plugin preserves validated
+native agent/model/variant; it never supplies tools, permissions or peer-provided
+system instructions. Missing active selection defers before the journal attempt.
+Session updates fence selection changes through broker admission.
+
+OpenCode owns inserted input. Its next normal runner iteration reads the new
+user record; an in-flight model request cannot see input added after it started.
+Insertion is `submitted`, not acknowledgement or proof of model processing.
+Native errors, permission denial, structured-output or compaction stops may end a
+run without consuming inserted input. These outcomes never authorize replay or a
+bridge-controlled second inference loop. The integration never cancels work,
+answers permissions, changes owner policy or claims exactly-once model execution.
+
+The 64-per-session and 1000-global broker limits cover queued/sending/uncertain
+work, not submitted native records awaiting model consumption. Durable journal
+row/byte ceilings still bound lifetime insertion. Protocol 2 retains its existing
+frames and receipts; older loaded plugins remain idle-only. Reinstall and fully
+restart OpenCode to activate the new plugin behavior. Heartbeats use events,
 not continuous model polling.
 
 Crash outcomes: before the attempt fence, no prompt has been authorized; after the

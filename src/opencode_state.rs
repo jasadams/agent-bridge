@@ -51,7 +51,11 @@ impl Db {
     }
     pub(crate) fn opencode_tick(&self, time: i64) -> Result<()> {
         self.conn.execute("UPDATE agents SET enabled=0 WHERE provider='opencode' AND EXISTS(SELECT 1 FROM opencode_leases l WHERE l.session=agents.session AND l.endpoint=agents.endpoint AND l.expires<=?1)", [time])?;
-        self.conn.execute("UPDATE messages SET state='failed',detail='OpenCode lease/generation expired or busy deadline elapsed; explicitly retry after live registration',updated=?1 WHERE state='queued' AND id IN(SELECT d.id FROM opencode_deliveries d LEFT JOIN opencode_leases l ON l.session=d.session WHERE d.phase='queued' AND (d.deadline<=?1 OR l.expires<=?1 OR l.generation<>d.generation OR l.session IS NULL))", [time])?;
+        // Queued is proof of no native attempt (including an explicit deferred
+        // receipt). Bound waiting by queue capacity and the exact owning lease,
+        // not elapsed native work/permission time. Keep schema 13's deadline
+        // column as compatibility metadata; it no longer authorizes expiry.
+        self.conn.execute("UPDATE messages SET state='failed',detail='OpenCode lease/generation expired; explicitly retry after live registration',updated=?1 WHERE state='queued' AND id IN(SELECT d.id FROM opencode_deliveries d LEFT JOIN opencode_leases l ON l.session=d.session WHERE d.phase='queued' AND (l.expires<=?1 OR l.generation<>d.generation OR l.session IS NULL))", [time])?;
         Ok(())
     }
 
@@ -291,7 +295,7 @@ impl Db {
             .context("OpenCode retry requires a live session lease")?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "UPDATE opencode_deliveries SET generation=?1,phase=?2,attempt=NULL,deadline=CASE WHEN phase='queued' THEN ?4 ELSE deadline END WHERE id=?3",
+            "UPDATE opencode_deliveries SET generation=?1,phase=?2,attempt=NULL WHERE id=?3",
             params![
                 generation,
                 if phase == "queued" {
@@ -299,8 +303,7 @@ impl Db {
                 } else {
                     "reconcile"
                 },
-                id,
-                now()+120_000
+                id
             ],
         )?;
         tx.execute("UPDATE messages SET state='queued',detail='OpenCode retry: unattempted work or read-only native reconciliation',updated=? WHERE id=?",params![now(),id])?;
@@ -502,35 +505,55 @@ mod tests {
         assert_eq!(db.get(&first.id).unwrap().state, "submitted");
     }
     #[test]
-    fn busy_deadline_is_anchored_across_heartbeat_and_restart() {
-        let (root, mut db, agent, generation) = setup();
-        let first = send(&db, &agent.name);
-        let (_, attempt) = dispatch(&mut db);
-        db.opencode_finish(&first.id, &attempt, "queued", "busy")
-            .unwrap();
-        let deadline: i64 = db
-            .conn
-            .query_row(
-                "SELECT deadline FROM opencode_deliveries WHERE id=?",
-                [&first.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
-            .unwrap();
-        drop(db);
-        let db = Db::open(&root.path().join("db")).unwrap();
-        let restored: i64 = db
-            .conn
-            .query_row(
-                "SELECT deadline FROM opencode_deliveries WHERE id=?",
-                [&first.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(deadline, restored);
-        db.opencode_tick(deadline + 1).unwrap();
-        assert_eq!(db.get(&first.id).unwrap().state, "failed");
+    fn live_unattempted_work_survives_old_busy_deadline_and_restart() {
+        for deferred in [false, true] {
+            let (root, mut db, agent, generation) = setup();
+            let first = send(&db, &agent.name);
+            let alias = Agent {
+                name: "alias".into(),
+                ..agent.clone()
+            };
+            db.register(&alias, false).unwrap();
+            let second = send(&db, &alias.name);
+            if deferred {
+                let (_, attempt) = dispatch(&mut db);
+                db.opencode_finish(&first.id, &attempt, "queued", "busy before native attempt")
+                    .unwrap();
+            }
+            db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, false)
+                .unwrap();
+            let deadline: i64 = db
+                .conn
+                .query_row(
+                    "SELECT deadline FROM opencode_deliveries WHERE id=?",
+                    [&first.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            // Advance tick deterministically past the old age limit while the
+            // exact generation remains live, as continuing heartbeats guarantee.
+            db.conn
+                .execute(
+                    "UPDATE opencode_leases SET expires=?",
+                    [deadline + LEASE_MS],
+                )
+                .unwrap();
+            db.opencode_tick(deadline + 1).unwrap();
+            assert_eq!(db.get(&first.id).unwrap().state, "queued");
+            assert!(db.claim().unwrap().is_none());
+            drop(db);
+            let mut db = Db::open(&root.path().join("db")).unwrap();
+            assert_eq!(db.get(&first.id).unwrap().state, "queued");
+            assert!(db.claim().unwrap().is_none());
+            db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
+                .unwrap();
+            let (msg, attempt) = dispatch(&mut db);
+            assert_eq!(msg.id, first.id);
+            assert_eq!(attempt.frame["op"], "deliver");
+            db.opencode_finish(&first.id, &attempt, "submitted", "native inserted")
+                .unwrap();
+            assert_eq!(db.claim().unwrap().unwrap().0.id, second.id);
+        }
     }
     #[test]
     fn expiry_between_claim_and_prepare_fails_one_message_without_stopping_other_clients() {
@@ -621,27 +644,22 @@ mod tests {
         );
     }
     #[test]
-    fn explicit_retry_refreshes_only_modern_provably_unattempted_window() {
-        let (_root, mut db, agent, _) = setup();
+    fn historical_unattempted_failure_requires_explicit_retry() {
+        let (_root, mut db, agent, generation) = setup();
         let queued = send(&db, &agent.name);
+        // A historical broker may already have failed this unattempted ID.
         db.conn
             .execute(
-                "UPDATE opencode_deliveries SET deadline=?1 WHERE id=?2",
-                params![now() - 1, queued.id],
+                "UPDATE messages SET state='failed' WHERE id=?",
+                [&queued.id],
             )
+            .unwrap();
+        db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
             .unwrap();
         db.opencode_tick(now()).unwrap();
         assert_eq!(db.get(&queued.id).unwrap().state, "failed");
+        assert!(db.claim().unwrap().is_none());
         db.retry(&queued.id, false).unwrap();
-        let deadline: i64 = db
-            .conn
-            .query_row(
-                "SELECT deadline FROM opencode_deliveries WHERE id=?",
-                [&queued.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(deadline > now());
         let (_, dispatch) = dispatch(&mut db);
         assert_eq!(dispatch.frame["op"], "deliver");
         assert_eq!(

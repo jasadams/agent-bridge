@@ -27,10 +27,15 @@ const env = {
 };
 const incoming = randomUUID(), replyID = randomUUID(), marker = `AGB4-IDLE-${randomUUID()}`;
 const busyMarker = `AGB4-BUSY-${randomUUID()}`, raceMarker = `AGB4-RACE-${randomUUID()}`, permissionMarker = `AGB4-PERMISSION-${randomUUID()}`;
+const longMarker = `AGB16-LONG-${randomUUID()}`, streamMarker = `AGB16-STREAM-${randomUUID()}`, errorMarker = `AGB16-ERROR-${randomUUID()}`;
+const captures = new Map<string, any[]>(), nativeEvents: any[] = [];
+const streamStarted = new Set<string>(), streamFinished = new Set<string>(), streamAborted = new Set<string>();
 const started = new Set<string>(), finished = new Set<string>(), aborted = new Set<string>(), permissionPending = new Set<string>(), permissionFinished = new Set<string>();
 const gates = new Map<string, () => void>(), stages = new Map<string, number>();
 let selected = "", modelRequests = 0, embeddedBun = "";
-const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+// The fixture deliberately holds /block beyond Bun's default 10-second idle
+// timeout. Scenario waits and assertions below still bound the native test.
+const model = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, async fetch(request) {
   const url = new URL(request.url), token = url.searchParams.get("token") ?? "";
   if (url.pathname === "/block") {
     started.add(token); embeddedBun = url.searchParams.get("runtime") ?? "";
@@ -43,6 +48,7 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
   if (url.pathname === "/permission-finished") { permissionFinished.add(token); return new Response("ok"); }
   if (url.pathname === "/event") {
     const event = await request.json() as any;
+    nativeEvents.push({ time: Date.now(), ...event });
     if (["permission.asked", "permission.updated"].includes(event.type)) {
       const info = event.properties.info ?? event.properties;
       if (typeof info.sessionID === "string") permissionPending.add(info.sessionID);
@@ -53,6 +59,13 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
   modelRequests++;
   const tools = (body.tools ?? []) as any[], text = JSON.stringify(body.messages ?? []);
   let toolCall: any;
+  const scenario = tools.length ? [permissionMarker, longMarker, streamMarker, errorMarker, raceMarker, busyMarker, marker].find(value => text.includes(value)) : undefined;
+  const stage = scenario ? stages.get(scenario) ?? 0 : -1;
+  if (scenario) {
+    const values = captures.get(scenario) ?? [];
+    values.push({ time: Date.now(), model: body.model, messages: body.messages }); captures.set(scenario, values);
+    stages.set(scenario, stage + 1);
+  }
   const tool = (suffix: string, args: unknown, id: string) => {
     const found = tools.find(t => t.function?.name.endsWith(suffix));
     if (!found) throw new Error(`Missing native fixture/MCP tool: ${suffix}`);
@@ -60,21 +73,31 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
   };
   // Title/summarization calls have no tools; never advance scenario state there.
   if (tools.length) {
-    const scenario = [permissionMarker, raceMarker, busyMarker, marker].find(value => text.includes(value));
-    const stage = scenario ? stages.get(scenario) ?? 0 : -1;
     if (scenario === marker && selected) {
       if (stage === 0) toolCall = tool("acknowledge_message", { id: incoming, agent: selected }, "call_ack");
       if (stage === 1) toolCall = tool("send_message", { from: selected, to: "native-probe", body: `Reply ${marker}`, id: replyID, parent: incoming }, "call_reply");
-    } else if (scenario && stage === 0) {
+    } else if (scenario && stage === 0 && ![streamMarker, errorMarker].includes(scenario)) {
       toolCall = tool(scenario === permissionMarker ? "fixture_permission" : "fixture_block", { token: scenario }, `call_${scenario.slice(0, 16)}`);
     }
-    if (scenario && toolCall) stages.set(scenario, stage + 1);
   }
   const content = toolCall ? null : "Disposable native fixture complete.";
   const response = { id: "chatcmpl-fixture", object: "chat.completion", created: Math.floor(Date.now()/1000), model: "fixture", choices: [{ index: 0, message: { role: "assistant", content, ...(toolCall ? { tool_calls: [toolCall] } : {}) }, finish_reason: toolCall ? "tool_calls" : "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } };
   if (!body.stream) return Response.json(response);
   const delta = { role: "assistant", ...(toolCall ? { tool_calls: [{ index: 0, ...toolCall }] } : { content }) };
   const chunk = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
+  if (scenario && [streamMarker, errorMarker].includes(scenario) && stage === 0) {
+    const heldScenario = scenario;
+    request.signal.addEventListener("abort", () => { if (!streamFinished.has(heldScenario)) streamAborted.add(heldScenario); }, { once: true });
+    const stream = new ReadableStream({ async start(controller) {
+      controller.enqueue(new TextEncoder().encode(chunk({ ...response, object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "Original held assistant context." }, finish_reason: null }] })));
+      streamStarted.add(heldScenario);
+      await new Promise<void>(release => gates.set(heldScenario, release));
+      streamFinished.add(heldScenario);
+      const ending = heldScenario === errorMarker ? chunk({ error: { message: "Controlled fixture stream failure", type: "invalid_request_error", code: "fixture_error" } }) : chunk({ ...response, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) + "data: [DONE]\n\n";
+      controller.enqueue(new TextEncoder().encode(ending)); controller.close();
+    }});
+    return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+  }
   return new Response(chunk({ ...response, object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] }) + chunk({ ...response, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: toolCall ? "tool_calls" : "stop" }] }) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }});
 const reserve = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
@@ -87,7 +110,7 @@ await writeFile(fixturePlugin, `import {tool} from ${JSON.stringify(pathToFileUR
 const origin=${JSON.stringify(origin)};
 const ping=(path,token)=>fetch(origin+path+'?token='+encodeURIComponent(token)+'&runtime='+Bun.version);
 export default async()=>({
- event:async({event})=>{if(event.type.startsWith('permission.'))await fetch(origin+'/event',{method:'POST',body:JSON.stringify(event)});},
+ event:async({event})=>{if(event.type.startsWith('permission.')||event.type==='session.status'||event.type==='session.error')await fetch(origin+'/event',{method:'POST',body:JSON.stringify(event)});},
  tool:{
  fixture_block:tool({description:'Disposable native blocking fixture',args:{token:tool.schema.string()},execute:async({token},ctx)=>{let complete=false;ctx.abort.addEventListener('abort',()=>{if(!complete)void ping('/aborted',token)},{once:true});await ping('/block',token);await ping('/complete',token);complete=true;return 'native fixture tool finished';}}),
  fixture_permission:tool({description:'Disposable native permission fixture',args:{token:tool.schema.string()},execute:async({token},ctx)=>{await ping('/permission-start',token);await ctx.ask({permission:'fixture_permission',patterns:[token],always:[],metadata:{fixture:true}});await ping('/permission-finished',token);return 'permission answered';}})
@@ -96,7 +119,8 @@ export default async()=>({
 const config = {
   $schema: "https://opencode.ai/config.json",
   enabled_providers: ["fixture"], model: "fixture/fixture", small_model: "fixture/fixture",
-  provider: { fixture: { npm: "@ai-sdk/openai-compatible", name: "Fixture", options: { baseURL: origin + "/v1", apiKey: "local-fixture-only" }, models: { fixture: { name: "Fixture", limit: { context: 8192, output: 2048 }, tool_call: true } } } },
+  provider: { fixture: { npm: "@ai-sdk/openai-compatible", name: "Fixture", options: { baseURL: origin + "/v1", apiKey: "local-fixture-only" }, models: { fixture: { name: "Fixture", limit: { context: 8192, output: 2048 }, tool_call: true }, owner: { name: "Owner fixture", limit: { context: 8192, output: 2048 }, tool_call: true, variants: { deep: {} } } } } },
+  agent: { owner: { description: "Disposable nondefault owner context", mode: "primary", model: "fixture/owner", variant: "deep", prompt: "Retain disposable owner specialist context." } },
   plugin: [[pathToFileURL(join(pluginDirectory, "index.ts")).href, { stateDir: state }], pathToFileURL(fixturePlugin).href],
   // Only this generated disposable fixture asks. Neither adapter nor plugin
   // modifies permissions or submits a native permission response.
@@ -144,8 +168,8 @@ try {
     });
     return { id, registration };
   }
-  async function prompt(id: string, text: string, messageID = `msg_fixture_${randomUUID().replaceAll("-", "")}`) {
-    const result = await client.session.promptAsync({ path: { id }, body: { messageID, parts: [{ type: "text", text }] } });
+  async function prompt(id: string, text: string, messageID = `msg_fixture_${randomUUID().replaceAll("-", "")}`, selection: { agent?: string; model?: { providerID: string; modelID: string }; variant?: string } = {}) {
+    const result = await client.session.promptAsync({ path: { id }, body: { ...selection, messageID, parts: [{ type: "text", text }] } });
     assert(!result.error, "Native fixture prompt rejected"); return messageID;
   }
   async function idle(id: string) { const status = await client.session.status(); return !!status.data && (!status.data[id] || status.data[id].type === "idle"); }
@@ -174,66 +198,92 @@ try {
   assert(history.data?.filter(item => item.info.id === mapped).length === 1, "Native retry duplicated the user message");
   await waitFor("idle after MCP fixture", () => idle(first.id));
 
-  const busy = await session("Disposable busy-tool probe");
-  await prompt(busy.id, busyMarker);
-  await waitFor("actual native blocking tool start", async () => started.has(busyMarker));
-  assert(!await idle(busy.id), "Blocking native tool must report busy");
-  const busyID = randomUUID();
-  await brokerRpc(state, { op: "send", id: busyID, sender: "native-probe", recipient: busy.registration.name, body: "Broker peer waits for native tool", parent: null });
-  const busyDispatch = query<any>("SELECT * FROM opencode_deliveries WHERE id=?", busyID);
-  const busyNative = nativeID(busyDispatch.namespace, busy.id, busyID);
-  // Bound observation spans a broker scheduling tick. It never drives delivery.
-  await Bun.sleep(1200);
-  const queuedBusy = await brokerRpc(state, { op: "get", id: busyID }) as any;
-  assert(queuedBusy.state === "queued", "Busy-tool peer work must stay broker-queued");
-  assert(!await nativeMessage(busy.id, busyNative), "Busy-tool peer prompt became visible before release");
-  assert(!finished.has(busyMarker) && !aborted.has(busyMarker), "Delivery completed or canceled a held native tool");
+  const owner = (variant: string) => ({ agent: "owner", model: { providerID: "fixture", modelID: "owner" }, variant });
+  const countText = (capture: any, text: string) => JSON.stringify(capture.messages).split(text).length - 1;
+  const waiting = (id: string) => query<any>("SELECT m.state,m.created,d.phase,d.attempt,d.content,d.generation,l.generation AS live_generation,l.ready,l.expires FROM messages m JOIN opencode_deliveries d ON d.id=m.id JOIN opencode_leases l ON l.session=d.session WHERE m.id=?", id);
+  async function sendPeer(target: { id: string; registration: any }, body: string, recipient = target.registration.name) {
+    const id = randomUUID();
+    await brokerRpc(state, { op: "send", id, sender: "native-probe", recipient, body, parent: null });
+    const d = query<any>("SELECT * FROM opencode_deliveries WHERE id=?", id);
+    return { id, native: nativeID(d.namespace, target.id, id), body };
+  }
+  async function inserted(target: { id: string }, peer: { id: string; native: string }, variant?: string) {
+    const record = await waitFor<any>("verified native insertion", async () => {
+      const record = await nativeMessage(target.id, peer.native);
+      return record && waiting(peer.id).state === "submitted" && record;
+    });
+    if (variant) assert(record.info.agent === "owner" && record.info.model.providerID === "fixture" && record.info.model.modelID === "owner" && record.info.model.variant === variant, "Peer insertion changed native owner selection");
+    return record;
+  }
+  async function nextRequest(token: string, peers: Array<{ body: string }>, original: string, sessionID: string, since: number) {
+    const request = await waitFor<any>("next normal model request with peer input", async () => captures.get(token)?.[1]);
+    assert(request.model === "owner", "Next model request changed selected model");
+    assert(peers.every(peer => countText(request, peer.body) === 1), "Next model request did not contain exact peer input once");
+    assert(JSON.stringify(request.messages).includes(original), "Next request lost original tool/assistant context");
+    assert(!nativeEvents.some(event => event.time >= since && event.time <= request.time && event.type === "session.status" && event.properties.sessionID === sessionID && event.properties.status.type === "idle"), "Original work went idle before consuming active peer input");
+    return request;
+  }
+
   await brokerRpc(state, { op: "pause", paused: true });
-  const cancelledID = randomUUID();
-  await brokerRpc(state, { op: "send", id: cancelledID, sender: "native-probe", recipient: busy.registration.name, body: "Cancel this still-queued peer work", parent: null });
-  await brokerRpc(state, { op: "cancel", id: cancelledID });
-  const cancelledDispatch = query<any>("SELECT * FROM opencode_deliveries WHERE id=?", cancelledID);
-  const cancelledNative = nativeID(cancelledDispatch.namespace, busy.id, cancelledID);
-  gates.get(busyMarker)!();
-  await waitFor("native blocking tool completion", async () => finished.has(busyMarker));
-  await waitFor("native idle while broker paused", () => idle(busy.id));
-  await Bun.sleep(1200);
-  const pausedMessage = await brokerRpc(state, { op: "get", id: busyID }) as any;
-  const cancelledMessage = await brokerRpc(state, { op: "get", id: cancelledID }) as any;
-  assert(pausedMessage.state === "queued" && !await nativeMessage(busy.id, busyNative), "Broker pause failed across native busy-to-idle transition");
-  assert(cancelledMessage.state === "cancelled" && !await nativeMessage(busy.id, cancelledNative), "Broker cancelled peer work reached the native session");
+  const long = await session("Disposable AGB-16 active tool and long paused queue");
+  await prompt(long.id, longMarker, undefined, owner("default"));
+  await waitFor("actual held native tool", async () => started.has(longMarker));
+  const toolHeldSince = Date.now();
+  const longPeer = await sendPeer(long, `Active tool peer ${randomUUID()}`);
+  const alias = `active-alias-${randomUUID()}`;
+  await brokerRpc(state, { op: "register", agent: { name: alias, provider: "opencode", session: long.id, endpoint: long.registration.endpoint, enabled: true }, replace: false });
+  const aliasPeer = await sendPeer(long, `Second alias peer ${randomUUID()}`, alias);
+  const cancelled = await sendPeer(long, "Cancel this paused unattempted input");
+  await brokerRpc(state, { op: "cancel", id: cancelled.id });
+  const permission = await session("Disposable native owner permission wait");
+  await prompt(permission.id, permissionMarker, undefined, owner("deep"));
+  await waitFor("unanswered native permission", async () => permissionPending.has(permission.id));
+  const permissionPeer = await sendPeer(permission, `Permission queued input ${randomUUID()}`);
+  console.log(JSON.stringify({ phase: "holding active native tool and permission with broker paused", milliseconds: 125000 }));
+  await Bun.sleep(125000);
+  const heldLong = waiting(longPeer.id), heldPermission = waiting(permissionPeer.id);
+  for (const held of [heldLong, heldPermission]) {
+    assert(Date.now() - held.created > 120000 && held.state === "queued" && held.phase === "queued" && held.attempt === null, "Live paused unattempted work did not survive old expiry");
+    assert(held.generation === held.live_generation && held.expires > Date.now(), "Exact native lease was lost during long wait");
+  }
+  assert(!await nativeMessage(long.id, longPeer.native) && !await nativeMessage(permission.id, permissionPeer.native), "Pause did not prevent native input");
+  assert(!finished.has(longMarker) && !aborted.has(longMarker) && !permissionFinished.has(permissionMarker), "Held native work or permission changed");
   await brokerRpc(state, { op: "pause", paused: false });
-  await waitFor("queued peer inserted after unpause and native tool completion", async () => !!await nativeMessage(busy.id, busyNative));
-  assert(!aborted.has(busyMarker), "Native work was canceled during deferred delivery");
+  await inserted(long, longPeer, "default"); await inserted(long, aliasPeer, "default");
+  await inserted(permission, permissionPeer, "deep");
+  assert(!await idle(long.id) && !finished.has(longMarker) && !aborted.has(longMarker), "Peer input was not inserted during original tool work");
+  assert(!await idle(permission.id) && !permissionFinished.has(permissionMarker) && captures.get(permissionMarker)?.length === 1, "Peer input answered permission or started model processing");
+  assert(waiting(cancelled.id).state === "cancelled" && !await nativeMessage(long.id, cancelled.native), "Cancelled queued input reached native session");
+  const heldHistory = await client.session.messages({ path: { id: long.id } });
+  const userIDs = heldHistory.data?.filter(item => item.info.role === "user").map(item => item.info.id) ?? [];
+  assert(userIDs.filter(id => id === longPeer.native).length === 1 && userIDs.indexOf(longPeer.native) < userIDs.indexOf(aliasPeer.native), "Native active input duplicated or bypassed alias FIFO");
+  gates.get(longMarker)!();
+  await waitFor("original tool completion", async () => finished.has(longMarker));
+  const toolRequest = await nextRequest(longMarker, [longPeer, aliasPeer], "native fixture tool finished", long.id, toolHeldSince);
+  assert(!aborted.has(longMarker), "Active insertion aborted original native tool");
 
-  const race = await session("Disposable native idle-to-busy race");
-  assert(await idle(race.id), "Race begins with a native idle snapshot");
-  await prompt(race.id, raceMarker);
-  await waitFor("native work starts after idle snapshot", async () => started.has(raceMarker));
-  assert(!await idle(race.id), "Race native tool must be busy before insertion");
-  // Native baseline: a stale idle snapshot cannot reserve the runner. The actual
-  // V1 prompt API inserts a user message while an existing runner is still busy.
-  // Broker code cannot eliminate this last race without a native atomic API.
-  const raceNative = await prompt(race.id, "Disposable race insertion after stale idle snapshot");
-  await waitFor("native race user message visibility", async () => !!await nativeMessage(race.id, raceNative));
-  assert(!finished.has(raceMarker) && !aborted.has(raceMarker), "Race injection changed existing work");
-  gates.get(raceMarker)!();
-  await waitFor("race native tool completes without cancellation", async () => finished.has(raceMarker));
-  assert(!aborted.has(raceMarker), "Native idle/busy race canceled the original tool");
+  const stream = await session("Disposable active native model stream");
+  await prompt(stream.id, streamMarker, undefined, owner("deep"));
+  await waitFor("actual SSE response held after first chunk", async () => streamStarted.has(streamMarker));
+  const streamHeldSince = Date.now(), streamPeer = await sendPeer(stream, `Active stream peer ${randomUUID()}`);
+  await inserted(stream, streamPeer, "deep");
+  assert(!await idle(stream.id) && !streamFinished.has(streamMarker) && !streamAborted.has(streamMarker), "Peer input did not arrive during held model stream");
+  gates.get(streamMarker)!();
+  const streamRequest = await nextRequest(streamMarker, [streamPeer], "Original held assistant context.", stream.id, streamHeldSince);
+  assert(streamFinished.has(streamMarker) && !streamAborted.has(streamMarker), "Active insertion aborted original model stream");
 
-  const permission = await session("Disposable permission-wait probe");
-  await prompt(permission.id, permissionMarker);
-  await waitFor("actual unanswered native permission request", async () => permissionPending.has(permission.id));
-  assert(!await idle(permission.id), "Native permission wait should remain busy");
-  const permissionID = randomUUID();
-  await brokerRpc(state, { op: "send", id: permissionID, sender: "native-probe", recipient: permission.registration.name, body: "Broker peer must not answer native permission", parent: null });
-  const permissionDispatch = query<any>("SELECT * FROM opencode_deliveries WHERE id=?", permissionID);
-  const permissionNative = nativeID(permissionDispatch.namespace, permission.id, permissionID);
+  const errored = await session("Disposable stream error after native insertion");
+  await prompt(errored.id, errorMarker, undefined, owner("default"));
+  await waitFor("error fixture stream held", async () => streamStarted.has(errorMarker));
+  const errorPeer = await sendPeer(errored, `Peer before controlled stream error ${randomUUID()}`);
+  await inserted(errored, errorPeer, "default");
+  gates.get(errorMarker)!();
+  await waitFor("controlled native stream error", async () => nativeEvents.some(event => event.type === "session.error" && event.properties.sessionID === errored.id));
   await Bun.sleep(1200);
-  const queuedPermission = await brokerRpc(state, { op: "get", id: permissionID }) as any;
-  assert(queuedPermission.state === "queued" && !await nativeMessage(permission.id, permissionNative), "Permission wait admitted a peer prompt");
-  assert(!permissionFinished.has(permissionMarker), "Delivery answered a native permission prompt");
-  console.log(JSON.stringify({ result: "passed", opencode: "1.18.35", standalone_bun: Bun.version, embedded_bun: embeddedBun, model: "scripted localhost OpenAI-compatible fixture", model_requests: modelRequests, exact_session: first.id, native_message_id: mapped, broker_id: incoming, reply_id: replyID, parent: incoming, explicit_acknowledgement: true, correlated_reply: true, readonly_reconciliation: true, native_user_messages: 1, busy_tool_deferred_until_completion: true, broker_pause_preserved: true, queued_cancel_preserved: true, permission_wait_queued_unanswered: true, idle_to_busy_native_insertion_visible: true, native_cancel_calls: 0, permission_reply_calls: 0 }));
+  const errorHistory = await client.session.messages({ path: { id: errored.id } });
+  assert(errorHistory.data?.filter(item => item.info.id === errorPeer.native).length === 1 && waiting(errorPeer.id).state === "submitted", "Later native error replayed input or invented acknowledgement");
+  assert(!nativeEvents.some(event => event.type === "permission.replied") && !permissionFinished.has(permissionMarker), "Harness answered owner permission");
+  console.log(JSON.stringify({ result: "passed", opencode: "1.18.35", standalone_bun: Bun.version, embedded_bun: embeddedBun, model: "scripted localhost OpenAI-compatible fixture", model_requests: modelRequests, exact_session: first.id, explicit_acknowledgement: true, correlated_reply: true, readonly_reconciliation: true, active_tool: { session: long.id, native: longPeer.native, alias_native: aliasPeer.native, original_not_aborted: true, next_model_request: toolRequest }, active_stream: { session: stream.id, native: streamPeer.native, original_not_aborted: true, next_model_request: streamRequest }, long_wait: { age_ms: Date.now() - heldLong.created, held: heldLong, permission: heldPermission }, permission_input_inserted_unanswered: true, broker_pause_preserved: true, queued_cancel_preserved: true, alias_fifo: true, stream_error_no_replay: true, native_cancel_calls: 0, permission_reply_calls: 0, retry_calls: 0, manual_fetch_calls: 0 }));
   success = true;
 } finally {
   async function stopChild(child: ReturnType<typeof Bun.spawn>) {
@@ -244,5 +294,12 @@ try {
   for (const release of gates.values()) release();
   model.stop(true);
   const output = await Promise.all(logs); if (!success) console.error(output.filter(Boolean).join("\n"));
+  const logDirectory = process.env.AGENT_BRIDGE_NATIVE_LOG_DIR;
+  if (logDirectory) {
+    await mkdir(logDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(join(logDirectory, "native-events.json"), JSON.stringify(nativeEvents), { mode: 0o600 });
+    await writeFile(join(logDirectory, "model-requests.json"), JSON.stringify(Object.fromEntries(captures)), { mode: 0o600 });
+    await Promise.all(output.map((value, index) => writeFile(join(logDirectory, ["broker.stdout.log", "broker.stderr.log", "opencode.stdout.log", "opencode.stderr.log"][index]!), value, { mode: 0o600 })));
+  }
   await rm(root, { recursive: true, force: true });
 }

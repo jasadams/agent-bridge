@@ -86,7 +86,8 @@ calling the client. Unknown, archived and mismatched sessions fail closed.
 The local `opencode_observe` operation registers a verified live generation and
 returns its durable broker namespace. Heartbeats, readiness, close and native
 admission bind that exact generation and endpoint instance. Metadata alone cannot
-enable a session. Socket protocol **2** delivers bounded structured frames that
+enable a session. The lease readiness bit means eligible for native input admission,
+including during active work and unanswered permissions. Socket protocol **2** delivers bounded structured frames that
 bind session, broker message ID, namespace, generation, dispatch attempt, original
 rendered content and native message ID. Both plugin and broker must be upgraded
 together; protocol 1 cannot provide this recovery contract.
@@ -94,14 +95,37 @@ together; protocol 1 cannot provide this recovery contract.
 FIFO and bounded backpressure belong to the broker, keyed by provider and native
 session across aliases. At most 64 pending messages may target one OpenCode
 conversation; the shared 1000-message queued bound also applies to direct/remote
-enqueue and retries. A busy or permission-waiting session defers before any native
-attempt, leaving the message broker-owned, queued and cancellable. Pause is checked
-again at admission. The plugin has no hidden future-submission queue. A durable
-120-second busy window expires without native events; heartbeats and restart never
-extend it. Explicit operator retry of known unattempted work starts a new bounded
-window. A queued *reconciliation* of an earlier attempt cannot be cancelled as if
+enqueue and retries. The plugin submits native input once through `promptAsync`,
+including while a tool/model operation or permission request is active. OpenCode
+persists the input and joins its existing runner without cancelling the task or
+answering permission. The next normal runner iteration can include that input;
+an already issued model request cannot see it. The current native agent, model
+and variant are preserved from validated session metadata; unavailable active
+selection defers before an attempt. No tools or permission overrides are copied.
+Pause is checked again at admission; queued work remains cancellable until then.
+The plugin has no hidden future-submission queue. Unattempted broker work waits
+while its exact owning session/generation remains live, and is dispatched when
+admission becomes available.
+Waiting is bounded by the queue count and message byte limits, rather than a
+120-second age limit. Lease loss, close or generation replacement still fails
+queued work without native events; restart does not extend a lease. Historical
+failed messages stay failed until explicit operator retry. A queued *reconciliation* of an earlier attempt cannot be cancelled as if
 it were unattempted work. Unresolved attempts remain barriers to fresh native
 submissions; read-only reconciliation can inspect multiple uncertain messages.
+
+These queue bounds apply to broker queued/sending/uncertain messages, not to input
+already inserted into the native conversation. Submitted input is owned by
+OpenCode; the journal's durable row/byte limits still apply. `submitted` proves
+exact native insertion, not model consumption, acknowledgement or completion.
+Native errors, permission denial, structured-output stops or other early exits
+may leave inserted input unprocessed. The bridge never replays it to force another
+run. The owner retains control of permission and native continuation.
+
+Active admission requires reinstalling the plugin with `opencode install` and a
+full OpenCode restart. Protocol 2 frames and receipt semantics are unchanged; its
+version alone does not advertise active support. A loaded older plugin remains
+idle-only with the updated broker. An older broker with the updated plugin may
+admit active input but retains its old 120-second broker expiry policy.
 
 A native ID is `msg_` plus a SHA-256 digest of the durable broker namespace, exact
 session and lowercase broker UUID, separated by NUL bytes. This avoids native ID
@@ -129,10 +153,10 @@ genuine unattempted legacy work is indistinguishable and requires conservative
 operator resolution. Only modern durable pre-attempt records can be retried as new
 submissions under the same message ID.
 
-The native idle check and submission are not atomic. Another native prompt can
-start after the final idle snapshot; the peer message may then become visible
-while native work is active. The supported runner joins that work rather than
-cancelling it; subsequent processing follows native behavior. Admission linearizes
+Native status/selection checks and submission do not reserve the runner or lock
+owner selection. Input can be inserted during existing native work; the supported
+runner joins that work without cancelling it. Subsequent processing follows
+native behavior. Admission linearizes
 an in-flight submission: a later pause cannot recall it. No native cancellation or
 permission response is sent. A model must explicitly acknowledge and send a reply
 with the broker parent ID. There is no exactly-once model-processing or completion
@@ -196,8 +220,10 @@ compact peer presentation and board opt-in/notification behavior. These checks
 use the same credential-free local provider boundary.
 The deterministic native harness uses a local model fixture; it checks real
 OpenCode/plugin/broker execution, acknowledgement/reply, read-only reconciliation,
-held native tools, queued pause/cancel, unanswered permission waits and the residual
-idle-to-busy race. It makes no native cancel/permission-response calls. It does not
+native insertion during held tools and SSE model streams, next-boundary model
+visibility, preserved owner agent/model/variant, alias FIFO, queued pause/cancel,
+more than 125 seconds of paused unattempted work, unanswered permission input and
+no replay after a controlled stream error. It makes no native cancel/permission-response calls. It does not
 test an external model's reasoning or the owner's production environment. Physical/native macOS runtime
 acceptance remains separate from source checks and CI tests.
 
