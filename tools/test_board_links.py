@@ -112,6 +112,17 @@ class Screen:
         return "\n".join("".join(self.cells.get((x, y), (" ", None))[0] for x in range(self.columns)) for y in range(self.rows))
 
 
+def stop(process):
+    """Reap only this fixture child, including signal-resistant PTY readers."""
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
 class Viewer:
     def __init__(self, binary, state, board, disabled=False):
         self.master, self.slave = pty.openpty()
@@ -147,11 +158,14 @@ class Viewer:
         self.pump(.2)
 
     def close(self):
-        if self.process.poll() is None:
-            self.process.terminate()
-        self.process.wait(timeout=5)
-        os.close(self.master)
-        os.close(self.slave)
+        try:
+            stop(self.process)
+        finally:
+            for name in ("master", "slave"):
+                descriptor = getattr(self, name)
+                if descriptor is not None:
+                    os.close(descriptor)
+                    setattr(self, name, None)
 
 
 def run(binary):
@@ -243,10 +257,11 @@ def run(binary):
                 assert rpc({"op": "named_board_read", "board": "alpha"})["markdown"] == changed
                 print("PASS: PTY OSC8 targets, same-label refresh, frozen copy, scroll/resize, editor/picker/board isolation, injection, raw exactness and disabled fallback")
             finally:
-                if viewer is not None:
-                    viewer.close()
-                broker.terminate()
-                broker.wait(timeout=5)
+                try:
+                    if viewer is not None:
+                        viewer.close()
+                finally:
+                    stop(broker)
 
 
 if __name__ == "__main__":
