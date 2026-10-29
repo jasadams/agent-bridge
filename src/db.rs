@@ -3,7 +3,9 @@ use crate::{
     protocol::{Agent, MAX_BODY, Message, Provider},
 };
 use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -11,6 +13,20 @@ use std::{
 
 pub struct Db {
     pub(crate) conn: Connection,
+}
+
+pub struct HistoryPage {
+    pub messages: Vec<Message>,
+    pub cursor: String,
+    pub has_more: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryCursor {
+    version: u8,
+    agent: Option<String>,
+    after: Option<String>,
 }
 
 pub(crate) fn now() -> i64 {
@@ -540,6 +556,66 @@ impl Db {
             s.query_map(params![agent, limit.clamp(1, 100) as i64], message_row)?
                 .collect::<rusqlite::Result<_>>()?,
         )
+    }
+
+    /// New messages only: state updates are read through `get`, never replayed.
+    /// Anchor by message ID rather than rowid so cursors survive SQLite VACUUM.
+    pub fn history_since(
+        &self,
+        agent: &Option<String>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<HistoryPage> {
+        ensure!((1..=100).contains(&limit), "Message limit must be 1–100");
+        let mut cursor = match cursor.filter(|value| !value.is_empty()) {
+            Some(value) => {
+                ensure!(value.len() <= 1024, "Invalid message cursor");
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(value)
+                    .context("Invalid message cursor")?;
+                let decoded: HistoryCursor =
+                    serde_json::from_slice(&bytes).context("Invalid message cursor")?;
+                ensure!(decoded.version == 1, "Unsupported message cursor version");
+                ensure!(
+                    decoded.agent == *agent,
+                    "Message cursor belongs to another agent scope"
+                );
+                decoded
+            }
+            None => HistoryCursor {
+                version: 1,
+                agent: agent.clone(),
+                after: None,
+            },
+        };
+        let after: i64 = match &cursor.after {
+            Some(id) => self
+                .conn
+                .query_row(
+                    "SELECT rowid FROM messages WHERE id=?1 AND (?2 IS NULL OR sender=?2 OR recipient=?2)",
+                    params![id, agent],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .context("Message cursor anchor is missing; restart with an empty cursor")?,
+            None => 0,
+        };
+        let mut statement = self.conn.prepare(
+            "SELECT * FROM messages WHERE rowid>?1 AND (?2 IS NULL OR sender=?2 OR recipient=?2) ORDER BY rowid ASC LIMIT ?3",
+        )?;
+        let mut messages: Vec<Message> = statement
+            .query_map(params![after, agent, limit as i64 + 1], message_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let has_more = messages.len() > limit;
+        messages.truncate(limit);
+        if let Some(last) = messages.last() {
+            cursor.after = Some(last.id.clone());
+        }
+        Ok(HistoryPage {
+            messages,
+            cursor: URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor)?),
+            has_more,
+        })
     }
 
     // Claim one message per recipient. SQLite access is serialized by the service mutex.

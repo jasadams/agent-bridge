@@ -760,7 +760,7 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
         )
         .await;
     assert!(!failed(&initialized), "{initialized}");
-    let revision = structured(&initialized)["result"]["board"]["revision"].clone();
+    let revision = structured(&initialized)["result"]["revision"].clone();
     for _ in 0..2 {
         let subscribed = mcp
             .call("subscribe_board", json!({"agent":native.name}))
@@ -777,7 +777,7 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
             .await
             .is_err()
     );
-    let revision = structured(&own)["result"]["board"]["revision"].clone();
+    let revision = structured(&own)["result"]["revision"].clone();
     // Invalid attribution must not apply an otherwise valid edit.
     let invalid = mcp.call("update_board", json!({"agent":"missing","expected_revision":revision,"edits":[{"op":"append","text":"must not apply"}]})).await;
     assert!(failed(&invalid), "{invalid}");
@@ -785,17 +785,15 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
     assert_eq!(structured(&unchanged)["result"]["revision"], revision);
     let first = mcp.call("update_board", json!({"expected_revision":revision,"edits":[{"op":"append","text":"Unattributed first\n"}]})).await;
     assert!(!failed(&first), "{first}");
-    let revision = structured(&first)["result"]["board"]["revision"].clone();
+    let revision = structured(&first)["result"]["revision"].clone();
     let second = mcp.call("update_board", json!({"expected_revision":revision,"edits":[{"op":"append","text":"PRIVATE_MARKDOWN_NEVER_IN_NOTICE\n"}]})).await;
     assert!(!failed(&second), "{second}");
-    let revision = structured(&second)["result"]["board"]["revision"].clone();
+    let revision = structured(&second)["result"]["revision"].clone();
     // A subsequent own-write must neither erase pending external work nor
     // extend its debounce. The notice points at the newest readable revision.
     let own = mcp.call("update_board", json!({"agent":native.name,"expected_revision":revision,"edits":[{"op":"append","text":"Own follow-up\n"}]})).await;
     assert!(!failed(&own), "{own}");
-    let revision = structured(&own)["result"]["board"]["revision"]
-        .as_str()
-        .unwrap();
+    let revision = structured(&own)["result"]["revision"].as_str().unwrap();
     assert!(
         timeout(Duration::from_millis(2200), native.received.recv())
             .await
@@ -901,7 +899,7 @@ async fn shared_markdown_board_updates_atomically_and_preserves_concurrent_agent
         )
         .await;
     assert!(!failed(&initial), "{initial}");
-    let revision = structured(&initial)["result"]["board"]["revision"].clone();
+    let revision = structured(&initial)["result"]["revision"].clone();
     let a = first.call("update_board", json!({
         "expected_revision":revision,
         "edits":[{"op":"replace","old":"| A | alpha | no |","new":"| A | complete ✓ | no |"}]
@@ -934,6 +932,7 @@ async fn shared_markdown_board_updates_atomically_and_preserves_concurrent_agent
             "update_board",
             json!({
                 "expected_revision":conflict["board"]["revision"],
+                "verbose":true,
                 "edits":[{"op":"replace","old":"| B | beta | no |","new":"| B | reviewing | yes |"}]
             }),
         )
@@ -1013,7 +1012,7 @@ async fn shared_markdown_board_updates_atomically_and_preserves_concurrent_agent
     let retry = first
         .call(
             "update_board",
-            json!({"expected_revision":current["revision"],
+            json!({"expected_revision":current["revision"],"verbose":true,
         "edits":[{"op":"append","text":missing}]}),
         )
         .await;
@@ -1027,4 +1026,176 @@ async fn shared_markdown_board_updates_atomically_and_preserves_concurrent_agent
     assert!(merged.contains("reviewing | yes"));
     first.close().await;
     second.close().await;
+}
+
+#[tokio::test]
+async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    running.inbox("alice");
+    running.inbox("bob");
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let mut send_sizes = Vec::new();
+    let mut board_sizes = Vec::new();
+    let board = mcp.call("read_board", json!({})).await;
+    let mut revision = structured(&board)["result"]["revision"].clone();
+    for length in [100, 50_000] {
+        let body = "x".repeat(length);
+        let sent = mcp
+            .call(
+                "send_message",
+                json!({"from":"alice","to":"bob","body":body}),
+            )
+            .await;
+        let receipt = &structured(&sent)["result"];
+        assert_eq!(receipt.as_object().unwrap().len(), 2);
+        assert!(receipt["state"].is_string());
+        send_sizes.push(sent["result"].to_string().len());
+        assert!(sent.to_string().len() < 600);
+        let id = receipt["id"].as_str().unwrap();
+        let verbose = mcp
+            .call(
+                "send_message",
+                json!({"from":"alice","to":"bob","body":body,"id":id,"verbose":true}),
+            )
+            .await;
+        assert_eq!(structured(&verbose)["result"]["body"], body);
+        // The compact receipt did not truncate or alter the persisted message.
+        let stored = mcp.call("get_message", json!({"id":id})).await;
+        assert_eq!(structured(&stored)["result"]["body"], body);
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let stored = mcp.call("get_message", json!({"id":id})).await;
+                if structured(&stored)["result"]["state"] == "submitted" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let ack = mcp
+            .call("acknowledge_message", json!({"id":id,"agent":"bob"}))
+            .await;
+        assert_eq!(
+            structured(&ack)["result"],
+            json!({"id":id,"state":"acknowledged"})
+        );
+        assert!(ack.to_string().len() < 400);
+        let ack = mcp
+            .call(
+                "acknowledge_message",
+                json!({"id":id,"agent":"bob","verbose":true}),
+            )
+            .await;
+        assert_eq!(structured(&ack)["result"]["body"], body);
+        let updated = mcp
+            .call(
+                "update_board",
+                json!({"expected_revision":revision,"edits":[{"op":"set","markdown":body}]}),
+            )
+            .await;
+        assert_eq!(structured(&updated)["result"].as_object().unwrap().len(), 1);
+        revision = structured(&updated)["result"]["revision"].clone();
+        board_sizes.push(updated["result"].to_string().len());
+        assert!(updated.to_string().len() < 400);
+        let unchanged = mcp
+            .call("read_board", json!({"if_revision":revision}))
+            .await;
+        assert_eq!(
+            structured(&unchanged)["result"],
+            json!({"revision":revision,"unchanged":true})
+        );
+        let changed = mcp.call("read_board", json!({"if_revision":"stale"})).await;
+        assert_eq!(structured(&changed)["result"]["markdown"], body);
+        let verbose = mcp.call("update_board", json!({"expected_revision":revision,"verbose":true,"edits":[{"op":"set","markdown":body}]})).await;
+        assert_eq!(structured(&verbose)["result"]["board"]["markdown"], body);
+    }
+    // State names vary during delivery, but growth is bounded independently of body size.
+    assert!(send_sizes[0].abs_diff(send_sizes[1]) < 32);
+    assert_eq!(board_sizes[0], board_sizes[1]);
+    let compact = mcp.call("list_agents", json!({})).await;
+    for agent in structured(&compact)["result"].as_array().unwrap() {
+        assert!(agent.get("endpoint").is_none());
+        assert!(agent.get("session").is_none());
+        assert!(agent.get("machine_name").is_none());
+        assert_eq!(agent["enabled"], true);
+    }
+    let verbose = mcp.call("list_agents", json!({"verbose":true})).await;
+    assert!(structured(&verbose)["result"][0].get("session").is_some());
+    assert!(
+        structured(&verbose)["result"][0]
+            .get("machine_name")
+            .is_some()
+    );
+    let error = mcp.call("update_board", json!({"expected_revision":revision,"edits":[{"op":"replace","old":"PRIVATE_MISSING_ANCHOR","new":"PRIVATE_REPLACEMENT"}]})).await;
+    assert!(failed(&error));
+    assert_eq!(
+        error["result"]["structuredContent"]["code"],
+        "operation_failed"
+    );
+    assert!(!error.to_string().contains("PRIVATE_MISSING_ANCHOR"));
+    assert!(!error.to_string().contains("PRIVATE_REPLACEMENT"));
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn incremental_message_reads_reuse_cursors_without_repeating_bodies() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    running.inbox("alice");
+    running.inbox("bob");
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let initial = mcp
+        .call(
+            "list_messages",
+            json!({"agent":"bob","cursor":"","limit":1}),
+        )
+        .await;
+    assert_eq!(structured(&initial)["result"]["messages"], json!([]));
+    let mut cursor = structured(&initial)["result"]["cursor"].clone();
+    let mut ids = Vec::new();
+    for body in ["first", "second"] {
+        let sent = mcp
+            .call(
+                "send_message",
+                json!({"from":"alice","to":"bob","body":body}),
+            )
+            .await;
+        ids.push(structured(&sent)["result"]["id"].clone());
+    }
+    for (index, id) in ids.iter().enumerate() {
+        let page = mcp
+            .call(
+                "list_messages",
+                json!({"agent":"bob","cursor":cursor,"limit":1}),
+            )
+            .await;
+        let page = &structured(&page)["result"];
+        assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(&page["messages"][0]["id"], id);
+        assert_eq!(page["has_more"], index == 0);
+        cursor = page["cursor"].clone();
+    }
+    let empty = mcp
+        .call("list_messages", json!({"agent":"bob","cursor":cursor}))
+        .await;
+    assert_eq!(
+        structured(&empty)["result"],
+        json!({"messages":[],"cursor":cursor,"has_more":false})
+    );
+    for arguments in [
+        json!({"agent":"alice","cursor":cursor}),
+        json!({"agent":"bob","cursor":"invalid"}),
+    ] {
+        assert!(failed(&mcp.call("list_messages", arguments).await));
+    }
+    // Existing callers still get recent-history arrays.
+    let legacy = mcp.call("list_messages", json!({"agent":"bob"})).await;
+    assert_eq!(structured(&legacy)["result"].as_array().unwrap().len(), 2);
+    mcp.close().await;
 }

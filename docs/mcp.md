@@ -119,6 +119,61 @@ For a send, retain the returned message UUID. If the broker response is ambiguou
 retry with that exact UUID and the same message rather than generating another.
 Submitted does not mean the other agent read the message or completed a task.
 
+## Compact results and incremental reads
+
+Write tools return compact action receipts by default. Pass `"verbose": true`
+to any write tool to include its full broker result. This changes only MCP output;
+message persistence, delivery, CLI output and access checks are unchanged.
+
+- `update_board` returns `{"result":{"revision":"…"}}` on success.
+- `send_message` returns `{"result":{"id":"…","state":"queued"},"id":"…"}`.
+  The top-level UUID is retained for retry compatibility, including failed sends.
+- `acknowledge_message` returns `{"result":{"id":"…","state":"acknowledged"}}`.
+- Subscriptions return subscription state, selected agent and revision when present.
+  Pairing tools retain the exchange ID, verification state, invitation link and
+  expiry needed for the next action; sharing returns the peer, agent and requested
+  sharing state. Full metadata is available with `verbose`.
+
+A stale board update remains an error with `conflict: true` and the **full current
+board**, even without `verbose`. Merge only intended edits against that revision.
+Other operation errors include `code` and a bounded actionable `error` string;
+they do not serialize submitted message bodies or board edits. SDK argument errors
+retain the standard MCP error shape. A failed pairing-notice subscription reports
+recovery instructions and the exchange ID when one was created, without echoing
+invitation material.
+
+`list_agents` also defaults to compact routing and availability fields. Local
+results retain names, provider and enabled state; remote results retain peer ID,
+alias, qualified routing name and online state. Pass `"verbose": true` for session,
+machine and transport metadata.
+
+To avoid receiving the same board text again, pass the last revision to `read_board`:
+
+```json
+{"if_revision":"<last-revision>"}
+```
+
+An unchanged board returns `{"result":{"revision":"…","unchanged":true}}`.
+A different revision returns the normal full snapshot.
+
+Existing `list_messages` calls return recent-history arrays. To opt into incremental
+reads, start with an empty cursor and the desired agent scope:
+
+```json
+{"agent":"<registered-agent>","cursor":"","limit":30}
+```
+
+The result becomes `{"messages":[…],"cursor":"…","has_more":false}` inside the
+usual `result` envelope. Pages are oldest first; reuse the returned opaque cursor
+with the same agent scope. Continue while `has_more` is true. An empty page retains
+the cursor and can be reused after new messages arrive. Omit `agent` to select all
+messages. Cursors survive broker restarts and reject malformed values or a different
+scope. They track **newly inserted messages**, not subsequent delivery-state changes;
+use `get_message` to check delivery or acknowledgement state, and incremental reads
+to receive new replies. If a cursor
+anchor has been removed, restart with an empty cursor. No waiting or polling behavior
+is introduced by these options.
+
 ## Approval and transport boundaries
 
 `confirm_pairing` requires the request ID, independently compared verification

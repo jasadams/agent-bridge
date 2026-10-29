@@ -99,6 +99,15 @@ pub enum Request {
         #[serde(default = "history_limit")]
         limit: usize,
     },
+    /// Creation-only incremental history in insertion order. An empty cursor starts a scan.
+    HistorySince {
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default = "history_limit")]
+        limit: usize,
+    },
     Get {
         id: String,
     },

@@ -578,6 +578,23 @@ impl Broker {
                 )
             }
             Request::Get { id } => self.message_value(&db, &db.get(&id)?)?,
+            Request::HistorySince {
+                agent,
+                cursor,
+                limit,
+            } => {
+                let agent = agent
+                    .map(|name| db.resolve_agent(&name).map(|a| a.name))
+                    .transpose()?;
+                let page = db.history_since(&agent, cursor.as_deref(), limit)?;
+                json!({
+                    "messages": page.messages.iter()
+                        .map(|message| self.message_value(&db, message))
+                        .collect::<Result<Vec<_>>>()?,
+                    "cursor": page.cursor,
+                    "has_more": page.has_more,
+                })
+            }
             Request::Ack { id, agent } => {
                 self.message_value(&db, &db.ack(&id, &db.resolve_agent(&agent)?.name)?)?
             }
