@@ -105,6 +105,7 @@ pub(super) fn agents(value: Value, verbose: bool) -> Value {
                             "display_name",
                             "qualified_name",
                             "enabled",
+                            "stale_reason",
                         ],
                     )
                 }

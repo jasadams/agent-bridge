@@ -67,7 +67,7 @@ enum Commands {
         #[arg(long)]
         session: String,
     },
-    /// List enabled peers. Include exited registrations with --all.
+    /// List available local sessions. Include stale registrations with --all.
     List {
         #[arg(long)]
         all: bool,
