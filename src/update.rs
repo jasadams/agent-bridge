@@ -120,6 +120,19 @@ fn lock(state: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Own only an acquired lock. Closing alone can leave flock held by a child
+/// between fork and exec, even with CLOEXEC; release the shared description
+/// explicitly before File closes it on every return/error/unwind path.
+struct UpdateLock(File);
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        // Drop cannot report errors. File close remains the fallback if unlock
+        // fails; no child may extend a successfully released lock's lifetime.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 /// Read-only and network-free; suitable for status and the board renderer.
 pub fn cached_status(state: &Path) -> Result<UpdateStatus> {
     Ok(status(&read_cache(state)?, crate::VERSION))
@@ -128,6 +141,7 @@ pub fn cached_status(state: &Path) -> Result<UpdateStatus> {
 pub fn set_automatic_checks(state: &Path, enabled: bool) -> Result<UpdateStatus> {
     let lock = lock(state)?;
     lock.lock_exclusive()?;
+    let _lock = UpdateLock(lock);
     let mut cache = read_cache(state)?;
     cache.automatic_checks = Some(enabled);
     write_cache(state, &cache)?;
@@ -142,6 +156,7 @@ pub fn record_installed(state: &Path, version: &str) -> Result<()> {
     );
     let lock = lock(state)?;
     lock.lock_exclusive()?;
+    let _lock = UpdateLock(lock);
     let mut cache = read_cache(state)?;
     cache.installed_version = Some(version.strip_prefix('v').unwrap_or(version).to_owned());
     write_cache(state, &cache)
@@ -245,6 +260,7 @@ fn check_with(
         }
         return Err(error).context("Cannot lock update check");
     }
+    let _lock = UpdateLock(lock);
     let mut cache = read_cache(state)?;
     if !forced
         && (!cache.automatic_checks.unwrap_or(true)
@@ -297,7 +313,96 @@ pub async fn run_checks(state: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Keep inherited file descriptions open across the parent's checker return.
+    /// The post-fork child uses only async-signal-safe system calls, never Rust
+    /// allocation, locks, destructors, or test assertions.
+    struct InheritedLockChild {
+        socket: UnixStream,
+        pid: Option<libc::pid_t>,
+    }
+
+    impl InheritedLockChild {
+        fn spawn() -> Self {
+            let (parent, child) = UnixStream::pair().unwrap();
+            parent
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let parent_fd = parent.as_raw_fd();
+            let child_fd = child.as_raw_fd();
+            // SAFETY: only the parent returns into Rust after fork. The child
+            // is bounded by poll and exits directly without running destructors.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                unsafe {
+                    libc::close(parent_fd);
+                    let ready = b'R';
+                    let sent = libc::write(child_fd, (&ready as *const u8).cast(), 1);
+                    let mut descriptor = libc::pollfd {
+                        fd: child_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let polled = libc::poll(&mut descriptor, 1, 30_000);
+                    let mut release = 0_u8;
+                    let received = if polled == 1 {
+                        libc::read(child_fd, (&mut release as *mut u8).cast(), 1)
+                    } else {
+                        -1
+                    };
+                    libc::_exit(i32::from(
+                        !(sent == 1 && polled == 1 && received == 1 && release == b'X'),
+                    ));
+                }
+            }
+            drop(child);
+            let mut result = Self {
+                socket: parent,
+                pid: Some(pid),
+            };
+            let mut ready = [0];
+            result.socket.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, *b"R");
+            result
+        }
+
+        fn finish(mut self) {
+            let status = self.release().unwrap();
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+
+        fn release(&mut self) -> std::io::Result<i32> {
+            let Some(pid) = self.pid.take() else {
+                return Ok(0);
+            };
+            let _ = self.socket.write_all(b"X");
+            let mut status = 0;
+            // SAFETY: pid is this fixture's child; the child's poll bounds the
+            // wait even when the parent test unwinds before releasing it.
+            loop {
+                let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if waited == pid {
+                    return Ok(status);
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    impl Drop for InheritedLockChild {
+        fn drop(&mut self) {
+            let _ = self.release();
+        }
+    }
 
     fn release(tag: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({"tag_name":tag,"draft":false,"prerelease":false}))
@@ -421,6 +526,79 @@ mod tests {
         check_with(state.path(), true, 102, fetch).unwrap();
         check_with(state.path(), false, 102 + CHECK_INTERVAL, fetch).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn completed_check_releases_lock_while_fork_child_retains_file_description() {
+        let state = tempfile::tempdir().unwrap();
+        let calls = AtomicUsize::new(0);
+        let fetch = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(release("v99.0.0"))
+        };
+        check_with(state.path(), false, 100, fetch).unwrap();
+        check_with(state.path(), false, 101, fetch).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut child = None;
+        check_with(state.path(), true, 102, || {
+            child = Some(InheritedLockChild::spawn());
+            fetch()
+        })
+        .unwrap();
+        check_with(state.path(), false, 102 + CHECK_INTERVAL, fetch).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        child.unwrap().finish();
+    }
+
+    #[test]
+    fn failed_check_releases_inherited_lock_and_preserves_failure_throttle() {
+        let state = tempfile::tempdir().unwrap();
+        let mut child = None;
+        let result = check_with(state.path(), true, 100, || {
+            child = Some(InheritedLockChild::spawn());
+            bail!("controlled fetch failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            cached_status(state.path()).unwrap().last_error.as_deref(),
+            Some("controlled fetch failure")
+        );
+        check_with(state.path(), false, 101, || panic!("failure must throttle")).unwrap();
+        let calls = AtomicUsize::new(0);
+        check_with(state.path(), false, 100 + CHECK_INTERVAL, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(release("v99.0.0"))
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(cached_status(state.path()).unwrap().last_error.is_none());
+        child.unwrap().finish();
+    }
+
+    #[test]
+    fn panicking_check_releases_inherited_lock_without_discarding_attempt_time() {
+        let state = tempfile::tempdir().unwrap();
+        let mut child = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_with(state.path(), true, 100, || {
+                child = Some(InheritedLockChild::spawn());
+                panic!("controlled fetch panic")
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            cached_status(state.path()).unwrap().last_checked_at,
+            Some(100)
+        );
+        check_with(state.path(), false, 101, || panic!("attempt must throttle")).unwrap();
+        let calls = AtomicUsize::new(0);
+        check_with(state.path(), false, 100 + CHECK_INTERVAL, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(release("v99.0.0"))
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        child.unwrap().finish();
     }
 
     #[test]
