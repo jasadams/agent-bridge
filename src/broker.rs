@@ -449,11 +449,46 @@ impl Broker {
             &req,
             Request::Register { .. } | Request::OpenCodeObserve { .. }
         );
+        let req = match req {
+            Request::BoardRead => Request::NamedBoardRead {
+                board: Default::default(),
+            },
+            Request::BoardUpdate {
+                expected_revision,
+                edits,
+                actor,
+            } => Request::NamedBoardUpdate {
+                board: Default::default(),
+                expected_revision,
+                edits,
+                actor,
+            },
+            Request::BoardSubscribe { agent } => Request::NamedBoardSubscribe {
+                board: Default::default(),
+                agent,
+            },
+            Request::BoardUnsubscribe { agent } => Request::NamedBoardUnsubscribe {
+                board: Default::default(),
+                agent,
+            },
+            request => request,
+        };
         let result = match req {
             // Board edits share the broker's local administration mutex. No
             // network request can invoke this API or select a filesystem path.
-            Request::BoardRead => json!(crate::board::read(&self.state_dir)?),
-            Request::BoardUpdate {
+            Request::BoardList => json!(crate::board::list(&self.state_dir)?),
+            Request::BoardCreate { board } => json!(crate::board::create(&self.state_dir, &board)?),
+            Request::NamedBoardRead { board } => {
+                json!(crate::board::read_named(&self.state_dir, &board)?)
+            }
+            Request::BoardRead
+            | Request::BoardUpdate { .. }
+            | Request::BoardSubscribe { .. }
+            | Request::BoardUnsubscribe { .. } => {
+                unreachable!("Legacy board requests normalized above")
+            }
+            Request::NamedBoardUpdate {
+                board: name,
                 expected_revision,
                 edits,
                 actor,
@@ -466,15 +501,18 @@ impl Broker {
                 // Observe external file changes before attributing this edit,
                 // otherwise an agent writing on top of a manual edit could
                 // accidentally suppress that earlier change for itself.
-                let before = crate::board::read(&self.state_dir)?;
-                self.board_notifications.lock().unwrap().observe(
+                let before = crate::board::read_named(&self.state_dir, &name)?;
+                self.board_notifications.lock().unwrap().observe_named(
+                    &name,
                     &before.revision,
                     None,
                     std::time::Instant::now(),
                 );
-                match crate::board::update(&self.state_dir, &expected_revision, &edits) {
+                match crate::board::update_named(&self.state_dir, &name, &expected_revision, &edits)
+                {
                     Ok(board) => {
-                        self.board_notifications.lock().unwrap().observe(
+                        self.board_notifications.lock().unwrap().observe_named(
+                            &name,
                             &board.revision,
                             actor.as_ref(),
                             std::time::Instant::now(),
@@ -490,17 +528,25 @@ impl Broker {
                     }
                 }
             }
-            Request::BoardSubscribe { agent } => {
+            Request::NamedBoardSubscribe { board: name, agent } => {
                 let agent = db.agent(&agent)?;
-                let board = crate::board::read(&self.state_dir)?;
+                let board = crate::board::read_named(&self.state_dir, &name)?;
                 let mut state = self.board_notifications.lock().unwrap();
                 state.prune(|name| db.agent(name).ok());
-                state.subscribe(agent.clone(), &board.revision, std::time::Instant::now())?;
-                json!({"subscribed":true,"agent":agent.name,"board":"main","revision":board.revision,"debounce_seconds":3,"max_delay_seconds":10,"persistent":false})
+                state.subscribe_named(
+                    &name,
+                    agent.clone(),
+                    &board.revision,
+                    std::time::Instant::now(),
+                )?;
+                json!({"subscribed":true,"agent":agent.name,"board":name,"revision":board.revision,"debounce_seconds":3,"max_delay_seconds":10,"persistent":false})
             }
-            Request::BoardUnsubscribe { agent } => {
-                self.board_notifications.lock().unwrap().unsubscribe(&agent);
-                json!({"subscribed":false,"agent":agent,"board":"main"})
+            Request::NamedBoardUnsubscribe { board, agent } => {
+                self.board_notifications
+                    .lock()
+                    .unwrap()
+                    .unsubscribe_named(&board, &agent);
+                json!({"subscribed":false,"agent":agent,"board":board})
             }
             Request::Register { mut agent, replace } => {
                 crate::clients::validate_registration(&mut agent)?;

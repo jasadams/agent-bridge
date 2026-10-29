@@ -1,7 +1,8 @@
 # Shared Markdown board
 
-The board is one local Markdown document shared by agents using this broker.
-Its contents are entirely up to the user and agents: tables, notes, checklists,
+Boards are local Markdown documents shared by agents using this broker.
+The default board is `main`; agents target other boards explicitly by name.
+Each board's contents are entirely up to the user and agents: tables, notes, checklists,
 headings or any other Markdown. Agent Bridge does not require task/status fields
 or automatically change the content when an agent starts or stops work.
 
@@ -15,7 +16,17 @@ Open the live terminal view:
 
 ```sh
 agent-bridge board
+agent-bridge board --create streamr
+agent-bridge board streamr
+agent-bridge board --list
+agent-bridge board streamr --raw
 ```
+
+The terminal always shows the selected board name. Press `b` outside the text
+editor to open the board picker. Save an unsaved response successfully or
+explicitly discard it before switching; cancelling keeps the draft and board.
+Switching resets document selection, response selection and viewport; pending
+reads and saves remain pinned to their originating board.
 
 Use `j`/`k` or arrow keys to scroll, Page Up/Down and Home/End to navigate,
 `h`/`l` to pan horizontally, `w` to toggle wrapping, and `r` to refresh.
@@ -47,8 +58,18 @@ For a custom broker state directory:
 agent-bridge --state-dir "/absolute/private/state" board
 ```
 
-The current document is stored as `boards/main.md` inside that private state
-directory. A read of a missing document returns empty Markdown and its revision;
+Documents are stored as `boards/<name>.md` inside that private state directory.
+Names are 1–64 lowercase ASCII characters matching
+`[a-z0-9][a-z0-9_-]{0,63}`; paths, dots and silent normalization are rejected.
+Use `--create NAME` (or MCP `create_board`) explicitly before using a non-main
+board. Creation works without a terminal and never overwrites an existing board.
+Unknown names fail without creating a file or falling back to main.
+`--list` and MCP `list_boards` return deterministic name-ordered metadata
+(name, existence and revision), without Markdown. They include absent `main`.
+There are at most 256 boards, including lazy `main`; listing scans at most
+1,024 directory entries and errors explicitly on excess instead of truncating.
+Existing `boards/main.md` stays in place; no migration is needed. A read of absent
+`main` returns empty Markdown and its revision;
 the first successful update creates it. Backups of the broker's state include the
 board. Print its exact Markdown once with `agent-bridge board --raw`.
 
@@ -130,15 +151,23 @@ Notifications are off by default. An enabled local Codex, Claude or OpenCode ses
 opt in with the `subscribe_board` MCP tool, selecting its exact registration:
 
 ```json
-{"agent":"codex-<this-session-UUID>"}
+{"board":"streamr","agent":"codex-<this-session-UUID>"}
 ```
 
 Use the real registration name supplied in the session's native context. The
 `unsubscribe_board` tool takes the same argument and cancels pending notices.
-Subscriptions end when the session ends, is disabled/replaced, or the broker
+A session can watch several boards independently. Unsubscribing with
+`{"board":"streamr","agent":"<exact-registration>"}` removes only that watch.
+Omitting `board` always selects `main`; there is no active-board setting or
+working-directory routing. Subscriptions end when the session ends, is disabled/replaced, or the broker
 restarts. They do not enable networking or share the board with other machines.
 
-A subscribed agent receives a native change notice with the latest board
+The broker permits at most 64 watches globally and 8 concurrent delivery workers.
+It polls at most one watched board every 250 ms in fair round-robin order;
+unwatched boards add no polling work. Coalescing, pending state and own-write
+suppression are independent for each board.
+
+A subscribed agent receives a native change notice naming the board and its latest
 revision and can call `read_board` to inspect checkboxes and text responses.
 Notifications coalesce after **3 seconds without another change**, with a
 **10-second maximum coalescing delay** from the first pending change. Those are
@@ -178,10 +207,18 @@ approval.
 ## Incremental updates
 
 `read_board` returns `markdown`, `revision`, `name`, `path` and `exists`.
-`update_board` requires that exact revision and an ordered array of edits:
+`update_board` requires that exact revision and an ordered array of edits.
+All four read/update/subscribe/unsubscribe tools accept optional `board`, default
+`main`; `create_board` requires it. Named-board revisions bind the board identity
+as well as content, so a revision from another board cannot authorize a write.
+Compact write receipts include `board`; conflict snapshots and unchanged reads
+include the selected identity. Keep conditional-read revisions scoped by board.
+For example, to edit `streamr`:
+
 
 ```json
 {
+  "board": "streamr",
   "expected_revision": "FULL_REVISION_RETURNED_BY_READ_BOARD",
   "agent": "codex-<this-session-UUID>",
   "edits": [
@@ -227,3 +264,20 @@ checkbox or marked text field. Terminal control sequences are removed for displa
 while the Markdown file
 retains its original text. Links, HTML and images do not execute commands or fetch
 network resources.
+
+## Broker compatibility
+
+Legacy clients keep using `main` against a new broker. Named-board operations use
+distinct protocol requests: an older broker rejects them before changing any
+board or subscription. Upgrade the broker and reconnect/restart the MCP client
+if named-board tools are unavailable or rejected. Main-only calls retain their
+legacy request forms where supported. Boards remain local to the selected broker;
+this adds no network access or cross-machine sharing.
+
+For an isolated terminal smoke test, start a broker with a fresh temporary
+`--state-dir`, create `alpha` and `beta`, and open `alpha`. Add a checkbox and text
+field through MCP; open a draft and verify `b` types into it. Cancel the editor,
+use `b` to select `beta`, then return to `alpha` and verify its controls and content.
+Exercise save/conflict/rebase with concurrent MCP edits, confirm failed saves
+preserve the draft, and check that switching never writes to the other board.
+Also check clipboard selection, refresh/reconnect and the selected-name display.

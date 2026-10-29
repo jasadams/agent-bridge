@@ -20,9 +20,79 @@ use std::{
 
 pub const MAX_BOARD_BYTES: usize = 64 * 1024;
 pub const MAX_EDITS: usize = 32;
-const BOARD_NAME: &str = "main";
+
 const DIRECTORY: &CStr = c"boards";
-const DOCUMENT: &CStr = c"main.md";
+pub const MAX_BOARDS: usize = 256;
+const MAX_DIRECTORY_ENTRIES: usize = 1024;
+
+/// A local board slug; validation is shared by every input boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Name(String);
+impl JsonSchema for Name {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "BoardName".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$", "minLength": 1, "maxLength": 64 })
+    }
+}
+impl Name {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn is_main(&self) -> bool {
+        self.0 == "main"
+    }
+    fn document(&self) -> CString {
+        CString::new(format!("{}.md", self.0)).expect("Validated slug")
+    }
+}
+impl Default for Name {
+    fn default() -> Self {
+        Self("main".into())
+    }
+}
+impl std::fmt::Display for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::str::FromStr for Name {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        ensure!(
+            !value.is_empty()
+                && value.len() <= 64
+                && (value.as_bytes()[0].is_ascii_lowercase()
+                    || value.as_bytes()[0].is_ascii_digit())
+                && value.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'_'
+                    || b == b'-'),
+            "Invalid board name"
+        );
+        Ok(Self(value.into()))
+    }
+}
+impl TryFrom<String> for Name {
+    type Error = anyhow::Error;
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+impl From<Name> for String {
+    fn from(value: Name) -> Self {
+        value.0
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Summary {
+    pub name: Name,
+    pub exists: bool,
+    pub revision: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -66,17 +136,28 @@ impl std::fmt::Display for Conflict {
 }
 impl std::error::Error for Conflict {}
 
-fn snapshot(state_dir: &Path, markdown: String, exists: bool) -> Snapshot {
+fn snapshot(state_dir: &Path, name: &Name, markdown: String, exists: bool) -> Snapshot {
     Snapshot {
-        name: BOARD_NAME.into(),
-        revision: Sha256::digest(markdown.as_bytes())
+        name: name.to_string(),
+        revision: revision_digest(name, &markdown)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect(),
         markdown,
-        path: state_dir.join("boards").join("main.md"),
+        path: state_dir.join("boards").join(format!("{name}.md")),
         exists,
     }
+}
+
+fn revision_digest(name: &Name, markdown: &str) -> sha2::digest::Output<Sha256> {
+    let mut digest = Sha256::new();
+    if !name.is_main() {
+        digest.update(b"agent-bridge-board\0");
+        digest.update(name.as_str().as_bytes());
+        digest.update(b"\0");
+    }
+    digest.update(markdown.as_bytes());
+    digest.finalize()
 }
 
 fn root(state_dir: &Path) -> Result<File> {
@@ -143,11 +224,15 @@ fn board_directory(state: &File, create: bool) -> Result<Option<File>> {
     }
 }
 
-fn read_document(state_dir: &Path, directory: &File) -> Result<Snapshot> {
-    let file = match open_at(directory, DOCUMENT, libc::O_RDONLY) {
+fn read_document(state_dir: &Path, name: &Name, directory: &File) -> Result<Snapshot> {
+    let file = match open_at(directory, &name.document(), libc::O_RDONLY) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(snapshot(state_dir, String::new(), false));
+            ensure!(
+                name.is_main(),
+                "Board {name} not found; create it explicitly first"
+            );
+            return Ok(snapshot(state_dir, name, String::new(), false));
         }
         Err(error) => {
             return Err(error).context("Cannot open board document without following links");
@@ -171,16 +256,132 @@ fn read_document(state_dir: &Path, directory: &File) -> Result<Snapshot> {
     ensure!(bytes.len() <= MAX_BOARD_BYTES, "Board exceeds 64 KiB");
     let markdown =
         String::from_utf8(bytes).context("Board document must contain UTF-8 Markdown")?;
-    Ok(snapshot(state_dir, markdown, true))
+    Ok(snapshot(state_dir, name, markdown, true))
 }
 
 /// Reading an absent board returns an empty document without creating a file.
 pub fn read(state_dir: &Path) -> Result<Snapshot> {
+    read_named(state_dir, &Name::default())
+}
+pub fn read_named(state_dir: &Path, name: &Name) -> Result<Snapshot> {
     let state = root(state_dir)?;
     let Some(directory) = board_directory(&state, false)? else {
-        return Ok(snapshot(state_dir, String::new(), false));
+        ensure!(
+            name.is_main(),
+            "Board {name} not found; create it explicitly first"
+        );
+        return Ok(snapshot(state_dir, name, String::new(), false));
     };
-    read_document(state_dir, &directory)
+    read_document(state_dir, name, &directory)
+}
+
+/// Create without replacing any existing entry. Broker serialization protects transactions.
+pub fn create(state_dir: &Path, name: &Name) -> Result<Snapshot> {
+    let entries = list(state_dir)?;
+    ensure!(
+        entries
+            .iter()
+            .all(|entry| &entry.name != name || !entry.exists),
+        "Board {name} already exists"
+    );
+    ensure!(
+        entries.iter().any(|entry| &entry.name == name) || entries.len() < MAX_BOARDS,
+        "At most 256 boards may exist"
+    );
+    let state = root(state_dir)?;
+    let directory = board_directory(&state, true)?.context("Board directory was not created")?;
+    let file = open_at(
+        &directory,
+        &name.document(),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+    )
+    .context("Cannot create board; it may already exist")?;
+    file.sync_all().context("Cannot persist new board")?;
+    directory
+        .sync_all()
+        .context("Cannot persist new board directory entry")?;
+    Ok(snapshot(state_dir, name, String::new(), true))
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn directory_errno() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+#[cfg(target_os = "macos")]
+unsafe fn directory_errno() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+/// Enumerate from the validated directory descriptor, with explicit work/output limits.
+pub fn list(state_dir: &Path) -> Result<Vec<Summary>> {
+    let state = root(state_dir)?;
+    let mut names = std::collections::BTreeSet::from([Name::default()]);
+    if let Some(directory) = board_directory(&state, false)? {
+        let fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        ensure!(fd >= 0, "Cannot duplicate board directory descriptor");
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            unsafe {
+                libc::close(fd);
+            }
+            anyhow::bail!("Cannot enumerate boards");
+        }
+        let result = (|| -> Result<()> {
+            let mut count = 0;
+            loop {
+                // POSIX readdir signals end or failure using errno.
+                unsafe {
+                    *directory_errno() = 0;
+                }
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    let code = unsafe { *directory_errno() };
+                    ensure!(
+                        code == 0,
+                        "Cannot enumerate boards: {}",
+                        std::io::Error::from_raw_os_error(code)
+                    );
+                    break;
+                }
+                count += 1;
+                ensure!(
+                    count <= MAX_DIRECTORY_ENTRIES,
+                    "Board directory exceeds 1024 entries"
+                );
+                let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                let Ok(filename) = std::str::from_utf8(bytes) else {
+                    continue;
+                };
+                let Some(slug) = filename.strip_suffix(".md") else {
+                    continue;
+                };
+                let Ok(name) = slug.parse::<Name>() else {
+                    continue;
+                };
+                names.insert(name);
+                ensure!(
+                    names.len() <= MAX_BOARDS,
+                    "Board listing exceeds 256 boards"
+                );
+            }
+            Ok(())
+        })();
+        unsafe {
+            libc::closedir(stream);
+        }
+        result?;
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let board = read_named(state_dir, &name)?;
+            Ok(Summary {
+                name,
+                exists: board.exists,
+                revision: board.revision,
+            })
+        })
+        .collect()
 }
 
 fn apply(markdown: &mut String, edit: &Edit) -> Result<()> {
@@ -235,6 +436,14 @@ fn apply(markdown: &mut String, edit: &Edit) -> Result<()> {
 /// Read again before retrying an ambiguous failure with a fresh revision.
 /// Concurrent callers must be serialized by the broker's administration mutex.
 pub fn update(state_dir: &Path, expected_revision: &str, edits: &[Edit]) -> Result<Snapshot> {
+    update_named(state_dir, &Name::default(), expected_revision, edits)
+}
+pub fn update_named(
+    state_dir: &Path,
+    name: &Name,
+    expected_revision: &str,
+    edits: &[Edit],
+) -> Result<Snapshot> {
     ensure!(
         expected_revision.len() == 64
             && expected_revision
@@ -249,8 +458,14 @@ pub fn update(state_dir: &Path, expected_revision: &str, edits: &[Edit]) -> Resu
     let state = root(state_dir)?;
     let existing_directory = board_directory(&state, false)?;
     let current = match &existing_directory {
-        Some(directory) => read_document(state_dir, directory)?,
-        None => snapshot(state_dir, String::new(), false),
+        Some(directory) => read_document(state_dir, name, directory)?,
+        None => {
+            ensure!(
+                name.is_main(),
+                "Board {name} not found; create it explicitly first"
+            );
+            snapshot(state_dir, name, String::new(), false)
+        }
     };
     if current.revision != expected_revision {
         return Err(Conflict { current }.into());
@@ -278,7 +493,7 @@ pub fn update(state_dir: &Path, expected_revision: &str, edits: &[Edit]) -> Resu
                 directory.as_raw_fd(),
                 temporary.as_ptr(),
                 directory.as_raw_fd(),
-                DOCUMENT.as_ptr(),
+                name.document().as_ptr(),
             )
         };
         if result != 0 {
@@ -296,7 +511,7 @@ pub fn update(state_dir: &Path, expected_revision: &str, edits: &[Edit]) -> Resu
         }
     }
     result?;
-    Ok(snapshot(state_dir, markdown, true))
+    Ok(snapshot(state_dir, name, markdown, true))
 }
 
 #[cfg(test)]
@@ -324,6 +539,199 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn board_names_validate_all_input_boundaries_and_schema() {
+        for value in [
+            "",
+            "Main",
+            ".",
+            "..",
+            "/tmp/a",
+            "a/b",
+            "a.md",
+            "-a",
+            "_a",
+            "a b",
+            "é",
+            &"x".repeat(65),
+        ] {
+            assert!(value.parse::<Name>().is_err(), "{value}");
+            assert!(
+                serde_json::from_value::<Name>(serde_json::json!(value)).is_err(),
+                "{value}"
+            );
+        }
+        for value in ["main", "0", "a-b_c", &"a".repeat(64)] {
+            let name: Name = value.parse().unwrap();
+            assert_eq!(name.as_str(), value);
+            assert_eq!(serde_json::to_value(name).unwrap(), value);
+        }
+        let schema = schemars::schema_for!(Name);
+        assert_eq!(schema.as_value()["pattern"], "^[a-z0-9][a-z0-9_-]{0,63}$");
+    }
+
+    #[test]
+    fn named_boards_are_explicit_independent_and_revision_bound() {
+        let state = private_state();
+        let alpha: Name = "alpha".parse().unwrap();
+        let beta: Name = "beta".parse().unwrap();
+        let unknown: Name = "unknown".parse().unwrap();
+        assert!(read_named(state.path(), &unknown).is_err());
+        assert!(
+            update_named(
+                state.path(),
+                &unknown,
+                &"0".repeat(64),
+                &[Edit::Set {
+                    markdown: "x".into()
+                }]
+            )
+            .is_err()
+        );
+        assert!(!state.path().join("boards").exists());
+        let empty_alpha = create(state.path(), &alpha).unwrap();
+        let empty_beta = create(state.path(), &beta).unwrap();
+        assert_ne!(empty_alpha.revision, empty_beta.revision);
+        assert!(
+            update_named(
+                state.path(),
+                &beta,
+                &empty_alpha.revision,
+                &[Edit::Set {
+                    markdown: "wrong".into()
+                }]
+            )
+            .unwrap_err()
+            .is::<Conflict>()
+        );
+        let written = update_named(
+            state.path(),
+            &alpha,
+            &empty_alpha.revision,
+            &[Edit::Set {
+                markdown: "private alpha".into(),
+            }],
+        )
+        .unwrap();
+        assert!(create(state.path(), &alpha).is_err());
+        assert_eq!(
+            read_named(state.path(), &alpha).unwrap().markdown,
+            written.markdown
+        );
+        assert_eq!(read_named(state.path(), &beta).unwrap().markdown, "");
+        assert!(!read(state.path()).unwrap().exists);
+        let listed = list(state.path()).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta", "main"]
+        );
+        let serialized = serde_json::to_value(&listed).unwrap();
+        assert!(
+            serialized
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.get("markdown").is_none())
+        );
+        assert_eq!(
+            read(state.path()).unwrap().revision,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn named_security_failures_preserve_main_and_reject_unsafe_listing() {
+        let state = private_state();
+        let main = set(state.path(), "main content");
+        let name: Name = "secure".parse().unwrap();
+        let secure = create(state.path(), &name).unwrap();
+        fs::remove_file(&secure.path).unwrap();
+        symlink(&main.path, &secure.path).unwrap();
+        assert!(read_named(state.path(), &name).is_err());
+        assert!(list(state.path()).is_err());
+        assert!(create(state.path(), &name).is_err());
+        fs::remove_file(&secure.path).unwrap();
+        fs::hard_link(&main.path, &secure.path).unwrap();
+        assert!(read_named(state.path(), &name).is_err());
+        fs::remove_file(&secure.path).unwrap();
+        assert_eq!(read(state.path()).unwrap().markdown, "main content");
+        let secure = create(state.path(), &name).unwrap();
+        fs::set_permissions(&secure.path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_named(state.path(), &name).is_err());
+        assert!(list(state.path()).is_err());
+        assert_eq!(read(state.path()).unwrap().markdown, "main content");
+    }
+
+    #[test]
+    fn listing_ignores_arbitrary_names_and_explicitly_bounds_enumeration() {
+        let state = private_state();
+        set(state.path(), "main");
+        let directory = state.path().join("boards");
+        fs::write(directory.join("secret.txt"), "not a board").unwrap();
+        fs::write(directory.join("Upper.md"), "not a board").unwrap();
+        symlink("/nonexistent", directory.join("arbitrary-link")).unwrap();
+        assert_eq!(list(state.path()).unwrap().len(), 1);
+        for index in 0..MAX_DIRECTORY_ENTRIES {
+            fs::write(directory.join(format!("ignored-{index}")), "").unwrap();
+        }
+        assert!(list(state.path()).unwrap_err().to_string().contains("1024"));
+    }
+
+    #[test]
+    fn creation_limit_reserves_main_and_keeps_a_full_listing_usable() {
+        let state = private_state();
+        create(state.path(), &"board-0".parse().unwrap()).unwrap();
+        let directory = state.path().join("boards");
+        for index in 1..MAX_BOARDS - 1 {
+            let path = directory.join(format!("board-{index}.md"));
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            drop(file);
+        }
+        let full = list(state.path()).unwrap();
+        assert_eq!(full.len(), MAX_BOARDS);
+        assert!(
+            !full
+                .iter()
+                .find(|entry| entry.name.is_main())
+                .unwrap()
+                .exists
+        );
+        let overflow: Name = "overflow".parse().unwrap();
+        assert!(create(state.path(), &overflow).is_err());
+        assert!(!directory.join("overflow.md").exists());
+        assert_eq!(list(state.path()).unwrap().len(), MAX_BOARDS);
+        // Main already occupies a reserved listing slot and can still be created.
+        assert!(create(state.path(), &Name::default()).unwrap().exists);
+        assert_eq!(list(state.path()).unwrap().len(), MAX_BOARDS);
+        assert!(create(state.path(), &overflow).is_err());
+    }
+
+    #[test]
+    fn concurrent_create_has_exactly_one_winner_without_overwriting() {
+        let state = private_state();
+        let name: Name = "race".parse().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let one = scope.spawn(|| {
+                barrier.wait();
+                create(state.path(), &name).is_ok()
+            });
+            let two = scope.spawn(|| {
+                barrier.wait();
+                create(state.path(), &name).is_ok()
+            });
+            assert_ne!(one.join().unwrap(), two.join().unwrap());
+        });
+        assert!(read_named(state.path(), &name).unwrap().exists);
+    }
     #[test]
     fn absent_read_is_empty_and_does_not_create_files() {
         let state = private_state();

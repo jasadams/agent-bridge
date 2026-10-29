@@ -68,7 +68,8 @@ unchanged. See [OpenCode support and limits](opencode.md).
 
 | Tool | Purpose |
 | --- | --- |
-| `read_board`, `update_board` | Read and atomically edit the local shared Markdown board with revision checks. |
+| `read_board`, `update_board` | Read and atomically edit a local Markdown board with revision checks; optional `board` defaults to `main`. |
+| `list_boards`, `create_board` | List compact board metadata in name order, or explicitly create an empty board using required `board`. |
 | `subscribe_board`, `unsubscribe_board` | Opt an exact local native session into or out of debounced board change notifications. |
 | `connection_status` | Inspect the local broker and peer connections. |
 | `list_agents` | List local sessions by default, or one explicitly selected peer's permitted sessions. |
@@ -87,8 +88,17 @@ a server shared by several conversations must not guess which session owns a cal
 Local registration names are available through `list_agents` or native registration
 context. Pairing alone still shares no sessions.
 
+Board names are lowercase ASCII slugs matching `[a-z0-9][a-z0-9_-]{0,63}`.
+Call `create_board({"board":"streamr"})` before using a non-main board; duplicates
+never overwrite content and unknown names never fall back to main. `list_boards({})`
+includes lazy, absent `main`, and returns name/existence/revision without Markdown.
+
 Board subscriptions are off by default and end with the selected session or a
-broker restart. Agents can use them to notice checkbox and text answers entered
+broker restart. `subscribe_board` and `unsubscribe_board` also accept optional
+`board` (default `main`); one session may watch several boards independently.
+Unsubscribing affects only the selected board. Global limits are 64 watches and
+8 concurrent delivery workers; at most one watched board is polled per 250 ms
+with fair round-robin scheduling. Agents can use them to notice checkbox and text answers entered
 in the TUI. Supply your own registered `agent` when calling `update_board` to
 suppress notifications of your own writes. See [interactive board usage](board.md)
 for the text-field syntax, debounce timing and concurrency behavior.
@@ -137,14 +147,15 @@ Submitted does not mean the other agent read the message or completed a task.
 ## Compact results and incremental reads
 
 Write tools return compact action receipts by default. Pass `"verbose": true`
-to any write tool to include its full broker result. This changes only MCP output;
+to tools offering that option to include the full broker result. `create_board`
+always returns its new full snapshot. This changes only MCP output;
 message persistence, delivery, CLI output and access checks are unchanged.
 
-- `update_board` returns `{"result":{"revision":"…"}}` on success.
+- `update_board` returns `{"result":{"board":"main","revision":"…"}}` on success.
 - `send_message` returns `{"result":{"id":"…","state":"queued"},"id":"…"}`.
   The top-level UUID is retained for retry compatibility, including failed sends.
 - `acknowledge_message` returns `{"result":{"id":"…","state":"acknowledged"}}`.
-- Subscriptions return subscription state, selected agent and revision when present.
+- Subscriptions return selected `board`, subscription state, agent and revision when present.
   Pairing tools retain the exchange ID, verification state, invitation link and
   expiry needed for the next action; sharing returns the peer, agent and requested
   sharing state. Full metadata is available with `verbose`.
@@ -165,11 +176,18 @@ machine and transport metadata.
 To avoid receiving the same board text again, pass the last revision to `read_board`:
 
 ```json
-{"if_revision":"<last-revision>"}
+{"board":"streamr","if_revision":"<last-revision>"}
 ```
 
-An unchanged board returns `{"result":{"revision":"…","unchanged":true}}`.
-A different revision returns the normal full snapshot.
+An unchanged board returns `{"result":{"name":"streamr","revision":"…","unchanged":true}}`.
+A different revision returns the normal full snapshot, including `name`. Scope cached
+revisions by board. Named-board revisions bind identity even when two documents
+have identical content; legacy main revisions remain compatible.
+
+Named-board RPCs use distinct operations so an old broker rejects them before
+mutation or subscription, without falling back to main. Upgrade the broker and
+reconnect/restart MCP to discover the new tools. Legacy main calls keep their
+request forms where supported. Named boards add no network sharing.
 
 Existing `list_messages` calls return recent-history arrays. To opt into incremental
 reads, start with an empty cursor and the desired agent scope:

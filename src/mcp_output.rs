@@ -30,14 +30,14 @@ pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value
             return value;
         }
         return match value["board"].get("revision") {
-            Some(revision) => json!({"revision":revision}),
+            Some(revision) => json!({"board":value["board"]["name"],"revision":revision}),
             None => value,
         };
     }
 
     let names: &[&str] = match tool {
         "send_message" | "acknowledge_message" => &["id", "state"],
-        "subscribe_board" | "unsubscribe_board" => &["subscribed", "agent", "revision"],
+        "subscribe_board" | "unsubscribe_board" => &["board", "subscribed", "agent", "revision"],
         "open_pairing" => &["open", "valid_for_seconds", "notifications"],
         "create_invite" => &[
             "link",
@@ -141,10 +141,10 @@ mod tests {
     fn board_receipt_is_constant_size_and_verbose_keeps_the_snapshot() {
         for length in [100, 50_000] {
             let value = json!({"applied":true,"board":{
-                "revision":"revision-id","markdown":"x".repeat(length),"path":"/board.md"
+                "name":"main","revision":"revision-id","markdown":"x".repeat(length),"path":"/board.md"
             }});
             let compact = write_result("update_board", value.clone(), false);
-            assert_eq!(compact, json!({"revision":"revision-id"}));
+            assert_eq!(compact, json!({"board":"main","revision":"revision-id"}));
             assert!(serde_json::to_vec(&compact).unwrap().len() < 100);
             assert_eq!(write_result("update_board", value.clone(), true), value);
         }
@@ -240,7 +240,7 @@ mod tests {
                 }),
                 false
             ),
-            json!({"subscribed":true,"agent":"agent","revision":"revision"})
+            json!({"board":"main","subscribed":true,"agent":"agent","revision":"revision"})
         );
         assert_eq!(
             write_result(
@@ -250,7 +250,7 @@ mod tests {
                 }),
                 false
             ),
-            json!({"subscribed":false,"agent":"agent"})
+            json!({"board":"main","subscribed":false,"agent":"agent"})
         );
         for (tool, value) in [
             ("cancel_pairing", json!({"cancelled":true,"id":"exchange"})),

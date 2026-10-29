@@ -1,4 +1,5 @@
 use agent_bridge::{
+    board::Name,
     broker, hook,
     network::trust::Permission,
     protocol::{Agent, Provider, Request},
@@ -28,6 +29,15 @@ enum Commands {
     Mcp,
     /// View and answer local shared Markdown board controls, or print its current Markdown.
     Board {
+        /// Board name (defaults to main); named boards require explicit creation.
+        #[arg(conflicts_with_all = ["list", "create"])]
+        name: Option<Name>,
+        /// List local boards without opening the terminal UI.
+        #[arg(long, conflicts_with_all = ["raw", "create"])]
+        list: bool,
+        /// Explicitly create an empty board without opening the terminal UI.
+        #[arg(long, value_name = "NAME", conflicts_with = "raw")]
+        create: Option<Name>,
         /// Print Markdown once without opening the terminal UI.
         #[arg(long)]
         raw: bool,
@@ -511,15 +521,45 @@ async fn main() -> Result<()> {
             );
         }
 
-        Commands::Board { raw } => {
+        Commands::Board {
+            name,
+            raw,
+            list,
+            create,
+        } => {
+            if list {
+                let value = broker::rpc(&state_dir, &Request::BoardList).await?;
+                let boards: Vec<agent_bridge::board::Summary> = serde_json::from_value(value)?;
+                for board in boards {
+                    println!(
+                        "{}\t{}\t{}",
+                        board.name,
+                        if board.exists { "exists" } else { "absent" },
+                        board.revision
+                    );
+                }
+                return Ok(());
+            }
+            if let Some(board) = create {
+                broker::rpc(
+                    &state_dir,
+                    &Request::BoardCreate {
+                        board: board.clone(),
+                    },
+                )
+                .await?;
+                println!("Created board {board}");
+                return Ok(());
+            }
+            let name = name.unwrap_or_default();
             if raw {
-                let value = broker::rpc(&state_dir, &Request::BoardRead).await?;
+                let value = broker::rpc(&state_dir, &Request::board_read(name.clone())).await?;
                 let board: agent_bridge::board::Snapshot = serde_json::from_value(value)?;
                 use std::io::Write;
                 std::io::stdout().write_all(board.markdown.as_bytes())?;
                 return Ok(());
             }
-            return agent_bridge::board_tui::run(state_dir).await;
+            return agent_bridge::board_tui::run_named(state_dir, name).await;
         }
         Commands::Serve {
             codex_bin,
@@ -929,6 +969,29 @@ fn pairing_token(token: Option<String>) -> Result<String> {
 #[cfg(test)]
 mod update_cli_tests {
     use super::*;
+
+    #[test]
+    fn board_modes_validate_names_and_conflicting_options() {
+        for args in [
+            vec!["agent-bridge", "board"],
+            vec!["agent-bridge", "board", "project", "--raw"],
+            vec!["agent-bridge", "board", "--list"],
+            vec!["agent-bridge", "board", "--create", "project"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["agent-bridge", "board", "../project"],
+            vec!["agent-bridge", "board", "--create", "UPPER"],
+            vec!["agent-bridge", "board", "--list", "--raw"],
+            vec!["agent-bridge", "board", "project", "--list"],
+            vec!["agent-bridge", "board", "project", "--create", "other"],
+            vec!["agent-bridge", "board", "--create", "project", "--raw"],
+            vec!["agent-bridge", "board", "--create", "project", "--list"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
     #[test]
     fn update_modes_are_explicit_and_mutually_exclusive() {

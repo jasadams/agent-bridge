@@ -155,6 +155,28 @@ pub enum Request {
     Pause {
         paused: bool,
     },
+    BoardList,
+    BoardCreate {
+        board: crate::board::Name,
+    },
+    NamedBoardRead {
+        board: crate::board::Name,
+    },
+    NamedBoardUpdate {
+        board: crate::board::Name,
+        expected_revision: String,
+        edits: Vec<crate::board::Edit>,
+        #[serde(default)]
+        actor: Option<String>,
+    },
+    NamedBoardSubscribe {
+        board: crate::board::Name,
+        agent: String,
+    },
+    NamedBoardUnsubscribe {
+        board: crate::board::Name,
+        agent: String,
+    },
     BoardRead,
     BoardUpdate {
         expected_revision: String,
@@ -300,6 +322,50 @@ pub enum Request {
         peer: String,
     },
 }
+impl Request {
+    pub fn board_read(board: crate::board::Name) -> Self {
+        if board.is_main() {
+            Self::BoardRead
+        } else {
+            Self::NamedBoardRead { board }
+        }
+    }
+    pub fn board_update(
+        board: crate::board::Name,
+        expected_revision: String,
+        edits: Vec<crate::board::Edit>,
+        actor: Option<String>,
+    ) -> Self {
+        if board.is_main() {
+            Self::BoardUpdate {
+                expected_revision,
+                edits,
+                actor,
+            }
+        } else {
+            Self::NamedBoardUpdate {
+                board,
+                expected_revision,
+                edits,
+                actor,
+            }
+        }
+    }
+    pub fn board_subscribe(board: crate::board::Name, agent: String) -> Self {
+        if board.is_main() {
+            Self::BoardSubscribe { agent }
+        } else {
+            Self::NamedBoardSubscribe { board, agent }
+        }
+    }
+    pub fn board_unsubscribe(board: crate::board::Name, agent: String) -> Self {
+        if board.is_main() {
+            Self::BoardUnsubscribe { agent }
+        } else {
+            Self::NamedBoardUnsubscribe { board, agent }
+        }
+    }
+}
 
 fn history_limit() -> usize {
     30
@@ -327,6 +393,102 @@ impl Response {
                 result: None,
                 error: Some(format!("{error:#}")),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod board_compatibility_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Frozen old board protocol: unit reads and strict unknown-field handling.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+    enum OldBoardRequest {
+        #[serde(rename = "board_read")]
+        Read,
+        #[serde(rename = "board_update")]
+        Update {
+            expected_revision: String,
+            edits: Vec<crate::board::Edit>,
+            #[serde(default)]
+            actor: Option<String>,
+        },
+        #[serde(rename = "board_subscribe")]
+        Subscribe { agent: String },
+        #[serde(rename = "board_unsubscribe")]
+        Unsubscribe { agent: String },
+    }
+    fn old_accepts(value: serde_json::Value) -> bool {
+        // Consume fields as an old handler would, without executing any side effects.
+        match serde_json::from_value::<OldBoardRequest>(value) {
+            Ok(OldBoardRequest::Read) => true,
+            Ok(OldBoardRequest::Update {
+                expected_revision,
+                edits,
+                actor,
+            }) => !expected_revision.is_empty() && !edits.is_empty() && actor.is_none(),
+            Ok(OldBoardRequest::Subscribe { agent } | OldBoardRequest::Unsubscribe { agent }) => {
+                !agent.is_empty()
+            }
+            Err(_) => false,
+        }
+    }
+    #[test]
+    fn main_builders_keep_legacy_wire_fixtures() {
+        let main = crate::board::Name::default();
+        let revision = "0".repeat(64);
+        let fixtures = [
+            (
+                Request::board_read(main.clone()),
+                json!({"op":"board_read"}),
+            ),
+            (
+                Request::board_update(
+                    main.clone(),
+                    revision.clone(),
+                    vec![crate::board::Edit::Append { text: "x".into() }],
+                    None,
+                ),
+                json!({"op":"board_update","expected_revision":revision,"edits":[{"op":"append","text":"x"}],"actor":null}),
+            ),
+            (
+                Request::board_subscribe(main.clone(), "agent".into()),
+                json!({"op":"board_subscribe","agent":"agent"}),
+            ),
+            (
+                Request::board_unsubscribe(main, "agent".into()),
+                json!({"op":"board_unsubscribe","agent":"agent"}),
+            ),
+        ];
+        for (request, fixture) in fixtures {
+            assert_eq!(serde_json::to_value(request).unwrap(), fixture);
+            assert!(old_accepts(fixture.clone()));
+            assert!(serde_json::from_value::<Request>(fixture).is_ok());
+        }
+    }
+    #[test]
+    fn old_protocol_stub_rejects_every_distinct_named_operation() {
+        let name: crate::board::Name = "release".parse().unwrap();
+        for request in [
+            Request::board_read(name.clone()),
+            Request::board_update(
+                name.clone(),
+                "0".repeat(64),
+                vec![crate::board::Edit::Append {
+                    text: "must not reach main".into(),
+                }],
+                None,
+            ),
+            Request::board_subscribe(name.clone(), "agent".into()),
+            Request::board_unsubscribe(name.clone(), "agent".into()),
+            Request::BoardCreate { board: name },
+            Request::BoardList,
+        ] {
+            let wire = serde_json::to_value(request).unwrap();
+            assert!(!old_accepts(wire.clone()), "{wire}");
+            assert!(serde_json::from_value::<Request>(wire).is_ok());
         }
     }
 }
