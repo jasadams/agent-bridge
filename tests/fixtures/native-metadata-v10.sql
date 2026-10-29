@@ -1,3 +1,5 @@
+-- Remove typed Codex control markers added after this fixture schema.
+DROP TABLE IF EXISTS codex_notices;
 -- Remove later local OpenCode recovery state when reconstructing a genuine v10 fixture.
 DROP TRIGGER IF EXISTS opencode_enqueue_bound;
 DROP TRIGGER IF EXISTS opencode_retry_bound;

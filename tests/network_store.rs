@@ -452,9 +452,9 @@ fn inbound_retry_cannot_redirect_to_another_provider_with_the_same_session_id() 
         true,
     )
     .unwrap();
-    p.b.retry(&local.id, false).unwrap();
+    assert!(p.b.retry(&local.id, false).is_err());
     assert!(p.b.claim().unwrap().is_none());
-    assert_eq!(p.b.get(&local.id).unwrap().state, "blocked");
+    assert_eq!(p.b.get(&local.id).unwrap().state, "failed");
 }
 
 #[test]
@@ -572,4 +572,110 @@ fn retained_history_quota_rejects_completed_message_growth_without_breaking_dedu
             before
         );
     }
+}
+
+#[test]
+fn codex_inbound_uses_canonical_alias_admission_and_duplicates_precede_pressure() {
+    let mut p = Pair::new();
+    let agent = Agent {
+        name: "native".into(),
+        provider: Provider::Codex,
+        session: "123e4567-e89b-12d3-a456-426614174000".into(),
+        endpoint: String::new(),
+        enabled: true,
+    };
+    p.b.register(&agent, false).unwrap();
+    let mut alias = agent.clone();
+    alias.name = "alias".into();
+    p.b.register(&alias, false).unwrap();
+    p.b.grant_peer(&p.aid, &agent.name, Permission::Receive, true)
+        .unwrap();
+    p.a.replace_remote_agents(
+        &p.bid,
+        &[RemoteAgent {
+            name: agent.name.clone(),
+            provider: agent.provider.clone(),
+            session: agent.session.clone(),
+        }],
+    )
+    .unwrap();
+    let remote_id = id();
+    p.a.send_remote(&p.aid, &remote_id, "user", "bob/native", "first", &None)
+        .unwrap();
+    let first = p.a.pending_transfers(&p.bid, 100).unwrap().pop().unwrap();
+    p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+    let (claimed, _) = p.b.claim().unwrap().unwrap();
+    p.b.finish(&claimed.id, "submitted", "native accepted")
+        .unwrap();
+    for _ in 0..63 {
+        let local =
+            p.b.send(&id(), "user", &alias.name, "local", &None)
+                .unwrap();
+        let (claimed, _) = p.b.claim().unwrap().unwrap();
+        assert_eq!(claimed.id, local.id);
+        p.b.finish(&local.id, "submitted", "native accepted")
+            .unwrap();
+    }
+    p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+    let next_id = id();
+    p.a.send_remote(&p.aid, &next_id, "user", "bob/native", "full", &None)
+        .unwrap();
+    let next =
+        p.a.pending_transfers(&p.bid, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == next_id)
+            .unwrap();
+    let error = p.b.accept_remote(&p.bid, &p.aid, &next).unwrap_err();
+    assert!(retryable(&error));
+    assert!(error.to_string().contains("64 unresolved"));
+    assert_eq!(p.b.history(&None, 100).unwrap().len(), 64);
+}
+
+#[test]
+fn outbound_remote_uuid_collision_never_uses_local_codex_slots_or_concurrency() {
+    let mut p = Pair::new();
+    let session = "123e4567-e89b-12d3-a456-426614174000";
+    let local = Agent {
+        name: "local-native".into(),
+        provider: Provider::Codex,
+        session: session.into(),
+        endpoint: String::new(),
+        enabled: true,
+    };
+    p.a.register(&local, false).unwrap();
+    p.a.replace_remote_agents(
+        &p.bid,
+        &[RemoteAgent {
+            name: "remote-native".into(),
+            provider: Provider::Codex,
+            session: session.into(),
+        }],
+    )
+    .unwrap();
+    let mut outgoing = Vec::new();
+    for _ in 0..64 {
+        let identifier = id();
+        p.a.send_remote(
+            &p.aid,
+            &identifier,
+            "user",
+            "bob/remote-native",
+            "remote",
+            &None,
+        )
+        .unwrap();
+        outgoing.push(identifier);
+    }
+    // Simulate a concurrent remote transport attempt with the identical UUID.
+    let conn = rusqlite::Connection::open(p._dir.path().join("a.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE messages SET state='sending' WHERE id=?",
+        [&outgoing[0]],
+    )
+    .unwrap();
+    let message =
+        p.a.send(&id(), "user", &local.name, "local", &None)
+            .unwrap();
+    assert_eq!(p.a.claim().unwrap().unwrap().0.id, message.id);
 }

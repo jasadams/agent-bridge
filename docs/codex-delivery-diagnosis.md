@@ -1,5 +1,12 @@
 # Codex native delivery diagnosis (AGB-11)
 
+This is historical queue-only evidence. The AGB-13 active delivery implementation
+is described in [Codex delivery](codex-delivery.md). Replay the original default
+queue-only harness on recorded commit `5cb93aa7b932c8bdeb84cc5c4b9c0257b327574c`;
+on the fixed current source use the harness `--production` mode. The evidence
+below remains unchanged and does not describe the fixed adapter's expected active
+behavior.
+
 ## Finding
 
 On Codex CLI **0.165.0**, `thread/queue/add` accepts a message into a native
@@ -52,8 +59,8 @@ used for this diagnosis or as a workaround.
 
 ## Reproduce safely
 
-Use a checkout of base `5cb93aa7b932c8bdeb84cc5c4b9c0257b327574c` or this diagnostic
-branch. The evidence manifest records the exact binaries, hashes, OS, Python,
+For the historical queue-only replay, use a checkout of base
+`5cb93aa7b932c8bdeb84cc5c4b9c0257b327574c`. The evidence manifest records the exact binaries, hashes, OS, Python,
 websockets version, synthetic session/message IDs and UTC boundaries:
 [recorded native evidence](diagnostics/codex-native-delivery.json).
 

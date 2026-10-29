@@ -539,6 +539,7 @@ impl Db {
             |r| r.get(0),
         )?;
         ensure!(count < 1000, "Queue is full (1000 pending messages)");
+        crate::codex_admission::check(&self.conn, &target.provider, &target.session, None)?;
         let t = now();
         self.conn.execute(
             "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',NULL,?8,?8)",
@@ -627,12 +628,19 @@ impl Db {
 
     // Claim one message per recipient. SQLite access is serialized by the service mutex.
     pub fn claim(&mut self) -> Result<Option<(Message, Agent)>> {
+        self.claim_excluding_codex(&[])
+    }
+
+    pub(crate) fn claim_excluding_codex(
+        &mut self,
+        busy_codex: &[String],
+    ) -> Result<Option<(Message, Agent)>> {
         if self.paused()? {
             return Ok(None);
         }
         self.block_revoked_inbound()?;
         self.opencode_tick(now())?;
-        let id:Option<String> = self.conn.query_row("SELECT m.id FROM messages m JOIN agents a ON a.name=m.recipient AND a.session=m.recipient_session AND a.enabled=1 WHERE (m.state='queued' OR (a.provider='opencode' AND m.state='uncertain' AND EXISTS(SELECT 1 FROM opencode_deliveries requested WHERE requested.id=m.id AND requested.phase='reconcile'))) AND NOT EXISTS(SELECT 1 FROM messages busy WHERE busy.recipient=m.recipient AND busy.state='sending') AND (a.provider<>'opencode' OR (EXISTS(SELECT 1 FROM opencode_deliveries d JOIN opencode_leases l ON l.session=d.session WHERE d.id=m.id AND d.generation=l.generation AND l.endpoint=a.endpoint AND l.expires>?1 AND (l.ready=1 OR d.phase='reconcile')) AND (EXISTS(SELECT 1 FROM opencode_deliveries current WHERE current.id=m.id AND current.phase='reconcile') OR NOT EXISTS(SELECT 1 FROM opencode_deliveries head JOIN messages h ON h.id=head.id WHERE head.session=m.recipient_session AND h.id<>m.id AND (h.state='sending' OR h.state='uncertain' OR (h.state='queued' AND (h.rowid<m.rowid OR head.phase<>'queued'))))))) ORDER BY m.rowid LIMIT 1",[now()],|r|r.get(0)).optional()?;
+        let id:Option<String> = self.conn.query_row("SELECT m.id FROM messages m JOIN agents a ON a.name=m.recipient AND a.session=m.recipient_session AND a.enabled=1 WHERE (a.provider<>'codex' OR NOT EXISTS(SELECT 1 FROM json_each(?2) running WHERE running.value=m.recipient_session)) AND (m.state='queued' OR (a.provider='opencode' AND m.state='uncertain' AND EXISTS(SELECT 1 FROM opencode_deliveries requested WHERE requested.id=m.id AND requested.phase='reconcile'))) AND EXISTS(SELECT 1 FROM message_context identity WHERE identity.id=m.id AND (json_extract(identity.destination,'$.provider')=a.provider OR (a.provider<>'codex' AND json_extract(identity.destination,'$.provider') IS NULL))) AND NOT EXISTS(SELECT 1 FROM messages busy JOIN message_context bc ON bc.id=busy.id WHERE busy.state='sending' AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=busy.id) AND (busy.recipient=m.recipient OR (a.provider='codex' AND busy.recipient_session=m.recipient_session AND (json_extract(bc.destination,'$.provider')='codex' OR json_extract(bc.destination,'$.provider') IS NULL)))) AND (a.provider<>'opencode' OR (EXISTS(SELECT 1 FROM opencode_deliveries d JOIN opencode_leases l ON l.session=d.session WHERE d.id=m.id AND d.generation=l.generation AND l.endpoint=a.endpoint AND l.expires>?1 AND (l.ready=1 OR d.phase='reconcile')) AND (EXISTS(SELECT 1 FROM opencode_deliveries current WHERE current.id=m.id AND current.phase='reconcile') OR NOT EXISTS(SELECT 1 FROM opencode_deliveries head JOIN messages h ON h.id=head.id WHERE head.session=m.recipient_session AND h.id<>m.id AND (h.state='sending' OR h.state='uncertain' OR (h.state='queued' AND (h.rowid<m.rowid OR head.phase<>'queued'))))))) ORDER BY m.rowid LIMIT 1",params![now(),serde_json::to_string(busy_codex)?],|r|r.get(0)).optional()?;
         let Some(id) = id else { return Ok(None) };
         self.conn.execute(
             "UPDATE messages SET state='sending',updated=? WHERE id=?",
@@ -687,6 +695,7 @@ impl Db {
             self.agent(&m.recipient)?.session == m.recipient_session,
             "Recipient session changed; create a new message explicitly"
         );
+        self.codex_retry_admission(&m, &self.agent(&m.recipient)?)?;
         self.conn.execute(
             "UPDATE messages SET state='queued',detail=NULL,updated=? WHERE id=?",
             params![now(), id],

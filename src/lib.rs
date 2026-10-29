@@ -7,6 +7,7 @@ pub mod board_tui;
 pub mod broker;
 pub mod clients;
 pub use clients::claude_discovery;
+mod codex_admission;
 pub mod db;
 pub mod delivery;
 pub mod opencode_install;
