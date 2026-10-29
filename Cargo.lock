@@ -96,6 +96,7 @@ dependencies = [
  "tokio-tungstenite",
  "tui-markdown",
  "unicode-general-category",
+ "url",
  "uuid",
  "vodozemac",
  "zeroize",
@@ -3327,8 +3328,6 @@ dependencies = [
 [[package]]
 name = "ratatui-core"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbb175c433c8e28a809d1f5773a2ae96e68c0ce40db865cbab1020bf33ae479c"
 dependencies = [
  "bitflags",
  "compact_str",
@@ -3361,8 +3360,6 @@ dependencies = [
 [[package]]
 name = "ratatui-widgets"
 version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66e3d19bcc9130ca376277d93b60767ff121ace3be06f5f95f81dd68956407d1"
 dependencies = [
  "bitflags",
  "hashbrown 0.17.1",
@@ -4254,8 +4251,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tui-markdown"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ab50607adeb8d597e0f3653e5b173c14d7d8ef95f89f25a985828f0e127ba1"
 dependencies = [
  "itertools 0.15.0",
  "pulldown-cmark",

@@ -2,6 +2,7 @@
 use crate::{
     board::{Edit, MAX_BOARD_BYTES, Name, Snapshot, Summary},
     board_interaction::{self, Control, Kind},
+    board_links::{self, SpanLinks, VisibleLink},
     board_selection::{Selection, Viewport},
     broker,
     protocol::Request,
@@ -37,6 +38,7 @@ const MAX_TABLE_CELLS: usize = 20_000;
 struct TerminalRestore;
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
+        let _ = board_links::close_output();
         let _ = crossterm::execute!(
             std::io::stdout(),
             DisableBracketedPaste,
@@ -78,7 +80,7 @@ fn safe_line(input: &str) -> String {
         .collect()
 }
 
-fn rendered_markdown(markdown: &str, width: u16) -> (Text<'static>, bool) {
+fn rendered_document(markdown: &str, width: u16) -> (Text<'static>, SpanLinks, bool) {
     let safe = safe_markdown(markdown);
     let lines = safe.lines().count();
     let columns = safe
@@ -87,13 +89,15 @@ fn rendered_markdown(markdown: &str, width: u16) -> (Text<'static>, bool) {
         .max()
         .unwrap_or(0);
     let plain = columns.saturating_mul(lines) > MAX_TABLE_CELLS;
-    let rendered = if plain {
-        Text::from(safe.as_str())
+    let (rendered, links) = if plain {
+        (Text::from(safe.as_str()), SpanLinks::new())
     } else {
         let options = tui_markdown::Options::default()
             .table_width(width)
             .table_row_dividers(true);
-        tui_markdown::from_str_with_options(&safe, &options)
+        let document = tui_markdown::from_str_with_links(&safe, &options);
+        let links = board_links::span_links(&document, markdown);
+        (document.text, links)
     };
     // Entity decoding can introduce controls that were absent from the source,
     // e.g. &#x1b;. Sanitize every final span, not just the Markdown input.
@@ -117,7 +121,13 @@ fn rendered_markdown(markdown: &str, width: u16) -> (Text<'static>, bool) {
             })
             .collect(),
     };
-    (owned, plain)
+    (owned, links, plain)
+}
+
+#[cfg(test)]
+fn rendered_markdown(markdown: &str, width: u16) -> (Text<'static>, bool) {
+    let (text, _, plain) = rendered_document(markdown, width);
+    (text, plain)
 }
 
 #[derive(Clone)]
@@ -230,6 +240,8 @@ struct View {
     snapshot: Option<Snapshot>,
     error: Option<String>,
     rendered: Text<'static>,
+    links: SpanLinks,
+    hyperlinks_enabled: bool,
     width: u16,
     scroll: (u16, u16),
     max_scroll: (u16, u16),
@@ -256,6 +268,8 @@ impl Default for View {
             snapshot: None,
             error: None,
             rendered: Text::default(),
+            links: SpanLinks::new(),
+            hyperlinks_enabled: board_links::enabled(),
             width: 0,
             scroll: (0, 0),
             max_scroll: (0, 0),
@@ -286,11 +300,13 @@ impl View {
         let generation = self.generation.wrapping_add(1);
         let update_notice = self.update_notice.take();
         let mouse_enabled = self.mouse_enabled;
+        let hyperlinks_enabled = self.hyperlinks_enabled;
         *self = Self {
             board,
             generation,
             update_notice,
             mouse_enabled,
+            hyperlinks_enabled,
             ..Self::default()
         };
         true
@@ -436,7 +452,7 @@ impl View {
                 .as_ref()
                 .map(|snapshot| snapshot.markdown.as_str())
                 .unwrap_or("");
-            (self.rendered, self.plain) = rendered_markdown(markdown, inner.width);
+            (self.rendered, self.links, self.plain) = rendered_document(markdown, inner.width);
             self.width = inner.width;
         }
         let content_height = self.paragraph().line_count(inner.width);
@@ -456,7 +472,22 @@ impl View {
         self.scroll.0 = self.scroll.0.min(self.max_scroll.0);
         self.scroll.1 = self.scroll.1.min(self.max_scroll.1);
         frame.render_widget(block, body);
-        frame.render_widget(self.paragraph().scroll(self.scroll), inner);
+        let mut visible = Vec::new();
+        self.paragraph().scroll(self.scroll).render_with_source(
+            inner,
+            frame.buffer_mut(),
+            |position, width, source| {
+                if let Some(source) = source
+                    && let Some(target) = self.links.get(&(source.line, source.span))
+                {
+                    visible.push(VisibleLink {
+                        position,
+                        width,
+                        target: target.clone(),
+                    });
+                }
+            },
+        );
         if self
             .selection
             .as_ref()
@@ -467,8 +498,9 @@ impl View {
         }
         if let Some(selection) = &self.selection {
             selection.paint(frame.buffer_mut());
+            visible = selection.links().to_vec();
         } else {
-            self.viewport = Viewport::capture(frame.buffer_mut(), inner);
+            self.viewport = Viewport::capture_links(frame.buffer_mut(), inner, visible.clone());
         }
         if let Some(editor) = &self.editor {
             let title = format!(
@@ -536,7 +568,7 @@ impl View {
             frame.render_widget(block, responses);
             frame.render_widget(Paragraph::new(lines), inner);
         }
-        let status = if self.selection.as_ref().is_some_and(Selection::is_dragging) {
+        let mut status = if self.selection.as_ref().is_some_and(Selection::is_dragging) {
             "Selecting text · view frozen · release mouse to copy · Esc cancels".into()
         } else if self.selection.is_some() {
             format!(
@@ -569,12 +601,18 @@ impl View {
                 usize::from(self.scroll.0) + 1
             )
         };
+        if self.hyperlinks_enabled && !board_links::fits(frame.buffer_mut(), &visible) {
+            status.push_str(" · Hyperlinks exceed output limit; inspect board --raw");
+        }
         frame.render_widget(Paragraph::new(vec![
             Line::from(safe_line(&status)),
             Line::from(if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · m native mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "m copy-on-select mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
             Line::from(safe_line(self.update_notice.as_deref().unwrap_or("")))
                 .style(Style::default().fg(Color::Yellow)),
         ]), footer);
+        if self.hyperlinks_enabled {
+            board_links::encode(frame.buffer_mut(), &visible);
+        }
     }
     fn key(&mut self, key: KeyEvent, page: u16) -> bool {
         if key.kind == KeyEventKind::Release {
@@ -1079,6 +1117,136 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn targets(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter_map(|cell| {
+                cell.symbol()
+                    .strip_prefix("\x1b]8;;")?
+                    .split_once("\x1b\\")
+                    .map(|(target, _)| target.to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hyperlinks_follow_target_only_updates_and_freeze_with_plain_clipboard_text() {
+        let mut view = View {
+            hyperlinks_enabled: true,
+            ..View::default()
+        };
+        view.update(Ok(snapshot("[SAME](https://example.test/old)", "one")));
+        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(
+            targets(&terminal)
+                .iter()
+                .all(|target| target.ends_with("/old"))
+        );
+        assert_eq!(targets(&terminal).len(), 4);
+        let area = view.viewport.as_ref().unwrap().area();
+        let anchor = Position::new(area.x, area.y);
+        view.selection = Selection::start(view.viewport.clone().unwrap(), anchor);
+        view.update(Ok(snapshot("[SAME](https://example.test/new)", "two")));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(
+            targets(&terminal)
+                .iter()
+                .all(|target| target.ends_with("/old"))
+        );
+        let copied = view
+            .selection
+            .as_mut()
+            .unwrap()
+            .finish(Position::new(anchor.x + 3, anchor.y))
+            .unwrap();
+        assert_eq!(copied, "SAME");
+        assert!(!copied.contains('\x1b'));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(
+            targets(&terminal)
+                .iter()
+                .all(|target| target.ends_with("/old"))
+        );
+        view.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10);
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(
+            targets(&terminal)
+                .iter()
+                .all(|target| target.ends_with("/new"))
+        );
+        assert_eq!(targets(&terminal).len(), 4);
+        assert!(view.switch("other".parse().unwrap()));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(targets(&terminal).is_empty());
+    }
+
+    #[test]
+    fn links_are_confined_to_document_and_clear_on_scroll_picker_and_unsafe_data() {
+        let mut view = View {
+            hyperlinks_enabled: true,
+            ..View::default()
+        };
+        let markdown = format!(
+            "[Ticket](https://example.test/ticket)\n\n{}",
+            "plain line\n\n".repeat(30)
+        );
+        view.update(Ok(snapshot(&markdown, "one")));
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let area = view.viewport.as_ref().unwrap().area();
+        for y in 0..16 {
+            for x in 0..70 {
+                if terminal.backend().buffer()[(x, y)]
+                    .symbol()
+                    .contains('\x1b')
+                {
+                    assert!(area.contains(Position::new(x, y)));
+                }
+            }
+        }
+        assert_eq!(targets(&terminal).len(), 6);
+        view.scroll.0 = 10;
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(targets(&terminal).is_empty());
+        view.scroll.0 = 0;
+        view.picker = Some((
+            vec![crate::board::Summary {
+                name: Name::default(),
+                exists: true,
+                revision: "one".into(),
+            }],
+            0,
+        ));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(targets(&terminal).is_empty());
+        view.picker = None;
+        for (index, markdown) in [
+            "[unsafe](javascript:alert(1))",
+            "[bad](https://example.test/&#x1b;bad)",
+            "[bad](https://example.test/&#x9c;bad)",
+            "[safe](https://example.test/)\x1b]52;c;injected\x07",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            view.update(Ok(snapshot(markdown, &format!("bad-{index}"))));
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            assert!(targets(&terminal).is_empty());
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .all(|cell| !cell.symbol().chars().any(char::is_control))
+            );
+        }
+    }
 
     fn snapshot(markdown: &str, revision: &str) -> Snapshot {
         Snapshot {

@@ -1,4 +1,5 @@
 //! Mouse selection over a frozen, rendered viewport, independent of Markdown.
+use crate::board_links::VisibleLink;
 use ratatui::{
     buffer::{Buffer, Cell, CellDiffOption},
     layout::{Position, Rect},
@@ -12,6 +13,7 @@ const MAX_VIEWPORT_CELLS: usize = 256 * 1024;
 #[derive(Clone)]
 pub(crate) struct Viewport {
     buffer: Buffer,
+    links: Vec<VisibleLink>,
 }
 impl Viewport {
     pub(crate) fn capture(buffer: &Buffer, area: Rect) -> Option<Self> {
@@ -27,7 +29,20 @@ impl Viewport {
                 frozen[(x, y)] = buffer[(x, y)].clone();
             }
         }
-        Some(Self { buffer: frozen })
+        Some(Self {
+            buffer: frozen,
+            links: Vec::new(),
+        })
+    }
+
+    pub(crate) fn capture_links(
+        buffer: &Buffer,
+        area: Rect,
+        links: Vec<VisibleLink>,
+    ) -> Option<Self> {
+        let mut viewport = Self::capture(buffer, area)?;
+        viewport.links = links;
+        Some(viewport)
     }
 
     pub(crate) fn area(&self) -> Rect {
@@ -42,6 +57,9 @@ pub(crate) struct Selection {
     dragging: bool,
 }
 impl Selection {
+    pub(crate) fn links(&self) -> &[VisibleLink] {
+        &self.viewport.links
+    }
     pub(crate) fn start(viewport: Viewport, anchor: Position) -> Option<Self> {
         if !viewport.area().contains(anchor) {
             return None;

@@ -83,7 +83,15 @@ jobs:
       - name: Validate source and installer
         run: |
           cargo fmt --check
+          rustfmt --edition 2024 --check --config skip_children=true vendor/ratatui-core/src/buffer/diff.rs vendor/ratatui-core/src/text/span.rs vendor/ratatui-widgets/src/paragraph.rs vendor/tui-markdown/src/lib.rs vendor/tui-markdown/src/links.rs vendor/tui-markdown/src/renderer/mod.rs vendor/tui-markdown/src/renderer/link.rs vendor/tui-markdown/src/renderer/table.rs
           cargo test --locked
+          python3 tools/test_board_links.py --binary target/debug/agent-bridge
+          cargo test --locked --manifest-path vendor/ratatui-core/Cargo.toml --target-dir target --lib --no-fail-fast buffer::
+          cargo clippy --locked --manifest-path vendor/ratatui-core/Cargo.toml --target-dir target --lib -- -D warnings
+          cargo test --locked --manifest-path vendor/tui-markdown/Cargo.toml --target-dir target --no-default-features --lib --no-fail-fast
+          cargo test --locked --manifest-path vendor/ratatui-widgets/Cargo.toml --target-dir target --no-default-features --lib --no-fail-fast paragraph
+          cargo clippy --locked --manifest-path vendor/tui-markdown/Cargo.toml --target-dir target --no-default-features --lib -- -D warnings
+          cargo clippy --locked --manifest-path vendor/ratatui-widgets/Cargo.toml --target-dir target --no-default-features --lib -- -D warnings
           cargo test --locked --manifest-path vendor/libp2p-relay/Cargo.toml --target-dir target
           cargo clippy --all-targets --locked -- -D warnings
           cargo fmt --manifest-path vendor/libp2p-relay/Cargo.toml --check

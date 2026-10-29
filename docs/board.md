@@ -73,6 +73,38 @@ Existing `boards/main.md` stays in place; no migration is needed. A read of abse
 the first successful update creates it. Backups of the broker's state include the
 board. Print its exact Markdown once with `agent-bridge board --raw`.
 
+## Click Markdown links
+
+Use ordinary Markdown labels in prose or tables, for example
+`[CDP-1277](https://example.test/tickets/CDP-1277)`. The terminal view shows the
+compact label, without widening the table for the URL. Supported terminals open
+it with their normal hyperlink gesture (often Cmd-click or Ctrl-click). With
+application mouse capture enabled, your terminal may require an additional
+modifier; press `m` to return mouse handling to the terminal if needed.
+
+Links use [OSC 8 hyperlinks](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda).
+Only validated HTTP/HTTPS destinations are enabled. Raw controls and decoded
+entities remain sanitized; unsupported or unsafe destinations never become
+terminal commands. Rendering does not open browsers or fetch resources.
+
+Terminal support and gestures vary. Unsupported terminals retain readable labels.
+Set `NO_TERM_HYPERLINKS=1` for a single invocation to disable hyperlink output;
+`TERM=dumb` also disables it. Use `agent-bridge board NAME --raw` to inspect or
+copy exact destinations and original Markdown in any terminal. Stored Markdown
+and raw output are unchanged; existing Links sections are retained.
+
+Hyperlinks are bounded to 1,024 distinct destinations and 16,384 attributed link
+fragments after wrapping per document, 2,048 bytes per validated URL, and 512 KiB
+of encoded hyperlink output per frame. Exceeding either document limit disables
+hyperlinks for the whole document; excess output
+disables them for that frame and shows a status hint. Labels remain readable and
+raw Markdown remains available. Complex-table plain-Markdown fallback also has
+no generated hyperlinks. A document containing raw terminal controls displays
+sanitized text with hyperlinks disabled.
+
+Copy selection contains visible text, never escape bytes or hidden destinations.
+Its document and link targets stay frozen together until selection is cleared.
+
 ## Copy text
 
 Press the left mouse button in the rendered document, drag across the text, and
