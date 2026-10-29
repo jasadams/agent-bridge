@@ -144,7 +144,7 @@ def stop(process, output=None):
 
 
 class Viewer:
-    def __init__(self, binary, state, board, disabled=False):
+    def __init__(self, binary, state, board, disabled=False, env=None):
         self.master, self.slave = pty.openpty()
         self.screen = Screen()
         self.output = bytearray()
@@ -152,7 +152,7 @@ class Viewer:
         def controlling_terminal():
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-        env = {**os.environ, "TERM": "xterm-256color"}
+        env = {**(os.environ if env is None else env), "TERM": "xterm-256color"}
         env.pop("NO_TERM_HYPERLINKS", None)
         if disabled:
             env["NO_TERM_HYPERLINKS"] = "1"

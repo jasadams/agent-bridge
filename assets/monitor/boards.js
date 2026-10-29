@@ -8,6 +8,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   let timer = null, readAbort = null, reading = false, backoff = 1000, raw = false, leaveChoice = null;
   let liveAbort = null, liveSequence = 0, refreshRequested = false;
   const controlRows = new Map();
+  let copySequence = 0;
   const node = (tag, text, className) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = String(text); if (className) n.className = className; return n; };
   const text = (element, value) => { if (element.textContent !== value) element.textContent = value; };
   const status = value => { text($("board-status"), value); };
@@ -79,7 +80,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       }
     }
   }
-  function renderNodes(nodes) {
+  function renderNodes(nodes, copyable = true) {
     let work = 0;
     function build(value, depth) {
       if (++work > 20000 || depth > 32 || !value || typeof value !== "object") throw new Error("Complex document");
@@ -96,6 +97,34 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
         } catch { /* Unsafe links remain inert text. */ }
       }
       for (const child of value.children) element.append(build(child, depth + 1));
+      if (value.tag === "a" && element.querySelector(".board-code-copy")) {
+        // Keep native buttons outside hyperlinks, including code nested in
+        // emphasis. Text/code retains the original safe link destination.
+        function linkChildren(child) {
+          if (child.nodeType === Node.ELEMENT_NODE && child.classList.contains("board-inline-code")) {
+            const linked = element.cloneNode(false), code = child.firstElementChild;
+            linked.append(code); child.prepend(linked); return child;
+          }
+          if (child.nodeType === Node.ELEMENT_NODE) {
+            for (const nested of Array.from(child.childNodes)) nested.replaceWith(linkChildren(nested));
+            return child;
+          }
+          const linked = element.cloneNode(false); linked.append(child.cloneNode(true)); return linked;
+        }
+        const wrapper = node("span");
+        for (const child of Array.from(element.childNodes)) wrapper.append(linkChildren(child));
+        return wrapper;
+      }
+      if (copyable && (value.tag === "code" || value.tag === "pre")) {
+        const wrapper = node(value.tag === "pre" ? "div" : "span", undefined,
+          value.tag === "pre" ? "board-code-block" : "board-inline-code");
+        const button = node("button", undefined, "board-code-copy");
+        button.type = "button";
+        button.setAttribute("aria-label", value.tag === "pre" ? "Copy code block" : "Copy inline code");
+        button.title = button.getAttribute("aria-label");
+        wrapper.append(element, button);
+        return wrapper;
+      }
       return element;
     }
     const fragment = document.createDocumentFragment();
@@ -119,10 +148,11 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     while (parent.childNodes.length > children.length) parent.lastChild.remove();
   }
   function renderDocument(view) {
+    copySequence++; text($("board-copy-feedback"), "");
     text($("selected-board-name"), view.name);
     text($("board-raw"), view.markdown);
     let document;
-    try { document = renderNodes(view.nodes); }
+    try { document = renderNodes(view.nodes, !view.render_notice); }
     catch { document = window.document.createDocumentFragment(); document.append(node("pre", view.markdown, "board-render-fallback")); }
     if (!view.markdown) document.append(node("p", view.exists ? "This board is empty." : "main has not been written yet.", "help"));
     if (view.render_notice) document.prepend(node("p", view.render_notice, "help notice"));
@@ -279,7 +309,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     if (!validName(name) || name === board) return;
     const c = capture();
     if (!await allowLeave() || !current(c)) return;
-    stop(); boardEpoch++; board = name; shown = null; latest = null; draft = null; backoff = 1000;
+    stop(); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; board = name; shown = null; latest = null; draft = null; backoff = 1000;
     $("selected-board-name").textContent = board; $("board-selector").value = board;
     $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); renderEditor(); error(""); status("Loading board…");
     const selected = capture();
@@ -303,12 +333,41 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   }
   async function leave(action) { const c = capture(); if (await allowLeave() && current(c)) { active = false; stop(); boardEpoch++; action(); } }
   function clear() {
-    active = false; authEpoch++; boardEpoch++; stop(); finishChoice(false);
+    active = false; authEpoch++; boardEpoch++; stop(); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
     board = "main"; shown = null; latest = null; draft = null; saving = false; raw = false; backoff = 1000;
     $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); $("board-selector").replaceChildren();
     $("selected-board-name").textContent = "main"; $("response-heading").textContent = "Edit response"; $("response-intent").textContent = "";
     $("board-newer").hidden = true; $("board-raw-toggle").setAttribute("aria-pressed", "false"); renderEditor(); error(""); status("Choose Boards to load main.");
   }
+  // Keep an existing manual selection (and its frozen snapshot) during a
+  // pointer copy; keyboard users can still Tab to and activate each button.
+  $("board-document").addEventListener("mousedown", event => {
+    if (event.button === 0 && event.target.closest("button.board-code-copy")) event.preventDefault();
+  });
+  $("board-document").addEventListener("click", async event => {
+    const button = event.target.closest("button.board-code-copy");
+    if (!button || !$("board-document").contains(button)) return;
+    event.preventDefault(); event.stopPropagation();
+    if (!active || !authenticated() || !shown) return;
+    const adjacent = button.previousElementSibling;
+    const code = adjacent?.tagName === "A" ? adjacent.querySelector("code") : adjacent;
+    if (!code || !["CODE", "PRE"].includes(code.tagName)) return;
+    const payload = code.textContent, c = capture(), revision = shown.revision, id = ++copySequence;
+    const live = () => current(c) && active && shown?.revision === revision && id === copySequence && button.isConnected;
+    const feedback = value => { if (live()) text($("board-copy-feedback"), value); };
+    if (new TextEncoder().encode(payload).length > 65536) {
+      feedback("Code exceeds the 64 KiB copy limit. Select a smaller portion manually."); return;
+    }
+    if (typeof navigator.clipboard?.writeText !== "function") {
+      feedback("Clipboard unavailable. Select and copy the code manually."); return;
+    }
+    try {
+      await navigator.clipboard.writeText(payload);
+      feedback("Code copied.");
+    } catch {
+      feedback("Clipboard permission denied or copy failed. Select and copy the code manually.");
+    }
+  });
   $("board-selector").addEventListener("change", e => { const name = e.target.value; e.target.value = board; void choose(name); });
   $("board-refresh").addEventListener("click", () => { if (draft || selectionHeld()) void review(); else void readSnapshot(true); });
   $("board-review-refresh").addEventListener("click", () => { void review(); });

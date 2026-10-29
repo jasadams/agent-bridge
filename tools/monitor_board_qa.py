@@ -423,6 +423,8 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         finally:
             isolated.close(); rpc(second_state, "monitor_disable")
         record("actual private monitor credential rotation clears boards and invalidates delayed old-auth data")
+        from monitor_code_copy_qa import code_copy_browser_checks
+        code_copy_browser_checks(page=page, rpc=rpc, state=state, token=token, record=record, output=output)
         page.locator("#messages-tab").click()
         expect(page.locator("#messages-view")).to_be_visible()
     finally:

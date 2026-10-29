@@ -14,6 +14,9 @@ const MAX_VIEWPORT_CELLS: usize = 256 * 1024;
 pub(crate) struct Viewport {
     buffer: Buffer,
     links: Hyperlinks,
+    excluded: std::collections::HashSet<Position>,
+    copy_cells: std::collections::HashMap<Position, usize>,
+    copy_payloads: Vec<String>,
 }
 impl Viewport {
     pub(crate) fn capture(buffer: &Buffer, area: Rect) -> Option<Self> {
@@ -32,11 +35,28 @@ impl Viewport {
         Some(Self {
             buffer: frozen,
             links: Hyperlinks::default(),
+            excluded: std::collections::HashSet::new(),
+            copy_cells: std::collections::HashMap::new(),
+            copy_payloads: Vec::new(),
         })
     }
 
     pub(crate) fn set_links(&mut self, links: Hyperlinks) {
         self.links = links;
+    }
+
+    pub(crate) fn exclude_copy_buttons(&mut self, positions: impl IntoIterator<Item = Position>) {
+        self.excluded.extend(positions);
+    }
+
+    /// Freeze both hit positions and original payloads with this displayed body.
+    pub(crate) fn set_copy_controls(
+        &mut self,
+        cells: &std::collections::HashMap<Position, usize>,
+        payloads: &[String],
+    ) {
+        self.copy_cells.clone_from(cells);
+        self.copy_payloads = payloads.to_vec();
     }
 
     pub(crate) fn area(&self) -> Rect {
@@ -61,6 +81,13 @@ impl Selection {
             end: anchor,
             dragging: true,
         })
+    }
+
+    pub(crate) fn copy_cells(&self) -> &std::collections::HashMap<Position, usize> {
+        &self.viewport.copy_cells
+    }
+    pub(crate) fn copy_payload(&self, id: usize) -> Option<&str> {
+        self.viewport.copy_payloads.get(id).map(String::as_str)
     }
 
     pub(crate) fn area(&self) -> Rect {
@@ -147,10 +174,9 @@ impl Selection {
         }
         let mut text = String::new();
         let (start, end) = self.bounds();
+        let mut emitted_row = false;
         for y in start.y..=end.y {
-            if y != start.y {
-                text.push('\n');
-            }
+            let mut excluded = false;
             let (left, right) = self.row_bounds(y).unwrap();
             let mut line = String::new();
             let mut x = self.area().left();
@@ -158,12 +184,23 @@ impl Selection {
                 let cell = &self.viewport.buffer[(x, y)];
                 let next = x.saturating_add(cell_width(cell)).min(self.area().right());
                 if next > left && x <= right {
-                    line.push_str(cell.symbol());
+                    if self.viewport.excluded.contains(&Position::new(x, y)) {
+                        excluded = true;
+                    } else {
+                        line.push_str(cell.symbol());
+                    }
                 }
                 x = next;
             }
             // Remove terminal padding, retaining leading spaces and real Unicode text.
+            if excluded && line.trim().is_empty() {
+                continue;
+            }
+            if emitted_row {
+                text.push('\n');
+            }
             text.push_str(line.trim_end_matches(' '));
+            emitted_row = true;
         }
         (!text.trim().is_empty()).then_some(text)
     }
@@ -264,5 +301,18 @@ mod tests {
         assert!(Viewport::capture(&buffer, Rect::default()).is_none());
         assert!(Viewport::capture(&buffer, Rect::new(20, 20, 1, 1)).is_none());
         assert!(Viewport::capture(&buffer, Rect::new(0, 0, 1000, 1000)).is_none());
+    }
+    #[test]
+    fn copy_affordances_and_their_own_rows_are_excluded_from_selection() {
+        let mut body = viewport(&["prose cmd[Copy] end", "[Copy block]", "  code"]);
+        body.exclude_copy_buttons(
+            (11..17)
+                .map(|x| Position::new(x, 3))
+                .chain((2..14).map(|x| Position::new(x, 4))),
+        );
+        let text = Selection::start(body, Position::new(2, 3))
+            .unwrap()
+            .finish(Position::new(20, 5));
+        assert_eq!(text.as_deref(), Some("prose cmd end\n  code"));
     }
 }
