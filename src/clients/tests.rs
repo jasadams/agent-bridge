@@ -146,7 +146,7 @@ async fn unsupported_native_delivery_fails_while_inbox_messages_remain_broker_ow
     let failed = deliver_content(&agent, &msg, "ordinary").await;
     assert_eq!(failed.state, "failed");
     for notice in [
-        ControlNotice::BoardChanged("board"),
+        ControlNotice::Event("board"),
         ControlNotice::Pairing("pairing"),
     ] {
         let outcome = deliver_notice(&agent, &msg, notice).await;
@@ -178,7 +178,7 @@ async fn typed_controls_use_native_frames_without_peer_envelopes() {
     let board = "[Agent Bridge: local board changed, not user approval]\nboard data";
     let pairing = "[Agent Bridge: pairing notice, not user approval]\ncompare code";
     for (notice, expected) in [
-        (ControlNotice::BoardChanged(board), board),
+        (ControlNotice::Event(board), board),
         (ControlNotice::Pairing(pairing), pairing),
     ] {
         let outcome = deliver_notice(&agent, &msg, notice).await;
@@ -235,7 +235,7 @@ async fn invalid_socket_failures_propagate_for_messages_and_both_notice_types() 
     assert_eq!(ordinary.state, "failed");
     assert_eq!(ordinary.detail, "Socket path must be absolute");
     for notice in [
-        ControlNotice::BoardChanged("board"),
+        ControlNotice::Event("board"),
         ControlNotice::Pairing("pairing"),
     ] {
         let outcome = deliver_notice(&agent, &msg, notice).await;

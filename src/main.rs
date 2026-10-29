@@ -2,7 +2,7 @@ use agent_bridge::{
     board::Name,
     broker, hook,
     network::trust::Permission,
-    protocol::{Agent, Provider, Request},
+    protocol::{Agent, EventSelector, Provider, Request},
     service,
 };
 use anyhow::{Context, Result};
@@ -41,6 +41,22 @@ enum Commands {
         /// Print Markdown once without opening the terminal UI.
         #[arg(long)]
         raw: bool,
+    },
+    /// Add explicit local event selectors; returns effective events and lifecycle snapshot.
+    Subscribe {
+        #[arg(long)]
+        agent: String,
+        /// JSON selector array, e.g. '[{"event":"board.changed","board":"main"}]'.
+        #[arg(long)]
+        events: String,
+    },
+    /// Remove selectors, or omit --events to remove all subscriptions.
+    Unsubscribe {
+        #[arg(long)]
+        agent: String,
+        /// JSON selector array to remove (must not be empty).
+        #[arg(long)]
+        events: Option<String>,
     },
     /// Run the background broker (launchd runs this command).
     Serve {
@@ -609,6 +625,18 @@ async fn main() -> Result<()> {
                 Request::List { all }
             }
         }
+        Commands::Subscribe { agent, events } => Request::Subscribe {
+            agent,
+            events: serde_json::from_str::<Vec<EventSelector>>(&events)
+                .context("Invalid event selector JSON")?,
+        },
+        Commands::Unsubscribe { agent, events } => Request::Unsubscribe {
+            agent,
+            events: events
+                .map(|value| serde_json::from_str::<Vec<EventSelector>>(&value))
+                .transpose()
+                .context("Invalid event selector JSON")?,
+        },
         Commands::Status => Request::Status,
         Commands::Monitor { action } => match action {
             MonitorAction::Enable { port } => Request::MonitorEnable { port },

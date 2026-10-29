@@ -70,7 +70,7 @@ unchanged. See [OpenCode support and limits](opencode.md).
 | --- | --- |
 | `read_board`, `update_board` | Read and atomically edit a local Markdown board with revision checks; optional `board` defaults to `main`. |
 | `list_boards`, `create_board` | List compact board metadata in name order, or explicitly create an empty board using required `board`. |
-| `subscribe_board`, `unsubscribe_board` | Opt an exact local native session into or out of debounced board change notifications. |
+| `subscribe`, `unsubscribe` | Add/remove explicit local board-change and agent-lifecycle event selectors for an exact registered route. |
 | `connection_status` | Inspect the local broker and peer connections. |
 | `list_agents` | List local sessions by default, or one explicitly selected peer's permitted sessions. |
 | `list_messages`, `get_message` | Inspect message history and delivery state. |
@@ -103,15 +103,106 @@ Call `create_board({"board":"streamr"})` before using a non-main board; duplicat
 never overwrite content and unknown names never fall back to main. `list_boards({})`
 includes lazy, absent `main`, and returns name/existence/revision without Markdown.
 
-Board subscriptions are off by default and end with the selected session or a
-broker restart. `subscribe_board` and `unsubscribe_board` also accept optional
-`board` (default `main`); one session may watch several boards independently.
-Unsubscribing affects only the selected board. Global limits are 64 watches and
-8 concurrent delivery workers; at most one watched board is polled per 250 ms
-with fair round-robin scheduling. Agents can use them to notice checkbox and text answers entered
-in the TUI. Supply your own registered `agent` when calling `update_board` to
-suppress notifications of your own writes. See [interactive board usage](board.md)
-for the text-field syntax, debounce timing and concurrency behavior.
+### Event subscriptions
+
+Subscriptions are off by default. Use your exact registered local route:
+
+```json
+{"agent":"coordinator-route","events":[{"event":"agent.opened"},{"event":"agent.closed"},{"event":"board.changed","board":"main"}]}
+```
+
+`subscribe` adds selectors idempotently; `unsubscribe` removes specified selectors
+idempotently, or removes all when `events` is omitted. Removing a selector that
+is not subscribed changes nothing. Removing one selector preserves the other
+selectors and their pending notices. Both return the effective
+`events`, `agent`, `agents` snapshot, `persistent:false` and `recovery`, including in compact
+mode. No compatibility aliases for the removed board-specific tools remain.
+Board selectors require explicit existing local names; unknown events, mixed or
+unknown fields, empty explicit lists, invalid boards and excessive selectors fail.
+There is no wildcard or automatic opt-in.
+
+Equivalent CLI commands accept a JSON selector array:
+
+```sh
+agent-bridge subscribe --agent coordinator-route --events '[{"event":"agent.opened"},{"event":"agent.closed"},{"event":"board.changed","board":"main"}]'
+agent-bridge unsubscribe --agent coordinator-route --events '[{"event":"board.changed","board":"main"}]'
+agent-bridge unsubscribe --agent coordinator-route
+```
+
+With lifecycle selectors, `subscribe` atomically establishes the watch and returns
+currently available local agents in `agents`, identified by provider/session,
+exact `route` and `display_name`. Subsequent transitions arrive as typed native
+control notices with event, observation time and reason where known. Existing
+agents appear in the snapshot, without replaying historical transitions. Repeating
+subscriptions is idempotent. Notices concern availability, not transcript creation
+or deletion, and exclude the receiving agent itself and the permanent user inbox.
+Heartbeat, title and alias changes alone produce no lifecycle event. Remote peer
+presence and private endpoints are excluded. Snapshot display labels are limited
+to 4,096 UTF-8 bytes, with safe truncation and `...`; exact routing identities
+remain unchanged. Ordinary agent listings retain their full display metadata.
+
+`subscribe` rejects a local available-agent snapshot exceeding 256 canonical
+identities or 65,536 encoded JSON bytes before changing any selectors. It never
+silently truncates the snapshot. Reduce local registrations before retrying.
+
+Closure removes subscriptions and pending notices; reconnect/reopen requires
+explicit opt-in. Subscriptions and event history do not survive broker restart:
+resubscribe and use the returned snapshot.
+
+An overflow or failed or uncertain lifecycle delivery makes the event stream
+incomplete. The broker attempts at most one `resync.required` control notice for
+that gap and suppresses further lifecycle transitions until you explicitly call
+`subscribe` with a lifecycle selector to obtain a fresh atomic snapshot. Adding
+only a board selector does not recover the lifecycle stream. A failed resync
+attempt is not replayed automatically; after a transport interruption, explicitly
+resubscribe even if no resync notice arrived. Recovery invalidates older pending
+lifecycle notices. Preserve per-identity transition order when interpreting
+notices. Native hooks/events, confirmed socket cleanup and OpenCode lease expiry
+have observation delays; `/exit` is not a universally synchronous callback.
+
+Unsubscribe, closure, recipient replacement and broker restart prevent pending
+notices from starting native delivery for an invalid subscription or recipient.
+Native I/O already admitted before that boundary may complete; these operations
+do not cancel it. Unsubscribing one selector does not cancel retained selectors'
+work. Failed or uncertain native attempts are not automatically replayed.
+
+Subscribe/unsubscribe receipts always include
+`recovery:{"total":0,"truncated":false,"items":[]}` when no attempted OpenCode
+control needs inspection, including for other providers. For OpenCode, a nonzero
+`total` identifies hidden attempted controls that can still block native delivery
+even though the returned availability snapshot is current. Up to 16 items expose
+only `id`, `state`, `reconciliation_pending`, `route_matches` and
+`lease_available`; `truncated:true` means more items exist. An `instruction` is
+included when `total` is nonzero. These diagnostics do not expose control text
+or add controls to peer-message history. Reading them performs no native work.
+
+Inspect the reported ID and use the existing CLI against the **same broker state
+directory** for explicit recovery:
+
+```sh
+agent-bridge --state-dir "/same/private/state" retry CONTROL_ID
+```
+
+For an attempted OpenCode control, this queues **read-only reconciliation** of
+existing native proof, without reinserting a prompt. Do not request duplicate
+insertion. A matching live route/lease is needed to perform native readback;
+`lease_available` reports current availability, not proof that insertion succeeded.
+A queued or pending reconciliation has not necessarily run. After a lease/generation
+change or broker restart, explicitly retry that same ID again if readback remains
+queued; this still reads proof and cannot insert another prompt.
+Missing or mismatched proof remains uncertain and may continue blocking delivery.
+There is no automatic retry, automatic promotion to submitted, or cancel escape
+that proves an uncertain attempt never happened. After reconciliation, explicitly
+subscribe to lifecycle events again if a fresh snapshot is needed.
+
+These notices are control data, require no acknowledgement or peer reply, do not
+enter peer-message history, and grant no owner approval or permission. See
+[native session setup](native-sessions.md) for availability evidence and delays.
+Board notices retain 3 quiet seconds / 10 maximum debounce thresholds, named-board
+context, fair polling, pause and exact-recipient fences. Supply your own registered
+`agent` on `update_board` to suppress own-write notices. Terminal and web responses
+both notify watchers through the same board update path. See [interactive board
+usage](board.md) for controls and concurrency behavior.
 
 ### Discover and share your session
 
@@ -167,7 +258,7 @@ message persistence, delivery, CLI output and access checks are unchanged.
 - `send_message` returns `{"result":{"id":"…","state":"queued"},"id":"…"}`.
   The top-level UUID is retained for retry compatibility, including failed sends.
 - `acknowledge_message` returns `{"result":{"id":"…","state":"acknowledged"}}`.
-- Subscriptions return selected `board`, subscription state, agent and revision when present.
+- Subscriptions retain the effective `events` and complete `agents` snapshot, including in compact results.
   Pairing tools retain the exchange ID, verification state, invitation link and
   expiry needed for the next action; sharing returns the peer, agent and requested
   sharing state. Full metadata is available with `verbose`.
@@ -197,9 +288,9 @@ revisions by board. Named-board revisions bind identity even when two documents
 have identical content; legacy main revisions remain compatible.
 
 Named-board RPCs use distinct operations so an old broker rejects them before
-mutation or subscription, without falling back to main. Upgrade the broker and
-reconnect/restart MCP to discover the new tools. Legacy main calls keep their
-request forms where supported. Named boards add no network sharing.
+mutation, without falling back to main. Upgrade the broker and
+reconnect/restart MCP to discover the new tools. Legacy main read/update calls keep their
+request forms where supported. Event subscriptions require the generic operations. Named boards add no network sharing.
 
 Existing `list_messages` calls return recent-history arrays. To opt into incremental
 reads, start with an empty cursor and the desired agent scope:

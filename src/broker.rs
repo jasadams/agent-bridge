@@ -220,6 +220,11 @@ impl Broker {
             .open(&dbpath)?;
         std::fs::set_permissions(&dbpath, std::fs::Permissions::from_mode(0o600))?;
         let db = Db::open(&dbpath)?;
+        let mut event_state = crate::board_notifications::State::default();
+        event_state.reconcile(
+            crate::board_notifications::available(&db)?,
+            "broker startup",
+        );
         let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         let broker = Self {
@@ -230,7 +235,7 @@ impl Broker {
             pairing_notifications: Arc::new(Mutex::new(
                 crate::pairing_notifications::State::default(),
             )),
-            board_notifications: Arc::new(Mutex::new(crate::board_notifications::State::default())),
+            board_notifications: Arc::new(Mutex::new(event_state)),
             lan_pairing: Arc::new(Mutex::new(None)),
             pairing_routes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             network_status: Arc::new(Mutex::new(json!({"enabled":false}))),
@@ -472,6 +477,14 @@ impl Broker {
             .lock()
             .map_err(|_| anyhow::anyhow!("Database lock poisoned"))?;
         db.opencode_tick(crate::db::now())?;
+        {
+            let mut state = self.board_notifications.lock().unwrap();
+            state.reconcile(
+                crate::board_notifications::available(&db)?,
+                "OpenCode lease expired",
+            );
+            state.prune(|name| db.agent(name).ok());
+        }
         let registration = matches!(
             &req,
             Request::Register { .. } | Request::OpenCodeObserve { .. }
@@ -490,305 +503,595 @@ impl Broker {
                 edits,
                 actor,
             },
-            Request::BoardSubscribe { agent } => Request::NamedBoardSubscribe {
-                board: Default::default(),
-                agent,
-            },
-            Request::BoardUnsubscribe { agent } => Request::NamedBoardUnsubscribe {
-                board: Default::default(),
-                agent,
-            },
             request => request,
         };
-        let result = match req {
-            // Board edits share the broker's local administration mutex. No
-            // network request can invoke this API or select a filesystem path.
-            Request::BoardList => json!(crate::board::list(&self.state_dir)?),
-            Request::BoardCreate { board } => json!(crate::board::create(&self.state_dir, &board)?),
-            Request::NamedBoardRead { board } => {
-                json!(crate::board::read_named(&self.state_dir, &board)?)
-            }
-            Request::BoardRead
-            | Request::BoardUpdate { .. }
-            | Request::BoardSubscribe { .. }
-            | Request::BoardUnsubscribe { .. } => {
-                unreachable!("Legacy board requests normalized above")
-            }
-            Request::NamedBoardUpdate {
-                board: name,
-                expected_revision,
-                edits,
-                actor,
-            } => {
-                let actor = actor.map(|name| db.agent(&name)).transpose()?;
-                ensure!(
-                    actor.as_ref().is_none_or(|agent| agent.enabled),
-                    "Board writer must be an enabled local registration"
-                );
-                match self.update_board_locked(&name, &expected_revision, &edits, actor.as_ref()) {
-                    Ok(board) => {
-                        json!({"applied":true,"board":board})
-                    }
-                    Err(error) => {
-                        if let Some(conflict) = error.downcast_ref::<crate::board::Conflict>() {
-                            json!({"applied":false,"conflict":true,"board":conflict.current,"message":"The board changed. Review this current snapshot and retry your edits with its revision."})
-                        } else {
-                            return Err(error);
+        let result = (|| -> Result<Value> {
+            Ok(match req {
+                // Board edits share the broker's local administration mutex. No
+                // network request can invoke this API or select a filesystem path.
+                Request::BoardList => json!(crate::board::list(&self.state_dir)?),
+                Request::BoardCreate { board } => {
+                    json!(crate::board::create(&self.state_dir, &board)?)
+                }
+                Request::NamedBoardRead { board } => {
+                    json!(crate::board::read_named(&self.state_dir, &board)?)
+                }
+                Request::BoardRead | Request::BoardUpdate { .. } => {
+                    unreachable!("Legacy board requests normalized above")
+                }
+                Request::NamedBoardUpdate {
+                    board: name,
+                    expected_revision,
+                    edits,
+                    actor,
+                } => {
+                    let actor = actor.map(|name| db.agent(&name)).transpose()?;
+                    ensure!(
+                        actor.as_ref().is_none_or(|agent| agent.enabled),
+                        "Board writer must be an enabled local registration"
+                    );
+                    match self.update_board_locked(
+                        &name,
+                        &expected_revision,
+                        &edits,
+                        actor.as_ref(),
+                    ) {
+                        Ok(board) => {
+                            json!({"applied":true,"board":board})
+                        }
+                        Err(error) => {
+                            if let Some(conflict) = error.downcast_ref::<crate::board::Conflict>() {
+                                json!({"applied":false,"conflict":true,"board":conflict.current,"message":"The board changed. Review this current snapshot and retry your edits with its revision."})
+                            } else {
+                                return Err(error);
+                            }
                         }
                     }
                 }
-            }
-            Request::NamedBoardSubscribe { board: name, agent } => {
-                let agent = db.agent(&agent)?;
-                let board = crate::board::read_named(&self.state_dir, &name)?;
-                let mut state = self.board_notifications.lock().unwrap();
-                state.prune(|name| db.agent(name).ok());
-                state.subscribe_named(
-                    &name,
-                    agent.clone(),
-                    &board.revision,
-                    std::time::Instant::now(),
-                )?;
-                json!({"subscribed":true,"agent":agent.name,"board":name,"revision":board.revision,"debounce_seconds":3,"max_delay_seconds":10,"persistent":false})
-            }
-            Request::NamedBoardUnsubscribe { board, agent } => {
-                self.board_notifications
-                    .lock()
-                    .unwrap()
-                    .unsubscribe_named(&board, &agent);
-                json!({"subscribed":false,"agent":agent,"board":board})
-            }
-            Request::Register { mut agent, replace } => {
-                crate::clients::validate_registration(&mut agent)?;
-                if agent.provider == Provider::OpenCode {
-                    db.opencode_alias_admission(&agent)?;
+                Request::Subscribe { agent, events } => {
+                    let agent = db.agent(&agent)?;
+                    let mut boards = std::collections::BTreeMap::new();
+                    ensure!(
+                        !events.is_empty() && events.len() <= 64,
+                        "Provide between 1 and 64 event selectors"
+                    );
+                    for event in &events {
+                        if let crate::protocol::EventSelector::BoardChanged { board } = event {
+                            boards.insert(
+                                board.clone(),
+                                crate::board::read_named(&self.state_dir, board)?.revision,
+                            );
+                        }
+                    }
+                    let agents = crate::board_notifications::available(&db)?;
+                    ensure!(
+                        agents.len() <= 256,
+                        "Available-agent snapshot exceeds 256 identities; reduce local registrations before subscribing"
+                    );
+                    ensure!(
+                        serde_json::to_vec(&agents)?.len() <= crate::protocol::MAX_BODY,
+                        "Available-agent snapshot exceeds 65536 bytes; reduce local registrations before subscribing"
+                    );
+                    let recovery = db.event_recovery(Some(&agent))?;
+                    let mut state = self.board_notifications.lock().unwrap();
+                    state.reconcile(agents.clone(), "local registration changed");
+                    state.prune(|name| db.agent(name).ok());
+                    state.subscribe(agent.clone(), &events, &boards, std::time::Instant::now())?;
+                    let effective = state.events(&agent.name);
+                    let lifecycle = effective.iter().any(|event| {
+                        !matches!(event, crate::protocol::EventSelector::BoardChanged { .. })
+                    });
+                    json!({"agent":agent.name,"events":effective,"agents":if lifecycle {agents} else {Vec::new()},"persistent":false,"recovery":recovery})
                 }
-                db.register(&agent, replace)?;
-                self.claude_failures.lock().unwrap().remove(&agent.name);
-                json!(agent)
-            }
-            Request::OpenCodeObserve {
-                session,
-                endpoint,
-                title,
-                ready,
-            } => {
-                ensure!(
-                    title
-                        .as_ref()
-                        .is_none_or(|s| s.len() <= 4096 && !s.chars().any(char::is_control)),
-                    "Invalid OpenCode title"
-                );
-                let mut agent = crate::protocol::Agent {
-                    name: crate::clients::lifecycle::routing_name(&Provider::OpenCode, &session),
-                    provider: Provider::OpenCode,
+                Request::Unsubscribe { agent, events } => {
+                    if let Some(events) = &events {
+                        ensure!(
+                            !events.is_empty() && events.len() <= 64,
+                            "Provide between 1 and 64 event selectors"
+                        );
+                        for event in events {
+                            if let crate::protocol::EventSelector::BoardChanged { board } = event {
+                                crate::board::read_named(&self.state_dir, board)?;
+                            }
+                        }
+                    }
+                    let registered: bool = db.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM agents WHERE name=?)",
+                        [&agent],
+                        |row| row.get(0),
+                    )?;
+                    let receiver = registered.then(|| db.agent(&agent)).transpose()?;
+                    let recovery = db.event_recovery(receiver.as_ref())?;
+                    let mut state = self.board_notifications.lock().unwrap();
+                    state.unsubscribe(&agent, events.as_deref());
+                    json!({"agent":agent,"events":state.events(&agent),"agents":[],"persistent":false,"recovery":recovery})
+                }
+                Request::Register { mut agent, replace } => {
+                    crate::clients::validate_registration(&mut agent)?;
+                    if agent.provider == Provider::OpenCode {
+                        db.opencode_alias_admission(&agent)?;
+                    }
+                    db.register(&agent, replace)?;
+                    if agent.provider == Provider::Claude {
+                        self.claude_failures
+                            .lock()
+                            .unwrap()
+                            .retain(|_, (session, _)| session != &agent.session);
+                    }
+                    json!(agent)
+                }
+                Request::OpenCodeObserve {
                     session,
                     endpoint,
-                    enabled: true,
-                };
-                crate::clients::validate_registration(&mut agent)?;
-                let result = db.opencode_observe(&agent, ready)?;
-                db.observe_session_name(&agent.provider, &agent.session, title.as_deref())?;
-                result
-            }
-            Request::OpenCodeHeartbeat {
-                session,
-                endpoint,
-                generation,
-                ready,
-            } => {
-                let endpoint = crate::clients::opencode::validate_endpoint(&endpoint)?
-                    .to_string_lossy()
-                    .into_owned();
-                db.opencode_heartbeat(&session, &endpoint, &generation, ready)?
-            }
-            Request::OpenCodeClose {
-                session,
-                endpoint,
-                generation,
-            } => {
-                let path = std::path::Path::new(&endpoint);
-                let endpoint = path
-                    .parent()
-                    .context("Missing OpenCode endpoint directory")?
-                    .canonicalize()?
-                    .join(
-                        path.file_name()
-                            .context("Missing OpenCode endpoint filename")?,
-                    )
-                    .to_string_lossy()
-                    .into_owned();
-                db.opencode_close(&session, &endpoint, &generation)?
-            }
-            Request::OpenCodeAdmit {
-                id,
-                session,
-                generation,
-                instance,
-                attempt,
-            } => db.opencode_admit(&id, &session, &generation, &instance, &attempt)?,
-            Request::OpenCodeNotice {
-                id,
-                recipient,
-                content,
-            } => {
-                let agent = db.resolve_agent(&recipient)?;
-                ensure!(
-                    agent.provider == Provider::OpenCode && agent.enabled,
-                    "Typed OpenCode notice requires an enabled exact local session"
-                );
-                let message = db.send(&id, "user", &agent.name, &content, &None)?;
-                db.opencode_notice_content(&id, &content)?;
-                json!({"queued":true,"message":message,"acknowledged":false})
-            }
-            Request::CodexNotice {
-                id,
-                recipient,
-                session,
-                content,
-            } => {
-                let message = db.codex_notice(&id, &recipient, &session, &content)?;
-                json!({"queued":true,"message":message,"acknowledged":false})
-            }
-            Request::Unregister { name, session } => {
-                // SessionEnd can race a disconnect, so exact names remain usable while disabled.
-                db.unregister(&db.resolve_agent(&name)?.name, &session)?;
-                json!({"unregistered":name})
-            }
-            Request::List { all } => {
-                let mut agents = Vec::new();
-                let machine = self.local_machine(&db)?;
-                for agent in db.listed_agents(all)? {
-                    let stale_reason = if !agent.enabled {
-                        Some("disabled".to_owned())
-                    } else if agent.provider == Provider::Claude {
-                        crate::clients::claude::stale_reason(Path::new(&agent.endpoint))
-                    } else {
-                        None
+                    title,
+                    ready,
+                } => {
+                    ensure!(
+                        title
+                            .as_ref()
+                            .is_none_or(|s| s.len() <= 4096 && !s.chars().any(char::is_control)),
+                        "Invalid OpenCode title"
+                    );
+                    let mut agent = crate::protocol::Agent {
+                        name: crate::clients::lifecycle::routing_name(
+                            &Provider::OpenCode,
+                            &session,
+                        ),
+                        provider: Provider::OpenCode,
+                        session,
+                        endpoint,
+                        enabled: true,
                     };
-                    if !all && stale_reason.is_some() {
-                        continue;
+                    crate::clients::validate_registration(&mut agent)?;
+                    let observed_at = crate::db::now();
+                    db.opencode_tick(observed_at)?;
+                    {
+                        let mut state = self.board_notifications.lock().unwrap();
+                        state.reconcile(
+                            crate::board_notifications::available(&db)?,
+                            "OpenCode lease expired",
+                        );
+                        state.prune(|name| db.agent(name).ok());
                     }
-                    let display = db.display_name(&agent.provider, &agent.session)?;
-                    let mut value = json!(agent);
-                    if let Some(reason) = stale_reason {
-                        value["stale_reason"] = json!(reason);
-                    }
-                    value["machine_name"] = machine["machine_name"].clone();
-                    value["peer_id"] = machine["peer_id"].clone();
-                    value["machine_display_name"] = machine["display_name"].clone();
-                    if let Some(display) = display {
-                        value["display_name"] = json!(display);
-                        value["qualified_name"] =
-                            json!(format!("{}:{display}", agent.provider.label()));
-                    }
-                    agents.push(value);
+                    let result = db.opencode_observe_at(&agent, ready, observed_at)?;
+                    db.observe_session_name(&agent.provider, &agent.session, title.as_deref())?;
+                    result
                 }
-                json!(agents)
-            }
-            Request::Send {
-                id,
-                sender,
-                recipient,
-                body,
-                parent,
-            } => {
-                if recipient.contains('/') {
-                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                    self.message_value(
-                        &db,
-                        &db.send_remote(&local, &id, &sender, &recipient, &body, &parent)?,
-                    )?
-                } else {
-                    self.message_value(&db, &db.send(&id, &sender, &recipient, &body, &parent)?)?
+                Request::OpenCodeHeartbeat {
+                    session,
+                    endpoint,
+                    generation,
+                    ready,
+                } => {
+                    let endpoint = crate::clients::opencode::validate_endpoint(&endpoint)?
+                        .to_string_lossy()
+                        .into_owned();
+                    db.opencode_heartbeat(&session, &endpoint, &generation, ready)?
                 }
-            }
-            Request::History { agent, limit } => {
-                let agent = agent
-                    .map(|name| db.resolve_agent(&name).map(|a| a.name))
-                    .transpose()?;
-                json!(
-                    db.history(&agent, limit)?
-                        .iter()
-                        .map(|message| self.message_value(&db, message))
-                        .collect::<Result<Vec<_>>>()?
-                )
-            }
-            Request::Get { id } => self.message_value(&db, &db.get(&id)?)?,
-            Request::HistorySince {
-                agent,
-                cursor,
-                limit,
-            } => {
-                let agent = agent
-                    .map(|name| db.resolve_agent(&name).map(|a| a.name))
-                    .transpose()?;
-                let page = db.history_since(&agent, cursor.as_deref(), limit)?;
-                json!({
-                    "messages": page.messages.iter()
-                        .map(|message| self.message_value(&db, message))
-                        .collect::<Result<Vec<_>>>()?,
-                    "cursor": page.cursor,
-                    "has_more": page.has_more,
-                })
-            }
-            Request::Ack { id, agent } => {
-                self.message_value(&db, &db.ack(&id, &db.resolve_agent(&agent)?.name)?)?
-            }
-            Request::Retry {
-                id,
-                allow_duplicate,
-            } => self.message_value(&db, &db.retry(&id, allow_duplicate)?)?,
-            Request::Cancel { id } => self.message_value(&db, &db.cancel(&id)?)?,
-            Request::Pause { paused } => {
-                db.pause(paused)?;
-                json!({"paused":paused})
-            }
-            Request::MonitorEnable { .. } => anyhow::bail!("Use the asynchronous monitor RPC"),
-            Request::MonitorDisable => self.monitor_control.lock().unwrap().disable(),
-            Request::MonitorStatus => self.monitor_control.lock().unwrap().status(),
-            Request::MonitorAccess => self.monitor_control.lock().unwrap().credentials(),
-            Request::Status => {
-                let mut network = self.network_status.lock().unwrap().clone();
-                network["configured"] = json!(db.network_config()?);
-                let updates = match crate::update::cached_status(&self.state_dir) {
-                    Ok(status) => json!(status),
-                    Err(error) => json!({"error": format!("{error:#}")}),
-                };
-                json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.monitor_control.lock().unwrap().status(),"machine":self.local_machine(&db)?,"updates":updates})
-            }
-            Request::RemoteList | Request::RemoteListPeer { .. } => {
-                let mut agents = match &req {
-                    Request::RemoteListPeer { peer } => db.remote_agents_for(peer)?,
-                    _ => db.remote_agents()?,
-                };
-                let status = self.network_status.lock().unwrap().clone();
-                if let Some(agents) = agents.as_array_mut() {
-                    for agent in agents {
-                        agent["online"] = json!(
-                            status["connected"]
-                                .as_array()
-                                .is_some_and(|ids| ids.iter().any(|id| id == &agent["peer_id"]))
+                Request::OpenCodeClose {
+                    session,
+                    endpoint,
+                    generation,
+                } => {
+                    let path = std::path::Path::new(&endpoint);
+                    let endpoint = path
+                        .parent()
+                        .context("Missing OpenCode endpoint directory")?
+                        .canonicalize()?
+                        .join(
+                            path.file_name()
+                                .context("Missing OpenCode endpoint filename")?,
+                        )
+                        .to_string_lossy()
+                        .into_owned();
+                    db.opencode_close(&session, &endpoint, &generation)?
+                }
+                Request::OpenCodeAdmit {
+                    id,
+                    session,
+                    generation,
+                    instance,
+                    attempt,
+                } => {
+                    if let Some(token) = db.event_control_token(&id)? {
+                        let message = db.get(&id)?;
+                        let agent = db.agent(&message.recipient)?;
+                        self.authorize_event_locked(&db, &agent, &token)?;
+                    }
+                    db.opencode_admit(&id, &session, &generation, &instance, &attempt)?
+                }
+                Request::OpenCodeNotice {
+                    id,
+                    recipient,
+                    content,
+                    event_token,
+                } => {
+                    let agent = db.agent(&recipient)?;
+                    ensure!(
+                        agent.provider == Provider::OpenCode && agent.enabled,
+                        "Typed OpenCode notice requires an enabled exact local session"
+                    );
+                    if let Some(token) = &event_token {
+                        self.authorize_event_locked(&db, &agent, token)?;
+                    }
+                    let transaction = db.conn.unchecked_transaction()?;
+                    let message = db.send(&id, "user", &agent.name, &content, &None)?;
+                    db.opencode_notice_content(&id, &content)?;
+                    if let Some(token) = &event_token {
+                        db.event_control_record(&id, token)?;
+                    }
+                    transaction.commit()?;
+                    json!({"queued":true,"message":message,"acknowledged":false})
+                }
+                Request::CodexNotice {
+                    id,
+                    recipient,
+                    session,
+                    content,
+                    event_token,
+                } => {
+                    let agent = db.agent(&recipient)?;
+                    if let Some(token) = &event_token {
+                        self.authorize_event_locked(&db, &agent, token)?;
+                    }
+                    let message = db.codex_event_notice(
+                        &id,
+                        &recipient,
+                        &session,
+                        &content,
+                        event_token.as_deref(),
+                    )?;
+                    json!({"queued":true,"message":message,"acknowledged":false})
+                }
+                Request::SessionClose {
+                    name,
+                    session,
+                    endpoint,
+                } => {
+                    // Normalize the parent only: SessionEnd may run after the
+                    // old socket was removed, but must never close its replacement.
+                    let endpoint = if endpoint.is_empty() {
+                        endpoint
+                    } else {
+                        let path = Path::new(&endpoint);
+                        path.parent()
+                            .context("Missing native endpoint directory")?
+                            .canonicalize()?
+                            .join(
+                                path.file_name()
+                                    .context("Missing native endpoint filename")?,
+                            )
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    db.close_native(&name, &session, &endpoint)?;
+                    json!({"closed":name})
+                }
+                Request::Unregister { name, session } => {
+                    // SessionEnd can race a disconnect, so exact names remain usable while disabled.
+                    db.unregister(&db.resolve_agent(&name)?.name, &session)?;
+                    json!({"unregistered":name})
+                }
+                Request::List { all } => {
+                    let mut agents = Vec::new();
+                    let machine = self.local_machine(&db)?;
+                    for agent in db.listed_agents(all)? {
+                        let stale_reason = if !agent.enabled {
+                            Some("disabled".to_owned())
+                        } else if agent.provider == Provider::Claude {
+                            crate::clients::claude::stale_reason(Path::new(&agent.endpoint))
+                        } else {
+                            None
+                        };
+                        if !all && stale_reason.is_some() {
+                            continue;
+                        }
+                        let display = db.display_name(&agent.provider, &agent.session)?;
+                        let mut value = json!(agent);
+                        if let Some(reason) = stale_reason {
+                            value["stale_reason"] = json!(reason);
+                        }
+                        value["machine_name"] = machine["machine_name"].clone();
+                        value["peer_id"] = machine["peer_id"].clone();
+                        value["machine_display_name"] = machine["display_name"].clone();
+                        if let Some(display) = display {
+                            value["display_name"] = json!(display);
+                            value["qualified_name"] =
+                                json!(format!("{}:{display}", agent.provider.label()));
+                        }
+                        agents.push(value);
+                    }
+                    json!(agents)
+                }
+                Request::Send {
+                    id,
+                    sender,
+                    recipient,
+                    body,
+                    parent,
+                } => {
+                    if recipient.contains('/') {
+                        let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                        self.message_value(
+                            &db,
+                            &db.send_remote(&local, &id, &sender, &recipient, &body, &parent)?,
+                        )?
+                    } else {
+                        self.message_value(
+                            &db,
+                            &db.send(&id, &sender, &recipient, &body, &parent)?,
+                        )?
+                    }
+                }
+                Request::History { agent, limit } => {
+                    let agent = agent
+                        .map(|name| db.resolve_agent(&name).map(|a| a.name))
+                        .transpose()?;
+                    json!(
+                        db.history(&agent, limit)?
+                            .iter()
+                            .map(|message| self.message_value(&db, message))
+                            .collect::<Result<Vec<_>>>()?
+                    )
+                }
+                Request::Get { id } => self.message_value(&db, &db.get(&id)?)?,
+                Request::HistorySince {
+                    agent,
+                    cursor,
+                    limit,
+                } => {
+                    let agent = agent
+                        .map(|name| db.resolve_agent(&name).map(|a| a.name))
+                        .transpose()?;
+                    let page = db.history_since(&agent, cursor.as_deref(), limit)?;
+                    json!({
+                        "messages": page.messages.iter()
+                            .map(|message| self.message_value(&db, message))
+                            .collect::<Result<Vec<_>>>()?,
+                        "cursor": page.cursor,
+                        "has_more": page.has_more,
+                    })
+                }
+                Request::Ack { id, agent } => {
+                    self.message_value(&db, &db.ack(&id, &db.resolve_agent(&agent)?.name)?)?
+                }
+                Request::Retry {
+                    id,
+                    allow_duplicate,
+                } => self.message_value(&db, &db.retry(&id, allow_duplicate)?)?,
+                Request::Cancel { id } => self.message_value(&db, &db.cancel(&id)?)?,
+                Request::Pause { paused } => {
+                    db.pause(paused)?;
+                    json!({"paused":paused})
+                }
+                Request::MonitorEnable { .. } => anyhow::bail!("Use the asynchronous monitor RPC"),
+                Request::MonitorDisable => self.monitor_control.lock().unwrap().disable(),
+                Request::MonitorStatus => self.monitor_control.lock().unwrap().status(),
+                Request::MonitorAccess => self.monitor_control.lock().unwrap().credentials(),
+                Request::Status => {
+                    let mut network = self.network_status.lock().unwrap().clone();
+                    network["configured"] = json!(db.network_config()?);
+                    let updates = match crate::update::cached_status(&self.state_dir) {
+                        Ok(status) => json!(status),
+                        Err(error) => json!({"error": format!("{error:#}")}),
+                    };
+                    json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.monitor_control.lock().unwrap().status(),"machine":self.local_machine(&db)?,"updates":updates})
+                }
+                Request::RemoteList | Request::RemoteListPeer { .. } => {
+                    let mut agents = match &req {
+                        Request::RemoteListPeer { peer } => db.remote_agents_for(peer)?,
+                        _ => db.remote_agents()?,
+                    };
+                    let status = self.network_status.lock().unwrap().clone();
+                    if let Some(agents) = agents.as_array_mut() {
+                        for agent in agents {
+                            agent["online"] =
+                                json!(status["connected"].as_array().is_some_and(|ids| {
+                                    ids.iter().any(|id| id == &agent["peer_id"])
+                                }));
+                        }
+                    }
+                    agents
+                }
+                Request::RelayList => json!(db.relay_nodes()?),
+                Request::RelayAdd { address } => {
+                    let configured = crate::network::relay_config::validate_relay(&address)?;
+                    if self.state_dir.join("identity.key").exists() {
+                        ensure!(
+                            Identity::load_or_create(&self.state_dir)?.info().peer_id
+                                != configured.peer_id,
+                            "This bridge cannot be its own relay"
                         );
                     }
+                    json!(db.add_relay(&address)?)
                 }
-                agents
-            }
-            Request::RelayList => json!(db.relay_nodes()?),
-            Request::RelayAdd { address } => {
-                let configured = crate::network::relay_config::validate_relay(&address)?;
-                if self.state_dir.join("identity.key").exists() {
+                Request::RelayRemove { peer_id } => json!(db.remove_relay(&peer_id)?),
+                Request::NetworkConfigure { enabled, listen } => {
+                    if !enabled {
+                        self.pairing_notifications.lock().unwrap().reset();
+                        self.pairing_generation.fetch_add(1, Ordering::SeqCst);
+                        self.contact_routes.lock().unwrap().clear();
+                        if let Some(manager) = self.lan_pairing.lock().unwrap().as_mut() {
+                            manager.close();
+                        }
+                        self.pairing_routes.lock().unwrap().clear();
+                    }
+                    if enabled {
+                        Identity::load_or_create(&self.state_dir)?;
+                    }
+                    db.set_network_mode(enabled, listen.as_deref(), enabled.then_some(false))?;
+                    json!(db.network_config()?)
+                }
+                Request::NetworkLan { listen } => {
+                    Identity::load_or_create(&self.state_dir)?;
+                    db.set_network_mode(
+                        true,
+                        Some(listen.as_deref().unwrap_or("/ip4/0.0.0.0/udp/0/quic-v1")),
+                        Some(true),
+                    )?;
+                    json!(db.network_config()?)
+                }
+                Request::PeersDiscover => {
+                    let config = db.network_config()?;
+                    let mut discovered = if config.enabled && config.lan {
+                        self.network_status.lock().unwrap()["discovered"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    if config.enabled {
+                        let status = self.network_status.lock().unwrap().clone();
+                        for (peer_id, addresses) in crate::network::relay_config::rendezvous_routes(
+                            &status["rendezvous"],
+                            &db.relay_nodes()?,
+                            &Identity::load_or_create(&self.state_dir)?.info().peer_id,
+                        ) {
+                            if let Some(existing) = discovered
+                                .iter_mut()
+                                .find(|entry| entry["peer_id"] == peer_id)
+                            {
+                                let hints = existing["addresses"]
+                                    .as_array_mut()
+                                    .context("Invalid discovery hints")?;
+                                for address in addresses {
+                                    if hints.len() < 8
+                                        && !hints.iter().any(|a| a == &address.to_string())
+                                    {
+                                        hints.push(json!(address.to_string()));
+                                    }
+                                }
+                                existing["via_rendezvous"] = json!(true);
+                            } else {
+                                discovered.push(json!({"peer_id":peer_id,"addresses":addresses.into_iter().map(|a|a.to_string()).collect::<Vec<_>>(),"via_rendezvous":true}));
+                            }
+                        }
+                    }
+                    let peers = db.peers()?;
+                    let mut labels: std::collections::BTreeMap<
+                        String,
+                        std::collections::BTreeSet<String>,
+                    > = std::collections::BTreeMap::new();
+                    for entry in &discovered {
+                        if let (Some(name), Some(id)) =
+                            (entry["machine_name"].as_str(), entry["peer_id"].as_str())
+                        {
+                            labels.entry(name.into()).or_default().insert(id.into());
+                        }
+                    }
+                    for peer in &peers {
+                        if let Some(name) = peer.alias.as_ref().or(peer.machine_name.as_ref()) {
+                            labels
+                                .entry(name.clone())
+                                .or_default()
+                                .insert(peer.peer_id.clone());
+                        }
+                    }
+                    let all_ids: std::collections::BTreeSet<String> = discovered
+                        .iter()
+                        .filter_map(|entry| entry["peer_id"].as_str().map(str::to_string))
+                        .chain(peers.iter().map(|peer| peer.peer_id.clone()))
+                        .collect();
+                    for entry in &mut discovered {
+                        let id = entry["peer_id"].clone();
+                        let peer = peers.iter().find(|peer| id == peer.peer_id);
+                        let claimed = entry["machine_name"].as_str();
+                        let name = peer
+                            .and_then(|peer| peer.machine_name.as_deref())
+                            .or(claimed);
+                        let peer_id = id.as_str().unwrap_or_default();
+                        let suffix = (8.min(peer_id.len())..=peer_id.len())
+                            .map(|length| &peer_id[peer_id.len() - length..])
+                            .find(|suffix| {
+                                !all_ids
+                                    .iter()
+                                    .any(|other| other != peer_id && other.ends_with(suffix))
+                            })
+                            .unwrap_or(peer_id);
+                        let display =
+                            if let Some(alias) = peer.and_then(|peer| peer.alias.as_deref()) {
+                                alias.to_string()
+                            } else if let Some(name) = name {
+                                if labels.get(name).is_some_and(|ids| ids.len() > 1) {
+                                    format!("{name} [{suffix}]")
+                                } else {
+                                    name.into()
+                                }
+                            } else {
+                                format!("peer [{suffix}]")
+                            };
+                        entry["machine_display_name"] = json!(display);
+                        entry["authenticated_machine_name"] =
+                            json!(peer.and_then(|peer| peer.machine_name.as_ref()));
+                        entry["fingerprint"] = id;
+                        entry["trusted"] = json!(peer.is_some_and(|peer| !peer.revoked));
+                        entry["revoked"] = json!(peer.is_some_and(|peer| peer.revoked));
+                        entry["verified_advertisement"] = json!(false);
+                    }
+                    json!(discovered)
+                }
+                Request::ContactCreate { seconds } => {
                     ensure!(
-                        Identity::load_or_create(&self.state_dir)?.info().peer_id
-                            != configured.peer_id,
-                        "This bridge cannot be its own relay"
+                        db.network_config()?.enabled,
+                        "Enable networking before creating a contact"
                     );
+                    let identity = Identity::load_or_create(&self.state_dir)?;
+                    let relays = db
+                        .relay_nodes()?
+                        .into_iter()
+                        .map(|r| r.address)
+                        .collect::<Vec<_>>();
+                    let contact = crate::network::contact::create(
+                        &identity,
+                        &db.machine_name()?,
+                        &relays,
+                        seconds,
+                    )?;
+                    let mut guard = self.lan_pairing.lock().unwrap();
+                    guard
+                        .get_or_insert(crate::network::lan_pairing::Manager::new(
+                            &identity.info().peer_id,
+                        )?)
+                        .open(seconds, crate::db::now())?;
+                    json!(contact)
                 }
-                json!(db.add_relay(&address)?)
-            }
-            Request::RelayRemove { peer_id } => json!(db.remove_relay(&peer_id)?),
-            Request::NetworkConfigure { enabled, listen } => {
-                if !enabled {
+                Request::ContactConnect { .. } | Request::ContactLocation { .. } => {
+                    anyhow::bail!("Use the asynchronous contact RPC")
+                }
+                Request::LanPairingWatch { agent, id, seconds } => {
+                    let agent = db.agent(&agent)?;
+                    ensure!(
+                        agent.enabled
+                            && crate::clients::supports(
+                                &agent.provider,
+                                crate::clients::Capability::PairingPrompts
+                            ),
+                        "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
+                    );
+                    let now = crate::db::now();
+                    let mut pairing = self.lan_pairing.lock().unwrap();
+                    let manager = pairing.as_mut().context("No pairing window or exchange")?;
+                    if let Some(id) = id.as_deref() {
+                        ensure!(
+                            manager.list(now).iter().any(|view| view.id == id),
+                            "Unknown or expired pairing exchange"
+                        );
+                    } else {
+                        ensure!(
+                            manager.window_open(now),
+                            "Open a pairing window before selecting its agent"
+                        );
+                    }
+                    self.pairing_notifications.lock().unwrap().watch(
+                        agent.clone(),
+                        id.clone(),
+                        seconds,
+                        now,
+                    )?;
+                    json!({"notification_agent":agent.name,"provider":agent.provider,"session":agent.session,"id":id,"valid_for_seconds":seconds})
+                }
+                Request::LanPairingClose => {
                     self.pairing_notifications.lock().unwrap().reset();
                     self.pairing_generation.fetch_add(1, Ordering::SeqCst);
                     self.contact_routes.lock().unwrap().clear();
@@ -796,583 +1099,463 @@ impl Broker {
                         manager.close();
                     }
                     self.pairing_routes.lock().unwrap().clear();
+                    json!({"open":false})
                 }
-                if enabled {
-                    Identity::load_or_create(&self.state_dir)?;
-                }
-                db.set_network_mode(enabled, listen.as_deref(), enabled.then_some(false))?;
-                json!(db.network_config()?)
-            }
-            Request::NetworkLan { listen } => {
-                Identity::load_or_create(&self.state_dir)?;
-                db.set_network_mode(
-                    true,
-                    Some(listen.as_deref().unwrap_or("/ip4/0.0.0.0/udp/0/quic-v1")),
-                    Some(true),
-                )?;
-                json!(db.network_config()?)
-            }
-            Request::PeersDiscover => {
-                let config = db.network_config()?;
-                let mut discovered = if config.enabled && config.lan {
-                    self.network_status.lock().unwrap()["discovered"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                if config.enabled {
-                    let status = self.network_status.lock().unwrap().clone();
-                    for (peer_id, addresses) in crate::network::relay_config::rendezvous_routes(
-                        &status["rendezvous"],
-                        &db.relay_nodes()?,
-                        &Identity::load_or_create(&self.state_dir)?.info().peer_id,
-                    ) {
-                        if let Some(existing) = discovered
-                            .iter_mut()
-                            .find(|entry| entry["peer_id"] == peer_id)
-                        {
-                            let hints = existing["addresses"]
-                                .as_array_mut()
-                                .context("Invalid discovery hints")?;
-                            for address in addresses {
-                                if hints.len() < 8
-                                    && !hints.iter().any(|a| a == &address.to_string())
-                                {
-                                    hints.push(json!(address.to_string()));
-                                }
-                            }
-                            existing["via_rendezvous"] = json!(true);
-                        } else {
-                            discovered.push(json!({"peer_id":peer_id,"addresses":addresses.into_iter().map(|a|a.to_string()).collect::<Vec<_>>(),"via_rendezvous":true}));
-                        }
-                    }
-                }
-                let peers = db.peers()?;
-                let mut labels: std::collections::BTreeMap<
-                    String,
-                    std::collections::BTreeSet<String>,
-                > = std::collections::BTreeMap::new();
-                for entry in &discovered {
-                    if let (Some(name), Some(id)) =
-                        (entry["machine_name"].as_str(), entry["peer_id"].as_str())
-                    {
-                        labels.entry(name.into()).or_default().insert(id.into());
-                    }
-                }
-                for peer in &peers {
-                    if let Some(name) = peer.alias.as_ref().or(peer.machine_name.as_ref()) {
-                        labels
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(peer.peer_id.clone());
-                    }
-                }
-                let all_ids: std::collections::BTreeSet<String> = discovered
-                    .iter()
-                    .filter_map(|entry| entry["peer_id"].as_str().map(str::to_string))
-                    .chain(peers.iter().map(|peer| peer.peer_id.clone()))
-                    .collect();
-                for entry in &mut discovered {
-                    let id = entry["peer_id"].clone();
-                    let peer = peers.iter().find(|peer| id == peer.peer_id);
-                    let claimed = entry["machine_name"].as_str();
-                    let name = peer
-                        .and_then(|peer| peer.machine_name.as_deref())
-                        .or(claimed);
-                    let peer_id = id.as_str().unwrap_or_default();
-                    let suffix = (8.min(peer_id.len())..=peer_id.len())
-                        .map(|length| &peer_id[peer_id.len() - length..])
-                        .find(|suffix| {
-                            !all_ids
-                                .iter()
-                                .any(|other| other != peer_id && other.ends_with(suffix))
-                        })
-                        .unwrap_or(peer_id);
-                    let display = if let Some(alias) = peer.and_then(|peer| peer.alias.as_deref()) {
-                        alias.to_string()
-                    } else if let Some(name) = name {
-                        if labels.get(name).is_some_and(|ids| ids.len() > 1) {
-                            format!("{name} [{suffix}]")
-                        } else {
-                            name.into()
-                        }
-                    } else {
-                        format!("peer [{suffix}]")
-                    };
-                    entry["machine_display_name"] = json!(display);
-                    entry["authenticated_machine_name"] =
-                        json!(peer.and_then(|peer| peer.machine_name.as_ref()));
-                    entry["fingerprint"] = id;
-                    entry["trusted"] = json!(peer.is_some_and(|peer| !peer.revoked));
-                    entry["revoked"] = json!(peer.is_some_and(|peer| peer.revoked));
-                    entry["verified_advertisement"] = json!(false);
-                }
-                json!(discovered)
-            }
-            Request::ContactCreate { seconds } => {
-                ensure!(
-                    db.network_config()?.enabled,
-                    "Enable networking before creating a contact"
-                );
-                let identity = Identity::load_or_create(&self.state_dir)?;
-                let relays = db
-                    .relay_nodes()?
-                    .into_iter()
-                    .map(|r| r.address)
-                    .collect::<Vec<_>>();
-                let contact = crate::network::contact::create(
-                    &identity,
-                    &db.machine_name()?,
-                    &relays,
-                    seconds,
-                )?;
-                let mut guard = self.lan_pairing.lock().unwrap();
-                guard
-                    .get_or_insert(crate::network::lan_pairing::Manager::new(
-                        &identity.info().peer_id,
-                    )?)
-                    .open(seconds, crate::db::now())?;
-                json!(contact)
-            }
-            Request::ContactConnect { .. } | Request::ContactLocation { .. } => {
-                anyhow::bail!("Use the asynchronous contact RPC")
-            }
-            Request::LanPairingWatch { agent, id, seconds } => {
-                let agent = db.agent(&agent)?;
-                ensure!(
-                    agent.enabled
-                        && crate::clients::supports(
-                            &agent.provider,
-                            crate::clients::Capability::PairingPrompts
-                        ),
-                    "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
-                );
-                let now = crate::db::now();
-                let mut pairing = self.lan_pairing.lock().unwrap();
-                let manager = pairing.as_mut().context("No pairing window or exchange")?;
-                if let Some(id) = id.as_deref() {
-                    ensure!(
-                        manager.list(now).iter().any(|view| view.id == id),
-                        "Unknown or expired pairing exchange"
-                    );
-                } else {
-                    ensure!(
-                        manager.window_open(now),
-                        "Open a pairing window before selecting its agent"
-                    );
-                }
-                self.pairing_notifications.lock().unwrap().watch(
-                    agent.clone(),
-                    id.clone(),
-                    seconds,
-                    now,
-                )?;
-                json!({"notification_agent":agent.name,"provider":agent.provider,"session":agent.session,"id":id,"valid_for_seconds":seconds})
-            }
-            Request::LanPairingClose => {
-                self.pairing_notifications.lock().unwrap().reset();
-                self.pairing_generation.fetch_add(1, Ordering::SeqCst);
-                self.contact_routes.lock().unwrap().clear();
-                if let Some(manager) = self.lan_pairing.lock().unwrap().as_mut() {
-                    manager.close();
-                }
-                self.pairing_routes.lock().unwrap().clear();
-                json!({"open":false})
-            }
-            Request::LanPairingList => {
-                let mut guard = self.lan_pairing.lock().unwrap();
-                let requests = guard
-                    .as_mut()
-                    .map(|manager| manager.list(crate::db::now()))
-                    .unwrap_or_default();
-                let discovered = self.network_status.lock().unwrap().clone();
-                let requests: Vec<_> = requests
-                    .into_iter()
-                    .map(|view| {
-                        let mut value = json!(view);
-                        let known = db.peer(&view.peer).ok();
-                        let claim = discovered["discovered"]
-                            .as_array()
-                            .and_then(|entries| entries.iter().find(|e| e["peer_id"] == view.peer))
-                            .and_then(|entry| entry["machine_name"].as_str());
-                        value["display_name"] = json!(
-                            known
-                                .as_ref()
-                                .map(|p| p.display_name.as_str())
-                                .or(claim)
-                                .unwrap_or(&view.peer)
-                        );
-                        value["identity_verified"] =
-                            json!(known.as_ref().is_some_and(|p| !p.revoked));
-                        value
-                    })
-                    .collect();
-                json!({"open":guard.as_mut().is_some_and(|manager| manager.window_open(crate::db::now())), "requests":requests})
-            }
-            Request::LanPairingOpen { seconds } => {
-                ensure!(
-                    db.network_config()?.enabled,
-                    "Enable networking before opening pairing"
-                );
-                let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                let mut guard = self.lan_pairing.lock().unwrap();
-                let manager =
-                    guard.get_or_insert(crate::network::lan_pairing::Manager::new(&local)?);
-                manager.open(seconds, crate::db::now())?;
-                json!({"open":true,"valid_for_seconds":seconds})
-            }
-            Request::LanPairingConnect {
-                peer,
-                address,
-                seconds,
-            } => {
-                ensure!(
-                    db.network_config()?.enabled,
-                    "Enable networking before pairing"
-                );
-                let status = self.network_status.lock().unwrap().clone();
-                let mut entries = status["discovered"].as_array().cloned().unwrap_or_default();
-                let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                for (id, addresses) in crate::network::relay_config::rendezvous_routes(
-                    &status["rendezvous"],
-                    &db.relay_nodes()?,
-                    &local,
-                ) {
-                    if let Some(entry) = entries.iter_mut().find(|entry| entry["peer_id"] == id) {
-                        let hints = entry["addresses"]
-                            .as_array_mut()
-                            .context("Invalid discovery hints")?;
-                        for address in addresses {
-                            if hints.len() < 8 {
-                                hints.push(json!(address.to_string()));
-                            }
-                        }
-                    } else {
-                        entries.push(json!({"peer_id":id,"addresses":addresses.into_iter().map(|a|a.to_string()).collect::<Vec<_>>()}));
-                    }
-                }
-                let matches: Vec<_> = entries
-                    .iter()
-                    .filter(|entry| entry["peer_id"] == peer || entry["machine_name"] == peer)
-                    .collect();
-                let (peer_id, addresses): (String, Vec<libp2p::Multiaddr>) = if let Some(address) =
-                    address
-                {
-                    crate::network::store::validate_address(&address, false)?;
-                    if address.contains("/p2p-circuit/") {
-                        crate::network::relay_config::configured_circuit(
-                            &address,
-                            &peer,
-                            &db.relay_nodes()?,
-                        )?;
-                    }
-                    let id: libp2p::PeerId = peer
-                        .parse()
-                        .context("An explicit address requires a canonical peer ID")?;
-                    ensure!(id.to_string() == peer, "Peer ID must be canonical");
-                    (peer, vec![address.parse()?])
-                } else {
-                    ensure!(
-                        matches.len() == 1,
-                        "Target is missing or ambiguous; use peers discover and a canonical peer ID"
-                    );
-                    let entry = matches[0];
-                    let id = entry["peer_id"]
-                        .as_str()
-                        .context("Invalid discovery identity")?
-                        .to_string();
-                    let addresses = entry["addresses"]
-                        .as_array()
-                        .context("No discovered addresses")?
-                        .iter()
-                        .take(4)
-                        .filter_map(|value| value.as_str()?.parse().ok())
-                        .collect();
-                    (id, addresses)
-                };
-                ensure!(!addresses.is_empty(), "No reachable target hints");
-                let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                let mut guard = self.lan_pairing.lock().unwrap();
-                let manager =
-                    guard.get_or_insert(crate::network::lan_pairing::Manager::new(&local)?);
-                let view = manager.start(&peer_id, seconds, crate::db::now())?;
-                let mut routes = self.pairing_routes.lock().unwrap();
-                // No more routes than active pairing transactions; bounded even after cancellation.
-                if routes.len() >= 8 && !routes.contains_key(&peer_id) {
-                    routes.clear();
-                }
-                routes.insert(peer_id, addresses);
-                json!(view)
-            }
-            Request::LanPairingAccept { id } => {
-                ensure!(db.network_config()?.enabled, "Networking is disabled");
-                let mut guard = self.lan_pairing.lock().unwrap();
-                json!(
-                    guard
+                Request::LanPairingList => {
+                    let mut guard = self.lan_pairing.lock().unwrap();
+                    let requests = guard
                         .as_mut()
-                        .context("No pairing window")?
-                        .accept(&id, crate::db::now())?
-                )
-            }
-            Request::LanPairingConfirm { id, code } => {
-                ensure!(db.network_config()?.enabled, "Networking is disabled");
-                let mut guard = self.lan_pairing.lock().unwrap();
-                json!(guard.as_mut().context("No pairing window")?.confirm(
-                    &id,
-                    &code,
-                    crate::db::now()
-                )?)
-            }
-            Request::LanPairingCancel { id } => {
-                self.pairing_generation.fetch_add(1, Ordering::SeqCst);
-                self.contact_routes
-                    .lock()
-                    .unwrap()
-                    .retain(|_, (pending, _)| pending != &id);
-                self.lan_pairing
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .context("No pairing window")?
-                    .cancel(&id, crate::db::now())?;
-                json!({"cancelled":true,"id":id})
-            }
-            Request::PairingOffer { seconds } => {
-                let identity = Identity::load_or_create(&self.state_dir)?;
-                json!(db.pairing_offer(&identity, &self.pairing_addresses(), seconds)?)
-            }
-            Request::PairingJoin {
-                token,
-                fingerprint,
-                alias,
-            } => {
-                let identity = Identity::load_or_create(&self.state_dir)?;
-                let mut result = serde_json::to_value(db.pairing_join(
-                    &identity,
-                    &token,
-                    &fingerprint,
-                    alias.as_deref(),
-                    &self.pairing_addresses(),
-                )?)?;
-                result["mutual_pairing_complete"] = json!(false);
-                result
-            }
-            Request::PairingFinish {
-                token,
-                fingerprint,
-                alias,
-            } => {
-                let identity = Identity::load_or_create(&self.state_dir)?;
-                json!({"peer":db.pairing_finish(&identity, &token, &fingerprint, alias.as_deref())?, "local_pairing_complete":true})
-            }
-            Request::PairingCancel { nonce } => {
-                db.pairing_cancel(&nonce)?;
-                json!({"cancelled":true,"nonce":nonce})
-            }
-            Request::InvitationCreate { seconds } => {
-                let identity = Identity::load_or_create(&self.state_dir)?;
-                let addresses: Vec<String> = self.network_status.lock().unwrap()["listening"]
-                    .as_array()
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(|value| value.as_str())
-                            .filter(|address| {
-                                crate::network::store::validate_address(address, false).is_ok()
-                            })
-                            .take(4)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                json!({"invitation":crate::network::invitation::create(&identity, &addresses, seconds)?,"fingerprint":identity.info().fingerprint,"valid_for_seconds":seconds})
-            }
-            Request::InvitationAccept {
-                token,
-                fingerprint,
-                alias,
-            } => {
-                let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                json!(db.accept_invitation(&token, &fingerprint, alias.as_deref(), &local)?)
-            }
-            Request::PeerAddress { peer, address } => {
-                db.set_peer_address(&peer, &address)?;
-                json!({"peer":peer,"address":address})
-            }
-            Request::Identity => json!(Identity::load_or_create(&self.state_dir)?.info()),
-            Request::MachineShow => self.local_machine(&db)?,
-            Request::MachineSetName { name } => {
-                db.set_machine_name(&name)?;
-                self.local_machine(&db)?
-            }
-            Request::PeersList => json!(db.peers()?),
-            Request::SharedSessions => db.shared_sessions()?,
-            Request::PeerUnshareSession {
-                peer,
-                provider,
-                session,
-            } => json!(db.unshare_peer_session(&peer, &provider, &session)?),
-            Request::PeerShare {
-                peer,
-                agent,
-                shared,
-            } => json!(db.share_peer_session(&peer, &agent, shared)?),
-            Request::PeerConnections => {
-                let status = self.network_status.lock().unwrap().clone();
-                let enabled = db.network_config()?.enabled;
-                let peers = db.peers()?;
-                let sharing = db.shared_sessions()?;
-                let mut guard = self.lan_pairing.lock().unwrap();
-                let requests = guard
-                    .as_mut()
-                    .map(|manager| manager.list(crate::db::now()))
-                    .unwrap_or_default();
-                let mut rows = std::collections::BTreeMap::<String, Value>::new();
-                for peer in peers {
-                    let connected = enabled
-                        && !peer.revoked
-                        && status["connected"]
-                            .as_array()
-                            .is_some_and(|ids| ids.iter().any(|id| id == &peer.peer_id));
-                    let state = if peer.revoked {
-                        "revoked"
-                    } else if connected {
-                        "connected"
-                    } else if !enabled {
-                        "network_disabled"
-                    } else {
-                        "offline"
-                    };
-                    let sessions: Vec<_> = sharing
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter(|s| s["peer_id"] == peer.peer_id)
-                        .cloned()
+                        .map(|manager| manager.list(crate::db::now()))
+                        .unwrap_or_default();
+                    let discovered = self.network_status.lock().unwrap().clone();
+                    let requests: Vec<_> = requests
+                        .into_iter()
+                        .map(|view| {
+                            let mut value = json!(view);
+                            let known = db.peer(&view.peer).ok();
+                            let claim = discovered["discovered"]
+                                .as_array()
+                                .and_then(|entries| {
+                                    entries.iter().find(|e| e["peer_id"] == view.peer)
+                                })
+                                .and_then(|entry| entry["machine_name"].as_str());
+                            value["display_name"] = json!(
+                                known
+                                    .as_ref()
+                                    .map(|p| p.display_name.as_str())
+                                    .or(claim)
+                                    .unwrap_or(&view.peer)
+                            );
+                            value["identity_verified"] =
+                                json!(known.as_ref().is_some_and(|p| !p.revoked));
+                            value
+                        })
                         .collect();
-                    rows.insert(peer.peer_id.clone(), json!({"peer_id":peer.peer_id,"display_name":peer.display_name,"alias":peer.alias,"machine_name":peer.machine_name,"trusted":!peer.revoked,"revoked":peer.revoked,"connected":connected,"state":state,"pairing":[],"shared_sessions":sessions}));
+                    json!({"open":guard.as_mut().is_some_and(|manager| manager.window_open(crate::db::now())), "requests":requests})
                 }
-                // Only report authenticated live endpoint paths. Infrastructure
-                // observations and stale snapshots never imply peer authorization.
-                for (id, row) in &mut rows {
-                    let transport = if row["connected"] == true {
-                        status["paths"]
-                            .as_array()
-                            .and_then(|paths| {
-                                paths.iter().find(|path| path["peer_id"] == id.as_str())
-                            })
-                            .cloned()
-                    } else {
-                        None
-                    };
-                    row["path"] = transport
-                        .as_ref()
-                        .and_then(|path| path.get("path"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    row["transport"] = transport.unwrap_or(Value::Null);
-                }
-                if enabled {
-                    for discovered in status["discovered"].as_array().into_iter().flatten() {
-                        let Some(id) = discovered["peer_id"].as_str() else {
-                            continue;
-                        };
-                        rows.entry(id.to_string()).or_insert_with(|| json!({"peer_id":id,"display_name":discovered["machine_name"],"machine_name":discovered["machine_name"],"trusted":false,"revoked":false,"connected":false,"state":"unpaired","pairing":[],"shared_sessions":[]}));
-                    }
+                Request::LanPairingOpen { seconds } => {
+                    ensure!(
+                        db.network_config()?.enabled,
+                        "Enable networking before opening pairing"
+                    );
                     let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                    for (id, _) in crate::network::relay_config::rendezvous_routes(
+                    let mut guard = self.lan_pairing.lock().unwrap();
+                    let manager =
+                        guard.get_or_insert(crate::network::lan_pairing::Manager::new(&local)?);
+                    manager.open(seconds, crate::db::now())?;
+                    json!({"open":true,"valid_for_seconds":seconds})
+                }
+                Request::LanPairingConnect {
+                    peer,
+                    address,
+                    seconds,
+                } => {
+                    ensure!(
+                        db.network_config()?.enabled,
+                        "Enable networking before pairing"
+                    );
+                    let status = self.network_status.lock().unwrap().clone();
+                    let mut entries = status["discovered"].as_array().cloned().unwrap_or_default();
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    for (id, addresses) in crate::network::relay_config::rendezvous_routes(
                         &status["rendezvous"],
                         &db.relay_nodes()?,
                         &local,
                     ) {
-                        rows.entry(id.clone()).or_insert_with(|| json!({"peer_id":id,"display_name":id,"trusted":false,"revoked":false,"connected":false,"state":"unpaired","via_rendezvous":true,"pairing":[],"shared_sessions":[]}));
+                        if let Some(entry) = entries.iter_mut().find(|entry| entry["peer_id"] == id)
+                        {
+                            let hints = entry["addresses"]
+                                .as_array_mut()
+                                .context("Invalid discovery hints")?;
+                            for address in addresses {
+                                if hints.len() < 8 {
+                                    hints.push(json!(address.to_string()));
+                                }
+                            }
+                        } else {
+                            entries.push(json!({"peer_id":id,"addresses":addresses.into_iter().map(|a|a.to_string()).collect::<Vec<_>>()}));
+                        }
                     }
-                }
-                for request in requests {
-                    let row = rows.entry(request.peer.clone()).or_insert_with(|| json!({"peer_id":request.peer,"display_name":request.peer,"trusted":false,"revoked":false,"connected":false,"state":"unpaired","pairing":[],"shared_sessions":[]}));
-                    if !matches!(request.state, "paired" | "cancelled")
-                        && row["trusted"] == false
-                        && row["revoked"] != true
+                    let matches: Vec<_> = entries
+                        .iter()
+                        .filter(|entry| entry["peer_id"] == peer || entry["machine_name"] == peer)
+                        .collect();
+                    let (peer_id, addresses): (String, Vec<libp2p::Multiaddr>) = if let Some(
+                        address,
+                    ) = address
                     {
-                        row["state"] = json!("pairing_pending");
+                        crate::network::store::validate_address(&address, false)?;
+                        if address.contains("/p2p-circuit/") {
+                            crate::network::relay_config::configured_circuit(
+                                &address,
+                                &peer,
+                                &db.relay_nodes()?,
+                            )?;
+                        }
+                        let id: libp2p::PeerId = peer
+                            .parse()
+                            .context("An explicit address requires a canonical peer ID")?;
+                        ensure!(id.to_string() == peer, "Peer ID must be canonical");
+                        (peer, vec![address.parse()?])
+                    } else {
+                        ensure!(
+                            matches.len() == 1,
+                            "Target is missing or ambiguous; use peers discover and a canonical peer ID"
+                        );
+                        let entry = matches[0];
+                        let id = entry["peer_id"]
+                            .as_str()
+                            .context("Invalid discovery identity")?
+                            .to_string();
+                        let addresses = entry["addresses"]
+                            .as_array()
+                            .context("No discovered addresses")?
+                            .iter()
+                            .take(4)
+                            .filter_map(|value| value.as_str()?.parse().ok())
+                            .collect();
+                        (id, addresses)
+                    };
+                    ensure!(!addresses.is_empty(), "No reachable target hints");
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    let mut guard = self.lan_pairing.lock().unwrap();
+                    let manager =
+                        guard.get_or_insert(crate::network::lan_pairing::Manager::new(&local)?);
+                    let view = manager.start(&peer_id, seconds, crate::db::now())?;
+                    let mut routes = self.pairing_routes.lock().unwrap();
+                    // No more routes than active pairing transactions; bounded even after cancellation.
+                    if routes.len() >= 8 && !routes.contains_key(&peer_id) {
+                        routes.clear();
                     }
-                    // Connection summaries need state, not the locally displayed secret comparison code.
-                    row["pairing"].as_array_mut().unwrap().push(json!({"id":request.id,"state":request.state,"role":request.role,"expires_at":request.expires_at,"local_confirmed":request.local_confirmed,"remote_confirmed":request.remote_confirmed}));
+                    routes.insert(peer_id, addresses);
+                    json!(view)
                 }
-                for row in rows.values_mut() {
-                    row.as_object_mut()
-                        .unwrap()
-                        .entry("path")
-                        .or_insert(Value::Null);
-                    row.as_object_mut()
-                        .unwrap()
-                        .entry("transport")
-                        .or_insert(Value::Null);
+                Request::LanPairingAccept { id } => {
+                    ensure!(db.network_config()?.enabled, "Networking is disabled");
+                    let mut guard = self.lan_pairing.lock().unwrap();
+                    json!(
+                        guard
+                            .as_mut()
+                            .context("No pairing window")?
+                            .accept(&id, crate::db::now())?
+                    )
                 }
-                json!(rows.into_values().collect::<Vec<_>>())
-            }
-            Request::PeerPair {
-                peer_id,
-                fingerprint,
-                alias,
-            } => {
-                ensure!(
-                    peer_id != Identity::load_or_create(&self.state_dir)?.info().peer_id,
-                    "Cannot pair this bridge with itself"
-                );
-                let suggested = if alias.is_none() && db.peer(&peer_id).is_err() {
-                    self.network_status.lock().unwrap()["discovered"]
+                Request::LanPairingConfirm { id, code } => {
+                    ensure!(db.network_config()?.enabled, "Networking is disabled");
+                    let mut guard = self.lan_pairing.lock().unwrap();
+                    json!(guard.as_mut().context("No pairing window")?.confirm(
+                        &id,
+                        &code,
+                        crate::db::now()
+                    )?)
+                }
+                Request::LanPairingCancel { id } => {
+                    self.pairing_generation.fetch_add(1, Ordering::SeqCst);
+                    self.contact_routes
+                        .lock()
+                        .unwrap()
+                        .retain(|_, (pending, _)| pending != &id);
+                    self.lan_pairing
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .context("No pairing window")?
+                        .cancel(&id, crate::db::now())?;
+                    json!({"cancelled":true,"id":id})
+                }
+                Request::PairingOffer { seconds } => {
+                    let identity = Identity::load_or_create(&self.state_dir)?;
+                    json!(db.pairing_offer(&identity, &self.pairing_addresses(), seconds)?)
+                }
+                Request::PairingJoin {
+                    token,
+                    fingerprint,
+                    alias,
+                } => {
+                    let identity = Identity::load_or_create(&self.state_dir)?;
+                    let mut result = serde_json::to_value(db.pairing_join(
+                        &identity,
+                        &token,
+                        &fingerprint,
+                        alias.as_deref(),
+                        &self.pairing_addresses(),
+                    )?)?;
+                    result["mutual_pairing_complete"] = json!(false);
+                    result
+                }
+                Request::PairingFinish {
+                    token,
+                    fingerprint,
+                    alias,
+                } => {
+                    let identity = Identity::load_or_create(&self.state_dir)?;
+                    json!({"peer":db.pairing_finish(&identity, &token, &fingerprint, alias.as_deref())?, "local_pairing_complete":true})
+                }
+                Request::PairingCancel { nonce } => {
+                    db.pairing_cancel(&nonce)?;
+                    json!({"cancelled":true,"nonce":nonce})
+                }
+                Request::InvitationCreate { seconds } => {
+                    let identity = Identity::load_or_create(&self.state_dir)?;
+                    let addresses: Vec<String> = self.network_status.lock().unwrap()["listening"]
                         .as_array()
-                        .and_then(|entries| {
-                            entries.iter().find(|entry| entry["peer_id"] == peer_id)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str())
+                                .filter(|address| {
+                                    crate::network::store::validate_address(address, false).is_ok()
+                                })
+                                .take(4)
+                                .map(str::to_string)
+                                .collect()
                         })
-                        .and_then(|entry| entry["machine_name"].as_str())
-                        .map(str::to_string)
-                        .map(|name| db.suggest_peer_alias(&peer_id, &name))
-                        .transpose()?
-                } else {
-                    None
-                };
-                json!(db.pair_peer(
-                    &peer_id,
-                    &fingerprint,
-                    alias.as_deref().or(suggested.as_deref())
-                )?)
-            }
-            Request::PeerGrant {
-                peer,
-                agent,
-                permission,
-                allow,
-            } => {
-                json!(db.grant_peer(&peer, &agent, permission, allow)?)
-            }
-            Request::PeerRevoke { peer } => {
-                self.pairing_notifications.lock().unwrap().reset();
-                self.pairing_generation.fetch_add(1, Ordering::SeqCst);
-                self.contact_routes.lock().unwrap().clear();
-                // Invalidate all incomplete approvals before revocation can race a delayed MAC.
-                if let Some(manager) = self.lan_pairing.lock().unwrap().as_mut() {
-                    manager.close();
+                        .unwrap_or_default();
+                    json!({"invitation":crate::network::invitation::create(&identity, &addresses, seconds)?,"fingerprint":identity.info().fingerprint,"valid_for_seconds":seconds})
                 }
-                self.pairing_routes.lock().unwrap().clear();
-                db.revoke_peer(&peer)?;
-                json!({"revoked":peer})
-            }
-        };
-        self.board_notifications
-            .lock()
-            .unwrap()
-            .prune(|name| db.agent(name).ok());
+                Request::InvitationAccept {
+                    token,
+                    fingerprint,
+                    alias,
+                } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!(db.accept_invitation(&token, &fingerprint, alias.as_deref(), &local)?)
+                }
+                Request::PeerAddress { peer, address } => {
+                    db.set_peer_address(&peer, &address)?;
+                    json!({"peer":peer,"address":address})
+                }
+                Request::Identity => json!(Identity::load_or_create(&self.state_dir)?.info()),
+                Request::MachineShow => self.local_machine(&db)?,
+                Request::MachineSetName { name } => {
+                    db.set_machine_name(&name)?;
+                    self.local_machine(&db)?
+                }
+                Request::PeersList => json!(db.peers()?),
+                Request::SharedSessions => db.shared_sessions()?,
+                Request::PeerUnshareSession {
+                    peer,
+                    provider,
+                    session,
+                } => json!(db.unshare_peer_session(&peer, &provider, &session)?),
+                Request::PeerShare {
+                    peer,
+                    agent,
+                    shared,
+                } => json!(db.share_peer_session(&peer, &agent, shared)?),
+                Request::PeerConnections => {
+                    let status = self.network_status.lock().unwrap().clone();
+                    let enabled = db.network_config()?.enabled;
+                    let peers = db.peers()?;
+                    let sharing = db.shared_sessions()?;
+                    let mut guard = self.lan_pairing.lock().unwrap();
+                    let requests = guard
+                        .as_mut()
+                        .map(|manager| manager.list(crate::db::now()))
+                        .unwrap_or_default();
+                    let mut rows = std::collections::BTreeMap::<String, Value>::new();
+                    for peer in peers {
+                        let connected = enabled
+                            && !peer.revoked
+                            && status["connected"]
+                                .as_array()
+                                .is_some_and(|ids| ids.iter().any(|id| id == &peer.peer_id));
+                        let state = if peer.revoked {
+                            "revoked"
+                        } else if connected {
+                            "connected"
+                        } else if !enabled {
+                            "network_disabled"
+                        } else {
+                            "offline"
+                        };
+                        let sessions: Vec<_> = sharing
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|s| s["peer_id"] == peer.peer_id)
+                            .cloned()
+                            .collect();
+                        rows.insert(peer.peer_id.clone(), json!({"peer_id":peer.peer_id,"display_name":peer.display_name,"alias":peer.alias,"machine_name":peer.machine_name,"trusted":!peer.revoked,"revoked":peer.revoked,"connected":connected,"state":state,"pairing":[],"shared_sessions":sessions}));
+                    }
+                    // Only report authenticated live endpoint paths. Infrastructure
+                    // observations and stale snapshots never imply peer authorization.
+                    for (id, row) in &mut rows {
+                        let transport = if row["connected"] == true {
+                            status["paths"]
+                                .as_array()
+                                .and_then(|paths| {
+                                    paths.iter().find(|path| path["peer_id"] == id.as_str())
+                                })
+                                .cloned()
+                        } else {
+                            None
+                        };
+                        row["path"] = transport
+                            .as_ref()
+                            .and_then(|path| path.get("path"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        row["transport"] = transport.unwrap_or(Value::Null);
+                    }
+                    if enabled {
+                        for discovered in status["discovered"].as_array().into_iter().flatten() {
+                            let Some(id) = discovered["peer_id"].as_str() else {
+                                continue;
+                            };
+                            rows.entry(id.to_string()).or_insert_with(|| json!({"peer_id":id,"display_name":discovered["machine_name"],"machine_name":discovered["machine_name"],"trusted":false,"revoked":false,"connected":false,"state":"unpaired","pairing":[],"shared_sessions":[]}));
+                        }
+                        let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                        for (id, _) in crate::network::relay_config::rendezvous_routes(
+                            &status["rendezvous"],
+                            &db.relay_nodes()?,
+                            &local,
+                        ) {
+                            rows.entry(id.clone()).or_insert_with(|| json!({"peer_id":id,"display_name":id,"trusted":false,"revoked":false,"connected":false,"state":"unpaired","via_rendezvous":true,"pairing":[],"shared_sessions":[]}));
+                        }
+                    }
+                    for request in requests {
+                        let row = rows.entry(request.peer.clone()).or_insert_with(|| json!({"peer_id":request.peer,"display_name":request.peer,"trusted":false,"revoked":false,"connected":false,"state":"unpaired","pairing":[],"shared_sessions":[]}));
+                        if !matches!(request.state, "paired" | "cancelled")
+                            && row["trusted"] == false
+                            && row["revoked"] != true
+                        {
+                            row["state"] = json!("pairing_pending");
+                        }
+                        // Connection summaries need state, not the locally displayed secret comparison code.
+                        row["pairing"].as_array_mut().unwrap().push(json!({"id":request.id,"state":request.state,"role":request.role,"expires_at":request.expires_at,"local_confirmed":request.local_confirmed,"remote_confirmed":request.remote_confirmed}));
+                    }
+                    for row in rows.values_mut() {
+                        row.as_object_mut()
+                            .unwrap()
+                            .entry("path")
+                            .or_insert(Value::Null);
+                        row.as_object_mut()
+                            .unwrap()
+                            .entry("transport")
+                            .or_insert(Value::Null);
+                    }
+                    json!(rows.into_values().collect::<Vec<_>>())
+                }
+                Request::PeerPair {
+                    peer_id,
+                    fingerprint,
+                    alias,
+                } => {
+                    ensure!(
+                        peer_id != Identity::load_or_create(&self.state_dir)?.info().peer_id,
+                        "Cannot pair this bridge with itself"
+                    );
+                    let suggested = if alias.is_none() && db.peer(&peer_id).is_err() {
+                        self.network_status.lock().unwrap()["discovered"]
+                            .as_array()
+                            .and_then(|entries| {
+                                entries.iter().find(|entry| entry["peer_id"] == peer_id)
+                            })
+                            .and_then(|entry| entry["machine_name"].as_str())
+                            .map(str::to_string)
+                            .map(|name| db.suggest_peer_alias(&peer_id, &name))
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    json!(db.pair_peer(
+                        &peer_id,
+                        &fingerprint,
+                        alias.as_deref().or(suggested.as_deref())
+                    )?)
+                }
+                Request::PeerGrant {
+                    peer,
+                    agent,
+                    permission,
+                    allow,
+                } => {
+                    json!(db.grant_peer(&peer, &agent, permission, allow)?)
+                }
+                Request::PeerRevoke { peer } => {
+                    self.pairing_notifications.lock().unwrap().reset();
+                    self.pairing_generation.fetch_add(1, Ordering::SeqCst);
+                    self.contact_routes.lock().unwrap().clear();
+                    // Invalidate all incomplete approvals before revocation can race a delayed MAC.
+                    if let Some(manager) = self.lan_pairing.lock().unwrap().as_mut() {
+                        manager.close();
+                    }
+                    self.pairing_routes.lock().unwrap().clear();
+                    db.revoke_peer(&peer)?;
+                    json!({"revoked":peer})
+                }
+            })
+        })();
+        {
+            let mut state = self.board_notifications.lock().unwrap();
+            state.reconcile(
+                crate::board_notifications::available(&db)?,
+                "local registration changed",
+            );
+            state.prune(|name| db.agent(name).ok());
+        }
+        self.revoke_event_controls_locked(&db)?;
         drop(db);
         self.wake.notify_one();
         self.network_wake.notify_one();
+        let result = result?;
         if registration {
             self.claude_wake.notify_one();
         }
         Ok(result)
+    }
+
+    pub(crate) fn event_guard(
+        &self,
+        agent: &crate::protocol::Agent,
+        token: &str,
+    ) -> crate::clients::NoticeGuard {
+        let broker = self.clone();
+        let agent = agent.clone();
+        let token = token.to_owned();
+        Arc::new(move || {
+            let db = broker.db.lock().unwrap();
+            ensure!(!db.paused()?, "Event delivery paused");
+            broker.authorize_event_locked(&db, &agent, &token)
+        })
+    }
+    fn authorize_event_locked(
+        &self,
+        db: &Db,
+        agent: &crate::protocol::Agent,
+        token: &str,
+    ) -> Result<()> {
+        ensure!(token.len() <= 1024, "Event authorization exceeds limit");
+        let current = db.agent(&agent.name)?;
+        ensure!(
+            current.enabled
+                && current.provider == agent.provider
+                && current.session == agent.session
+                && current.endpoint == agent.endpoint,
+            "Event recipient registration changed"
+        );
+        ensure!(
+            self.board_notifications
+                .lock()
+                .unwrap()
+                .authorizes(token, &current),
+            "Event subscription was removed or replaced"
+        );
+        Ok(())
+    }
+    fn revoke_event_controls_locked(&self, db: &Db) -> Result<()> {
+        for (id, token) in db.event_controls()? {
+            let message = db.get(&id)?;
+            let valid = db.agent(&message.recipient).ok().is_some_and(|agent| {
+                agent.session == message.recipient_session
+                    && self.authorize_event_locked(db, &agent, &token).is_ok()
+            });
+            if !valid {
+                db.event_control_revoke(&id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Caller holds the local DB administration mutex. HTTP additionally retains
@@ -1407,24 +1590,42 @@ impl Broker {
         let db = self.db.lock().unwrap();
         let mut previous = self.claude_failures.lock().unwrap();
         let mut failed = std::collections::HashMap::new();
-        for agent in db.listed_agents(false)? {
-            if agent.provider != Provider::Claude
-                || crate::clients::claude::stale_reason(Path::new(&agent.endpoint)).is_none()
-            {
+        let agents = db.listed_agents(false)?;
+        let mut live = std::collections::HashSet::new();
+        let mut stale = Vec::new();
+        for agent in agents
+            .into_iter()
+            .filter(|agent| agent.provider == Provider::Claude)
+        {
+            if crate::clients::claude::stale_reason(Path::new(&agent.endpoint)).is_none() {
+                live.insert(agent.session.clone());
+            } else {
+                stale.push(agent);
+            }
+        }
+        for agent in stale {
+            // An old alias socket cannot retire a native session that remains
+            // reachable through another exact registration of that identity.
+            if live.contains(&agent.session) {
                 continue;
             }
             let identity = (agent.session.clone(), agent.endpoint.clone());
             if previous.get(&agent.name) == Some(&identity) {
-                db.unregister(&agent.name, &agent.session)?;
+                db.close_native(&agent.name, &agent.session, &agent.endpoint)?;
             } else {
                 failed.insert(agent.name, identity);
             }
         }
         *previous = failed;
-        self.board_notifications
-            .lock()
-            .unwrap()
-            .prune(|name| db.agent(name).ok());
+        {
+            let mut state = self.board_notifications.lock().unwrap();
+            state.reconcile(
+                crate::board_notifications::available(&db)?,
+                "local registration changed",
+            );
+            state.prune(|name| db.agent(name).ok());
+        }
+        self.revoke_event_controls_locked(&db)?;
         drop(db);
         self.network_wake.notify_one();
         Ok(())
@@ -1463,23 +1664,57 @@ impl Broker {
         let enabled = thread["status"]["type"] != "notLoaded";
         let mut db = self.db.lock().unwrap();
         db.observe_codex(session, thread["name"].as_str(), enabled)?;
-        self.board_notifications
-            .lock()
-            .unwrap()
-            .prune(|name| db.agent(name).ok());
+        if !enabled {
+            db.codex_offline(Some(session))?;
+        }
+        {
+            let mut state = self.board_notifications.lock().unwrap();
+            state.reconcile(
+                crate::board_notifications::available(&db)?,
+                "local registration changed",
+            );
+            state.prune(|name| db.agent(name).ok());
+        }
+        self.revoke_event_controls_locked(&db)?;
         drop(db);
         self.wake.notify_one();
         self.network_wake.notify_one();
         Ok(())
     }
 
+    /// Reconcile the complete initial loaded scan without closing unchanged
+    /// sessions merely because the read-only observer connected after startup.
+    pub fn reconcile_codex_loaded(&self, loaded: &std::collections::HashSet<String>) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        for agent in db.listed_agents(false)? {
+            if agent.provider == Provider::Codex && !loaded.contains(&agent.session) {
+                db.codex_offline(Some(&agent.session))?;
+            }
+        }
+        {
+            let mut state = self.board_notifications.lock().unwrap();
+            state.reconcile(
+                crate::board_notifications::available(&db)?,
+                "Codex session absent from complete loaded scan",
+            );
+            state.prune(|name| db.agent(name).ok());
+        }
+        self.revoke_event_controls_locked(&db)?;
+        Ok(())
+    }
+
     pub fn codex_offline(&self, session: Option<&str>) -> Result<()> {
         let db = self.db.lock().unwrap();
         db.codex_offline(session)?;
-        self.board_notifications
-            .lock()
-            .unwrap()
-            .prune(|name| db.agent(name).ok());
+        {
+            let mut state = self.board_notifications.lock().unwrap();
+            state.reconcile(
+                crate::board_notifications::available(&db)?,
+                "local registration changed",
+            );
+            state.prune(|name| db.agent(name).ok());
+        }
+        self.revoke_event_controls_locked(&db)?;
         Ok(())
     }
 
@@ -1491,7 +1726,16 @@ impl Broker {
         let mut workers = JoinSet::new();
         let mut codex_workers = CodexWorkers::default();
         loop {
-            self.db.lock().unwrap().opencode_tick(crate::db::now())?;
+            {
+                let db = self.db.lock().unwrap();
+                db.opencode_tick(crate::db::now())?;
+                let mut state = self.board_notifications.lock().unwrap();
+                state.reconcile(
+                    crate::board_notifications::available(&db)?,
+                    "OpenCode lease expired",
+                );
+                state.prune(|name| db.agent(name).ok());
+            }
             // Construct and enable before querying so arrivals cannot be lost between query and wait.
             let notified = self.wake.notified();
             tokio::pin!(notified);
@@ -1499,6 +1743,7 @@ impl Broker {
             while workers.len() < 16 {
                 let next = {
                     let mut db = self.db.lock().unwrap();
+                    self.revoke_event_controls_locked(&db)?;
                     db.claim_excluding_codex(&codex_workers.sessions())?.map(|(msg, agent)| {
                         let machines = json!({"source_machine":self.message_machine(&db, &msg.sender)?,"destination_machine":self.message_machine(&db, &msg.recipient)?,"sender_name":self.message_sender_name(&db, &msg.sender)});
                         let dispatch = if agent.provider==Provider::OpenCode {
@@ -1512,17 +1757,28 @@ impl Broker {
                             }
                         } else { None };
                         let raw_codex_notice = agent.provider == Provider::Codex && db.codex_is_notice(&msg.id)?;
-                        Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch, raw_codex_notice)))
+                        let event_token = db.event_control_token(&msg.id)?;
+                        Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch, raw_codex_notice, event_token)))
                     }).transpose()?.flatten()
                 };
-                let Some((msg, agent, machines, dispatch, raw_codex_notice)) = next else {
+                let Some((msg, agent, machines, dispatch, raw_codex_notice, event_token)) = next
+                else {
                     break;
                 };
                 let this = self.clone();
                 let worker_agent = agent.clone();
                 let worker = workers.spawn(async move {
                     let mut outcome = if raw_codex_notice {
-                        crate::clients::deliver_content(&agent, &msg, &msg.body).await
+                        if let Some(token) = &event_token {
+                            crate::clients::codex::deliver_guarded(
+                                &msg,
+                                &msg.body,
+                                Some(this.event_guard(&agent, token)),
+                            )
+                            .await
+                        } else {
+                            crate::clients::deliver_content(&agent, &msg, &msg.body).await
+                        }
                     } else if let Some(dispatch) = &dispatch {
                         crate::clients::opencode::deliver_dispatch(&agent, dispatch).await
                     } else {
@@ -1538,6 +1794,11 @@ impl Broker {
                     if raw_codex_notice && outcome.state == "submitted" {
                         outcome.detail =
                             "Native accepted typed control; no acknowledgement is required".into();
+                    }
+                    if outcome.state != "submitted"
+                        && let Some(token) = &event_token
+                    {
+                        this.board_notifications.lock().unwrap().lost(token, &agent);
                     }
                     let db = this.db.lock().unwrap();
                     let result = if let Some(dispatch) = &dispatch {
@@ -1842,12 +2103,17 @@ mod opencode_admission_tests {
             .unwrap();
         assert!(
             broker
-                .request(Request::BoardSubscribe {
-                    agent: agent.name.clone()
+                .request(Request::Subscribe {
+                    agent: agent.name.clone(),
+                    events: vec![crate::protocol::EventSelector::BoardChanged {
+                        board: Default::default()
+                    }],
                 })
-                .unwrap()["subscribed"]
-                .as_bool()
-                == Some(true)
+                .unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1
         );
         let error = broker
             .request(Request::LanPairingWatch {
@@ -1862,7 +2128,10 @@ mod opencode_admission_tests {
                 .contains("Pairing prompts are unavailable")
         );
         broker
-            .request(Request::BoardUnsubscribe { agent: agent.name })
+            .request(Request::Unsubscribe {
+                agent: agent.name,
+                events: None,
+            })
             .unwrap();
     }
     #[tokio::test]

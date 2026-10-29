@@ -88,6 +88,7 @@ pub(crate) async fn deliver_control_notice(
                 recipient: agent.name.clone(),
                 session: agent.session.clone(),
                 content: notice.text().to_owned(),
+                event_token: None,
             },
         )
         .await
@@ -105,6 +106,7 @@ pub(crate) async fn deliver_control_notice(
                 id: msg.id.clone(),
                 recipient: agent.name.clone(),
                 content: notice.text().to_owned(),
+                event_token: None,
             },
         )
         .await
@@ -116,6 +118,46 @@ pub(crate) async fn deliver_control_notice(
         };
     }
     crate::clients::deliver_notice(agent, msg, notice).await
+}
+
+/// Event controls carry their subscription fence into the existing durable
+/// native queues. Claude refreshes it after connecting and before writing.
+pub(crate) async fn deliver_event_notice(
+    agent: &Agent,
+    msg: &Message,
+    state_dir: &Path,
+    token: &str,
+    guard: crate::clients::NoticeGuard,
+) -> Outcome {
+    if let Err(error) = guard() {
+        return Outcome::failed(error);
+    }
+    let request = match agent.provider {
+        Provider::Codex => crate::protocol::Request::CodexNotice {
+            id: msg.id.clone(),
+            recipient: agent.name.clone(),
+            session: agent.session.clone(),
+            content: msg.body.clone(),
+            event_token: Some(token.to_owned()),
+        },
+        Provider::OpenCode => crate::protocol::Request::OpenCodeNotice {
+            id: msg.id.clone(),
+            recipient: agent.name.clone(),
+            content: msg.body.clone(),
+            event_token: Some(token.to_owned()),
+        },
+        Provider::Claude => {
+            return crate::clients::claude::deliver_guarded(agent, msg, &msg.body, Some(&guard))
+                .await;
+        }
+        Provider::Inbox => return Outcome::failed("Inbox does not support event control notices"),
+    };
+    match crate::broker::rpc(state_dir, &request).await {
+        Ok(_) => Outcome::submitted(
+            "Typed event notice durably queued; native insertion is unconfirmed and no acknowledgement is required",
+        ),
+        Err(error) => Outcome::failed(error),
+    }
 }
 
 async fn deliver_content(agent: &Agent, msg: &Message, content: &str) -> Outcome {

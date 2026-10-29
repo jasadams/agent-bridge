@@ -24,6 +24,10 @@ WITH contexts AS (
  FROM messages m LEFT JOIN message_context c ON c.id=m.id
  LEFT JOIN outbound_transfers o ON o.id=m.id LEFT JOIN inbound_transfers i ON i.local_id=m.id
  LEFT JOIN peers ps ON ps.peer_id=i.peer_id LEFT JOIN peers pd ON pd.peer_id=o.peer_id
+ WHERE coalesce(json_extract(c.destination,'$.control_notice'),0)<>1
+ AND json_extract(c.destination,'$.event_control') IS NULL
+ AND NOT EXISTS(SELECT 1 FROM codex_notices n WHERE n.id=m.id)
+ AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=m.id AND d.content=m.body)
 ), rows AS (
  SELECT *,json_set(src,'$.peer_id',coalesce(json_extract(src,'$.peer_id'),$local_peer),'$.machine_name',coalesce(json_extract(src,'$.machine_name'),$local_name)) AS source,
  json_set(dst,'$.peer_id',coalesce(json_extract(dst,'$.peer_id'),$local_peer),'$.machine_name',coalesce(json_extract(dst,'$.machine_name'),$local_name)) AS destination FROM contexts
@@ -158,6 +162,44 @@ mod tests {
             enabled: true,
         }
     }
+    #[test]
+    fn monitor_lists_details_and_threads_exclude_durable_typed_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("db")).unwrap();
+        let native = Agent {
+            name: "native".into(),
+            provider: Provider::Codex,
+            session: "123e4567-e89b-12d3-a456-426614174000".into(),
+            endpoint: String::new(),
+            enabled: true,
+        };
+        db.register(&native, false).unwrap();
+        let peer = db
+            .send(
+                &uuid::Uuid::new_v4().to_string(),
+                "user",
+                &native.name,
+                "ordinary peer",
+                &None,
+            )
+            .unwrap();
+        let notice = db
+            .codex_notice(
+                &uuid::Uuid::new_v4().to_string(),
+                &native.name,
+                &native.session,
+                "typed control",
+            )
+            .unwrap();
+        let machine = json!({"peer_id":null,"machine_name":"local"});
+        let page = db.monitor_page(&MonitorQuery::default(), &machine).unwrap();
+        assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(page["messages"][0]["id"], peer.id);
+        assert!(db.monitor_detail(&notice.id, &machine).is_err());
+        assert!(db.monitor_detail(&peer.id, &machine).is_ok());
+        assert_eq!(db.get(&notice.id).unwrap().state, "queued");
+    }
+
     #[test]
     fn monitor_preserves_sessions_filters_pages_and_reads_without_delivery_recovery() {
         let dir = tempfile::tempdir().unwrap();

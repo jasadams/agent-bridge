@@ -108,6 +108,7 @@ impl Db {
         conn.execute("UPDATE opencode_deliveries SET namespace=(SELECT value FROM settings WHERE key='opencode_namespace') WHERE namespace='legacy'", [])?;
         conn.execute("UPDATE agents SET enabled=0 WHERE provider='opencode'", [])?;
         conn.execute("UPDATE messages SET state='uncertain', detail='Service stopped during delivery; inspect the native conversation before retrying.' WHERE state='sending' AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=messages.id)", [])?;
+        conn.execute("UPDATE messages SET state='failed', detail='Event subscription expired on broker restart; resubscribe for a fresh snapshot' WHERE state='queued' AND id IN (SELECT id FROM message_context WHERE json_extract(destination,'$.event_control') IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')", [])?;
         Ok(Self { conn })
     }
 
@@ -479,7 +480,10 @@ impl Db {
     }
 
     pub fn codex_offline(&self, session: Option<&str>) -> Result<()> {
-        self.conn.execute("UPDATE agents SET enabled=0 WHERE provider='codex' AND name='codex-'||session AND (?1 IS NULL OR session=?1)",[session])?;
+        self.conn.execute(
+            "UPDATE agents SET enabled=0 WHERE provider='codex' AND (?1 IS NULL OR session=?1)",
+            [session],
+        )?;
         Ok(())
     }
 
@@ -488,6 +492,23 @@ impl Db {
         self.conn.execute(
             "UPDATE agents SET enabled=0 WHERE name=? AND session=?",
             params![name, session],
+        )?;
+        Ok(())
+    }
+
+    /// Confirmed native lifecycle closure retires canonical aliases only after
+    /// verifying that the reporting exact route still names that session.
+    pub(crate) fn close_native(&self, name: &str, session: &str, endpoint: &str) -> Result<()> {
+        let agent = self.agent(name)?;
+        ensure!(
+            agent.provider != Provider::Inbox
+                && agent.session == session
+                && agent.endpoint == endpoint,
+            "Native close requires the unchanged exact native registration"
+        );
+        self.conn.execute(
+            "UPDATE agents SET enabled=0 WHERE provider=? AND session=?",
+            params![agent.provider.label(), session],
         )?;
         Ok(())
     }
@@ -558,8 +579,41 @@ impl Db {
         self.get_optional(id)?.context("Unknown message")
     }
 
+    /// An opaque broker/subscription capability, never peer-controlled message text.
+    /// Existing immutable destination metadata keeps this durable without a schema change.
+    pub(crate) fn event_control_record(&self, id: &str, token: &str) -> Result<()> {
+        ensure!(
+            !token.is_empty() && token.len() <= 4096,
+            "Invalid event control fence"
+        );
+        let changed = self.conn.execute("UPDATE message_context SET destination=json_set(destination,'$.event_control',?1) WHERE id=?2 AND (json_extract(destination,'$.event_control') IS NULL OR json_extract(destination,'$.event_control')=?1)",params![token,id])?;
+        ensure!(
+            changed == 1,
+            "Event control fence conflicts with existing delivery"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn event_control_token(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT json_extract(destination,'$.event_control') FROM message_context WHERE id=?", [id], |row| row.get(0)).optional()?.flatten())
+    }
+
+    pub(crate) fn event_controls(&self) -> Result<Vec<(String, String)>> {
+        let mut query = self.conn.prepare("SELECT m.id,json_extract(c.destination,'$.event_control') FROM messages m JOIN message_context c ON c.id=m.id WHERE m.state='queued' AND json_extract(c.destination,'$.event_control') IS NOT NULL")?;
+        Ok(query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Only proof of no attempt permits revocation. Already admitted native work
+    /// retains the existing submitted/uncertain receipt and reconciliation rules.
+    pub(crate) fn event_control_revoke(&self, id: &str) -> Result<()> {
+        self.conn.execute("UPDATE messages SET state='failed',detail='Event subscription or exact recipient expired before native admission',updated=?1 WHERE id=?2 AND state='queued' AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')", params![now(),id])?;
+        Ok(())
+    }
+
     pub fn history(&self, agent: &Option<String>, limit: usize) -> Result<Vec<Message>> {
-        let mut s=self.conn.prepare("SELECT * FROM messages WHERE (?1 IS NULL OR sender=?1 OR recipient=?1) ORDER BY rowid DESC LIMIT ?2")?;
+        let mut s=self.conn.prepare("SELECT * FROM messages WHERE NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=messages.id AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM codex_notices n WHERE n.id=messages.id) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.content=messages.body) AND (?1 IS NULL OR sender=?1 OR recipient=?1) ORDER BY rowid DESC LIMIT ?2")?;
         Ok(
             s.query_map(params![agent, limit.clamp(1, 100) as i64], message_row)?
                 .collect::<rusqlite::Result<_>>()?,
@@ -609,7 +663,7 @@ impl Db {
             None => 0,
         };
         let mut statement = self.conn.prepare(
-            "SELECT * FROM messages WHERE rowid>?1 AND (?2 IS NULL OR sender=?2 OR recipient=?2) ORDER BY rowid ASC LIMIT ?3",
+            "SELECT * FROM messages WHERE NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=messages.id AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM codex_notices n WHERE n.id=messages.id) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.content=messages.body) AND rowid>?1 AND (?2 IS NULL OR sender=?2 OR recipient=?2) ORDER BY rowid ASC LIMIT ?3",
         )?;
         let mut messages: Vec<Message> = statement
             .query_map(params![after, agent, limit as i64 + 1], message_row)?

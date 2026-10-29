@@ -36,19 +36,20 @@ async fn run_inner(state: &Path, provider: Provider) -> Result<()> {
         .context("Hook input is missing session_id")?;
     let name = routing_name(&provider, session);
     let event = data["hook_event_name"].as_str().unwrap_or("SessionStart");
+    let endpoint = adapter.hook_endpoint()?;
     if event == "SessionEnd" {
         rpc(
             state,
-            &Request::Unregister {
+            &Request::SessionClose {
                 name,
                 session: session.into(),
+                endpoint,
             },
         )
         .await?;
         println!("{{}}");
         return Ok(());
     }
-    let endpoint = adapter.hook_endpoint()?;
     rpc(
         state,
         &Request::Register {

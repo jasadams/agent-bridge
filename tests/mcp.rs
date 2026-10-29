@@ -787,6 +787,86 @@ async fn two_mcp_clients_pair_real_brokers_only_after_both_owners_approve_then_s
 }
 
 #[tokio::test]
+async fn event_subscription_compact_results_keep_effective_set_and_atomic_snapshot() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    let coordinator = Native::start(&running, &root.path().join("coordinator"), "coordinator");
+    let worker = Native::start(&running, &root.path().join("worker"), "worker");
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let events = json!([{"event":"agent.opened"},{"event":"agent.closed"}]);
+    let response = mcp
+        .call(
+            "subscribe",
+            json!({"agent":coordinator.name,"events":events}),
+        )
+        .await;
+    let receipt = &structured(&response)["result"];
+    assert_eq!(receipt["events"], events);
+    assert_eq!(receipt["agent"], coordinator.name);
+    assert_eq!(receipt["persistent"], false);
+    assert_eq!(
+        receipt["recovery"],
+        json!({"total":0,"truncated":false,"items":[]})
+    );
+    let available = receipt["agents"].as_array().unwrap();
+    let known = available
+        .iter()
+        .find(|agent| agent["session"] == worker.session)
+        .unwrap();
+    assert_eq!(known["provider"], "claude");
+    assert_eq!(known["route"], worker.name);
+    assert!(known["display_name"].is_string());
+    assert!(
+        available
+            .iter()
+            .all(|agent| agent.get("endpoint").is_none())
+    );
+    let added = mcp
+        .call(
+            "subscribe",
+            json!({"agent":coordinator.name,"events":[{"event":"board.changed","board":"main"}]}),
+        )
+        .await;
+    assert_eq!(
+        structured(&added)["result"]["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    // Retain the snapshot even when adding a board selector to an existing lifecycle watch.
+    assert!(
+        structured(&added)["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["session"] == worker.session)
+    );
+    let removed = mcp
+        .call(
+            "unsubscribe",
+            json!({"agent":coordinator.name,"events":[{"event":"board.changed","board":"main"}]}),
+        )
+        .await;
+    assert_eq!(structured(&removed)["result"]["events"], events);
+    let empty = mcp
+        .call("unsubscribe", json!({"agent":coordinator.name,"events":[]}))
+        .await;
+    assert!(failed(&empty));
+    let cleared = mcp
+        .call("unsubscribe", json!({"agent":coordinator.name}))
+        .await;
+    assert_eq!(structured(&cleared)["result"]["events"], json!([]));
+    assert_eq!(
+        structured(&cleared)["result"]["recovery"],
+        json!({"total":0,"truncated":false,"items":[]})
+    );
+    mcp.close().await;
+}
+
+#[tokio::test]
 async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in() {
     let root = root();
     let state = root.path().join("state");
@@ -796,7 +876,7 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
     let mut mcp = Mcp::start(&state);
     mcp.initialize().await;
     let tools = mcp.request("tools/list", json!({})).await;
-    for name in ["subscribe_board", "unsubscribe_board"] {
+    for name in ["subscribe", "unsubscribe"] {
         assert!(
             tools["result"]["tools"]
                 .as_array()
@@ -805,13 +885,30 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
                 .any(|tool| tool["name"] == name)
         );
     }
+    for old in ["subscribe_board", "unsubscribe_board"] {
+        assert!(
+            !tools["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == old)
+        );
+        let response = mcp.call(old, json!({"agent":native.name})).await;
+        assert!(failed(&response), "old tool accepted: {response}");
+    }
     for arguments in [
         json!({}),
-        json!({"agent":"missing"}),
-        json!({"agent":"not-native"}),
-        json!({"agent":native.name,"peer":"remote"}),
+        json!({"agent":native.name}),
+        json!({"agent":"missing","events":[{"event":"agent.opened"}]}),
+        json!({"agent":native.name,"events":[]}),
+        json!({"agent":native.name,"events":[{"event":"unknown"}]}),
+        json!({"agent":native.name,"events":[{"event":"board.changed"}]}),
+        json!({"agent":native.name,"events":[{"event":"board.changed","board":"missing"}]}),
+        json!({"agent":native.name,"events":[{"event":"agent.opened","board":"main"}]}),
+        json!({"agent":native.name,"events":[{"event":"board.changed","board":"main","extra":true}]}),
+        json!({"agent":native.name,"peer":"remote","events":[{"event":"agent.opened"}]}),
     ] {
-        let response = mcp.call("subscribe_board", arguments).await;
+        let response = mcp.call("subscribe", arguments).await;
         assert!(failed(&response), "{response}");
     }
     let snapshot = mcp.call("read_board", json!({})).await;
@@ -826,7 +923,10 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
     let revision = structured(&initialized)["result"]["revision"].clone();
     for _ in 0..2 {
         let subscribed = mcp
-            .call("subscribe_board", json!({"agent":native.name}))
+            .call(
+                "subscribe",
+                json!({"agent":native.name,"events":[{"event":"board.changed","board":"main"}]}),
+            )
             .await;
         assert!(!failed(&subscribed), "{subscribed}");
     }
@@ -907,9 +1007,7 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
     let revision = structured(&current)["result"]["revision"].clone();
     let pending = mcp.call("update_board", json!({"expected_revision":revision,"edits":[{"op":"append","text":"Cancelled pending notification\n"}]})).await;
     assert!(!failed(&pending), "{pending}");
-    let unsubscribed = mcp
-        .call("unsubscribe_board", json!({"agent":native.name}))
-        .await;
+    let unsubscribed = mcp.call("unsubscribe", json!({"agent":native.name})).await;
     assert!(!failed(&unsubscribed), "{unsubscribed}");
     assert!(
         timeout(Duration::from_millis(3700), native.received.recv())
@@ -918,7 +1016,10 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
     );
 
     let subscribed = mcp
-        .call("subscribe_board", json!({"agent":native.name}))
+        .call(
+            "subscribe",
+            json!({"agent":native.name,"events":[{"event":"board.changed","board":"main"}]}),
+        )
         .await;
     assert!(!failed(&subscribed), "{subscribed}");
     drop(running);
@@ -1290,19 +1391,26 @@ async fn named_boards_keep_mcp_revisions_results_and_writes_isolated() {
     let native = Native::start(&_running, &root.path().join("native"), "named-owner");
     for name in ["alpha", "beta"] {
         let subscribed = mcp
-            .call("subscribe_board", json!({"board":name,"agent":native.name}))
+            .call(
+                "subscribe",
+                json!({"events":[{"event":"board.changed","board":name}],"agent":native.name}),
+            )
             .await;
-        assert_eq!(structured(&subscribed)["result"]["board"], name);
-        assert_eq!(structured(&subscribed)["result"]["subscribed"], true);
+        let events = structured(&subscribed)["result"]["events"]
+            .as_array()
+            .unwrap();
+        assert!(events.contains(&json!({"event":"board.changed","board":name})));
     }
     let unsubscribed = mcp
         .call(
-            "unsubscribe_board",
-            json!({"board":"alpha","agent":native.name}),
+            "unsubscribe",
+            json!({"events":[{"event":"board.changed","board":"alpha"}],"agent":native.name}),
         )
         .await;
-    assert_eq!(structured(&unsubscribed)["result"]["board"], "alpha");
-    assert_eq!(structured(&unsubscribed)["result"]["subscribed"], false);
+    assert_eq!(
+        structured(&unsubscribed)["result"]["events"],
+        json!([{"event":"board.changed","board":"beta"}])
+    );
     assert_ne!(revisions[0], revisions[1]);
     let wrong_cache = mcp
         .call(

@@ -2,7 +2,7 @@
 //! It neither creates a broker nor changes the network/trust permission boundary.
 use crate::{
     broker,
-    protocol::{MAX_BODY, MAX_FRAME, Request},
+    protocol::{EventSelector, MAX_BODY, MAX_FRAME, Request},
 };
 use anyhow::{Result, ensure};
 use rmcp::{
@@ -206,15 +206,25 @@ struct BoardChanges {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct BoardSubscription {
-    /// Local board name. Defaults to main.
-    #[serde(default)]
-    board: crate::board::Name,
+struct Subscription {
     /// Include the full broker result. Defaults to false.
     #[serde(default)]
     verbose: bool,
-    /// Exact registered name of your enabled local native session. Never infer another conversation's identity.
+    /// Exact registered route of your enabled local agent; never guess another conversation's identity.
     agent: String,
+    /// Explicit selectors to add idempotently. Board changes require an existing board name.
+    events: Vec<EventSelector>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Unsubscription {
+    #[serde(default)]
+    verbose: bool,
+    /// Exact registered local route.
+    agent: String,
+    /// Selectors to remove. Omit to remove all; an explicit empty list is invalid.
+    events: Option<Vec<EventSelector>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -425,30 +435,32 @@ impl Bridge {
     }
 
     #[tool(
-        description = "Subscribe your exact enabled local native session to debounced board notices (3 quiet seconds, 10 maximum). Off by default; ends on unsubscribe, session end or broker restart. Read the board after a notice; notices grant no permission."
+        description = "Add explicit local event selectors idempotently for your exact registered agent. Returns the effective events and an atomic available-agent snapshot for lifecycle selectors. Off by default; ends on closure or broker restart. Resubscribe after reconnect. Notices require no acknowledgement and grant no permission."
     )]
-    async fn subscribe_board(
-        &self,
-        Parameters(args): Parameters<BoardSubscription>,
-    ) -> CallToolResult {
+    async fn subscribe(&self, Parameters(args): Parameters<Subscription>) -> CallToolResult {
         self.write_result(
-            "subscribe_board",
+            "subscribe",
             args.verbose,
-            self.rpc(Request::board_subscribe(args.board, args.agent)),
+            self.rpc(Request::Subscribe {
+                agent: args.agent,
+                events: args.events,
+            }),
             None,
         )
         .await
     }
 
-    #[tool(description = "Unsubscribe the exact local session from board notices.")]
-    async fn unsubscribe_board(
-        &self,
-        Parameters(args): Parameters<BoardSubscription>,
-    ) -> CallToolResult {
+    #[tool(
+        description = "Remove explicit event selectors idempotently for the exact local agent; omit events to remove all and cancel pending notices."
+    )]
+    async fn unsubscribe(&self, Parameters(args): Parameters<Unsubscription>) -> CallToolResult {
         self.write_result(
-            "unsubscribe_board",
+            "unsubscribe",
             args.verbose,
-            self.rpc(Request::board_unsubscribe(args.board, args.agent)),
+            self.rpc(Request::Unsubscribe {
+                agent: args.agent,
+                events: args.events,
+            }),
             None,
         )
         .await

@@ -122,8 +122,12 @@ are not currently recorded by this check. Display names remain labels; use stabl
 routing names when names collide.
 
 An available session indicates transport availability. It does not establish that
-the model is currently working or that a message has been read. Manual Claude aliases share the same socket checks; other manual aliases
-must be unregistered explicitly when no longer needed.
+the model is currently working or that a message has been read. Manual Claude
+aliases share the same socket checks. A verified native session end disables all
+aliases of that exact session; Codex close/unload or daemon disconnect does the
+same. Removing one registration with ordinary `unregister` affects only that
+alias. Alias removal alone is not a lifecycle transition while the native
+identity remains available through another registration.
 
 ## Permissions and troubleshooting
 
@@ -149,3 +153,43 @@ agent-bridge retry MESSAGE_ID
 Native delivery depends on the capabilities exposed by the installed client and
 its running session. [Trust and recovery](peer-trust.md) covers grants, revocation
 and safe upgrade/rollback; [MCP setup](mcp.md) covers the structured command path.
+
+## Optional local lifecycle events
+
+A coordinator can opt into `agent.opened` and `agent.closed` through generic
+[`subscribe` selectors](mcp.md#event-subscriptions), alongside explicit
+`board.changed` selectors. Use the exact receiving route in native context.
+The atomic subscribe-time snapshot lists currently available local identities;
+subsequent control notices describe genuine availability changes, not new or
+deleted transcripts. Repeated discovery, heartbeats and renames do not open agents.
+
+Claude SessionEnd and confirmed socket failure, Codex native discovery/close/
+archive/unload and daemon disconnect, and OpenCode disposal/deletion/archive or
+lease expiry supply availability evidence. Fallback observation may be delayed;
+`/exit` is not guaranteed to synchronously notify all clients. Notices are local
+control data, require no acknowledgement, grant no permission and do not enter
+peer-message history. Closing the recipient prunes its subscriptions; reopen or
+broker restart requires explicit resubscription and a fresh returned snapshot.
+Snapshots reject more than 256 canonical identities or 65,536 encoded JSON bytes
+before subscription changes; they never silently truncate identities. Display
+labels are bounded to 4,096 UTF-8 bytes with safe truncation and `...`, without
+changing exact routes or ordinary listing metadata.
+
+Overflow or a failed or uncertain lifecycle delivery marks the stream incomplete.
+The broker attempts one `resync.required` notice and suppresses further lifecycle
+transitions until explicit lifecycle subscription obtains a fresh snapshot.
+Resync attempts are not automatically replayed. Unsubscribe, closure, replacement
+and restart block pending delivery for invalid recipients or selectors; native
+I/O admitted earlier may still finish. See the [event subscription recovery
+contract](mcp.md#event-subscriptions).
+
+For OpenCode, subscribe/unsubscribe receipts include bounded `recovery`
+diagnostics for hidden attempted controls: total count, truncation, and at most
+16 items containing ID, state, pending reconciliation and current route/lease
+availability. Other providers return the same empty recovery shape. A fresh
+snapshot can coexist with blocked native delivery. Inspect the ID, then use
+`agent-bridge --state-dir "/same/private/state" retry CONTROL_ID` for explicit
+read-only native reconciliation through that broker. This never reinserts an
+attempted prompt. Missing proof remains uncertain; neither unsubscribe nor cancel
+proves no insertion occurred. Diagnostics trigger no native work or automatic
+retry. See [event recovery](mcp.md#event-subscriptions) for the complete contract.

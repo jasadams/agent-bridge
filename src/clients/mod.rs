@@ -23,16 +23,19 @@ pub enum Capability {
     LifecycleRegistration,
 }
 
+/// Refresh authorization after asynchronous native preflight and before the first write.
+pub(crate) type NoticeGuard = std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// Controls remain distinct from ordinary peer messages, including at dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlNotice<'a> {
-    BoardChanged(&'a str),
+    Event(&'a str),
     Pairing(&'a str),
 }
 impl<'a> ControlNotice<'a> {
     pub(crate) fn text(self) -> &'a str {
         match self {
-            Self::BoardChanged(text) | Self::Pairing(text) => text,
+            Self::Event(text) | Self::Pairing(text) => text,
         }
     }
 }
