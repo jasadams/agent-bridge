@@ -127,7 +127,12 @@ agent-bridge board
 agent-bridge board --create streamr
 agent-bridge board streamr
 agent-bridge board --list
+agent-bridge board streamr --metadata
 ```
+
+Terminal and web boards display an automatic Last Updated footer in the viewer's
+local timezone. Agents do not need to add clock text to Markdown; `--metadata`
+exposes the persisted UTC timestamp and revision without changing the document.
 
 Then ask your agents:
 

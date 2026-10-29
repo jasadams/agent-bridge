@@ -536,7 +536,7 @@ impl Broker {
                         marker.valid(),
                         "Invalid message input identity, ID or label"
                     );
-                    let current = crate::board::read_named(&self.state_dir, &board)?;
+                    let current = self.read_board_locked(&db, &board)?;
                     let text = format!(
                         "{}<!-- board-message: {} -->\n",
                         if current.markdown.ends_with('\n') || current.markdown.is_empty() {
@@ -549,6 +549,7 @@ impl Broker {
                     let candidate = format!("{}{text}", current.markdown);
                     ensure!(crate::board_interaction::controls(&candidate).iter().any(|control| matches!(&control.kind, crate::board_interaction::Kind::Message { id, instance, owner } if id == &marker.id && instance == &marker.instance && owner == &marker.owner) && control.label == marker.label), "Message input ID is duplicated or board controls are malformed");
                     match self.update_board_locked(
+                        &db,
                         &board,
                         &expected_revision,
                         &[crate::board::Edit::Append { text }],
@@ -564,12 +565,16 @@ impl Broker {
                         }
                     }
                 }
-                Request::BoardList => json!(crate::board::list(&self.state_dir)?),
+                Request::BoardList => json!(self.list_boards_locked(&db)?),
                 Request::BoardCreate { board } => {
-                    json!(crate::board::create(&self.state_dir, &board)?)
+                    json!(crate::board_metadata::enrich(
+                        &db,
+                        &self.state_dir,
+                        crate::board::create(&self.state_dir, &board)?
+                    )?)
                 }
                 Request::NamedBoardRead { board } => {
-                    json!(crate::board::read_named(&self.state_dir, &board)?)
+                    json!(self.read_board_locked(&db, &board)?)
                 }
                 Request::BoardRead | Request::BoardUpdate { .. } => {
                     unreachable!("Legacy board requests normalized above")
@@ -586,6 +591,7 @@ impl Broker {
                         "Board writer must be an enabled local registration"
                     );
                     match self.update_board_locked(
+                        &db,
                         &name,
                         &expected_revision,
                         &edits,
@@ -614,7 +620,7 @@ impl Broker {
                         if let crate::protocol::EventSelector::BoardChanged { board } = event {
                             boards.insert(
                                 board.clone(),
-                                crate::board::read_named(&self.state_dir, board)?.revision,
+                                self.read_board_locked(&db, board)?.revision,
                             );
                         }
                     }
@@ -646,7 +652,7 @@ impl Broker {
                         );
                         for event in events {
                             if let crate::protocol::EventSelector::BoardChanged { board } = event {
-                                crate::board::read_named(&self.state_dir, board)?;
+                                self.read_board_locked(&db, board)?;
                             }
                         }
                     }
@@ -1643,7 +1649,7 @@ impl Broker {
             }
             Ok(None) => (),
         }
-        let snapshot = match crate::board::read_named(&self.state_dir, &request.board) {
+        let snapshot = match self.read_board_locked(db, &request.board) {
             Ok(snapshot) => snapshot,
             Err(error) => return Reply::error(503, "unavailable", error),
         };
@@ -1716,23 +1722,60 @@ impl Broker {
         }
     }
 
+    /// Caller already holds the local database administration mutex.
+    pub(crate) fn read_board_locked(
+        &self,
+        db: &Db,
+        name: &crate::board::Name,
+    ) -> Result<crate::board::Snapshot> {
+        crate::board_metadata::enrich(
+            db,
+            &self.state_dir,
+            crate::board::read_named(&self.state_dir, name)?,
+        )
+    }
+
+    /// Enrich the exact snapshots read by the bounded board listing.
+    pub(crate) fn list_boards_locked(&self, db: &Db) -> Result<Vec<crate::board::Summary>> {
+        crate::board::list(&self.state_dir)?
+            .into_iter()
+            .map(|summary| crate::board_metadata::enrich_summary(db, &self.state_dir, summary))
+            .collect()
+    }
+
     /// Caller holds the local DB administration mutex. HTTP additionally retains
     /// its monitor generation guard through this update and both observations.
     pub(crate) fn update_board_locked(
         &self,
+        db: &Db,
         name: &crate::board::Name,
         expected: &str,
         edits: &[crate::board::Edit],
         actor: Option<&crate::protocol::Agent>,
     ) -> Result<crate::board::Snapshot> {
-        let before = crate::board::read_named(&self.state_dir, name)?;
+        let before = self.read_board_locked(db, name)?;
         self.board_notifications.lock().unwrap().observe_named(
             name,
             &before.revision,
             None,
             std::time::Instant::now(),
         );
-        let board = crate::board::update_named(&self.state_dir, name, expected, edits)?;
+        let board = match crate::board::update_named(&self.state_dir, name, expected, edits) {
+            Ok(board) => crate::board_metadata::enrich(db, &self.state_dir, board)?,
+            Err(error) => {
+                if let Some(conflict) = error.downcast_ref::<crate::board::Conflict>() {
+                    return Err(crate::board::Conflict {
+                        current: crate::board_metadata::enrich(
+                            db,
+                            &self.state_dir,
+                            conflict.current.clone(),
+                        )?,
+                    }
+                    .into());
+                }
+                return Err(error);
+            }
+        };
         self.board_notifications.lock().unwrap().observe_named(
             name,
             &board.revision,
@@ -2505,5 +2548,109 @@ mod codex_worker_tests {
             db.finish(&queued.id, "failed", "test worker cleanup")
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod board_timestamp_integration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timestamp_persistence_error_still_prunes_lifecycle_subscriptions() {
+        let root = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let agent = crate::protocol::Agent {
+            name: "timestamp-watcher".into(),
+            provider: Provider::Codex,
+            session: uuid::Uuid::new_v4().to_string(),
+            endpoint: String::new(),
+            enabled: true,
+        };
+        broker
+            .request(Request::Register {
+                agent: agent.clone(),
+                replace: false,
+            })
+            .unwrap();
+        broker
+            .request(Request::Subscribe {
+                agent: agent.name.clone(),
+                events: vec![
+                    crate::protocol::EventSelector::AgentOpened {},
+                    crate::protocol::EventSelector::BoardChanged {
+                        board: Default::default(),
+                    },
+                ],
+            })
+            .unwrap();
+        let before = broker.request(Request::BoardRead).unwrap();
+        assert_eq!(
+            broker
+                .board_notifications
+                .lock()
+                .unwrap()
+                .events(&agent.name)
+                .len(),
+            2
+        );
+        // SQLite FAIL retains earlier trigger statements, modeling a failed
+        // metadata write that changes registration availability before returning.
+        broker
+            .db
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_board_timestamp BEFORE INSERT ON settings
+             WHEN NEW.key='board_timestamps' BEGIN
+               UPDATE agents SET enabled=0 WHERE name='timestamp-watcher';
+               SELECT RAISE(FAIL, 'timestamp persistence fixture failure');
+             END;",
+            )
+            .unwrap();
+        let error = broker
+            .request(Request::board_update(
+                Default::default(),
+                before["revision"].as_str().unwrap().into(),
+                vec![crate::board::Edit::Set {
+                    markdown: "applied before metadata failure".into(),
+                }],
+                None,
+            ))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timestamp persistence fixture failure"));
+        assert!(
+            !broker
+                .db
+                .lock()
+                .unwrap()
+                .agent(&agent.name)
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            broker
+                .board_notifications
+                .lock()
+                .unwrap()
+                .events(&agent.name)
+                .is_empty()
+        );
+        // This is the documented post-rename ambiguity, not an unapplied write.
+        assert_eq!(
+            crate::board::read(&broker.state_dir).unwrap().markdown,
+            "applied before metadata failure"
+        );
+        broker
+            .db
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch("DROP TRIGGER fail_board_timestamp")
+            .unwrap();
+        let after = broker.request(Request::BoardRead).unwrap();
+        assert_ne!(after["revision"], before["revision"]);
+        assert!(after["last_updated"].is_i64());
     }
 }

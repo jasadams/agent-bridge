@@ -6,6 +6,19 @@ separate web process, Node.js runtime, CDN, asset download or model call. Messag
 shows delivery history; Boards reads local named boards and accepts only changes
 to their existing checkbox and marked text response controls.
 
+Each board has a **Last Updated** footer outside both rendered and raw Markdown.
+It presents the broker's nullable UTC Unix millisecond `last_updated` metadata in
+the browser's local timezone, including DST; missing/unreliable times show Unknown.
+Snapshots, conditional responses and successful saves retain `last_updated_source`
+(`file_mtime` or `unknown`). Selected-board events also carry existence and time
+metadata, so explicitly creating empty `main` refreshes its footer even though its
+content revision stays unchanged. Refresh uses the existing bounded read/reconnect
+path. A draft or selected old document keeps its
+matching timestamp until the new content is reviewed; locking or changing boards
+clears the old footer. Sending a message never updates board content time.
+See [board metadata semantics](board.md) for persistence, no-op/conflict stability,
+external-file observations and their limits. No timestamp is added to Markdown.
+
 With the broker running, enable it:
 
 ```sh

@@ -155,7 +155,7 @@ async fn board_events_follow_only_selected_revision_including_external_edits_and
         .unwrap();
     assert_eq!(
         first,
-        serde_json::json!({"name":"alpha", "revision":board::read_named(root.path(), &alpha).unwrap().revision})
+        serde_json::json!({"name":"alpha", "revision":board::read_named(root.path(), &alpha).unwrap().revision, "exists":true, "last_updated":board::read_named(root.path(), &alpha).unwrap().last_updated, "last_updated_source":"file_mtime"})
     );
     // Another board and unrelated broker activity must not invalidate alpha.
     let before = board::read_named(root.path(), &beta).unwrap();
@@ -183,7 +183,7 @@ async fn board_events_follow_only_selected_revision_including_external_edits_and
         .unwrap();
     assert_eq!(
         changed,
-        serde_json::json!({"name":"alpha", "revision":board::read_named(root.path(), &alpha).unwrap().revision})
+        serde_json::json!({"name":"alpha", "revision":board::read_named(root.path(), &alpha).unwrap().revision, "exists":true, "last_updated":board::read_named(root.path(), &alpha).unwrap().last_updated, "last_updated_source":"file_mtime"})
     );
     assert_ne!(changed["revision"], first["revision"]);
     assert!(!changed.to_string().contains("Private external content"));
@@ -199,6 +199,85 @@ async fn board_events_follow_only_selected_revision_including_external_edits_and
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn board_events_refresh_metadata_when_virtual_main_is_created_with_same_revision() {
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let mut stream = connect(&access, "/api/boards/main/events", &auth(&access)).await;
+    let initial = timeout(Duration::from_secs(3), board_event(&mut stream))
+        .await
+        .unwrap();
+    assert_eq!(initial["exists"], false);
+    assert_eq!(initial["last_updated"], Value::Null);
+    assert_eq!(initial["last_updated_source"], "unknown");
+    let created = running
+        .broker
+        .request(Request::BoardCreate {
+            board: Default::default(),
+        })
+        .unwrap();
+    assert_eq!(created["revision"], initial["revision"]);
+    let changed = timeout(Duration::from_secs(3), board_event(&mut stream))
+        .await
+        .unwrap();
+    assert_eq!(changed["name"], "main");
+    assert_eq!(changed["revision"], initial["revision"]);
+    assert_eq!(changed["exists"], true);
+    assert_eq!(changed["last_updated"], created["last_updated"]);
+    assert!(changed["last_updated"].is_i64());
+    assert_eq!(changed["last_updated_source"], "file_mtime");
+    assert!(changed.get("markdown").is_none());
+    let conditional = json_body(
+        &get(
+            &access,
+            &format!(
+                "/api/boards/main?if_revision={}",
+                initial["revision"].as_str().unwrap()
+            ),
+            &auth(&access),
+        )
+        .await,
+    );
+    assert_eq!(conditional["unchanged"], true);
+    for field in [
+        "name",
+        "revision",
+        "exists",
+        "last_updated",
+        "last_updated_source",
+    ] {
+        assert_eq!(conditional[field], changed[field]);
+    }
+    assert!(conditional.get("markdown").is_none());
+    std::fs::File::options()
+        .write(true)
+        .open(root.path().join("boards/main.md"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000))
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(1100), board_event(&mut stream))
+            .await
+            .is_err()
+    );
+    let touched = json_body(
+        &get(
+            &access,
+            &format!(
+                "/api/boards/main?if_revision={}",
+                initial["revision"].as_str().unwrap()
+            ),
+            &auth(&access),
+        )
+        .await,
+    );
+    assert_eq!(touched["unchanged"], true);
+    for field in ["revision", "exists", "last_updated", "last_updated_source"] {
+        assert_eq!(touched[field], changed[field]);
+    }
 }
 
 #[tokio::test]
@@ -419,6 +498,8 @@ async fn board_http_reads_controls_save_conditional_conflict_and_narrow_security
     let access = running.enable(0).await;
     let empty = json_body(&get(&access, "/api/boards/main", &auth(&access)).await);
     assert_eq!(empty["exists"], false);
+    assert!(empty["last_updated"].is_null());
+    assert_eq!(empty["last_updated_source"], "unknown");
     assert!(!root.path().join("boards").exists());
     for name in ["alpha", "beta"] {
         running
@@ -443,6 +524,10 @@ async fn board_http_reads_controls_save_conditional_conflict_and_narrow_security
     );
     let view = json_body(&get(&access, "/api/boards/alpha", &auth(&access)).await);
     assert_eq!(view["controls"].as_array().unwrap().len(), 2);
+    assert!(view["last_updated"].is_i64());
+    assert_eq!(view["last_updated_source"], "file_mtime");
+    assert_eq!(listed["boards"][0]["last_updated"], view["last_updated"]);
+    let beta_time = listed["boards"][1]["last_updated"].clone();
     let conditional = json_body(
         &get(
             &access,
@@ -455,6 +540,11 @@ async fn board_http_reads_controls_save_conditional_conflict_and_narrow_security
         .await,
     );
     assert_eq!(conditional["unchanged"], true);
+    assert_eq!(conditional["last_updated"], view["last_updated"]);
+    assert_eq!(
+        conditional["last_updated_source"],
+        view["last_updated_source"]
+    );
     assert!(conditional.get("markdown").is_none());
     let dto = serde_json::json!({"board":"alpha","expected_revision":view["revision"],"control_id":view["controls"][0]["id"],"value":{"type":"checkbox","checked":true}}).to_string();
     for (headers, status) in [
@@ -504,6 +594,22 @@ async fn board_http_reads_controls_save_conditional_conflict_and_narrow_security
     )
     .await;
     assert!(valid.starts_with("HTTP/1.1 200"), "{valid}");
+    let saved = json_body(&valid)["board"].clone();
+    assert!(saved["last_updated"].is_i64());
+    let noop = serde_json::json!({"board":"alpha","expected_revision":saved["revision"],"control_id":saved["controls"][0]["id"],"value":{"type":"checkbox","checked":true}}).to_string();
+    let noop = json_body(
+        &post(
+            &access,
+            "/api/boards/alpha/responses",
+            &post_headers(&access),
+            &noop,
+        )
+        .await,
+    );
+    assert_eq!(noop["unchanged"], true);
+    assert_eq!(noop["board"]["last_updated"], saved["last_updated"]);
+    let beta = json_body(&get(&access, "/api/boards/beta", &auth(&access)).await);
+    assert_eq!(beta["last_updated"], beta_time);
     assert!(
         board::read_named(root.path(), &alpha)
             .unwrap()
@@ -519,6 +625,10 @@ async fn board_http_reads_controls_save_conditional_conflict_and_narrow_security
     .await;
     assert!(stale.starts_with("HTTP/1.1 409"));
     assert_eq!(json_body(&stale)["board"]["name"], "alpha");
+    assert_eq!(
+        json_body(&stale)["board"]["last_updated"],
+        saved["last_updated"]
+    );
     assert!(
         post(&access, "/api/messages", &post_headers(&access), "{}")
             .await

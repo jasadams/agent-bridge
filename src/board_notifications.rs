@@ -671,7 +671,7 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
             let mut state = broker.board_notifications.lock().unwrap();
             state.prune(|name| db.agent(name).ok());
             if let Some(name) = state.next_board() {
-                match crate::board::read_named(&broker.state_dir, &name) {
+                match broker.read_board_locked(&db, &name) {
                     Ok(board) => {
                         state.observe_named(&name, &board.revision, None, Instant::now());
                         last_error = None;

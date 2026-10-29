@@ -528,6 +528,7 @@ struct View {
     notice: Option<String>,
     update_notice: Option<String>,
     viewport: Option<Viewport>,
+    viewport_metadata: Option<(String, Option<i64>)>,
     selection: Option<Selection>,
     mouse_enabled: bool,
 }
@@ -568,6 +569,7 @@ impl Default for View {
             notice: None,
             update_notice: None,
             viewport: None,
+            viewport_metadata: None,
             selection: None,
             mouse_enabled: true,
         }
@@ -887,6 +889,7 @@ impl View {
                             || old.name != snapshot.name
                             || old.path != snapshot.path
                             || old.exists != snapshot.exists
+                            || old.last_updated != snapshot.last_updated
                     });
                 if self.snapshot.as_ref().map(|old| &old.revision) != Some(&snapshot.revision) {
                     self.width = 0;
@@ -950,13 +953,30 @@ impl View {
             Constraint::Length(3),
         ])
         .areas(frame.area());
+        let document_area = Block::bordered().inner(body);
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.area() != document_area)
+        {
+            self.selection = None;
+            self.notice = Some("Text selection cancelled because the board layout changed.".into());
+        }
         let (name, revision) = self
             .snapshot
             .as_ref()
             .map(|snapshot| {
                 (
                     safe_line(&snapshot.name),
-                    snapshot.revision.chars().take(12).collect::<String>(),
+                    self.selection
+                        .as_ref()
+                        .and(self.viewport_metadata.as_ref())
+                        .map_or(snapshot.revision.as_str(), |(revision, _)| {
+                            revision.as_str()
+                        })
+                        .chars()
+                        .take(12)
+                        .collect::<String>(),
                 )
             })
             .unwrap_or_else(|| (self.board.to_string(), "connecting".into()));
@@ -1003,7 +1023,19 @@ impl View {
             .as_ref()
             .map(|snapshot| safe_line(&snapshot.path.to_string_lossy()))
             .unwrap_or_default();
-        let block = Block::bordered().title(path);
+        let updated = crate::board_time::footer(
+            match self.selection.as_ref().and(self.viewport_metadata.as_ref()) {
+                Some((_, timestamp)) => *timestamp,
+                None => self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.last_updated),
+            },
+            body.width.saturating_sub(4),
+        );
+        let block = Block::bordered()
+            .title(path)
+            .title_bottom(Line::from(updated).centered());
         let inner = block.inner(body);
         if self.width != inner.width {
             self.clear_copy_focus();
@@ -1041,14 +1073,6 @@ impl View {
         self.scroll.1 = self.scroll.1.min(self.max_scroll.1);
         frame.render_widget(block, body);
         frame.render_widget(self.paragraph().scroll(self.scroll), inner);
-        if self
-            .selection
-            .as_ref()
-            .is_some_and(|selection| selection.area() != inner)
-        {
-            self.selection = None;
-            self.notice = Some("Text selection cancelled because the board layout changed.".into());
-        }
         if let Some(selection) = &self.selection {
             self.code_cells.clear();
             links_limited = !selection.paint(frame.buffer_mut());
@@ -1095,6 +1119,11 @@ impl View {
                 viewport.exclude_copy_buttons(self.code_cells.keys().copied());
                 viewport.set_copy_controls(&self.code_cells, &self.code_payloads);
             }
+            self.viewport_metadata = self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| (snapshot.revision.clone(), snapshot.last_updated));
+
             if !self.link_urls.is_empty() && self.hyperlinks_enabled {
                 let mut mask = Buffer::empty(inner);
                 let paragraph = Paragraph::new(self.link_mask.clone());
@@ -1998,6 +2027,8 @@ mod tests {
             revision: revision.into(),
             path: PathBuf::from("/private/boards/main.md"),
             exists: true,
+            last_updated: None,
+            last_updated_source: Default::default(),
         }
     }
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -2627,6 +2658,10 @@ mod tests {
                 exists: false,
                 ..initial.clone()
             },
+            Snapshot {
+                last_updated: Some(1_768_435_200_000),
+                ..initial.clone()
+            },
         ] {
             let mut view = View::default();
             assert!(view.update(Ok(initial.clone())));
@@ -2634,6 +2669,57 @@ mod tests {
             assert!(!view.update(Ok(changed)));
         }
     }
+    #[test]
+    fn last_updated_border_is_visible_while_scrolling_and_follows_frozen_selection() {
+        let markdown = (0..100)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let mut original = snapshot(&markdown, "old-revision");
+        original.last_updated = Some(1_768_435_200_000);
+        for width in [10_u16, 32, 90] {
+            let mut view = View::default();
+            view.update(Ok(original.clone()));
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let bottom = |terminal: &Terminal<TestBackend>| {
+                (0..width)
+                    .map(|x| terminal.backend().buffer()[(x, 16)].symbol())
+                    .collect::<String>()
+            };
+            let title = crate::board_time::footer(original.last_updated, width.saturating_sub(4));
+            assert!(bottom(&terminal).contains(&title));
+            view.scroll = (40, 0);
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            assert!(bottom(&terminal).contains(&title));
+            assert!(
+                !view
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .markdown
+                    .contains("Last Updated")
+            );
+        }
+        let mut view = View::default();
+        view.update(Ok(original));
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        view.selection = Selection::start(view.viewport.clone().unwrap(), Position::new(2, 2));
+        let mut newer = snapshot("new content", "new-revision");
+        newer.last_updated = Some(1_784_073_600_000);
+        view.update(Ok(newer.clone()));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let frozen = buffer_text(&terminal);
+        assert!(frozen.contains("old-revision"));
+        assert!(!frozen.contains("new-revision"));
+        assert!(frozen.contains(&crate::board_time::footer(Some(1_768_435_200_000), 86)));
+        view.selection = None;
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let current = buffer_text(&terminal);
+        assert!(current.contains("new-revision"));
+        assert!(current.contains(&crate::board_time::footer(newer.last_updated, 86)));
+    }
+
     #[test]
     fn generic_markdown_headings_tables_and_unicode_render() {
         let mut view = View::default();
@@ -3344,6 +3430,8 @@ mod tests {
                 name: "project".parse().unwrap(),
                 exists: true,
                 revision: "two".into(),
+                last_updated: None,
+                last_updated_source: Default::default(),
             }],
             0,
         ));
@@ -3359,6 +3447,8 @@ mod tests {
                 name: "project".parse().unwrap(),
                 exists: true,
                 revision: "two".into(),
+                last_updated: None,
+                last_updated_source: Default::default(),
             }],
             0,
         ));

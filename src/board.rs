@@ -87,11 +87,24 @@ impl From<Name> for String {
     }
 }
 
+/// Provenance of the revision-bound UTC timestamp.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LastUpdatedSource {
+    FileMtime,
+    #[default]
+    Unknown,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Summary {
     pub name: Name,
     pub exists: bool,
     pub revision: String,
+    #[serde(default)]
+    pub last_updated: Option<i64>,
+    #[serde(default)]
+    pub last_updated_source: LastUpdatedSource,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,6 +114,10 @@ pub struct Snapshot {
     pub revision: String,
     pub path: PathBuf,
     pub exists: bool,
+    #[serde(default)]
+    pub last_updated: Option<i64>,
+    #[serde(default)]
+    pub last_updated_source: LastUpdatedSource,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -146,7 +163,37 @@ fn snapshot(state_dir: &Path, name: &Name, markdown: String, exists: bool) -> Sn
         markdown,
         path: state_dir.join("boards").join(format!("{name}.md")),
         exists,
+        last_updated: None,
+        last_updated_source: LastUpdatedSource::Unknown,
     }
+}
+
+fn stable_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && before.mode() == after.mode()
+        && before.uid() == after.uid()
+        && before.nlink() == after.nlink()
+}
+
+fn assign_file_time(board: &mut Snapshot, metadata: &std::fs::Metadata) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    board.last_updated = metadata
+        .modified()
+        .ok()
+        .filter(|time| *time <= SystemTime::now())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+    board.last_updated_source = if board.last_updated.is_some() {
+        LastUpdatedSource::FileMtime
+    } else {
+        LastUpdatedSource::Unknown
+    };
 }
 
 fn revision_digest(name: &Name, markdown: &str) -> sha2::digest::Output<Sha256> {
@@ -225,7 +272,7 @@ fn board_directory(state: &File, create: bool) -> Result<Option<File>> {
 }
 
 fn read_document(state_dir: &Path, name: &Name, directory: &File) -> Result<Snapshot> {
-    let file = match open_at(directory, &name.document(), libc::O_RDONLY) {
+    let mut file = match open_at(directory, &name.document(), libc::O_RDONLY) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             ensure!(
@@ -251,12 +298,20 @@ fn read_document(state_dir: &Path, name: &Name, directory: &File) -> Result<Snap
         "Board exceeds 64 KiB"
     );
     let mut bytes = Vec::new();
-    file.take(MAX_BOARD_BYTES as u64 + 1)
+    (&mut file)
+        .take(MAX_BOARD_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= MAX_BOARD_BYTES, "Board exceeds 64 KiB");
     let markdown =
         String::from_utf8(bytes).context("Board document must contain UTF-8 Markdown")?;
-    Ok(snapshot(state_dir, name, markdown, true))
+    let after = file.metadata()?;
+    ensure!(
+        stable_metadata(&metadata, &after),
+        "Board changed while reading; retry the read"
+    );
+    let mut board = snapshot(state_dir, name, markdown, true);
+    assign_file_time(&mut board, &after);
+    Ok(board)
 }
 
 /// Reading an absent board returns an empty document without creating a file.
@@ -300,7 +355,9 @@ pub fn create(state_dir: &Path, name: &Name) -> Result<Snapshot> {
     directory
         .sync_all()
         .context("Cannot persist new board directory entry")?;
-    Ok(snapshot(state_dir, name, String::new(), true))
+    let mut board = snapshot(state_dir, name, String::new(), true);
+    assign_file_time(&mut board, &file.metadata()?);
+    Ok(board)
 }
 
 #[cfg(target_os = "linux")]
@@ -379,6 +436,8 @@ pub fn list(state_dir: &Path) -> Result<Vec<Summary>> {
                 name,
                 exists: board.exists,
                 revision: board.revision,
+                last_updated: board.last_updated,
+                last_updated_source: board.last_updated_source,
             })
         })
         .collect()
@@ -474,12 +533,15 @@ pub fn update_named(
     for edit in edits {
         apply(&mut markdown, edit)?;
     }
+    if markdown == current.markdown {
+        return Ok(current);
+    }
     let directory = match existing_directory {
         Some(directory) => directory,
         None => board_directory(&state, true)?.context("Board directory was not created")?,
     };
     let temporary = CString::new(format!(".board-{}.tmp", uuid::Uuid::new_v4()))?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<std::fs::Metadata> {
         let mut file = open_at(
             &directory,
             &temporary,
@@ -488,6 +550,7 @@ pub fn update_named(
         .context("Cannot stage board update")?;
         file.write_all(markdown.as_bytes())?;
         file.sync_all()?;
+        let metadata = file.metadata()?;
         let result = unsafe {
             libc::renameat(
                 directory.as_raw_fd(),
@@ -503,15 +566,17 @@ pub fn update_named(
         directory
             .sync_all()
             .context("Cannot persist board directory")?;
-        Ok(())
+        Ok(metadata)
     })();
     if result.is_err() {
         unsafe {
             libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0);
         }
     }
-    result?;
-    Ok(snapshot(state_dir, name, markdown, true))
+    let metadata = result?;
+    let mut board = snapshot(state_dir, name, markdown, true);
+    assign_file_time(&mut board, &metadata);
+    Ok(board)
 }
 
 #[cfg(test)]
@@ -537,6 +602,33 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn descriptor_validation_detects_concurrent_in_place_and_unlink_changes() {
+        let state = private_state();
+        let board = set(state.path(), "before");
+        let file = File::open(&board.path).unwrap();
+        let before = file.metadata().unwrap();
+        let path = board.path.clone();
+        std::thread::spawn(move || {
+            let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+            writer.write_all(b"after!").unwrap();
+            writer
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+        assert!(!stable_metadata(&before, &file.metadata().unwrap()));
+        let stable = file.metadata().unwrap();
+        // Atomic external saves do not mutate the open old descriptor's bytes.
+        let replacement = state.path().join("replacement");
+        std::fs::write(&replacement, "replacement").unwrap();
+        std::fs::rename(&replacement, &board.path).unwrap();
+        // Unlink changes ctime/nlink, so rejecting rather than returning a
+        // snapshot is also honest; the replacement is available on retry.
+        assert!(!stable_metadata(&stable, &file.metadata().unwrap()));
     }
 
     #[test]

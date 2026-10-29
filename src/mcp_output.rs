@@ -1,5 +1,7 @@
 //! MCP response views. Persistence and CLI results retain their complete records.
-use serde_json::{Map, Value, json};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::{Map, Value};
 
 /// Select fields without filling missing fields with null or changing non-object results.
 fn fields(value: Value, names: &[&str]) -> Value {
@@ -20,6 +22,13 @@ fn fields(value: Value, names: &[&str]) -> Value {
     }
 }
 
+pub(super) fn board_revision(value: Value) -> Value {
+    fields(
+        value,
+        &["name", "revision", "last_updated", "last_updated_source"],
+    )
+}
+
 pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value {
     if verbose || value.get("error").is_some() {
         return value;
@@ -29,10 +38,16 @@ pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value
         if value["conflict"] == true || value["applied"] != true {
             return value;
         }
-        return match value["board"].get("revision") {
-            Some(revision) => json!({"board":value["board"]["name"],"revision":revision}),
-            None => value,
-        };
+        if value["board"].get("revision").is_some() {
+            let mut result = board_revision(value["board"].take());
+            if let Some(object) = result.as_object_mut()
+                && let Some(name) = object.remove("name")
+            {
+                object.insert("board".into(), name);
+            }
+            return result;
+        }
+        return value;
     }
 
     let names: &[&str] = match tool {
@@ -160,6 +175,21 @@ mod tests {
             write_result("update_board", conflict.clone(), false),
             conflict
         );
+    }
+
+    #[test]
+    fn compact_board_metadata_preserves_utc_time_and_unknown_without_markdown() {
+        for time in [json!(null), json!(1_768_435_200_000_i64)] {
+            let board = json!({"name":"project","revision":"revision-id","markdown":"private", "last_updated":time,"last_updated_source":"file_mtime"});
+            let metadata = board_revision(board.clone());
+            assert_eq!(metadata["last_updated"], time);
+            assert!(metadata.get("markdown").is_none());
+            let receipt =
+                write_result("update_board", json!({"applied":true,"board":board}), false);
+            assert_eq!(receipt["last_updated"], time);
+            assert_eq!(receipt["board"], "project");
+            assert_eq!(receipt["last_updated_source"], "file_mtime");
+        }
     }
 
     #[test]

@@ -189,7 +189,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             wait("actual native frame", lambda: any(f.get("msg_id") == first["id"] for f in frames))
             frame = next(f for f in frames if f.get("msg_id") == first["id"])
             assert frame["from"] == "user" and frame["session_id"] == session and body in frame["message"]["content"]
-            assert read() == before, "Sending edited board content/revision"
+            assert read() == before, "Sending edited board Markdown/revision/timestamp"
             expect(row().locator(".message-feedback")).to_contain_text("does not mean")
             textarea.fill("second deliberate message"); page.keyboard.press("Enter"); second = sent("second deliberate message")
             assert first["id"] != second["id"]
@@ -254,7 +254,9 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             # An accepted retry remains safe after a board revision change.
             write(read()["markdown"] + "\nChanged after lost receipt\n")
             expect(page.locator("#board-document")).to_contain_text("Changed after lost receipt", timeout=15000)
+            retry_board = read()
             page.keyboard.press("Enter"); sent("accepted but lost response")
+            assert read() == retry_board, "Retry changed board Markdown, revision or timestamp"
             assert posts[-1] == old and len(history("accepted but lost response")) == 1
             record("real accepted POST with lost response retains UUID/body; explicit identical retry after board change returns one durable message")
 

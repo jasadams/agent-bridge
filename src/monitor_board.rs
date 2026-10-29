@@ -222,7 +222,7 @@ pub(crate) fn view(snapshot: &Snapshot) -> Value {
             start: None,
         }]
     });
-    let mut result = json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"markdown":snapshot.markdown,"display_markdown":display.as_ref(),"nodes":nodes,"controls":controls});
+    let mut result = json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"last_updated":snapshot.last_updated,"last_updated_source":snapshot.last_updated_source,"markdown":snapshot.markdown,"display_markdown":display.as_ref(),"nodes":nodes,"controls":controls});
     if notice {
         result["render_notice"] =
             json!("This document is complex; showing plain text. Raw Markdown remains available.");
@@ -245,19 +245,33 @@ fn conflict(snapshot: &Snapshot) -> Reply {
         body: json!({"applied":false,"conflict":true,"board":view(snapshot),"code":"conflict","error":"The board or control changed. Review the current board before saving again."}),
     }
 }
+/// Content identity plus authoritative metadata observed by the live board feed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct BoardIdentity {
+    pub revision: String,
+    pub exists: bool,
+    pub last_updated: Option<i64>,
+    pub last_updated_source: board::LastUpdatedSource,
+}
+
 impl Broker {
     pub(crate) fn monitor_board_revision(
         &self,
         generation: u64,
         name: &Name,
-    ) -> Result<String, Reply> {
-        let _db = self.db.lock().unwrap();
+    ) -> Result<BoardIdentity, Reply> {
+        let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
             return Err(reply(401, "unauthorized", "Monitor access expired"));
         }
-        board::read_named(&self.state_dir, name)
-            .map(|snapshot| snapshot.revision)
+        self.read_board_locked(&db, name)
+            .map(|snapshot| BoardIdentity {
+                revision: snapshot.revision,
+                exists: snapshot.exists,
+                last_updated: snapshot.last_updated,
+                last_updated_source: snapshot.last_updated_source,
+            })
             .map_err(|_| {
                 reply(
                     404,
@@ -267,12 +281,12 @@ impl Broker {
             })
     }
     pub(crate) fn monitor_boards(&self, generation: u64) -> Reply {
-        let _db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
             return reply(401, "unauthorized", "Monitor access expired");
         }
-        match board::list(&self.state_dir) {
+        match self.list_boards_locked(&db) {
             Ok(boards) => Reply {
                 status: 200,
                 body: json!({"boards":boards}),
@@ -286,16 +300,16 @@ impl Broker {
         name: &Name,
         conditional: Option<&str>,
     ) -> Reply {
-        let _db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
             return reply(401, "unauthorized", "Monitor access expired");
         }
-        match board::read_named(&self.state_dir, name) {
+        match self.read_board_locked(&db, name) {
             Ok(snapshot) => Reply {
                 status: 200,
                 body: if conditional == Some(snapshot.revision.as_str()) {
-                    json!({"name":snapshot.name,"revision":snapshot.revision,"unchanged":true})
+                    json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"last_updated":snapshot.last_updated,"last_updated_source":snapshot.last_updated_source,"unchanged":true})
                 } else {
                     view(&snapshot)
                 },
@@ -324,7 +338,7 @@ impl Broker {
         let result = self.board_message_submit_locked(&db, &request);
         let mut body = result.body;
         if body["code"] == "conflict"
-            && let Ok(snapshot) = board::read_named(&self.state_dir, name)
+            && let Ok(snapshot) = self.read_board_locked(&db, name)
         {
             body["board"] = view(&snapshot);
         }
@@ -339,7 +353,7 @@ impl Broker {
         name: &Name,
         request: ResponseRequest,
     ) -> Reply {
-        let _db = self.db.lock().unwrap();
+        let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
             return reply(401, "unauthorized", "Monitor access expired");
@@ -347,7 +361,7 @@ impl Broker {
         if !request.valid(name) {
             return reply(400, "invalid_response", "Invalid board response");
         }
-        let current = match board::read_named(&self.state_dir, name) {
+        let current = match self.read_board_locked(&db, name) {
             Ok(v) => v,
             Err(_) => {
                 return reply(
@@ -392,6 +406,7 @@ impl Broker {
             };
         }
         match self.update_board_locked(
+            &db,
             name,
             &current.revision,
             &[board::Edit::Set { markdown: updated }],
@@ -439,6 +454,97 @@ mod tests {
             value,
         }
     }
+    #[tokio::test]
+    async fn message_send_retry_and_conflict_preserve_board_timestamp_and_projection() {
+        use crate::protocol::{Agent, Provider, Request};
+        use std::os::unix::fs::MetadataExt;
+        let (root, bound, old) = setup();
+        let broker = &bound.broker;
+        let owner = Agent {
+            name: "timestamp-recipient".into(),
+            provider: Provider::Inbox,
+            session: uuid::Uuid::new_v4().to_string(),
+            endpoint: String::new(),
+            enabled: true,
+        };
+        broker
+            .request(Request::Register {
+                agent: owner.clone(),
+                replace: false,
+            })
+            .unwrap();
+        let added = broker
+            .request(Request::AddBoardMessageInput {
+                agent: owner.name,
+                board: Default::default(),
+                expected_revision: old.revision,
+                id: "timestamp-message".into(),
+                label: "Message recipient".into(),
+            })
+            .unwrap();
+        assert_eq!(added["applied"], true);
+        let before: Snapshot = serde_json::from_value(added["board"].clone()).unwrap();
+        assert!(before.last_updated.is_some());
+        let file_before = std::fs::metadata(&before.path).unwrap();
+        broker.monitor_control.lock().unwrap().enable(0);
+        let control = board_interaction::controls(&before.markdown)
+            .into_iter()
+            .find(|control| matches!(control.kind, Kind::Message { .. }))
+            .unwrap();
+        let mut submission = crate::board_messages::Submission {
+            board: Default::default(),
+            expected_revision: before.revision.clone(),
+            control_id: control_id(&before, &control),
+            id: uuid::Uuid::new_v4().to_string(),
+            text: "Only a native message, never a board edit".into(),
+        };
+        let sent = broker.monitor_board_message(1, &Name::default(), submission.clone());
+        assert_eq!(sent.status, 200);
+        assert_eq!(sent.body["accepted"], true);
+        assert_eq!(
+            broker
+                .monitor_board_message(1, &Name::default(), submission.clone())
+                .body["duplicate"],
+            true
+        );
+        submission.id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            broker
+                .request(Request::BoardMessageSend {
+                    request: submission.clone()
+                })
+                .unwrap()["accepted"],
+            true
+        );
+        submission.expected_revision = "0".repeat(64);
+        submission.id = uuid::Uuid::new_v4().to_string();
+        let conflict = broker.monitor_board_message(1, &Name::default(), submission);
+        assert_eq!(conflict.status, 409);
+        assert_eq!(
+            conflict.body["board"]["last_updated"],
+            before.last_updated.unwrap()
+        );
+        assert!(
+            !conflict.body["board"]["display_markdown"]
+                .as_str()
+                .unwrap()
+                .contains("board-message:")
+        );
+        let after: Snapshot =
+            serde_json::from_value(broker.request(Request::BoardRead).unwrap()).unwrap();
+        assert_eq!(after.markdown, before.markdown);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.last_updated, before.last_updated);
+        assert_eq!(after.last_updated_source, before.last_updated_source);
+        let file_after = std::fs::metadata(&after.path).unwrap();
+        assert_eq!(file_after.ino(), file_before.ino());
+        assert_eq!(
+            file_after.modified().unwrap(),
+            file_before.modified().unwrap()
+        );
+        assert_eq!(board::read(root.path()).unwrap().markdown, before.markdown);
+    }
+
     #[tokio::test]
     async fn message_metadata_is_hidden_only_in_rendered_view() {
         let (root, _bound, old) = setup();

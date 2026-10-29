@@ -20,7 +20,41 @@ agent-bridge board --create streamr
 agent-bridge board streamr
 agent-bridge board --list
 agent-bridge board streamr --raw
+agent-bridge board streamr --metadata
 ```
+
+The document's bottom border shows **Last Updated** outside its Markdown. It
+stays visible while scrolling, shortens to fit narrow terminals, and uses the
+viewer's process timezone (`TZ` or the system setting), including daylight saving.
+The web board shows the same instant in its footer using the browser's timezone.
+Different viewers can therefore see different local clock times for identical
+UTC metadata. Unknown or unavailable times are shown as unknown, never as now.
+Agents no longer need to maintain clock text in the document. Existing timestamp
+prose is left untouched, and `--raw` still prints the exact Markdown only.
+
+`--metadata` prints JSON without Markdown. Board snapshots, listings, MCP reads
+(including conditional reads) and update receipts expose `last_updated`, a nullable
+UTC Unix timestamp in **milliseconds**, and `last_updated_source` (`file_mtime` or
+`unknown`). Older brokers without these fields are shown as unknown by the TUI.
+
+The broker persists revision/existence-bound metadata independently for each board
+in its existing settings store. A real content change takes the modification time
+captured from the same validated file descriptor as that content. Reads, redraws,
+notifications, restarts, conflicts, rejected edits, same-value updates and metadata-only
+touches do not advance a recorded time. Existing documents use their defensible
+file time rather than being stamped when first opened; absent virtual `main` and
+unreliable/future modification times remain unknown. A timestamp cannot be supplied
+through Markdown or edit parameters.
+
+External content changes are detected by revision refresh and use the captured
+file time, not their discovery time. Restoring previously observed content after
+an observed intervening change takes the restore's file time. This is not a
+forensic edit log: editors can preserve file times, and an unobserved byte-identical
+rewrite or A→B→A sequence cannot be distinguished from a touch. Those do not invent
+a newer timestamp. If a write fails after its atomic rename, content may already
+have changed; read back the coherent current revision/time before retrying, as with
+other ambiguous board writes. A frozen text selection keeps the displayed revision
+and timestamp together until it is released.
 
 The terminal always shows the selected board name. Press `b` outside the text
 editor to open the board picker. Save an unsaved response successfully or

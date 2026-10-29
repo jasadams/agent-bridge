@@ -41,6 +41,9 @@ enum Commands {
         /// Print Markdown once without opening the terminal UI.
         #[arg(long)]
         raw: bool,
+        /// Print revision and UTC timestamp metadata as JSON, without Markdown.
+        #[arg(long, conflicts_with_all = ["raw", "list", "create"])]
+        metadata: bool,
     },
     /// Add explicit local event selectors; returns effective events and lifecycle snapshot.
     Subscribe {
@@ -575,6 +578,7 @@ async fn main() -> Result<()> {
             raw,
             list,
             create,
+            metadata,
         } => {
             if list {
                 let value = broker::rpc(&state_dir, &Request::BoardList).await?;
@@ -601,6 +605,17 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             let name = name.unwrap_or_default();
+            if metadata {
+                let board = broker::rpc(&state_dir, &Request::board_read(name)).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "name":board["name"], "revision":board["revision"], "exists":board["exists"],
+                        "last_updated":board["last_updated"], "last_updated_source":board["last_updated_source"]
+                    }))?
+                );
+                return Ok(());
+            }
             if raw {
                 let value = broker::rpc(&state_dir, &Request::board_read(name.clone())).await?;
                 let board: agent_bridge::board::Snapshot = serde_json::from_value(value)?;
@@ -1036,6 +1051,7 @@ mod update_cli_tests {
         for args in [
             vec!["agent-bridge", "board"],
             vec!["agent-bridge", "board", "project", "--raw"],
+            vec!["agent-bridge", "board", "project", "--metadata"],
             vec!["agent-bridge", "board", "--list"],
             vec!["agent-bridge", "board", "--create", "project"],
         ] {
@@ -1045,6 +1061,9 @@ mod update_cli_tests {
             vec!["agent-bridge", "board", "../project"],
             vec!["agent-bridge", "board", "--create", "UPPER"],
             vec!["agent-bridge", "board", "--list", "--raw"],
+            vec!["agent-bridge", "board", "--raw", "--metadata"],
+            vec!["agent-bridge", "board", "--list", "--metadata"],
+            vec!["agent-bridge", "board", "--create", "project", "--metadata"],
             vec!["agent-bridge", "board", "project", "--list"],
             vec!["agent-bridge", "board", "project", "--create", "other"],
             vec!["agent-bridge", "board", "--create", "project", "--raw"],
