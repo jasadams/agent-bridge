@@ -1,6 +1,6 @@
 # Native session setup
 
-Agent Bridge connects to existing Codex and Claude Code sessions. The broker,
+Agent Bridge connects to existing Codex, Claude Code and OpenCode sessions. The broker,
 client MCP connection and native delivery adapter have separate responsibilities:
 MCP provides agent tools, while native adapters deliver incoming messages to the
 selected running session.
@@ -71,11 +71,37 @@ client updates may require compatibility changes. Native control notifications
 (pairing and board changes) keep their separate format. A live UI check is needed
 when qualifying a new client version.
 
+## OpenCode
+
+For supported OpenCode **1.18.35** V1, install the bundled native plugin and MCP
+connection explicitly:
+
+```sh
+agent-bridge opencode install
+```
+
+Fully restart OpenCode after installation or updates. Send a prompt in the
+existing conversation you want to use, then check its live registration:
+
+```sh
+agent-bridge list
+```
+
+Its exact route is `opencode-SESSION_ID`, where the native ID starts with `ses_`.
+Stored conversation history is not advertised automatically. The setup command
+does not start a native session or model, change permissions, or enable peer
+sharing. Repeat it after upgrading Agent Bridge to update the extracted plugin.
+
+See [OpenCode installation options](install.md#optional-opencode-integration) for
+custom state/configuration paths, backups and removal, and the
+[OpenCode guide](opencode.md) for lifecycle, receipts, recovery and explicitly
+shared sessions.
+
 ## Session names
 
 `agent-bridge list` shows available registrations, native display names and stable
-routing names. Automatically registered names use `codex-<thread-UUID>` or
-`claude-<session-UUID>`. Qualified display names such as `codex:reviewer` are also
+routing names. Automatically registered names use `codex-<thread-UUID>`,
+`claude-<session-UUID>` or `opencode-<ses_ID>`. Qualified display names such as `codex:reviewer` are also
 accepted for messaging. If a display name is ambiguous, use the stable name.
 
 ```sh
