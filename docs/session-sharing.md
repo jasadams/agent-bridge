@@ -39,6 +39,10 @@ provider/session from `peers shared` to remove stale grants:
 agent-bridge peers unshare machine-b --provider codex --session OLD_SESSION_UUID
 ```
 
+OpenCode uses the same commands with `--provider opencode --session ses_...`;
+its ID must be `ses_` followed by exactly 26 ASCII letters/digits. Claude/Codex
+retain UUID session validation. Titles are display metadata, never grants.
+
 This form needs no current registration and never broadens access. `shared` lists
 partial grants too, along with provider/session, current routing names, enabled
 state and a `stale` flag when no registration remains. `shared: true` means all
@@ -86,6 +90,14 @@ Network disable stops transfers without deleting stored grants.
 agent-bridge list --remote
 agent-bridge send --from LOCAL_AGENT_ID --to machine-b/REMOTE_AGENT_ID --message 'Hello'
 ```
+
+OpenCode can be either endpoint when both brokers support it. Provider support
+is negotiated separately from permission: it never shares an ungranted session.
+The legacy directory permanently filters out OpenCode while retaining permitted
+Claude/Codex/Inbox entries. This is covered by a strict older-reader fixture from
+pre-OpenCode commit `8fde538`. An older peer that successfully answers the legacy
+directory is explicitly unsupported for an OpenCode transfer; an extension failure
+without that successful fallback is retried rather than treated as proof.
 
 The receiver must explicitly acknowledge and send a correlated reply. Submitted
 status is not proof of receipt or task completion. Stop-sharing and revocation

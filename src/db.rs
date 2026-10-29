@@ -254,10 +254,7 @@ impl Db {
             "Peer is revoked; verify its fingerprint and pair again first"
         );
         let agent = self.resolve_agent(agent)?;
-        ensure!(
-            agent.provider != Provider::OpenCode,
-            "OpenCode sessions are local-only; remote grants are not implemented"
-        );
+        crate::clients::validate_remote_session(&agent.provider, &agent.session)?;
         ensure!(
             !allow || agent.enabled,
             "Cannot grant access to a disabled agent"

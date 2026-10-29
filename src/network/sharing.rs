@@ -12,10 +12,7 @@ impl Db {
     pub fn share_peer_session(&mut self, peer: &str, agent: &str, shared: bool) -> Result<Peer> {
         let peer = self.peer(peer)?;
         let agent = self.resolve_agent(agent)?;
-        ensure!(
-            agent.provider != Provider::OpenCode,
-            "OpenCode sessions are local-only; remote sharing is not implemented"
-        );
+        crate::clients::validate_remote_session(&agent.provider, &agent.session)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -59,10 +56,7 @@ impl Db {
         provider: &Provider,
         session: &str,
     ) -> Result<Peer> {
-        ensure!(
-            !session.is_empty() && session.len() <= 200,
-            "Session ID must contain 1–200 bytes"
-        );
+        crate::clients::validate_remote_session(provider, session)?;
         let peer = self.peer(peer)?;
         let tx = self
             .conn

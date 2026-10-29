@@ -1,4 +1,4 @@
-# OpenCode local native messaging
+# OpenCode native messaging
 
 The built-in `opencode` provider targets an exact existing OpenCode session, not
 its build/plan mode. This integration supports OpenCode **1.18.35**, its **V1**
@@ -72,17 +72,51 @@ the broker message ID as its parent; API acceptance never supplies that authorit
 AGB-4 must add durable receipts, restart reconciliation and ordered busy-session
 recovery without changing this distinction.
 
+## Sharing with a paired machine
+
+OpenCode sessions are private by default. After owner-approved machine pairing,
+explicitly share the exact live registration on each machine:
+
+```sh
+agent-bridge peers share machine-b --agent opencode-SESSION_ID
+agent-bridge list --remote
+agent-bridge send --from opencode-SESSION_ID --to machine-b/REMOTE_AGENT_ID --message 'Hello'
+```
+
+The share operation grants discover, send and receive for the exact `opencode`
+provider and native `ses_` ID. A title rename keeps that identity; a replacement
+session cannot inherit it. The other owner independently shares their destination.
+Unshare/revocation and disabled/replaced registration checks apply before queued
+native submission. Replies pin both endpoints to the original provider/session,
+even if a cached directory changes. See [session sharing](session-sharing.md).
+
+Upgraded brokers negotiate provider support before dispatching an OpenCode source
+or destination. A peer that successfully answers only the legacy directory is
+reported as unsupported for OpenCode; work is not relabeled or reported delivered.
+Legacy directories permanently omit OpenCode so older strict provider readers
+can still discover Claude, Codex and Inbox. The protocol remains version 1 on
+`/agent-bridge/message/1`; the opt-in `directory_supported` exchange adds bounded
+explicit provider capabilities without granting session access. An extension
+rejection or codec error alone does not prove lack of support: the broker first
+requires a successful legacy directory response. The strict legacy directory
+fixture is pinned to pre-OpenCode commit `8fde538`.
+
+Schema 12 extends the strict session grant provider constraint to OpenCode while
+preserving existing permissions. Older binaries reject this newer database schema;
+a downgrade requires the matching pre-upgrade database backup and binary.
+
 No API `tools`/permissions fields, permission hooks, approval responses, automatic
-remote sharing or native peer cards are introduced. OpenCode remote validation,
-grants and sharing fail with an explicit local-only error pending AGB-6. Existing
-Claude/Codex transport and remote contracts remain unchanged.
+remote sharing or native peer cards are introduced.
 
 ## Validation
 
 See the plugin README for frozen dependency installation, type checks, supplied
 in-process-client tests, and the disposable native compatibility harness. Tests
 use temporary directories and local processes; they do not use owner sessions,
-configuration or credentials. Rust integration coverage is in `tests/opencode.rs`.
+configuration or credentials. Rust local transport coverage is in `tests/opencode.rs`; store/trust and
+isolated two-broker remote coverage are in `tests/opencode_store.rs` and
+`tests/opencode_network.rs`. These source checks do not establish live model
+reasoning, physical cross-machine delivery or macOS runtime acceptance.
 The deterministic native harness uses a local model fixture; it checks real
 OpenCode/plugin/broker execution and message correlation, not an external model's
 reasoning or the owner's production environment. Physical/native macOS runtime

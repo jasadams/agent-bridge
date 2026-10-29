@@ -3,7 +3,9 @@ use super::{
     discovery::{DiscoveredPeer, normalize_lan_address},
     identity::Identity,
     transport::{Incoming, Transport},
-    wire::{Operation, VERSION, WireRequest, WireResponse},
+    wire::{
+        Operation, VERSION, WireRequest, WireResponse, supported_providers, validate_providers,
+    },
 };
 use crate::{broker::Broker, db::Db};
 use anyhow::{Result, anyhow, ensure};
@@ -17,6 +19,7 @@ use std::{
 enum Kind {
     Hello,
     Directory,
+    DirectorySupported(Option<String>),
     Sync,
     Send(String),
 }
@@ -42,6 +45,11 @@ struct Schedule {
     directory: Instant,
     sync: Instant,
     failures: u32,
+    providers: Option<Vec<String>>,
+    probe: Instant,
+    fallback: bool,
+    legacy: bool,
+    send_permit: Option<String>,
 }
 impl Default for Schedule {
     fn default() -> Self {
@@ -52,6 +60,11 @@ impl Default for Schedule {
             directory: now,
             sync: now,
             failures: 0,
+            providers: None,
+            probe: now,
+            fallback: false,
+            legacy: false,
+            send_permit: None,
         }
     }
 }
@@ -183,6 +196,13 @@ fn respond(broker: &Broker, local_peer: &str, incoming: Incoming) {
             Operation::Directory => WireResponse::Directory {
                 agents: db.export_agents(&peer)?,
             },
+            Operation::DirectorySupported { providers } => {
+                validate_providers(&providers)?;
+                WireResponse::SupportedDirectory {
+                    providers: supported_providers(),
+                    agents: db.export_agents_supported(&peer, &providers)?,
+                }
+            }
             Operation::Send { envelope } => {
                 db.accept_remote(local_peer, &peer, &envelope)?;
                 broker.wake.notify_one();
@@ -209,6 +229,22 @@ fn apply(broker: &Broker, done: Completed) -> Result<()> {
             db.remember_peer_name(&done.peer, &machine_name)
         }
         (Kind::Directory, WireResponse::Directory { agents }) => {
+            ensure!(
+                agents
+                    .iter()
+                    .all(|agent| agent.provider != crate::protocol::Provider::OpenCode),
+                "Legacy directory contains an unsupported provider"
+            );
+            db.replace_remote_agents(&done.peer, &agents)
+        }
+        (Kind::DirectorySupported(_), WireResponse::SupportedDirectory { providers, agents }) => {
+            validate_providers(&providers)?;
+            ensure!(
+                agents
+                    .iter()
+                    .all(|agent| providers.iter().any(|p| p == agent.provider.label())),
+                "Directory contains an unadvertised provider"
+            );
             db.replace_remote_agents(&done.peer, &agents)
         }
         (Kind::Sync, WireResponse::Status { events }) => db.apply_events(&done.peer, &events),
@@ -232,6 +268,64 @@ fn apply(broker: &Broker, done: Completed) -> Result<()> {
         )),
         _ => Err(anyhow!("Unexpected remote response")),
     }
+}
+
+fn complete_request(broker: &Broker, done: Completed, schedule: &mut Schedule) -> Result<()> {
+    let legacy_fallback = matches!(done.kind, Kind::Directory) && schedule.fallback;
+    apply(broker, done)?;
+    if legacy_fallback {
+        schedule.legacy = true;
+        schedule.fallback = false;
+        schedule.probe = Instant::now() + Duration::from_secs(60);
+        schedule.directory = Instant::now() + Duration::from_secs(5);
+    }
+    Ok(())
+}
+
+fn next_transfer(
+    db: &Db,
+    peer: &str,
+    schedule: &mut Schedule,
+) -> Result<Option<(Kind, Operation)>> {
+    for envelope in db.pending_transfers(peer, 100)? {
+        let needs_extension = envelope.source.provider == crate::protocol::Provider::OpenCode
+            || envelope.destination.provider == crate::protocol::Provider::OpenCode;
+        if needs_extension {
+            if schedule.legacy
+                || schedule
+                    .providers
+                    .as_ref()
+                    .is_some_and(|providers| !providers.iter().any(|p| p == "opencode"))
+            {
+                db.transfer_result(
+                    peer,
+                    &envelope.id,
+                    &WireResponse::Rejected {
+                        reason: "Peer does not support OpenCode sessions".into(),
+                        retryable: false,
+                    },
+                )?;
+                continue;
+            }
+            if schedule.send_permit.as_deref() != Some(&envelope.id) {
+                return Ok(Some((
+                    Kind::DirectorySupported(Some(envelope.id)),
+                    Operation::DirectorySupported {
+                        providers: supported_providers(),
+                    },
+                )));
+            }
+            schedule.send_permit = None;
+        }
+        db.mark_transfer_attempt(&envelope.id)?;
+        return Ok(Some((
+            Kind::Send(envelope.id.clone()),
+            Operation::Send {
+                envelope: Box::new(envelope),
+            },
+        )));
+    }
+    Ok(None)
 }
 
 pub async fn run(broker: Broker) {
@@ -548,9 +642,30 @@ pub async fn run(broker: Broker) {
                             },
                         )));
                     }
+                    if schedule.fallback {
+                        return Ok(Some((Kind::Directory, Operation::Directory)));
+                    }
+                    if now >= schedule.probe {
+                        schedule.probe = now + Duration::from_secs(60);
+                        return Ok(Some((
+                            Kind::DirectorySupported(None),
+                            Operation::DirectorySupported {
+                                providers: supported_providers(),
+                            },
+                        )));
+                    }
                     if now >= schedule.directory {
                         schedule.directory = now + Duration::from_secs(5);
-                        return Ok(Some((Kind::Directory, Operation::Directory)));
+                        return Ok(Some(if schedule.providers.is_some() {
+                            (
+                                Kind::DirectorySupported(None),
+                                Operation::DirectorySupported {
+                                    providers: supported_providers(),
+                                },
+                            )
+                        } else {
+                            (Kind::Directory, Operation::Directory)
+                        }));
                     }
                     if now >= schedule.sync {
                         schedule.sync = now + Duration::from_secs(1);
@@ -561,16 +676,7 @@ pub async fn run(broker: Broker) {
                             },
                         )));
                     }
-                    if let Some(envelope) = db.pending_transfers(&peer, 1)?.into_iter().next() {
-                        db.mark_transfer_attempt(&envelope.id)?;
-                        return Ok(Some((
-                            Kind::Send(envelope.id.clone()),
-                            Operation::Send {
-                                envelope: Box::new(envelope),
-                            },
-                        )));
-                    }
-                    Ok(None)
+                    next_transfer(&db, &peer, schedule)
                 })();
                 let (kind, operation) = match work {
                     Ok(Some(work)) => work,
@@ -621,7 +727,7 @@ pub async fn run(broker: Broker) {
                     let response = result.unwrap_or_else(|_| json!({"ok":false,"error":"pairing request rejected"}));
                     let _ = incoming.response.send(response);
                 }
-                NetworkIncoming::Stopped => { active = None; *broker.network_handle.lock().unwrap() = None; broker.network_generation.fetch_add(1,std::sync::atomic::Ordering::SeqCst); start_after = Instant::now() + Duration::from_secs(2); }
+                NetworkIncoming::Stopped => { schedules.clear(); active = None; *broker.network_handle.lock().unwrap() = None; broker.network_generation.fetch_add(1,std::sync::atomic::Ordering::SeqCst); start_after = Instant::now() + Duration::from_secs(2); }
             },
             Some(done) = pairing_tasks.next(), if !pairing_tasks.is_empty() => {
                 pairing_busy.remove(&done.id);
@@ -634,6 +740,33 @@ pub async fn run(broker: Broker) {
             Some(done) = tasks.next(), if !tasks.is_empty() => {
                 busy.remove(&done.peer);
                 let schedule = schedules.entry(done.peer.clone()).or_default();
+                if let Kind::DirectorySupported(ref send_id) = done.kind {
+                    let send_id = send_id.clone();
+                    let providers = match &done.result {
+                        Ok(WireResponse::SupportedDirectory { providers, .. }) => Some(providers.clone()),
+                        _ => None,
+                    };
+                    match apply(&broker, done) {
+                        Ok(()) => {
+                            schedule.providers = providers;
+                            schedule.legacy = false;
+                            schedule.fallback = false;
+                            schedule.send_permit = send_id;
+                            schedule.directory = Instant::now() + Duration::from_secs(5);
+                        }
+                        Err(error) => {
+                            // An unknown extension or codec failure must not back off
+                            // supported traffic. Only a successful legacy request proves
+                            // this peer is reachable without the extension.
+                            schedule.providers = None;
+                            schedule.send_permit = None;
+                            schedule.fallback = true;
+                            last_error = Some(error.to_string());
+                        }
+                    }
+                    schedule.next = Instant::now();
+                    continue;
+                }
                 if matches!(done.kind, Kind::Hello) {
                     // Metadata is optional: old peers can reject this operation.
                     // Keep the unchanged v1 message protocol usable in either case.
@@ -641,8 +774,10 @@ pub async fn run(broker: Broker) {
                     schedule.next = Instant::now();
                     continue;
                 }
-                match apply(&broker, done) {
-                    Ok(()) => { schedule.failures = 0; schedule.next = Instant::now(); }
+                match complete_request(&broker, done, schedule) {
+                    Ok(()) => {
+                        schedule.failures = 0; schedule.next = Instant::now();
+                    }
                     Err(error) => {
                         schedule.failures = (schedule.failures + 1).min(6);
                         let jitter = u16::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..2].try_into().unwrap()) as u64 % 250;
@@ -663,6 +798,146 @@ mod tests {
         wire::{Envelope, RemoteAgent},
     };
     use crate::protocol::Provider;
+
+    #[tokio::test]
+    async fn only_successful_legacy_fallback_establishes_unsupported_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+        let peer = libp2p::PeerId::random().to_string();
+        bound
+            .broker
+            .db
+            .lock()
+            .unwrap()
+            .pair_peer(&peer, &peer, None)
+            .unwrap();
+        let mut schedule = Schedule {
+            fallback: true,
+            ..Schedule::default()
+        };
+        for result in [
+            Err(anyhow!("transport timeout")),
+            Ok(WireResponse::Rejected {
+                reason: "offline".into(),
+                retryable: true,
+            }),
+            Ok(WireResponse::SupportedDirectory {
+                providers: supported_providers(),
+                agents: vec![],
+            }),
+        ] {
+            assert!(
+                complete_request(
+                    &bound.broker,
+                    Completed {
+                        peer: peer.clone(),
+                        kind: Kind::Directory,
+                        result
+                    },
+                    &mut schedule
+                )
+                .is_err()
+            );
+            assert!(!schedule.legacy);
+            assert!(schedule.fallback);
+        }
+        complete_request(
+            &bound.broker,
+            Completed {
+                peer,
+                kind: Kind::Directory,
+                result: Ok(WireResponse::Directory { agents: vec![] }),
+            },
+            &mut schedule,
+        )
+        .unwrap();
+        assert!(schedule.legacy);
+        assert!(!schedule.fallback);
+        assert!(schedule.probe > Instant::now());
+    }
+
+    #[test]
+    fn opencode_dispatch_requires_a_new_exact_message_permit_and_legacy_does_not_starve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("messages.sqlite3")).unwrap();
+        let local = libp2p::PeerId::random().to_string();
+        let peer = libp2p::PeerId::random().to_string();
+        db.pair_peer(&peer, &peer, None).unwrap();
+        db.grant_peer(&peer, "user", Permission::Send, true)
+            .unwrap();
+        let native = RemoteAgent {
+            name: "native".into(),
+            provider: Provider::OpenCode,
+            session: "ses_0123456789abcdefghijklmnop".into(),
+        };
+        let inbox = RemoteAgent {
+            name: "user".into(),
+            provider: Provider::Inbox,
+            session: "user".into(),
+        };
+        db.replace_remote_agents(&peer, &[native, inbox]).unwrap();
+        let native_id = uuid::Uuid::new_v4().to_string();
+        db.send_remote(
+            &local,
+            &native_id,
+            "user",
+            &format!("{peer}/native"),
+            "native",
+            &None,
+        )
+        .unwrap();
+        let inbox_id = uuid::Uuid::new_v4().to_string();
+        db.send_remote(
+            &local,
+            &inbox_id,
+            "user",
+            &format!("{peer}/user"),
+            "inbox",
+            &None,
+        )
+        .unwrap();
+        let mut schedule = Schedule {
+            providers: Some(supported_providers()),
+            ..Schedule::default()
+        };
+        assert!(
+            matches!(next_transfer(&db, &peer, &mut schedule).unwrap(), Some((Kind::DirectorySupported(Some(id)), _)) if id == native_id)
+        );
+        assert_eq!(
+            db.transfer_info(&native_id).unwrap().unwrap()["state"],
+            "pending"
+        );
+        schedule.send_permit = Some(inbox_id.clone());
+        assert!(
+            matches!(next_transfer(&db, &peer, &mut schedule).unwrap(), Some((Kind::DirectorySupported(Some(id)), _)) if id == native_id)
+        );
+        schedule.send_permit = Some(native_id.clone());
+        assert!(
+            matches!(next_transfer(&db, &peer, &mut schedule).unwrap(), Some((Kind::Send(id), _)) if id == native_id)
+        );
+        assert!(schedule.send_permit.is_none());
+        assert!(
+            matches!(next_transfer(&db, &peer, &mut schedule).unwrap(), Some((Kind::DirectorySupported(Some(id)), _)) if id == native_id)
+        );
+        // Restart loses all proof. A confirmed legacy peer explicitly rejects
+        // native work, then dispatches supported work in the same scheduling pass.
+        let mut restarted = Schedule::default();
+        assert!(
+            matches!(next_transfer(&db, &peer, &mut restarted).unwrap(), Some((Kind::DirectorySupported(Some(id)), _)) if id == native_id)
+        );
+        restarted.legacy = true;
+        assert!(
+            matches!(next_transfer(&db, &peer, &mut restarted).unwrap(), Some((Kind::Send(id), _)) if id == inbox_id)
+        );
+        let info = db.transfer_info(&native_id).unwrap().unwrap();
+        assert_eq!(info["state"], "rejected");
+        assert!(
+            info["detail"]
+                .as_str()
+                .unwrap()
+                .contains("does not support OpenCode")
+        );
+    }
 
     #[test]
     fn authenticated_live_direct_routes_outlast_discovery_but_never_trust_stale_or_mismatched_paths()

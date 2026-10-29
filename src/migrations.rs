@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -132,6 +132,33 @@ INSERT INTO session_metadata SELECT 'codex',session,display_name FROM native_cod
 DROP TABLE native_claude;
 DROP TABLE native_codex;")?;
         tx.pragma_update(None, "user_version", 11)?;
+    }
+    if version < 12 {
+        // SQLite cannot extend a CHECK constraint in place. Preserve every grant
+        // and any explicit indexes/triggers while rebuilding the constrained table.
+        let auxiliary = {
+            let mut statement = tx.prepare(
+                "SELECT sql FROM sqlite_schema WHERE tbl_name='peer_grants' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute_batch(
+            "CREATE TABLE peer_grants_v12(
+ peer_id TEXT NOT NULL REFERENCES peers(peer_id) ON DELETE CASCADE,
+ provider TEXT NOT NULL CHECK(provider IN ('claude','codex','inbox','opencode')),
+ session TEXT NOT NULL,
+ permission TEXT NOT NULL CHECK(permission IN ('discover','send','receive')),
+ PRIMARY KEY(peer_id,provider,session,permission));
+INSERT INTO peer_grants_v12 SELECT peer_id,provider,session,permission FROM peer_grants;
+DROP TABLE peer_grants;
+ALTER TABLE peer_grants_v12 RENAME TO peer_grants;",
+        )?;
+        for sql in auxiliary {
+            tx.execute_batch(&sql)?;
+        }
+        tx.pragma_update(None, "user_version", 12)?;
     }
     tx.commit()?;
     Ok(())

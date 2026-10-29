@@ -363,6 +363,10 @@ async fn peer_without_machine_metadata_still_accepts_v1_message_transfers() {
                         retryable: false,
                     }
                 }
+                Operation::DirectorySupported { .. } => WireResponse::Rejected {
+                    reason: "unsupported provider negotiation".into(),
+                    retryable: false,
+                },
                 Operation::Directory => WireResponse::Directory {
                     agents: vec![RemoteAgent {
                         name: "user".into(),

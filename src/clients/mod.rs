@@ -144,17 +144,18 @@ pub fn validate_session(provider: &Provider, session: &str) -> Result<()> {
 /// Retain their stricter wire boundary and original error context.
 pub fn validate_remote_session(provider: &Provider, session: &str) -> Result<()> {
     ensure!(
-        *provider != Provider::OpenCode,
-        "OpenCode sessions are local-only; remote support is not implemented"
-    );
-    ensure!(
         !session.is_empty() && session.len() <= 200 && !session.chars().any(char::is_control),
         "Invalid remote session"
     );
     if let Some(adapter) = Adapter::for_provider(provider) {
         adapter
             .validate_session(session)
-            .context("Native remote session must be a UUID")?;
+            .with_context(|| match provider {
+                Provider::OpenCode => {
+                    "Native remote OpenCode session must use ses_ plus 26 ASCII letters/digits"
+                }
+                _ => "Native remote session must be a UUID",
+            })?;
     }
     Ok(())
 }

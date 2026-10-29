@@ -247,7 +247,7 @@ async fn live_registration_titles_disposal_and_endpoint_conflicts_use_shared_reg
 }
 
 #[test]
-fn native_identity_and_local_only_boundary_are_provider_specific() {
+fn native_identity_and_remote_boundary_are_provider_specific() {
     assert_eq!("opencode".parse::<Provider>().unwrap(), Provider::OpenCode);
     assert_eq!(
         serde_json::to_value(Provider::OpenCode).unwrap(),
@@ -257,7 +257,10 @@ fn native_identity_and_local_only_boundary_are_provider_specific() {
     for value in ["", ID, "ses_../escape", "ses_0123456789abcdefghijklmno\n"] {
         assert!(clients::validate_session(&Provider::OpenCode, value).is_err());
     }
-    assert!(clients::validate_remote_session(&Provider::OpenCode, SESSION).is_err());
+    clients::validate_remote_session(&Provider::OpenCode, SESSION).unwrap();
+    for value in ["", ID, "ses_../escape", "ses_0123456789abcdefghijklmno\n"] {
+        assert!(clients::validate_remote_session(&Provider::OpenCode, value).is_err());
+    }
 }
 
 #[tokio::test]
