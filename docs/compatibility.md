@@ -14,7 +14,10 @@ Use Rust 1.98.0, Bun 1.3.11, Python 3.11+, and `websockets==15.0.1` in your own
 environment. The runner does not install tools. Native pins are OpenCode 1.18.35
 (V1 SDK/plugin 1.18.35), Claude Code 2.1.300, and the standalone Codex 0.165.0
 artifact with its experimental private Unix WebSocket queue API. Similarly named
-Codex builds without that API are not qualified by this run.
+Codex builds without that API are not qualified by this run. These are measured
+fixture pins, not production routing gates. Active delivery uses runtime
+[capabilities and protocol validation](codex-delivery.md), with
+[newer-runtime evidence](codex-capability-delivery-regression.md) recorded separately.
 
 From a clean checkout of the revision being qualified:
 

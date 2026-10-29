@@ -72,7 +72,7 @@ async fn rpc(socket: &mut Socket, id: u64, method: &str, params: Value) -> Resul
     }
     bail!("Native notification budget exceeded")
 }
-async fn prepare(path: &Path, home: &Path, session: &str) -> Result<(Socket, bool)> {
+async fn prepare(path: &Path, home: &Path, session: &str) -> Result<Socket> {
     crate::delivery::validate_socket(path)?;
     let stream = UnixStream::connect(path).await?;
     crate::delivery::validate_peer(&stream, unsafe { libc::geteuid() })?;
@@ -110,12 +110,7 @@ async fn prepare(path: &Path, home: &Path, session: &str) -> Result<(Socket, boo
             .context("Invalid loaded-session response")?;
         ensure!(data.len() <= 100, "Native session page exceeded budget");
         if data.iter().any(|v| v.as_str() == Some(session)) {
-            let pinned = initialized["userAgent"]
-                .as_str()
-                .and_then(|agent| agent.split_whitespace().next())
-                .and_then(|token| token.split_once('/'))
-                .is_some_and(|(prefix, version)| !prefix.is_empty() && version == "0.165.0");
-            return Ok((socket, pinned));
+            return Ok(socket);
         }
         cursor = loaded["nextCursor"].as_str().map(str::to_string);
         let Some(next) = &cursor else {
@@ -155,9 +150,9 @@ async fn deliver_at_tracking(
             break;
         }
     }
-    let Some((mut socket, pinned)) = socket else {
+    let Some(mut socket) = socket else {
         return Outcome::failed(
-            "No compatible private native daemon has the loaded destination session; check Codex home/version. Insecure command-line fallback is disabled.",
+            "No compatible private native daemon has the loaded destination session; check Codex home/protocol. Insecure command-line fallback is disabled.",
         );
     };
     // Reads cannot insert input. A stale/malformed selection fails before any write.
@@ -172,7 +167,7 @@ async fn deliver_at_tracking(
             Some(Value::Bool(value)) => *value,
             _ => bail!("Invalid native direct-input capability"),
         };
-        if status == "active" && capability && pinned {
+        if status == "active" && capability {
             let turns = rpc(&mut socket, 31, "thread/turns/list", json!({"threadId":msg.recipient_session,"limit":1,"sortDirection":"desc","itemsView":"summary"})).await?;
             let data = turns["data"].as_array().context("Invalid native turn page")?;
             ensure!(data.len() == 1 && data[0]["status"] == "inProgress", "Native active turn changed before submission; explicitly retry");
@@ -187,7 +182,7 @@ async fn deliver_at_tracking(
         Ok(turn) => turn,
         Err(_) => {
             return Outcome::failed(
-                "Native metadata/version or active turn could not be verified; no input was submitted. Check compatibility and explicitly retry",
+                "Native protocol metadata or active turn could not be verified; no input was submitted. Check compatibility and explicitly retry",
             );
         }
     };
@@ -231,7 +226,6 @@ async fn deliver_at_tracking(
         }
         Err(error)
             if turn.is_none()
-                && pinned
                 && error
                     .downcast_ref::<Rejection>()
                     .is_some_and(|error| error.queue_full) =>
@@ -351,7 +345,31 @@ mod tests {
                 }
                 let result = match method {
                     "initialize" => {
-                        json!({"userAgent":if mode.contains("unknown-version") {"agent_bridge_queue/0.166.0"} else if mode.contains("spoof-version") {"agent_bridge_queue/0.165.0.evil"} else if mode.contains("prefix-empty") {"/0.165.0"} else if mode.contains("prefix-malformed") {"other/extra/0.165.0"} else if mode.contains("prefix-other") {"first_observer/0.165.0"} else {"agent_bridge_queue/0.165.0 test"},"codexHome":if mode=="wrong-home" {"/".into()}else{expected_home.to_string_lossy().to_string()}})
+                        let version = if mode.contains("v166") {
+                            "0.166.0"
+                        } else {
+                            "0.165.0"
+                        };
+                        let user_agent = if mode.contains("unknown-version") {
+                            "agent_bridge_queue/0.167.0".to_owned()
+                        } else if mode.contains("spoof-version") {
+                            format!("agent_bridge_queue/{version}.evil")
+                        } else if mode.contains("prefix-empty") {
+                            format!("/{version}")
+                        } else if mode.contains("prefix-malformed") {
+                            format!("other/extra/{version}")
+                        } else if mode.contains("prefix-other") {
+                            format!("first_observer/{version}")
+                        } else {
+                            format!("agent_bridge_queue/{version} test")
+                        };
+                        let mut result = json!({"userAgent":user_agent,"codexHome":if mode=="wrong-home" {"/".into()}else{expected_home.to_string_lossy().to_string()}});
+                        if mode.contains("agent-missing") {
+                            result.as_object_mut().unwrap().remove("userAgent");
+                        } else if mode.contains("agent-object") {
+                            result["userAgent"] = json!({"version":"diagnostic only"});
+                        }
+                        result
                     }
                     "thread/loaded/list" => {
                         let page = requests
@@ -380,11 +398,11 @@ mod tests {
                             ));
                             break;
                         }
-                        if mode == "read-unsupported" {
+                        if mode.starts_with("read-unsupported") {
                             socket.send(WsMessage::Text(json!({"id":value["id"],"error":{"code":-32601,"message":"secret unsupported"}}).to_string().into())).await.unwrap();
                             break;
                         }
-                        let mut thread = json!({"id":if mode=="wrong-thread" {"other"} else {"123e4567-e89b-12d3-a456-426614174000"},"status":{"type":if mode=="unknown-status" {"mystery"} else if mode.starts_with("active") {"active"} else {"idle"}},"canAcceptDirectInput":!mode.contains("cap-false")});
+                        let mut thread = json!({"id":if mode.starts_with("wrong-thread") {"other"} else {"123e4567-e89b-12d3-a456-426614174000"},"status":{"type":if mode.starts_with("unknown-status") {"mystery"} else if mode.starts_with("active") {"active"} else {"idle"}},"canAcceptDirectInput":!mode.contains("cap-false")});
                         if mode.contains("cap-missing") {
                             thread
                                 .as_object_mut()
@@ -610,13 +628,26 @@ mod tests {
     async fn active_capability_selects_exactly_one_write_and_preserves_text() {
         for (mode, expected) in [
             ("active", "turn/steer"),
+            ("active-v166", "turn/steer"),
+            ("active-agent-missing", "turn/steer"),
+            ("active-agent-object", "turn/steer"),
+            ("idle-unknown-version", "thread/queue/add"),
+            ("active-unknown-version-cap-false", "thread/queue/add"),
+            ("active-unknown-version-cap-missing", "thread/queue/add"),
+            ("idle-v166", "thread/queue/add"),
+            ("active-v166-cap-false", "thread/queue/add"),
+            ("active-v166-cap-missing", "thread/queue/add"),
+            ("active-v166-spoof-version", "turn/steer"),
+            ("active-v166-prefix-other", "turn/steer"),
+            ("active-v166-prefix-empty", "turn/steer"),
+            ("active-v166-prefix-malformed", "turn/steer"),
             ("active-cap-false", "thread/queue/add"),
             ("active-cap-missing", "thread/queue/add"),
-            ("active-unknown-version", "thread/queue/add"),
-            ("active-spoof-version", "thread/queue/add"),
+            ("active-unknown-version", "turn/steer"),
+            ("active-spoof-version", "turn/steer"),
             ("active-prefix-other", "turn/steer"),
-            ("active-prefix-empty", "thread/queue/add"),
-            ("active-prefix-malformed", "thread/queue/add"),
+            ("active-prefix-empty", "turn/steer"),
+            ("active-prefix-malformed", "turn/steer"),
         ] {
             let (_root, path, home, task, _ready) = fixture(mode).await;
             let msg = message();
@@ -659,6 +690,16 @@ mod tests {
             "wrong-thread",
             "unknown-status",
             "active-cap-malformed",
+            "active-v166-cap-malformed",
+            "active-v166-stale-turn",
+            "active-v166-no-turn",
+            "active-v166-many-turns",
+            "active-unknown-version-cap-malformed",
+            "active-unknown-version-stale-turn",
+            "active-unknown-version-many-turns",
+            "unknown-status-unknown-version",
+            "wrong-thread-unknown-version",
+            "read-unsupported-unknown-version",
             "active-stale-turn",
             "active-no-turn",
             "active-many-turns",
@@ -685,6 +726,11 @@ mod tests {
     async fn attempted_steer_never_falls_back_and_ambiguous_protocol_stays_uncertain() {
         for mode in [
             "active-lost-response",
+            "active-v166-lost-response",
+            "active-v166-reject",
+            "active-v166-wrong-turn",
+            "active-v166-wrong-rpc-id",
+            "active-v166-collision",
             "active-reject",
             "active-wrong-turn",
             "active-wrong-rpc-id",
@@ -692,7 +738,6 @@ mod tests {
             "active-overflow",
             "active-large-frame",
             "contradictory",
-            "queue-full-unknown-version",
             "queue-full-other-code",
             "queue-full-error-data",
         ] {
@@ -714,9 +759,12 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn pinned_exact_queue_capacity_rejection_is_definite_and_notifications_are_bounded() {
+    async fn exact_queue_capacity_error_semantics_are_definite_and_notifications_are_bounded() {
         for (mode, state) in [
             ("queue-full", "failed"),
+            ("queue-full-v166", "failed"),
+            ("queue-full-unknown-version", "failed"),
+            ("active-v166-notifications-ok", "submitted"),
             ("active-notifications-ok", "submitted"),
         ] {
             let (_root, path, home, task, _ready) = fixture(mode).await;

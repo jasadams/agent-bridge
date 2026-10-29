@@ -3,6 +3,7 @@
 import os
 import asyncio
 import errno
+import importlib.util
 from pathlib import Path
 import sys
 import subprocess
@@ -15,8 +16,60 @@ from unittest.mock import Mock, patch
 
 from qualification_native import Fixture, Processes, Qualification, private_env
 
+probe_spec = importlib.util.spec_from_file_location("codex_native_probe", Path(__file__).with_name("codex-native-delivery.py"))
+codex_probe = importlib.util.module_from_spec(probe_spec)
+probe_spec.loader.exec_module(codex_probe)
+
 
 class Isolation(unittest.TestCase):
+    def test_codex_probe_exit_observation_does_not_reap_owned_leader(self):
+        probe = codex_probe.Probe.__new__(codex_probe.Probe)
+        child = Mock(pid=12345)
+        probe.children = [("native", child)]
+        # Mock the Linux-only observation API so this safety contract is checked
+        # on every CI platform without starting a native runtime.
+        native_os = Mock(P_PID=1, WEXITED=2, WNOWAIT=4, WNOHANG=8)
+        native_os.waitid.return_value = object()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(codex_probe, "os", native_os):
+                with self.assertRaisesRegex(AssertionError, "child exited"):
+                    asyncio.run(probe.wait_path(Path(directory) / "missing.sock"))
+        native_os.waitid.assert_called_once_with(1, child.pid, 2 | 4 | 8)
+        child.poll.assert_not_called()
+        child.wait.assert_not_called()
+
+    def test_codex_probe_provider_start_failure_closes_without_shutdown(self):
+        probe = codex_probe.Probe.__new__(codex_probe.Probe)
+        server, worker = Mock(), Mock()
+        worker.start.side_effect = RuntimeError("injected thread startup failure")
+        with patch.object(codex_probe.http.server, "ThreadingHTTPServer", return_value=server), patch.object(codex_probe.threading, "Thread", return_value=worker):
+            with self.assertRaisesRegex(RuntimeError, "injected thread startup failure"):
+                probe.fixture()
+        server.server_close.assert_called_once()
+        server.shutdown.assert_not_called()
+        self.assertIsNone(probe.server)
+        self.assertIsNone(probe.worker)
+
+    def test_codex_probe_cleanup_attempts_all_stages_and_records_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            probe = codex_probe.Probe.__new__(codex_probe.Probe)
+            probe.root, probe.current, probe.children, probe.events, probe.cases = Path(directory), None, [], [], []
+            probe.processes = Mock(cleanup_errors=["injected process cleanup failure"])
+            probe.processes.close.return_value = {}
+            probe.server = Mock()
+            probe.server.shutdown.side_effect = RuntimeError("injected provider failure")
+            probe.worker = Mock()
+            probe.worker.is_alive.return_value = False
+            probe.socket_identity = None
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                probe.cleanup()
+            probe.server.server_close.assert_called_once()
+            probe.worker.join.assert_called_once_with(timeout=5)
+            import json
+            results = json.loads((probe.root / "results.json").read_text())
+            self.assertEqual(len(results["cleanup_errors"]), 2)
+            self.assertIn("injected process cleanup failure", results["cleanup_errors"])
+
     def test_darwin_zombie_only_group_permission_error_still_reaps_leader(self):
         processes = Processes(Path("/unused"))
         child = Mock(pid=12345, returncode=None)
