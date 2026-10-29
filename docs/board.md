@@ -106,6 +106,32 @@ return mouse selection to the terminal and use its normal copy command. Many
 terminals also provide Shift-drag to bypass application mouse handling; that
 shortcut depends on the terminal.
 
+## Links
+
+Write links as `[label](https://example.com)`. HTTP and HTTPS links display only
+their styled label and use OSC 8 terminal hyperlinks. The link's source must fit
+on one line, and its label cannot contain another link or image. Other links,
+schemes, non-ASCII URLs and URLs longer than 2048 bytes retain the `label (url)`
+display.
+Terminals without OSC 8 support show just the label for hyperlinks. Set
+`NO_TERM_HYPERLINKS=1` for one invocation to disable generated links; `TERM=dumb`
+also disables them. Use `agent-bridge board NAME --raw` to inspect or copy exact
+Markdown and destinations. Rendering never opens a browser or fetches resources.
+
+Targets are deduplicated and limited to 1,024 distinct destinations. At most
+16,384 source label graphemes and 16,384 visible link cells are attributed.
+Exceeding a source budget restores the original `label (url)` rendering for the
+whole document; exceeding the visible-cell or conservative 512 KiB encoded-output
+budget keeps the frame plain and shows a status hint. A board containing raw
+terminal controls is sanitized with generated hyperlinks disabled. Raw Markdown
+and existing Links sections remain unchanged.
+The label can differ from its destination, so check the URL your terminal shows
+on hover before opening an unexpected link.
+
+Cmd/Ctrl-click requires the terminal to handle the mouse. If board selection
+captures it, press `m` outside the text editor to hand the mouse back to the
+terminal. The click shortcut depends on your terminal.
+
 ## Answer questions in the terminal
 
 Agents can put standard task checkboxes and marked text fields anywhere in the
@@ -204,6 +230,7 @@ For example, the user can instruct their agents:
 > containing its current task, status, and any blocker or action needed from me.
 > Keep the row short; leave detailed progress in your native session. Update your
 > own row when work changes. Preserve other agents' rows and notes.
+> Write links as `[label](url)`.
 > Read the latest board first, and retry conflicts against the returned revision.
 
 Those columns are a user convention, not an application schema. The same tools

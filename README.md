@@ -11,6 +11,8 @@ checkboxes and text responses, or inspect message delivery in the browser monito
 Run it on Linux or macOS with a single binary. You control which machines are
 paired and which individual sessions can communicate.
 
+Write board links as `[label](https://example.com)` to keep ticket and PR labels compact and clickable in compatible terminals.
+
 ## What you can do
 
 - **Coordinate agents across machines.** Automatic LAN discovery, NAT traversal

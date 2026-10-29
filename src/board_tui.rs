@@ -14,15 +14,19 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use pulldown_cmark::{
+    CodeBlockKind, Event as MarkdownEvent, Options as MarkdownOptions, Parser, Tag, TagEnd,
+};
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Layout, Position},
     style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Wrap},
 };
 use std::{
-    borrow::Cow,
+    collections::{HashMap, HashSet},
     io::IsTerminal,
     path::{Path, PathBuf},
     time::Duration,
@@ -33,10 +37,182 @@ const FALLBACK_REFRESH: Duration = Duration::from_secs(1);
 // Tables with many sparse cells can expand far beyond their Markdown input.
 // Leave such documents readable as plain Markdown instead of allocating a huge grid.
 const MAX_TABLE_CELLS: usize = 20_000;
+#[cfg(test)]
+const MAX_LINK_URL_BYTES: usize = crate::board_links::MAX_URI_BYTES;
+
+struct LinkGlyph {
+    text: String,
+    style: Style,
+    link: usize,
+}
+
+fn link_color(index: usize) -> Color {
+    let id = index + 1;
+    Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8)
+}
+
+// Replace link labels with non-Markdown glyphs of identical display width. This
+// lets tui-markdown size and split tables without ever seeing the destinations.
+fn markdown_links(safe: &str) -> (String, HashMap<char, LinkGlyph>, Vec<String>) {
+    let options = MarkdownOptions::ENABLE_TABLES
+        | MarkdownOptions::ENABLE_FOOTNOTES
+        | MarkdownOptions::ENABLE_STRIKETHROUGH
+        | MarkdownOptions::ENABLE_TASKLISTS
+        | MarkdownOptions::ENABLE_HEADING_ATTRIBUTES
+        | MarkdownOptions::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | MarkdownOptions::ENABLE_MATH
+        | MarkdownOptions::ENABLE_GFM
+        | MarkdownOptions::ENABLE_DEFINITION_LIST
+        | MarkdownOptions::ENABLE_SUPERSCRIPT
+        | MarkdownOptions::ENABLE_SUBSCRIPT;
+    let references = Parser::new_ext(safe, options);
+    let definitions = references.reference_definitions();
+    let parser = Parser::new_ext(safe, options);
+    let events: Vec<_> = parser.into_offset_iter().collect();
+    let mut used: HashSet<_> = safe.chars().collect();
+    for (event, _) in &events {
+        match event {
+            MarkdownEvent::Text(text)
+            | MarkdownEvent::Code(text)
+            | MarkdownEvent::InlineHtml(text)
+            | MarkdownEvent::Html(text)
+            | MarkdownEvent::InlineMath(text)
+            | MarkdownEvent::DisplayMath(text)
+            | MarkdownEvent::Start(Tag::CodeBlock(CodeBlockKind::Fenced(text)))
+            | MarkdownEvent::Start(Tag::Link { dest_url: text, .. })
+            | MarkdownEvent::Start(Tag::Image { dest_url: text, .. }) => used.extend(text.chars()),
+            _ => (),
+        }
+    }
+    let mut events = events.into_iter();
+    let mut source = String::new();
+    let mut copied = 0;
+    let mut glyphs = HashMap::new();
+    let mut urls = Vec::new();
+    let mut target_ids = HashMap::new();
+    let mut narrow = 0xf0000;
+    let mut wide = 0x20000;
+    let mut table_cell = false;
+    while let Some((event, range)) = events.next() {
+        match event {
+            MarkdownEvent::Start(Tag::TableCell) => {
+                table_cell = true;
+                continue;
+            }
+            MarkdownEvent::End(TagEnd::TableCell) => {
+                table_cell = false;
+                continue;
+            }
+            _ => (),
+        }
+        let MarkdownEvent::Start(Tag::Link { dest_url, id, .. }) = event else {
+            continue;
+        };
+        let link_source = &safe[range.clone()];
+        let mut eligible =
+            !link_source.contains('\n') && !(table_cell && link_source.contains("\\|"));
+        let mut depth = 1;
+        for (event, _) in events.by_ref() {
+            match event {
+                MarkdownEvent::Start(Tag::Link { .. }) => {
+                    depth += 1;
+                    eligible = false;
+                }
+                MarkdownEvent::Start(Tag::Image { .. }) => eligible = false,
+                MarkdownEvent::End(TagEnd::Link) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => (),
+            }
+        }
+        if !eligible || !crate::board_links::valid_target(&dest_url) {
+            continue;
+        }
+        let mut snippet = safe[range.clone()].to_owned();
+        if let Some(definition) = definitions.get(&id) {
+            snippet.push_str("\n\n");
+            snippet.push_str(&safe[definition.span.clone()]);
+        }
+        let mut label = tui_markdown::from_str(&snippet);
+        let [line] = label.lines.as_mut_slice() else {
+            continue;
+        };
+        let label_len = match line.spans.as_slice() {
+            [body @ .., open, destination, close]
+                if open.content == " ("
+                    && destination.content == dest_url.as_ref()
+                    && close.content == ")" =>
+            {
+                body.len()
+            }
+            _ => continue,
+        };
+        line.spans.truncate(label_len);
+        if !line
+            .spans
+            .iter()
+            .any(|span| Span::raw(safe_line(&span.content)).width() > 0)
+        {
+            continue;
+        }
+        source.push_str(&safe[copied..range.start]);
+        let link = if let Some(&link) = target_ids.get(dest_url.as_ref()) {
+            link
+        } else {
+            if urls.len() == crate::board_links::MAX_LINKS {
+                return (safe.to_owned(), HashMap::new(), Vec::new());
+            }
+            let link = urls.len();
+            target_ids.insert(dest_url.to_string(), link);
+            urls.push(dest_url.into_string());
+            link
+        };
+        for span in label.lines.iter().flat_map(|line| &line.spans) {
+            let clean = Span::styled(safe_line(&span.content), span.style);
+            for glyph in clean.styled_graphemes(Style::default()) {
+                let width = Span::raw(glyph.symbol).width();
+                if width == 0 {
+                    continue;
+                }
+                if glyphs.len() == crate::board_links::MAX_LINK_CELLS {
+                    return (safe.to_owned(), HashMap::new(), Vec::new());
+                }
+                let next = if width == 1 { &mut narrow } else { &mut wide };
+                // Labels without nested images cannot expand beyond the board's
+                // source size, leaving enough unused scalars in each range.
+                let marker = loop {
+                    let marker = char::from_u32(*next).unwrap();
+                    *next += 1;
+                    if !used.contains(&marker) {
+                        break marker;
+                    }
+                };
+                glyphs.insert(
+                    marker,
+                    LinkGlyph {
+                        text: glyph.symbol.to_owned(),
+                        style: glyph.style,
+                        link,
+                    },
+                );
+                // Entity punctuation preserves the surrounding Markdown's
+                // delimiter context and keeps label spaces out of block syntax.
+                source.push_str(&format!("&#{};", u32::from(marker)));
+            }
+        }
+        copied = range.end;
+    }
+    source.push_str(&safe[copied..]);
+    (source, glyphs, urls)
+}
 
 struct TerminalRestore;
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
+        crate::board_links::close_output();
         let _ = crossterm::execute!(
             std::io::stdout(),
             DisableBracketedPaste,
@@ -78,7 +254,10 @@ fn safe_line(input: &str) -> String {
         .collect()
 }
 
-fn rendered_markdown(markdown: &str, width: u16) -> (Text<'static>, bool) {
+fn rendered_markdown(
+    markdown: &str,
+    width: u16,
+) -> (Text<'static>, bool, Text<'static>, Vec<String>) {
     let safe = safe_markdown(markdown);
     let lines = safe.lines().count();
     let columns = safe
@@ -87,37 +266,81 @@ fn rendered_markdown(markdown: &str, width: u16) -> (Text<'static>, bool) {
         .max()
         .unwrap_or(0);
     let plain = columns.saturating_mul(lines) > MAX_TABLE_CELLS;
+    let (source, glyphs, urls) = if plain {
+        (safe.clone(), HashMap::new(), Vec::new())
+    } else {
+        markdown_links(&safe)
+    };
     let rendered = if plain {
         Text::from(safe.as_str())
     } else {
         let options = tui_markdown::Options::default()
             .table_width(width)
             .table_row_dividers(true);
-        tui_markdown::from_str_with_options(&safe, &options)
+        tui_markdown::from_str_with_options(&source, &options)
     };
     // Entity decoding can introduce controls that were absent from the source,
     // e.g. &#x1b;. Sanitize every final span, not just the Markdown input.
+    let mut mask = Text::default();
     let owned = Text {
         alignment: rendered.alignment,
         style: rendered.style,
         lines: rendered
             .lines
             .into_iter()
-            .map(|line| Line {
-                alignment: line.alignment,
-                style: line.style,
-                spans: line
-                    .spans
-                    .into_iter()
-                    .map(|span| Span {
-                        style: span.style,
-                        content: Cow::Owned(safe_line(&span.content)),
-                    })
-                    .collect(),
+            .map(|line| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let mut ids: Vec<Span<'static>> = Vec::new();
+                for span in line.spans {
+                    let clean = safe_line(&span.content);
+                    let clean = Span::raw(clean);
+                    let chars: Vec<_> = clean.styled_graphemes(Style::default()).collect();
+                    for ch in &chars {
+                        let (text, style, link) = if let Some(glyph) =
+                            ch.symbol.chars().next().and_then(|ch| glyphs.get(&ch))
+                        {
+                            (
+                                glyph.text.clone(),
+                                glyph.style.patch(span.style),
+                                Some(glyph.link),
+                            )
+                        } else {
+                            (ch.symbol.to_owned(), span.style, None)
+                        };
+                        let id_style = Style::default().fg(link.map_or(Color::Reset, link_color));
+                        if spans.last().is_some_and(|last| last.style == style)
+                            && ids.last().is_some_and(|last| last.style == id_style)
+                        {
+                            spans.last_mut().unwrap().content.to_mut().push_str(&text);
+                            ids.last_mut().unwrap().content.to_mut().push_str(&text);
+                        } else {
+                            ids.push(Span::styled(text.clone(), id_style));
+                            spans.push(Span::styled(text, style));
+                        }
+                    }
+                }
+                mask.lines.push(Line {
+                    alignment: line.alignment,
+                    spans: ids,
+                    ..Line::default()
+                });
+                Line {
+                    alignment: line.alignment,
+                    style: line.style,
+                    spans,
+                }
             })
             .collect(),
     };
-    (owned, plain)
+    let urls = if markdown
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    {
+        Vec::new()
+    } else {
+        urls
+    };
+    (owned, plain, mask, urls)
 }
 
 #[derive(Clone)]
@@ -230,6 +453,9 @@ struct View {
     snapshot: Option<Snapshot>,
     error: Option<String>,
     rendered: Text<'static>,
+    link_mask: Text<'static>,
+    link_urls: Vec<String>,
+    hyperlinks_enabled: bool,
     width: u16,
     scroll: (u16, u16),
     max_scroll: (u16, u16),
@@ -256,6 +482,9 @@ impl Default for View {
             snapshot: None,
             error: None,
             rendered: Text::default(),
+            link_mask: Text::default(),
+            link_urls: Vec::new(),
+            hyperlinks_enabled: true,
             width: 0,
             scroll: (0, 0),
             max_scroll: (0, 0),
@@ -286,11 +515,13 @@ impl View {
         let generation = self.generation.wrapping_add(1);
         let update_notice = self.update_notice.take();
         let mouse_enabled = self.mouse_enabled;
+        let hyperlinks_enabled = self.hyperlinks_enabled;
         *self = Self {
             board,
             generation,
             update_notice,
             mouse_enabled,
+            hyperlinks_enabled,
             ..Self::default()
         };
         true
@@ -359,6 +590,7 @@ impl View {
         }
     }
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        let mut links_limited = false;
         let response_height = if self.editor.is_some() {
             9
         } else if self.controls.is_empty() {
@@ -436,7 +668,8 @@ impl View {
                 .as_ref()
                 .map(|snapshot| snapshot.markdown.as_str())
                 .unwrap_or("");
-            (self.rendered, self.plain) = rendered_markdown(markdown, inner.width);
+            (self.rendered, self.plain, self.link_mask, self.link_urls) =
+                rendered_markdown(markdown, inner.width);
             self.width = inner.width;
         }
         let content_height = self.paragraph().line_count(inner.width);
@@ -466,9 +699,24 @@ impl View {
             self.notice = Some("Text selection cancelled because the board layout changed.".into());
         }
         if let Some(selection) = &self.selection {
-            selection.paint(frame.buffer_mut());
+            links_limited = !selection.paint(frame.buffer_mut());
         } else {
             self.viewport = Viewport::capture(frame.buffer_mut(), inner);
+            if !self.link_urls.is_empty() && self.hyperlinks_enabled {
+                let mut mask = Buffer::empty(inner);
+                let paragraph = Paragraph::new(self.link_mask.clone());
+                let paragraph = if self.wrap {
+                    paragraph.wrap(Wrap { trim: false })
+                } else {
+                    paragraph
+                };
+                ratatui::widgets::Widget::render(paragraph.scroll(self.scroll), inner, &mut mask);
+                let links = crate::board_links::Hyperlinks::new(&mask, &self.link_urls);
+                if let Some(viewport) = &mut self.viewport {
+                    viewport.set_links(links.clone());
+                }
+                links_limited = !links.paint(frame.buffer_mut());
+            }
         }
         if let Some(editor) = &self.editor {
             let title = format!(
@@ -554,6 +802,8 @@ impl View {
             safe_line(notice)
         } else if self.snapshot.is_none() {
             "Connecting to the local broker…".into()
+        } else if links_limited {
+            "Hyperlink output limit reached · use --raw to inspect destinations".into()
         } else if self.plain {
             "Complex table shown as plain Markdown".into()
         } else if self
@@ -977,6 +1227,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
     fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut view = View {
         board,
+        hyperlinks_enabled: crate::board_links::enabled(),
         ..View::default()
     };
     view.update(Ok(initial));
@@ -1399,9 +1650,575 @@ mod tests {
         assert!(text.contains('地'));
         assert!(text.contains('│'));
     }
+
+    fn hyperlink_segments(buffer: &Buffer) -> Vec<(Position, String, String)> {
+        let mut links = Vec::new();
+        for y in buffer.area.top()..buffer.area.bottom() {
+            for x in buffer.area.left()..buffer.area.right() {
+                if let Some(link) = buffer[(x, y)].symbol().strip_prefix("\x1b]8;;") {
+                    let (url, label) = link.split_once("\x1b\\").unwrap();
+                    let label = label.strip_suffix("\x1b]8;;\x1b\\").unwrap();
+                    assert!(!url.chars().any(char::is_control));
+                    assert!(!label.chars().any(char::is_control));
+                    links.push((Position::new(x, y), url.to_owned(), label.to_owned()));
+                }
+            }
+        }
+        links
+    }
+
+    #[test]
+    fn paragraph_and_table_links_use_label_width_and_osc8_buffer_cells() {
+        let url = "https://github.com/immutable/data-platform/pull/714";
+        for markdown in [
+            format!("[dp#714]({url})"),
+            format!("| PR | State |\n|---|---|\n| [dp#714]({url}) | ready |"),
+        ] {
+            let mut view = View::default();
+            view.update(Ok(snapshot(&markdown, "one")));
+            let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
+            let mut drawn = Buffer::default();
+            terminal
+                .draw(|frame| {
+                    view.draw(frame);
+                    drawn = frame.buffer_mut().clone();
+                })
+                .unwrap();
+            let links = hyperlink_segments(&drawn);
+            assert_eq!(links.len(), 1);
+            let (start, target, label) = &links[0];
+            assert_eq!(target, url);
+            assert_eq!(label, "dp#714");
+            assert!(!view.rendered.to_string().contains(url));
+            assert!(view.rendered.width() < 30);
+            assert_eq!(drawn[*start].fg, Color::Blue);
+            assert!(
+                drawn[*start]
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            );
+            assert_eq!(
+                drawn[*start].diff_option,
+                ratatui::buffer::CellDiffOption::ForcedWidth(std::num::NonZeroU16::new(6).unwrap())
+            );
+            for x in start.x + 1..start.x + 6 {
+                assert_eq!(
+                    drawn[(x, start.y)].diff_option,
+                    ratatui::buffer::CellDiffOption::Skip
+                );
+            }
+            assert!(
+                buffer_text(&terminal)
+                    .contains(&format!("\x1b]8;;{url}\x1b\\dp#714\x1b]8;;\x1b\\"))
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_and_overlong_links_keep_the_destination_fallback() {
+        for url in [
+            "file:///tmp/test".to_owned(),
+            "javascript:alert(1)".into(),
+            "mailto:person@example.com".into(),
+            "../relative".into(),
+            format!("https://example.com/{}", "x".repeat(MAX_LINK_URL_BYTES)),
+        ] {
+            let (text, plain, _, urls) = rendered_markdown(&format!("[label]({url})"), 80);
+            assert!(!plain);
+            assert!(urls.is_empty());
+            assert_eq!(text.to_string(), format!("label ({url})"));
+        }
+        let url = format!(
+            "https://example.com/{}",
+            "x".repeat(MAX_LINK_URL_BYTES - 20)
+        );
+        assert_eq!(url.len(), MAX_LINK_URL_BYTES);
+        let (text, _, _, urls) = rendered_markdown(&format!("[label]({url})"), 80);
+        assert_eq!(text.to_string(), "label");
+        assert_eq!(urls, [url]);
+    }
+
+    #[test]
+    fn entity_encoded_controls_in_links_never_escape_into_output() {
+        let markdown = "[bad] (unused) [url](https://example.com/&#x1b;]8;evil&#x7;) [safe&#x1b;label&#7;](https://example.com/safe)";
+        let mut view = View::default();
+        view.update(Ok(snapshot(markdown, "one")));
+        let mut terminal = Terminal::new(TestBackend::new(110, 18)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let links = hyperlink_segments(terminal.backend().buffer());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1, "https://example.com/safe");
+        assert_eq!(links[0].2, "safelabel");
+        for span in view.rendered.lines.iter().flat_map(|line| &line.spans) {
+            assert!(!span.content.chars().any(char::is_control));
+        }
+        assert!(!buffer_text(&terminal).contains('\x07'));
+        assert!(!buffer_text(&terminal).contains("\x1b]8;evil"));
+    }
+
+    #[test]
+    fn wrapped_paragraph_and_table_labels_link_every_segment() {
+        let label = "abcdefghijklmnopqrstuvwx";
+        for markdown in [
+            format!("[{label}](https://example.com)"),
+            format!("| H |\n|---|\n| [{label}](https://example.com) |\n"),
+        ] {
+            let mut view = View::default();
+            view.update(Ok(snapshot(&markdown, "one")));
+            let mut terminal = Terminal::new(TestBackend::new(16, 25)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let links = hyperlink_segments(terminal.backend().buffer());
+            assert!(links.len() >= 2, "{links:?}");
+            assert!(links.iter().all(|(_, url, _)| url == "https://example.com"));
+            assert_eq!(
+                links
+                    .iter()
+                    .map(|(_, _, text)| text.as_str())
+                    .collect::<String>(),
+                label
+            );
+            assert!(links.windows(2).all(|rows| rows[0].0.y < rows[1].0.y));
+        }
+    }
+
+    #[test]
+    fn link_copy_and_partial_highlight_use_the_frozen_visible_label() {
+        let mut view = View::default();
+        view.update(Ok(snapshot("[dp#714](https://example.com)", "one")));
+        let mut terminal = Terminal::new(TestBackend::new(70, 15)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let area = view.viewport.as_ref().unwrap().area();
+        let start = Position::new(area.x + 1, area.y);
+        let end = Position::new(area.x + 4, area.y);
+        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), start));
+        view.mouse(mouse_event(MouseEventKind::Drag(MouseButton::Left), end));
+        view.update(Ok(snapshot("[changed](https://example.org)", "two")));
+        let mut drawn = Buffer::default();
+        terminal
+            .draw(|frame| {
+                view.draw(frame);
+                drawn = frame.buffer_mut().clone();
+            })
+            .unwrap();
+        let links = hyperlink_segments(&drawn);
+        assert_eq!(
+            links
+                .iter()
+                .map(|(_, _, label)| label.as_str())
+                .collect::<String>(),
+            "dp#714"
+        );
+        assert!(links.iter().all(|(_, url, _)| url == "https://example.com"));
+        assert_eq!(drawn[start].bg, Color::Yellow);
+        assert_ne!(drawn[(area.x, area.y)].bg, Color::Yellow);
+        assert_eq!(links[1].2, "p#71");
+        let (_, copied) = view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), end));
+        assert_eq!(copied.as_deref(), Some("p#71"));
+    }
+
+    #[test]
+    fn scrolling_and_panning_keep_link_segments_on_the_visible_label() {
+        let markdown = (0..20)
+            .map(|row| {
+                format!("row{row:02} [abcdefghijklmnopqrstuvwx](https://example.com/{row})  \n")
+            })
+            .collect::<String>();
+        let mut view = View::default();
+        view.update(Ok(snapshot(&markdown, "one")));
+        let mut terminal = Terminal::new(TestBackend::new(18, 13)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        view.scroll.0 = 3;
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let links = hyperlink_segments(terminal.backend().buffer());
+        assert_eq!(links[0].1, "https://example.com/1");
+        assert_eq!(links[0].2, "abcdefghijklmnop");
+        assert_eq!(links[0].0.y, view.viewport.as_ref().unwrap().area().y + 1);
+        view.wrap = false;
+        view.scroll = (2, 10);
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let links = hyperlink_segments(terminal.backend().buffer());
+        assert_eq!(links[0].1, "https://example.com/2");
+        assert_eq!(links[0].2, "efghijklmnopqrst");
+        assert_eq!(links[0].0.x, view.viewport.as_ref().unwrap().area().x);
+    }
+
+    #[test]
+    fn reference_links_styles_and_unicode_survive_table_splitting() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(
+            "| H |\n|---|\n| [**地球** e\u{301} 👩‍💻][PR] |\n\n[pr]: https://example.com",
+            "one",
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(14, 22)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let links = hyperlink_segments(terminal.backend().buffer());
+        let visible = links
+            .iter()
+            .map(|(_, _, text)| text.as_str())
+            .collect::<String>();
+        assert!(visible.contains("地球"), "{links:?}");
+        assert!(visible.contains("e\u{301}"), "{links:?}");
+        assert!(visible.contains("👩‍💻"), "{links:?}");
+        assert!(
+            terminal.backend().buffer()[links[0].0]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn styled_grapheme_boundaries_keep_the_mask_aligned() {
+        let mut view = View::default();
+        view.update(Ok(snapshot("[`👩‍`💻x](https://example.com)", "one")));
+        let mut terminal = Terminal::new(TestBackend::new(20, 15)).unwrap();
+        let mut drawn = Buffer::default();
+        terminal
+            .draw(|frame| {
+                view.draw(frame);
+                drawn = frame.buffer_mut().clone();
+            })
+            .unwrap();
+        let links = hyperlink_segments(&drawn);
+        assert_eq!(
+            links
+                .iter()
+                .map(|(_, _, label)| label.as_str())
+                .collect::<String>(),
+            "👩‍💻x"
+        );
+    }
+
+    #[test]
+    fn multiline_links_fall_back_and_single_line_container_links_are_hyperlinks() {
+        for markdown in [
+            "[a  \nb](https://example.com)",
+            "> [a  \n> b](https://example.com)",
+            "- [a  \n  b](https://example.com)",
+            "[a\nb](https://example.com)",
+            "[a](https://example.com\n \"title\")",
+        ] {
+            let mut view = View::default();
+            view.update(Ok(snapshot(markdown, "one")));
+            let mut terminal = Terminal::new(TestBackend::new(30, 15)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let links = hyperlink_segments(terminal.backend().buffer());
+            assert!(links.is_empty(), "{markdown}: {links:?}");
+            assert!(view.link_urls.is_empty());
+            let expected = tui_markdown::from_str(markdown).to_string();
+            assert!(expected.contains("(https://example.com)"));
+            assert_eq!(view.rendered.to_string(), expected);
+        }
+        for markdown in [
+            "> [label](https://example.com)",
+            "- [label](https://example.com)",
+        ] {
+            let mut view = View::default();
+            view.update(Ok(snapshot(markdown, "one")));
+            let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let links = hyperlink_segments(terminal.backend().buffer());
+            assert_eq!(links.len(), 1, "{markdown}: {links:?}");
+            assert_eq!(links[0].1, "https://example.com");
+            assert_eq!(links[0].2, "label");
+            assert!(!view.rendered.to_string().contains("https://example.com"));
+        }
+    }
+
+    #[test]
+    fn nested_image_labels_fall_back_without_expanding_link_markers() {
+        let markdown = format!(
+            "[start](https://example.com/start)\n\n{}\n\n[finish](https://example.com/finish)\n\n[i]: https://example.com/{}",
+            "[![][i]](https://example.com/outer)\n\n".repeat(20),
+            "x".repeat(2048)
+        );
+        assert!(markdown.len() < MAX_BOARD_BYTES);
+        let (source, glyphs, urls) = markdown_links(&markdown);
+        assert_eq!(glyphs.len(), "startfinish".len());
+        assert!(source.len() <= markdown.len() + 40 * glyphs.len());
+        assert_eq!(
+            urls,
+            ["https://example.com/start", "https://example.com/finish"]
+        );
+        let (text, _, _, urls) = rendered_markdown(&markdown, 80);
+        assert_eq!(
+            urls,
+            ["https://example.com/start", "https://example.com/finish"]
+        );
+        let fallback = markdown
+            .replace("[start](https://example.com/start)", "start")
+            .replace("[finish](https://example.com/finish)", "finish");
+        assert_eq!(
+            text.to_string(),
+            tui_markdown::from_str(&fallback).to_string()
+        );
+        let mut view = View::default();
+        view.update(Ok(snapshot(&markdown, "one")));
+        let mut terminal = Terminal::new(TestBackend::new(80, 15)).unwrap();
+        for expected in ["start", "finish"] {
+            if expected == "finish" {
+                view.scroll.0 = u16::MAX;
+            }
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let links = hyperlink_segments(terminal.backend().buffer());
+            assert_eq!(links.len(), 1, "{links:?}");
+            assert_eq!(links[0].2, expected);
+            assert_eq!(links[0].1, format!("https://example.com/{expected}"));
+        }
+    }
+
+    #[test]
+    fn labels_with_inline_or_reference_images_keep_the_original_rendering() {
+        for markdown in [
+            "[![alt](https://example.com/image)](https://example.com/outer)",
+            "[![alt][image]](https://example.com/outer)\n\n[image]: https://example.com/image",
+        ] {
+            let (source, glyphs, urls) = markdown_links(markdown);
+            assert_eq!(source, markdown);
+            assert!(glyphs.is_empty());
+            assert!(urls.is_empty());
+            let (text, _, _, _) = rendered_markdown(markdown, 80);
+            assert_eq!(
+                text.to_string(),
+                tui_markdown::from_str(markdown).to_string()
+            );
+            assert!(text.to_string().contains("(https://example.com/outer)"));
+        }
+    }
+
+    #[test]
+    fn link_label_spaces_cannot_create_markdown_structure() {
+        for label in ["    x", " a ", " ", "a  b"] {
+            let (text, _, mask, urls) =
+                rendered_markdown(&format!("[{label}](https://example.com)"), 80);
+            assert_eq!(text.to_string(), label);
+            assert_eq!(urls, ["https://example.com"]);
+            assert!(text.lines.iter().flat_map(|line| &line.spans).all(|span| {
+                span.style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            }));
+            assert!(
+                mask.lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| span.style.fg == Some(link_color(0)))
+            );
+        }
+        for markdown in [
+            "outside [ a ](https://example.com) padding",
+            "| H |\n|---|\n| [ a ](https://example.com) |",
+        ] {
+            let (text, _, mask, _) = rendered_markdown(markdown, 80);
+            let owned = mask
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.style.fg == Some(link_color(0)))
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(owned, " a ");
+            assert_eq!(text.to_string(), mask.to_string());
+        }
+    }
+
+    #[test]
+    fn links_preserve_adjacent_emphasis_delimiters() {
+        for markdown in [
+            "_a_[label](https://example.com)",
+            "[label](https://example.com)_a_",
+        ] {
+            let (text, _, _, _) = rendered_markdown(markdown, 80);
+            assert!(!text.to_string().contains('_'));
+            let span = text
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains('a') && !span.content.contains("label"))
+                .unwrap();
+            assert!(
+                span.style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::ITALIC)
+            );
+        }
+    }
+
+    #[test]
+    fn reference_definitions_requiring_container_context_keep_the_fallback() {
+        for markdown in [
+            "[shown][pr]\n\n> [pr]:\n> https://example.com",
+            "[a][r]\n\n> [r]: https://x.example\n> \"title\"",
+        ] {
+            let mut view = View::default();
+            view.update(Ok(snapshot(markdown, "one")));
+            let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            assert!(view.link_urls.is_empty());
+            assert!(hyperlink_segments(terminal.backend().buffer()).is_empty());
+            assert_eq!(
+                view.rendered.to_string(),
+                tui_markdown::from_str(markdown).to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn table_links_with_escaped_pipes_keep_the_original_display_and_copy() {
+        let markdown = "| H |\n|---|\n| [`a\\|b`](https://example.com) |";
+        let mut view = View::default();
+        view.update(Ok(snapshot(markdown, "one")));
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(view.link_urls.is_empty());
+        assert!(hyperlink_segments(terminal.backend().buffer()).is_empty());
+        assert!(view.rendered.to_string().contains("a|b"));
+        assert!(!view.rendered.to_string().contains("a\\|b"));
+        assert!(view.rendered.to_string().contains("(https://example.com)"));
+        let area = view.viewport.as_ref().unwrap().area();
+        let start = Position::new(area.x + 2, area.y + 3);
+        let end = Position::new(start.x + 2, start.y);
+        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), start));
+        view.mouse(mouse_event(MouseEventKind::Drag(MouseButton::Left), end));
+        let (_, copied) = view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), end));
+        assert_eq!(copied.as_deref(), Some("a|b"));
+        let (text, _, _, urls) = rendered_markdown("[`a\\|b`](https://example.com)", 80);
+        assert_eq!(urls, ["https://example.com"]);
+        assert_eq!(text.to_string(), "a\\|b");
+    }
+
+    #[test]
+    fn decoded_fence_info_cannot_alias_a_link_marker() {
+        let markdown = "[x](https://a.example)\n\n```&#983040;\ncode\n```";
+        let mut view = View::default();
+        view.update(Ok(snapshot(markdown, "one")));
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let links = hyperlink_segments(terminal.backend().buffer());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1, "https://a.example");
+        assert_eq!(links[0].2, "x");
+        assert!(view.rendered.to_string().contains("```\u{f0000}"));
+    }
+
+    #[test]
+    fn non_ascii_destinations_keep_the_fallback() {
+        for url in [
+            "https://example.com/地球",
+            "https://é.example",
+            "https://example.com/&#233;",
+        ] {
+            let markdown = format!("[label]({url})");
+            let mut view = View::default();
+            view.update(Ok(snapshot(&markdown, "one")));
+            let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            assert!(view.link_urls.is_empty());
+            assert!(hyperlink_segments(terminal.backend().buffer()).is_empty());
+            assert_eq!(
+                view.rendered.to_string(),
+                tui_markdown::from_str(&markdown).to_string()
+            );
+        }
+        let (text, _, _, urls) = rendered_markdown("[label](https://example.com/%C3%A9)", 80);
+        assert_eq!(text.to_string(), "label");
+        assert_eq!(urls, ["https://example.com/%C3%A9"]);
+    }
+
+    #[test]
+    fn empty_or_sanitized_empty_labels_keep_the_destination_visible() {
+        for markdown in [
+            "before [](https://a.example) after",
+            "before [&#x1b;&#7;](https://a.example) after",
+            "before [\u{200d}](https://a.example) after",
+        ] {
+            let mut view = View::default();
+            view.update(Ok(snapshot(markdown, "one")));
+            let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            assert!(view.link_urls.is_empty());
+            assert!(hyperlink_segments(terminal.backend().buffer()).is_empty());
+            assert!(view.rendered.to_string().contains("(https://a.example)"));
+            assert!(
+                view.rendered
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| !span.content.chars().any(char::is_control))
+            );
+        }
+    }
+    #[test]
+    fn repeated_long_reference_targets_are_deduplicated_before_storage() {
+        let url = format!("https://example.test/{}", "x".repeat(1800));
+        let markdown = format!("{}\n\n[x]: {url}\n", "[x] ".repeat(15_000));
+        assert!(markdown.len() < MAX_BOARD_BYTES);
+        let (_, glyphs, urls) = markdown_links(&markdown);
+        // pulldown-cmark deliberately caps reference-expansion fuel; unresolved
+        // references keep their ordinary rendering rather than bypassing it.
+        assert!(!glyphs.is_empty());
+        assert!(glyphs.len() < 15_000);
+        assert_eq!(urls, [url]);
+        assert!(glyphs.values().all(|glyph| glyph.link == 0));
+    }
+
+    #[test]
+    fn runtime_hyperlink_opt_out_survives_named_board_switches() {
+        let mut view = View {
+            hyperlinks_enabled: false,
+            ..View::default()
+        };
+        view.update(Ok(snapshot("[label](https://example.test/)", "one")));
+        let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(hyperlink_segments(terminal.backend().buffer()).is_empty());
+        assert!(view.switch("other".parse().unwrap()));
+        assert!(!view.hyperlinks_enabled);
+    }
+
+    #[test]
+    fn document_link_budgets_fall_back_completely_without_later_repopulation() {
+        let exact = format!(
+            "[{}](https://example.test/)",
+            "x".repeat(crate::board_links::MAX_LINK_CELLS)
+        );
+        assert_eq!(
+            markdown_links(&exact).1.len(),
+            crate::board_links::MAX_LINK_CELLS
+        );
+        let overflow = format!(
+            "[{}x](https://example.test/) [later](https://example.test/later)",
+            "x".repeat(crate::board_links::MAX_LINK_CELLS)
+        );
+        let (source, glyphs, urls) = markdown_links(&overflow);
+        assert_eq!(source, overflow);
+        assert!(glyphs.is_empty() && urls.is_empty());
+        let many = (0..=crate::board_links::MAX_LINKS)
+            .map(|id| format!("[x](https://example.test/{id}) "))
+            .collect::<String>();
+        assert!(many.len() < MAX_BOARD_BYTES);
+        let (source, glyphs, urls) = markdown_links(&many);
+        assert_eq!(source, many);
+        assert!(glyphs.is_empty() && urls.is_empty());
+    }
+
+    #[test]
+    fn literal_and_code_labels_never_alias_real_link_targets() {
+        let markdown = "SAME `[SAME](https://example.test/code)` \\[SAME](https://example.test/escaped) [SAME](https://example.test/a)[SAME](https://example.test/b)";
+        let mut view = View::default();
+        view.update(Ok(snapshot(markdown, "one")));
+        let mut terminal = Terminal::new(TestBackend::new(160, 18)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let links = hyperlink_segments(terminal.backend().buffer());
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].1, "https://example.test/a");
+        assert_eq!(links[1].1, "https://example.test/b");
+        assert_eq!(links[0].2, "SAME");
+        assert_eq!(links[1].2, "SAME");
+    }
+
     #[test]
     fn raw_and_entity_encoded_terminal_controls_never_reach_spans() {
-        let (text, _) = rendered_markdown(
+        let (text, _, _, _) = rendered_markdown(
             "# Safe\u{1b}]52;c;secret\u{7}\n&#x1b;]0;title&#7; &#x9b;2J",
             80,
         );
@@ -1442,7 +2259,7 @@ mod tests {
     #[test]
     fn pathological_sparse_tables_fall_back_to_plain_markdown() {
         let markdown = format!("{}\n{}", "|x".repeat(1000), "|\n".repeat(100));
-        let (text, plain) = rendered_markdown(&markdown, 80);
+        let (text, plain, _, _) = rendered_markdown(&markdown, 80);
         assert!(plain);
         assert!(text.lines.len() > 50);
     }
