@@ -231,7 +231,16 @@ describe("fixture cleanup deadline", () => {
     const disconnected = new Promise<void>(resolve => idle.on("close", () => resolve()));
     try {
       await new Promise<void>((resolve, reject) => { idle.on("connect", resolve); idle.on("error", reject); });
-      await expect(s.cleanup()).rejects.toThrow("Fixture broker sockets did not close within teardown budget");
+      // Plain await keeps Bun 1.3.11's rejection matcher from entering a nested
+      // native event loop while socket/context cleanup is still pending.
+      const outcome = await s.cleanup().then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      expect(outcome.ok).toBe(false);
+      if (outcome.ok) throw new Error("Expected fixture cleanup to reject");
+      expect(outcome.error).toBeInstanceOf(Error);
+      expect((outcome.error as Error).message).toBe("Fixture broker sockets did not close within teardown budget");
       await disconnected;
       expect(s.socketState()).toMatchObject({ accepted: 3, closed: 3, active: 0 });
       await expect(stat(s.directory)).rejects.toMatchObject({ code: "ENOENT" });
@@ -241,7 +250,16 @@ describe("fixture cleanup deadline", () => {
   test("missing close response still rejects after awaited private resource cleanup", async () => {
     const s = await setup(); await s.created(); const endpoint = s.endpoint();
     s.brokerResponse(async request => request.op === "opencode_close" ? false : undefined);
-    await expect(s.cleanup()).rejects.toThrow("Some native leases could not be closed; expiry fences them");
+    // Plain await keeps Bun 1.3.11's rejection matcher from entering a nested
+    // native event loop while socket/context cleanup is still pending.
+    const outcome = await s.cleanup().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) throw new Error("Expected fixture cleanup to reject");
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect((outcome.error as Error).message).toBe("Some native leases could not be closed; expiry fences them");
     expect(s.socketState()).toMatchObject({ accepted: 2, closed: 2, active: 0 });
     expect(s.socketState().ended).toBeGreaterThanOrEqual(1);
     expect(s.requests.filter(r => r.op === "opencode_close")).toHaveLength(1);
