@@ -12,6 +12,10 @@ impl Db {
     pub fn share_peer_session(&mut self, peer: &str, agent: &str, shared: bool) -> Result<Peer> {
         let peer = self.peer(peer)?;
         let agent = self.resolve_agent(agent)?;
+        ensure!(
+            agent.provider != Provider::OpenCode,
+            "OpenCode sessions are local-only; remote sharing is not implemented"
+        );
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

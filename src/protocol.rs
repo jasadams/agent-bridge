@@ -8,6 +8,9 @@ pub const MAX_BODY: usize = 64 * 1024;
 pub enum Provider {
     Claude,
     Codex,
+    #[serde(rename = "opencode")]
+    #[value(name = "opencode")]
+    OpenCode,
     Inbox,
 }
 
@@ -18,6 +21,7 @@ impl std::str::FromStr for Provider {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "opencode" => Ok(Self::OpenCode),
             "inbox" => Ok(Self::Inbox),
             _ => anyhow::bail!("Unknown provider: {value}"),
         }
@@ -29,6 +33,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::OpenCode => "opencode",
             Self::Inbox => "inbox",
         }
     }
@@ -65,6 +70,12 @@ pub enum Request {
         agent: Agent,
         #[serde(default)]
         replace: bool,
+    },
+    #[serde(rename = "opencode_observe")]
+    OpenCodeObserve {
+        session: String,
+        endpoint: String,
+        title: Option<String>,
     },
     Unregister {
         name: String,

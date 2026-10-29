@@ -1,0 +1,293 @@
+use agent_bridge::{
+    broker::{self, Broker},
+    clients, delivery,
+    protocol::{Agent, Message, Provider, Request},
+};
+use serde_json::{Value, json};
+use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::{fs::PermissionsExt, net::UnixListener},
+    path::PathBuf,
+};
+
+const SESSION: &str = "ses_0123456789abcdefghijklmnop";
+const OTHER: &str = "ses_0123456789abcdefghijklmnox";
+const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+struct PluginSocket {
+    root: tempfile::TempDir,
+    path: PathBuf,
+    worker: std::thread::JoinHandle<()>,
+}
+impl PluginSocket {
+    fn start(count: usize, response: impl Fn(Value, &str) -> Value + Send + 'static) -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("ab-oc-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let instance = uuid::Uuid::new_v4().to_string();
+        let path = root.path().join(format!("{instance}.sock"));
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let frame = serde_json::from_str(&line).unwrap();
+                writeln!(stream, "{}", response(frame, &instance)).unwrap();
+            }
+        });
+        Self { root, path, worker }
+    }
+    fn agent(&self) -> Agent {
+        Agent {
+            name: format!("opencode-{SESSION}"),
+            provider: Provider::OpenCode,
+            session: SESSION.into(),
+            endpoint: self.path.to_str().unwrap().into(),
+            enabled: true,
+        }
+    }
+    fn finish(self) {
+        self.worker.join().unwrap();
+    }
+}
+fn receipt(frame: Value, instance: &str) -> Value {
+    if frame["session"] != SESSION {
+        return json!({"ok":false,"error":"unknown session"});
+    }
+    let mut value = json!({"ok":true,"session":SESSION,"instance":instance});
+    if frame["op"] == "deliver" {
+        assert!(!frame["content"].as_str().unwrap().is_empty());
+        assert!(frame.get("permissions").is_none());
+        assert!(frame.get("tools").is_none());
+        value["id"] = frame["id"].clone();
+        value["native_message_id"] = json!(format!(
+            "msg_{}",
+            frame["id"].as_str().unwrap().replace('-', "")
+        ));
+    }
+    value
+}
+fn message() -> Message {
+    Message {
+        id: ID.into(),
+        sender: "user".into(),
+        recipient: format!("opencode-{SESSION}"),
+        recipient_session: SESSION.into(),
+        body: "test".into(),
+        parent: None,
+        hops: 0,
+        state: "queued".into(),
+        detail: None,
+        created: 0,
+        updated: 0,
+    }
+}
+
+#[tokio::test]
+async fn exact_session_receipts_bind_native_and_broker_ids() {
+    let plugin = PluginSocket::start(2, receipt);
+    for _ in 0..2 {
+        let outcome = delivery::deliver(
+            &plugin.agent(),
+            &message(),
+            std::path::Path::new("unused"),
+            plugin.root.path(),
+        )
+        .await;
+        assert_eq!(outcome.state, "submitted", "{}", outcome.detail);
+        assert!(
+            outcome
+                .detail
+                .contains("acknowledgement remain unconfirmed")
+        );
+    }
+    plugin.finish();
+}
+
+#[tokio::test]
+async fn wrong_instance_session_and_message_receipts_never_submit() {
+    for field in ["instance", "session", "id", "native_message_id"] {
+        let plugin = PluginSocket::start(1, move |frame, instance| {
+            let mut value = receipt(frame, instance);
+            value[field] = json!("wrong");
+            value
+        });
+        let outcome = delivery::deliver(
+            &plugin.agent(),
+            &message(),
+            std::path::Path::new("unused"),
+            plugin.root.path(),
+        )
+        .await;
+        assert_eq!(outcome.state, "uncertain");
+        plugin.finish();
+    }
+    let plugin = PluginSocket::start(0, receipt);
+    let mut msg = message();
+    msg.recipient_session = OTHER.into();
+    assert_eq!(
+        delivery::deliver(
+            &plugin.agent(),
+            &msg,
+            std::path::Path::new("unused"),
+            plugin.root.path()
+        )
+        .await
+        .state,
+        "failed"
+    );
+    plugin.finish();
+}
+
+#[tokio::test]
+async fn live_registration_titles_disposal_and_endpoint_conflicts_use_shared_registry() {
+    let plugin = PluginSocket::start(4, receipt);
+    let agent = plugin.agent();
+    let state = plugin.root.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    for title in ["First", "Renamed"] {
+        broker::rpc(
+            &state,
+            &Request::OpenCodeObserve {
+                session: SESSION.into(),
+                endpoint: agent.endpoint.clone(),
+                title: Some(title.into()),
+            },
+        )
+        .await
+        .unwrap();
+        let listed = broker::rpc(&state, &Request::List { all: false })
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["session"] == SESSION && a["display_name"] == title)
+        );
+    }
+    assert!(
+        broker::rpc(
+            &state,
+            &Request::OpenCodeObserve {
+                session: OTHER.into(),
+                endpoint: agent.endpoint.clone(),
+                title: None
+            }
+        )
+        .await
+        .is_err()
+    );
+    let other = PluginSocket::start(1, receipt);
+    assert!(
+        broker::rpc(
+            &state,
+            &Request::OpenCodeObserve {
+                session: SESSION.into(),
+                endpoint: other.agent().endpoint,
+                title: None
+            }
+        )
+        .await
+        .is_err()
+    );
+    other.finish();
+    broker::rpc(
+        &state,
+        &Request::Unregister {
+            name: agent.name.clone(),
+            session: SESSION.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let listed = broker::rpc(&state, &Request::List { all: false })
+        .await
+        .unwrap();
+    assert!(
+        !listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["session"] == SESSION)
+    );
+    // Re-registration still requires a live exact-session probe.
+    broker::rpc(
+        &state,
+        &Request::Register {
+            agent,
+            replace: false,
+        },
+    )
+    .await
+    .unwrap();
+    server.abort();
+    plugin.finish();
+}
+
+#[test]
+fn native_identity_and_local_only_boundary_are_provider_specific() {
+    assert_eq!("opencode".parse::<Provider>().unwrap(), Provider::OpenCode);
+    assert_eq!(
+        serde_json::to_value(Provider::OpenCode).unwrap(),
+        "opencode"
+    );
+    clients::validate_session(&Provider::OpenCode, SESSION).unwrap();
+    for value in ["", ID, "ses_../escape", "ses_0123456789abcdefghijklmno\n"] {
+        assert!(clients::validate_session(&Provider::OpenCode, value).is_err());
+    }
+    assert!(clients::validate_remote_session(&Provider::OpenCode, SESSION).is_err());
+}
+
+#[tokio::test]
+async fn rejected_oversized_and_extra_field_receipts_fail_closed() {
+    for variant in 0..3 {
+        let plugin = PluginSocket::start(1, move |frame, instance| match variant {
+            0 => {
+                json!({"ok":false,"instance":instance,"session":SESSION,"id":ID,"uncertain":false,"error":"unknown or stale"})
+            }
+            1 => json!({"ok":false,"error":"x".repeat(agent_bridge::protocol::MAX_FRAME + 1)}),
+            _ => {
+                let mut value = receipt(frame, instance);
+                value["unexpected"] = json!(true);
+                value
+            }
+        });
+        let outcome = delivery::deliver(
+            &plugin.agent(),
+            &message(),
+            std::path::Path::new("unused"),
+            plugin.root.path(),
+        )
+        .await;
+        assert_eq!(outcome.state, "uncertain");
+        plugin.finish();
+    }
+}
+
+#[test]
+fn opencode_endpoint_requires_private_socket_and_canonical_instance() {
+    let plugin = PluginSocket::start(0, receipt);
+    clients::opencode::validate_endpoint(plugin.path.to_str().unwrap()).unwrap();
+    std::fs::set_permissions(&plugin.path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(clients::opencode::validate_endpoint(plugin.path.to_str().unwrap()).is_err());
+    std::fs::set_permissions(&plugin.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = plugin
+        .root
+        .path()
+        .join(format!("{}.sock", uuid::Uuid::new_v4()));
+    std::os::unix::fs::symlink(&plugin.path, &link).unwrap();
+    assert!(clients::opencode::validate_endpoint(link.to_str().unwrap()).is_err());
+    std::fs::set_permissions(plugin.root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(clients::opencode::validate_endpoint(plugin.path.to_str().unwrap()).is_err());
+    std::fs::set_permissions(plugin.root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    plugin.finish();
+}

@@ -13,7 +13,7 @@ mod update_install;
 #[derive(Parser)]
 #[command(
     version = agent_bridge::VERSION,
-    about = "Durable local and peer messaging between native Claude and Codex sessions"
+    about = "Durable local and peer messaging for native Claude, Codex and local OpenCode sessions"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -827,11 +827,17 @@ async fn main() -> Result<()> {
     if let Some((agent, _)) = &notify_agent {
         let agents = broker::rpc(&state_dir, &Request::List { all: false }).await?;
         anyhow::ensure!(
-            agents.as_array().is_some_and(|agents| agents
-                .iter()
-                .any(|entry| entry["name"] == *agent
+            agents
+                .as_array()
+                .is_some_and(|agents| agents.iter().any(|entry| entry["name"] == *agent
                     && entry["enabled"] == true
-                    && matches!(entry["provider"].as_str(), Some("claude" | "codex")))),
+                    && entry["provider"]
+                        .as_str()
+                        .and_then(|provider| provider.parse::<Provider>().ok())
+                        .is_some_and(|provider| agent_bridge::clients::supports(
+                            &provider,
+                            agent_bridge::clients::Capability::ControlNotices
+                        )))),
             "Pairing notification agent must be an enabled local native session; use --agent with a registered name"
         );
     }

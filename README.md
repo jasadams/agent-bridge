@@ -99,7 +99,9 @@ agent-bridge list
 
 Agent Bridge uses your existing agent sessions and makes no model API calls.
 [Native session setup](docs/native-sessions.md) explains registration, names and
-permission troubleshooting.
+permission troubleshooting. The opt-in [OpenCode V1 plugin](docs/opencode.md)
+adds exact-session messaging on the same machine with OpenCode 1.18.35; remote
+OpenCode sharing and busy/restart recovery remain follow-up work.
 
 ## Open your shared board
 
@@ -214,6 +216,7 @@ platform binaries, checksums, dependency notices and corresponding source.
 | [MCP tools](docs/mcp.md) | Client setup and structured agent tools |
 | [Shared board](docs/board.md) | Markdown editing, concurrency and live terminal controls |
 | [Native sessions](docs/native-sessions.md) | Codex discovery, Claude registration and permissions |
+| [OpenCode](docs/opencode.md) | Pinned V1 plugin, local live sessions and receipt limits |
 | [Pairing](docs/lan-pairing.md) | Owner-approved machine connections |
 | [Session sharing](docs/session-sharing.md) | Access to selected local sessions |
 | [Message monitor](docs/local-monitor.md) | Read-only browser visibility |

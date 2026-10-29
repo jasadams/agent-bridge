@@ -5,6 +5,7 @@ pub mod claude_discovery;
 pub mod codex;
 pub mod codex_discovery;
 pub mod lifecycle;
+pub mod opencode;
 
 use crate::{
     delivery::Outcome,
@@ -40,12 +41,14 @@ impl<'a> ControlNotice<'a> {
 pub enum Adapter {
     Claude,
     Codex,
+    OpenCode,
 }
 impl Adapter {
     pub fn for_provider(provider: &Provider) -> Option<Self> {
         match provider {
             Provider::Claude => Some(Self::Claude),
             Provider::Codex => Some(Self::Codex),
+            Provider::OpenCode => Some(Self::OpenCode),
             Provider::Inbox => None,
         }
     }
@@ -54,7 +57,7 @@ impl Adapter {
         matches!(
             (self, capability),
             (
-                Self::Claude | Self::Codex,
+                Self::Claude | Self::Codex | Self::OpenCode,
                 Capability::Messages
                     | Capability::ControlNotices
                     | Capability::LifecycleRegistration
@@ -66,12 +69,16 @@ impl Adapter {
         match self {
             Self::Claude => claude::validate_session(session),
             Self::Codex => codex::validate_session(session),
+            Self::OpenCode => opencode::validate_session(session),
         }
     }
 
     pub fn validate_endpoint(self, endpoint: &str) -> Result<String> {
         match self {
             Self::Claude => Ok(claude::validate_socket(Path::new(endpoint))?
+                .to_string_lossy()
+                .into_owned()),
+            Self::OpenCode => Ok(opencode::validate_endpoint(endpoint)?
                 .to_string_lossy()
                 .into_owned()),
             Self::Codex => {
@@ -92,7 +99,9 @@ impl Adapter {
     ) -> String {
         match self {
             Self::Claude => claude::claude_content(msg, machines),
-            Self::Codex => crate::delivery::envelope_with_machines(msg, state_dir, machines),
+            Self::Codex | Self::OpenCode => {
+                crate::delivery::envelope_with_machines(msg, state_dir, machines)
+            }
         }
     }
 
@@ -100,6 +109,7 @@ impl Adapter {
         match self {
             Self::Claude => claude::deliver(agent, msg, content).await,
             Self::Codex => codex::deliver(msg, content).await,
+            Self::OpenCode => opencode::deliver(agent, msg, content).await,
         }
     }
 
@@ -108,6 +118,7 @@ impl Adapter {
             Self::Claude => std::env::var("CLAUDE_CODE_MESSAGING_SOCKET")
                 .context("Claude did not export an inbox socket; check /status"),
             Self::Codex => Ok(String::new()),
+            Self::OpenCode => anyhow::bail!("OpenCode lifecycle is owned by its plugin"),
         }
     }
 }
@@ -132,6 +143,10 @@ pub fn validate_session(provider: &Provider, session: &str) -> Result<()> {
 /// Remote directories carry identities, never local native endpoint paths.
 /// Retain their stricter wire boundary and original error context.
 pub fn validate_remote_session(provider: &Provider, session: &str) -> Result<()> {
+    ensure!(
+        *provider != Provider::OpenCode,
+        "OpenCode sessions are local-only; remote support is not implemented"
+    );
     ensure!(
         !session.is_empty() && session.len() <= 200 && !session.chars().any(char::is_control),
         "Invalid remote session"

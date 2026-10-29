@@ -304,6 +304,21 @@ impl Broker {
     }
     pub async fn request_async(&self, req: Request) -> Result<Value> {
         match req {
+            req @ Request::OpenCodeObserve { .. } => {
+                let broker = self.clone();
+                tokio::task::spawn_blocking(move || broker.request(req)).await?
+            }
+            req @ Request::Register {
+                agent:
+                    crate::protocol::Agent {
+                        provider: Provider::OpenCode,
+                        ..
+                    },
+                ..
+            } => {
+                let broker = self.clone();
+                tokio::task::spawn_blocking(move || broker.request(req)).await?
+            }
             Request::MonitorEnable { port } => {
                 self.monitor_control.lock().unwrap().enable(port);
                 timeout(Duration::from_secs(5), async {
@@ -401,11 +416,35 @@ impl Broker {
     }
 
     pub fn request(&self, req: Request) -> Result<Value> {
+        // A native probe may trigger lifecycle cleanup through this same broker.
+        // Complete transport I/O before holding the database administration lock.
+        let candidate = match &req {
+            Request::Register { agent, .. } if agent.provider == Provider::OpenCode => {
+                Some(agent.clone())
+            }
+            Request::OpenCodeObserve {
+                session, endpoint, ..
+            } => Some(crate::protocol::Agent {
+                name: crate::clients::lifecycle::routing_name(&Provider::OpenCode, session),
+                provider: Provider::OpenCode,
+                session: session.clone(),
+                endpoint: endpoint.clone(),
+                enabled: true,
+            }),
+            _ => None,
+        };
+        if let Some(mut agent) = candidate {
+            crate::clients::validate_registration(&mut agent)?;
+            crate::clients::opencode::verify_registration(&agent)?;
+        }
         let mut db = self
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("Database lock poisoned"))?;
-        let registration = matches!(&req, Request::Register { .. });
+        let registration = matches!(
+            &req,
+            Request::Register { .. } | Request::OpenCodeObserve { .. }
+        );
         let result = match req {
             // Board edits share the broker's local administration mutex. No
             // network request can invoke this API or select a filesystem path.
@@ -462,6 +501,29 @@ impl Broker {
             Request::Register { mut agent, replace } => {
                 crate::clients::validate_registration(&mut agent)?;
                 db.register(&agent, replace)?;
+                json!(agent)
+            }
+            Request::OpenCodeObserve {
+                session,
+                endpoint,
+                title,
+            } => {
+                ensure!(
+                    title
+                        .as_ref()
+                        .is_none_or(|s| s.len() <= 4096 && !s.chars().any(char::is_control)),
+                    "Invalid OpenCode title"
+                );
+                let mut agent = crate::protocol::Agent {
+                    name: crate::clients::lifecycle::routing_name(&Provider::OpenCode, &session),
+                    provider: Provider::OpenCode,
+                    session,
+                    endpoint,
+                    enabled: true,
+                };
+                crate::clients::validate_registration(&mut agent)?;
+                db.register(&agent, false)?;
+                db.observe_session_name(&agent.provider, &agent.session, title.as_deref())?;
                 json!(agent)
             }
             Request::Unregister { name, session } => {

@@ -83,3 +83,12 @@ to change notifications with a 3-second debounce and 10-second coalescing cap;
 subscriptions expire with session lifecycle or broker restart. Storage,
 editing and rendering are separated for later board/source selection; this
 version does not synchronize boards between machines. See [shared board](board.md).
+
+## OpenCode local sessions
+
+A pinned OpenCode 1.18.35 V1 plugin and built-in local adapter register observed
+live sessions, retain shared native titles and submit peer messages to exact
+existing conversations with ordinary retry deduplication. Native insertion
+receipts remain distinct from model acknowledgements and correlated replies.
+Remote OpenCode sharing (AGB-6), busy ordering and restart recovery (AGB-4) remain
+separate. See [OpenCode integration](opencode.md) for scope and validation limits.

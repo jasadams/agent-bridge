@@ -255,6 +255,10 @@ impl Db {
         );
         let agent = self.resolve_agent(agent)?;
         ensure!(
+            agent.provider != Provider::OpenCode,
+            "OpenCode sessions are local-only; remote grants are not implemented"
+        );
+        ensure!(
             !allow || agent.enabled,
             "Cannot grant access to a disabled agent"
         );
@@ -294,6 +298,16 @@ impl Db {
             "The name user is reserved for your inbox"
         );
         crate::clients::validate_session(&agent.provider, &agent.session)?;
+        if agent.provider == Provider::OpenCode {
+            let conflicting: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE provider='opencode' AND session=?1 AND enabled=1 AND endpoint<>?2)",
+                params![agent.session, agent.endpoint], |row| row.get(0),
+            )?;
+            ensure!(
+                !conflicting,
+                "OpenCode session is already registered by another plugin instance; unregister that exact session first"
+            );
+        }
         let tx = self.conn.transaction()?;
         let old: Option<(String, String)> = tx
             .query_row(

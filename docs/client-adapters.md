@@ -1,11 +1,14 @@
 # Built-in native client adapters
 
-`src/clients/` is the integration boundary for Claude and Codex. Its explicit
+`src/clients/` is the integration boundary for Claude, Codex and local OpenCode. Its explicit
 `Adapter::for_provider` dispatch selects native session and endpoint validation,
 message transport, lifecycle registration, and capabilities. Inbox has no native
 adapter: its history and message availability remain broker-owned.
 
 The Claude adapter owns private Unix socket validation and user-frame generation.
+The OpenCode adapter uses its pinned V1 plugin private socket, verifies exact live
+sessions and application insertion receipts, and shares native title metadata.
+OpenCode remains local-only pending AGB-6; see [OpenCode setup and limits](opencode.md).
 The Codex adapter owns private daemon initialization, loaded-session checks, and
 queue submission. Discovery observers and hook/context generation live in this
 module too. Discovery only observes existing sessions; it never starts or resumes

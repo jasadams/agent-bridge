@@ -171,11 +171,17 @@ impl Bridge {
     async fn native_agent(&self, name: &str) -> Result<()> {
         let agents = self.rpc(Request::List { all: false }).await?;
         ensure!(
-            agents.as_array().is_some_and(|agents| agents
-                .iter()
-                .any(|agent| agent["name"] == name
+            agents
+                .as_array()
+                .is_some_and(|agents| agents.iter().any(|agent| agent["name"] == name
                     && agent["enabled"] == true
-                    && matches!(agent["provider"].as_str(), Some("claude" | "codex")))),
+                    && agent["provider"]
+                        .as_str()
+                        .and_then(|provider| provider.parse::<crate::protocol::Provider>().ok())
+                        .is_some_and(|provider| crate::clients::supports(
+                            &provider,
+                            crate::clients::Capability::ControlNotices
+                        )))),
             "Choose an enabled local native agent for pairing notifications"
         );
         Ok(())
