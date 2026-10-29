@@ -7,12 +7,13 @@
   <meta name="referrer" content="no-referrer">
   <title>Agent Bridge · Message monitor</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="/boards.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
   <header class="masthead">
-    <a class="brand" href="/" aria-label="Agent Bridge monitor home"><span class="brand-mark" aria-hidden="true">ab</span><span>Agent Bridge<small>Message monitor</small></span></a>
-    <span class="read-only">Read only</span>
+    <a class="brand" href="/" aria-label="Agent Bridge monitor home"><span class="brand-mark" aria-hidden="true">ab</span><span>Agent Bridge<small>Local monitor</small></span></a>
+    <span class="read-only">Messages are read only</span>
     <div class="connection" role="status" aria-live="polite"><span id="connection-dot" class="dot" aria-hidden="true"></span><span id="connection-label">Locked</span></div>
     <button id="lock-button" class="quiet" type="button" hidden>Lock monitor</button>
   </header>
@@ -20,7 +21,7 @@
     <section id="login" class="login-card" aria-labelledby="login-heading">
       <span class="eyebrow">Your local message traffic</span>
       <h1 id="login-heading">A window into the conversation.</h1>
-      <p>Follow messages between your agents, inspect delivery, and trace replies. The monitor cannot send or change messages.</p>
+      <p>Follow messages between your agents, inspect delivery, and trace replies. Messages stay read only. Open Boards to read local Markdown and save existing response fields.</p>
       <form id="login-form" method="post" action="/">
         <label for="access-token">Monitor access token</label>
         <div class="unlock-row"><input id="access-token" name="token" type="password" maxlength="256" autocomplete="off" autocapitalize="off" spellcheck="false" required aria-describedby="token-help"><button class="primary" type="submit">Unlock monitor <span aria-hidden="true">→</span></button></div>
@@ -28,7 +29,9 @@
         <p id="login-error" class="error" role="alert" hidden></p>
       </form>
     </section>
-    <section id="workspace" aria-label="Message activity" hidden>
+    <section id="workspace" aria-label="Local monitor" hidden>
+      <nav class="view-navigation" aria-label="Monitor views"><button id="messages-tab" type="button" aria-pressed="true">Messages</button><button id="boards-tab" type="button" aria-pressed="false">Boards</button></nav>
+      <div id="messages-view">
       <div class="page-heading"><div><span class="eyebrow">Local observability</span><h1>Message activity<span class="live-tag">Live</span></h1><p>Every hop, with the context to follow it.</p></div><div class="machine-card"><span class="caption">This machine</span><strong id="local-machine">Local bridge</strong><span id="last-updated" class="help">Waiting for messages</span></div></div>
       <form id="filters" class="filters" aria-label="Filter messages">
         <div class="filter-field"><label for="machine-filter">Machine</label><input id="machine-filter" name="machine" type="search" placeholder="Name or peer ID" maxlength="256" autocomplete="off"></div>
@@ -52,9 +55,24 @@
           <div id="detail-content" hidden></div>
         </aside>
       </div>
-      <p class="privacy-note">Local, read-only, and served by Agent Bridge. Messages stay on this machine’s monitor connection. Access is not isolated from other programs running as your OS user.</p>
+      </div>
+      <section id="boards-view" aria-labelledby="boards-heading" hidden>
+        <div class="page-heading"><div><span class="eyebrow">Local shared Markdown</span><h1 id="boards-heading">Board <span id="selected-board-name">main</span></h1><p>Read the board and answer its existing response fields.</p></div></div>
+        <div class="board-toolbar"><label for="board-selector">Board</label><select id="board-selector" aria-label="Choose board"></select><button id="board-refresh" type="button">Refresh</button><button id="board-raw-toggle" type="button" aria-pressed="false">Raw Markdown</button></div>
+        <p id="board-status" class="help notice" role="status" aria-live="polite">Choose Boards to load main.</p>
+        <p id="board-error" class="error notice" role="alert" hidden></p>
+        <div id="board-newer" class="notice" hidden><span>Newer content is available. Your draft or text selection is being kept.</span> <button id="board-review-refresh" type="button">Review latest</button></div>
+        <div class="board-layout">
+          <section class="board-document-panel" aria-label="Board document"><div id="board-document" class="board-document"></div><pre id="board-raw" class="board-raw" aria-label="Exact raw Markdown" hidden></pre></section>
+          <section class="board-responses" aria-labelledby="responses-heading"><h2 id="responses-heading">Responses</h2><p class="help">Responses are shared board data, not owner approval.</p><div id="board-controls"></div>
+            <section id="response-editor" aria-labelledby="response-heading" hidden><h3 id="response-heading">Edit response</h3><label id="response-label" for="response-text">Response</label><textarea id="response-text" rows="5" maxlength="65536"></textarea><p id="response-intent" class="help" hidden></p><p id="response-feedback" role="status" aria-live="polite"></p><div class="response-actions"><button id="response-save" class="primary" type="button">Save response</button><button id="response-cancel" type="button">Cancel response</button><button id="response-review" type="button" hidden>Review current board</button><button id="response-rebase" type="button" hidden>Rebase unchanged field</button></div></section>
+          </section>
+        </div>
+      </section>
+      <p class="privacy-note">Local and served by Agent Bridge. Messages remain read only; board responses edit only existing controls. Access is not isolated from other programs running as your OS user.</p>
     </section>
   </main>
+  <dialog id="unsaved-dialog" aria-labelledby="unsaved-title" aria-describedby="unsaved-description"><h2 id="unsaved-title">Keep your response?</h2><p id="unsaved-description">Save the response before leaving, discard it, or cancel to keep editing.</p><div class="response-actions"><button id="unsaved-save" class="primary" type="button">Save and continue</button><button id="unsaved-discard" type="button">Discard and continue</button><button id="unsaved-cancel" type="button">Cancel navigation</button></div></dialog>
   <noscript><p class="notice">Enable JavaScript to authenticate and view the local message monitor.</p></noscript>
 </body>
 </html>

@@ -26,7 +26,8 @@ paired and which individual sessions can communicate.
   pairing and explicit session grants determine who can communicate. Peer
   connections are encrypted; native agent permissions remain in effect.
 - **See what happened.** Durable message history, acknowledgements, correlated
-  replies and a read-only local browser monitor make communication inspectable.
+  replies and a local browser monitor make communication inspectable. Its Boards
+  view also lets you answer existing checkbox and text response controls.
 
 The shared board is currently local to one machine. Peer messaging supports
 communication between paired machines.
@@ -160,14 +161,17 @@ that explicit peer; without a peer, the tool lists local sessions only.
 - [Connect over the Internet](docs/internet-invitations.md)
 - [Run your own relay](docs/public-relays.md)
 
-## Monitor messages
+## Monitor messages and boards
 
 ```sh
 agent-bridge monitor enable
 ```
 
-Open the printed local URL and enter the separate access token. The monitor is
-read-only and listens on loopback. It is enabled independently of peer networking.
+Open the printed local URL and enter the separate access token. Choose Messages
+for read-only message history or Boards to browse named local boards and answer
+their existing checkbox/text controls. It listens only on loopback and is enabled
+independently of peer networking. It cannot send messages, pair machines or edit
+arbitrary Markdown.
 
 ```sh
 agent-bridge monitor disable
@@ -227,7 +231,7 @@ platform binaries, checksums, dependency notices and corresponding source.
 | [OpenCode](docs/opencode.md) | Pinned V1 plugin, local live sessions and receipt limits |
 | [Pairing](docs/lan-pairing.md) | Owner-approved machine connections |
 | [Session sharing](docs/session-sharing.md) | Access to selected local sessions |
-| [Message monitor](docs/local-monitor.md) | Read-only browser visibility |
+| [Local monitor](docs/local-monitor.md) | Message history and named-board responses in the browser |
 | [Trust and security](docs/peer-trust.md) | Identities, grants, revocation and recovery |
 | [Security review](docs/security-review.md) | Review scope, fixes and remaining validation |
 | [Releases](docs/releasing.md) | Semantic version tags, build artifacts and publication |

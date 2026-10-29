@@ -24,6 +24,52 @@ pub struct Control {
     pub kind: Kind,
 }
 impl Control {
+    /// Set the requested state without turning an ordinary retry into a toggle.
+    pub fn set_checked(&self, markdown: &str, desired: bool) -> Result<String> {
+        let Kind::Checkbox { checked } = self.kind else {
+            anyhow::bail!("Not a checkbox control");
+        };
+        if checked == desired {
+            return Ok(markdown.to_owned());
+        }
+        self.replacement(markdown, None)
+    }
+
+    /// Unchanged parsed text remains byte-exact, including its original quoting.
+    pub fn set_text(&self, markdown: &str, desired: &str) -> Result<String> {
+        let Kind::Text { value, .. } = &self.kind else {
+            anyhow::bail!("Not a text control");
+        };
+        ensure!(
+            desired.len() <= MAX_BOARD_BYTES,
+            "Text response exceeds 64 KiB"
+        );
+        if value == desired {
+            return Ok(markdown.to_owned());
+        }
+        self.replacement(markdown, Some(desired))
+    }
+
+    /// Stable only for the unique field's unchanged parsed value on this board.
+    pub fn text_rebase_key(&self, board: &str) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let Kind::Text { id, value, .. } = &self.kind else {
+            return None;
+        };
+        let mut digest = Sha256::new();
+        for part in [board, id, value] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        Some(
+            digest
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        )
+    }
+
     pub fn replacement(&self, markdown: &str, value: Option<&str>) -> Result<String> {
         let replacement = match &self.kind {
             Kind::Checkbox { checked } => if *checked { " " } else { "x" }.to_owned(),

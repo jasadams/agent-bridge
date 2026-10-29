@@ -52,6 +52,13 @@ for checking explicitly and disabling automatic checks.
 The broker must be running. Agents use the existing persistent MCP server and its
 `read_board` and `update_board` tools. There is no extra server or binary.
 
+The existing [local web monitor](local-monitor.md) also has a Boards view. It
+lists named boards, renders their Markdown and lets you answer the same existing
+checkbox and marked text controls. Browser selection is local to that tab; it
+does not change terminal or agent selection. Creation and general Markdown edits
+remain CLI/MCP operations. Browser drafts stay in memory and use explicit
+save/discard/cancel choices, revision checks and current-board review on conflicts.
+
 For a custom broker state directory:
 
 ```sh
@@ -250,12 +257,12 @@ only the intended edits with its revision. Do not replace the whole board using
 an old copy. After an ambiguous transport failure, read the current document
 before retrying an append or another edit.
 
-## Local scope and future selection
+## Local scope
 
-This version exposes one local board named `main`. It does not synchronize the
-file or grant board access to paired machines. Content storage, broker requests,
-MCP tools and rendering are separate modules so a future board/source selector can
-reuse the editor and viewer without imposing a content schema.
+Named boards remain local to this broker's selected state directory. They do not
+synchronize files or grant board access to paired machines. CLI, terminal, MCP
+and browser views share storage and revision-checked updates without a required
+content schema.
 
 Manual file edits are possible, but external editors do not participate in the
 broker's revision transaction. Coordinate manual changes with active agents to

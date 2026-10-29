@@ -22,6 +22,7 @@ pub mod service;
 pub mod update;
 
 pub mod monitor;
+mod monitor_board;
 mod monitor_data;
 
 mod pairing_notifications;
