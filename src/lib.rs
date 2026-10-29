@@ -1,5 +1,6 @@
 pub mod board;
 mod board_clipboard;
+mod board_code_copy;
 pub mod board_interaction;
 mod board_links;
 mod board_notifications;

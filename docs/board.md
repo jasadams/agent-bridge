@@ -80,6 +80,33 @@ Existing `boards/main.md` stays in place; no migration is needed. A read of abse
 the first successful update creates it. Backups of the broker's state include the
 board. Print its exact Markdown once with `agent-bridge board --raw`.
 
+## Copy code
+
+Rendered inline code has a contrasting background and an adjacent **Copy** control.
+Click that control once to copy the complete parsed code span; selecting or clicking
+the code text keeps ordinary selection and link behavior. Each rendered code block
+has a **Copy block** control at its top. It copies the entire block, including lines
+outside the viewport, indentation and its logical trailing newline. Copies omit
+Markdown delimiters, language labels, display wrapping and button labels. They never
+execute commands or write to the board, its timestamp or subscriptions.
+
+In the TUI, outside an editor or board picker, press `c` to focus the visible code
+copy controls. Tab/Shift-Tab cycles them, Enter or Space copies, and Escape leaves
+copy focus. Normal Tab navigation still belongs to response fields. Scroll or pan to
+reach other controls; resizing, wrapping, board switching and content changes reset
+copy focus so old screen coordinates cannot target another snippet. Keyboard copying
+also works when `m` has returned mouse handling to your terminal. A drag selection
+omits copy-control cells while retaining selected code and prose.
+
+The TUI sends a bounded, write-only OSC 52 clipboard request and reports **Copy sent
+to terminal**; it cannot confirm terminal clipboard acceptance. The browser uses its
+clipboard write API and reports success, denial or unavailable support honestly;
+manual selection remains available. Neither interface reads the clipboard. Copy
+requests over 64 KiB of UTF-8 are rejected rather than truncated. Empty blocks leave
+the terminal clipboard unchanged and report that no copy was sent. Raw Markdown and
+complex documents shown as a plain-source fallback retain manual copying rather
+than presenting parsed-code controls.
+
 ## Copy text
 
 Press the left mouse button in the rendered document, drag across the text, and

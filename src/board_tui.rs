@@ -14,9 +14,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use pulldown_cmark::{
-    CodeBlockKind, Event as MarkdownEvent, Options as MarkdownOptions, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Parser, Tag, TagEnd};
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -54,17 +52,7 @@ fn link_color(index: usize) -> Color {
 // Replace link labels with non-Markdown glyphs of identical display width. This
 // lets tui-markdown size and split tables without ever seeing the destinations.
 fn markdown_links(safe: &str) -> (String, HashMap<char, LinkGlyph>, Vec<String>) {
-    let options = MarkdownOptions::ENABLE_TABLES
-        | MarkdownOptions::ENABLE_FOOTNOTES
-        | MarkdownOptions::ENABLE_STRIKETHROUGH
-        | MarkdownOptions::ENABLE_TASKLISTS
-        | MarkdownOptions::ENABLE_HEADING_ATTRIBUTES
-        | MarkdownOptions::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | MarkdownOptions::ENABLE_MATH
-        | MarkdownOptions::ENABLE_GFM
-        | MarkdownOptions::ENABLE_DEFINITION_LIST
-        | MarkdownOptions::ENABLE_SUPERSCRIPT
-        | MarkdownOptions::ENABLE_SUBSCRIPT;
+    let options = crate::board_code_copy::markdown_options();
     let references = Parser::new_ext(safe, options);
     let definitions = references.reference_definitions();
     let parser = Parser::new_ext(safe, options);
@@ -254,10 +242,27 @@ fn safe_line(input: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn rendered_markdown(
     markdown: &str,
     width: u16,
 ) -> (Text<'static>, bool, Text<'static>, Vec<String>) {
+    let (text, plain, links, urls, _, _) = rendered_board(markdown, width);
+    (text, plain, links, urls)
+}
+
+fn rendered_board(
+    markdown: &str,
+    width: u16,
+) -> (
+    Text<'static>,
+    bool,
+    Text<'static>,
+    Vec<String>,
+    Text<'static>,
+    Vec<String>,
+) {
+    let prepared = crate::board_code_copy::Prepared::new(markdown);
     let safe = safe_markdown(markdown);
     let lines = safe.lines().count();
     let columns = safe
@@ -269,7 +274,7 @@ fn rendered_markdown(
     let (source, glyphs, urls) = if plain {
         (safe.clone(), HashMap::new(), Vec::new())
     } else {
-        markdown_links(&safe)
+        markdown_links(&prepared.source)
     };
     let rendered = if plain {
         Text::from(safe.as_str())
@@ -282,6 +287,7 @@ fn rendered_markdown(
     // Entity decoding can introduce controls that were absent from the source,
     // e.g. &#x1b;. Sanitize every final span, not just the Markdown input.
     let mut mask = Text::default();
+    let mut code_mask = Text::default();
     let owned = Text {
         alignment: rendered.alignment,
         style: rendered.style,
@@ -291,6 +297,7 @@ fn rendered_markdown(
             .map(|line| {
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 let mut ids: Vec<Span<'static>> = Vec::new();
+                let mut code_ids: Vec<Span<'static>> = Vec::new();
                 for span in line.spans {
                     let clean = safe_line(&span.content);
                     let clean = Span::raw(clean);
@@ -307,6 +314,29 @@ fn rendered_markdown(
                         } else {
                             (ch.symbol.to_owned(), span.style, None)
                         };
+                        let code = text.chars().next().and_then(|ch| prepared.glyphs.get(&ch));
+                        let (text, style, link, code_style) = if let Some(code) = code {
+                            let code_style = Style::default()
+                                .fg(crate::board_code_copy::id_color(code.snippet))
+                                .bg(if code.button {
+                                    Color::Blue
+                                } else {
+                                    Color::Reset
+                                });
+                            (
+                                code.text.clone(),
+                                if code.button {
+                                    crate::board_code_copy::button_style()
+                                } else {
+                                    crate::board_code_copy::code_style()
+                                },
+                                if code.button { None } else { link },
+                                code_style,
+                            )
+                        } else {
+                            (text, style, link, Style::default().fg(Color::Reset))
+                        };
+                        code_ids.push(Span::styled(text.clone(), code_style));
                         let id_style = Style::default().fg(link.map_or(Color::Reset, link_color));
                         if spans.last().is_some_and(|last| last.style == style)
                             && ids.last().is_some_and(|last| last.style == id_style)
@@ -319,6 +349,11 @@ fn rendered_markdown(
                         }
                     }
                 }
+                code_mask.lines.push(Line {
+                    alignment: line.alignment,
+                    spans: code_ids,
+                    ..Line::default()
+                });
                 mask.lines.push(Line {
                     alignment: line.alignment,
                     spans: ids,
@@ -340,7 +375,14 @@ fn rendered_markdown(
     } else {
         urls
     };
-    (owned, plain, mask, urls)
+    (
+        owned,
+        plain,
+        mask,
+        urls,
+        code_mask,
+        if plain { Vec::new() } else { prepared.payloads },
+    )
 }
 
 #[derive(Clone)]
@@ -456,6 +498,12 @@ struct View {
     link_mask: Text<'static>,
     link_urls: Vec<String>,
     hyperlinks_enabled: bool,
+    code_mask: Text<'static>,
+    code_payloads: Vec<String>,
+    code_cells: HashMap<Position, usize>,
+    copy_focus: bool,
+    focused_copy: Option<usize>,
+    pending_copy: Option<String>,
     width: u16,
     scroll: (u16, u16),
     max_scroll: (u16, u16),
@@ -485,6 +533,12 @@ impl Default for View {
             link_mask: Text::default(),
             link_urls: Vec::new(),
             hyperlinks_enabled: true,
+            code_mask: Text::default(),
+            code_payloads: Vec::new(),
+            code_cells: HashMap::new(),
+            copy_focus: false,
+            focused_copy: None,
+            pending_copy: None,
             width: 0,
             scroll: (0, 0),
             max_scroll: (0, 0),
@@ -557,6 +611,8 @@ impl View {
                     });
                 if self.snapshot.as_ref().map(|old| &old.revision) != Some(&snapshot.revision) {
                     self.width = 0;
+                    self.clear_copy_focus();
+                    self.code_cells.clear();
                     self.controls = board_interaction::controls(&snapshot.markdown);
                     // Source positions are only valid for the snapshot selected.
                     // Insertion/reordering must never silently retarget a response.
@@ -663,13 +719,21 @@ impl View {
         let block = Block::bordered().title(path);
         let inner = block.inner(body);
         if self.width != inner.width {
+            self.clear_copy_focus();
+            self.code_cells.clear();
             let markdown = self
                 .snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.markdown.as_str())
                 .unwrap_or("");
-            (self.rendered, self.plain, self.link_mask, self.link_urls) =
-                rendered_markdown(markdown, inner.width);
+            (
+                self.rendered,
+                self.plain,
+                self.link_mask,
+                self.link_urls,
+                self.code_mask,
+                self.code_payloads,
+            ) = rendered_board(markdown, inner.width);
             self.width = inner.width;
         }
         let content_height = self.paragraph().line_count(inner.width);
@@ -699,9 +763,51 @@ impl View {
             self.notice = Some("Text selection cancelled because the board layout changed.".into());
         }
         if let Some(selection) = &self.selection {
+            self.code_cells.clear();
             links_limited = !selection.paint(frame.buffer_mut());
+            if self.copy_focus {
+                for (&position, &id) in selection.copy_cells() {
+                    if self.focused_copy == Some(id) {
+                        frame.buffer_mut()[position]
+                            .set_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+                    }
+                }
+            }
         } else {
+            let mut code_mask = Buffer::empty(inner);
+            let code_paragraph = Paragraph::new(self.code_mask.clone());
+            let code_paragraph = if self.wrap {
+                code_paragraph.wrap(Wrap { trim: false })
+            } else {
+                code_paragraph
+            };
+            ratatui::widgets::Widget::render(
+                code_paragraph.scroll(self.scroll),
+                inner,
+                &mut code_mask,
+            );
+            self.code_cells.clear();
+            for y in inner.top()..inner.bottom() {
+                for x in inner.left()..inner.right() {
+                    let position = Position::new(x, y);
+                    let cell = &code_mask[position];
+                    if cell.bg == Color::Blue
+                        && let Some(id) = crate::board_code_copy::color_id(cell.fg)
+                        && id < self.code_payloads.len()
+                    {
+                        self.code_cells.insert(position, id);
+                        if self.copy_focus && self.focused_copy == Some(id) {
+                            frame.buffer_mut()[position]
+                                .set_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+                        }
+                    }
+                }
+            }
             self.viewport = Viewport::capture(frame.buffer_mut(), inner);
+            if let Some(viewport) = &mut self.viewport {
+                viewport.exclude_copy_buttons(self.code_cells.keys().copied());
+                viewport.set_copy_controls(&self.code_cells, &self.code_payloads);
+            }
             if !self.link_urls.is_empty() && self.hyperlinks_enabled {
                 let mut mask = Buffer::empty(inner);
                 let paragraph = Paragraph::new(self.link_mask.clone());
@@ -821,7 +927,7 @@ impl View {
         };
         frame.render_widget(Paragraph::new(vec![
             Line::from(safe_line(&status)),
-            Line::from(if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · m native mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "m copy-on-select mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
+            Line::from(if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · c code copies · m native mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "c code copies · m copy-on-select mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
             Line::from(safe_line(self.update_notice.as_deref().unwrap_or("")))
                 .style(Style::default().fg(Color::Yellow)),
         ]), footer);
@@ -830,7 +936,23 @@ impl View {
         if key.kind == KeyEventKind::Release {
             return false;
         }
-        if self.selection.take().is_some() && key.code == KeyCode::Esc {
+        let frozen_copy_key = self.editor.is_none()
+            && self.picker.is_none()
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| !selection.is_dragging())
+            && ((key.code == KeyCode::Char('c') && key.modifiers.is_empty())
+                || (self.copy_focus
+                    && matches!(
+                        key.code,
+                        KeyCode::Tab
+                            | KeyCode::BackTab
+                            | KeyCode::Enter
+                            | KeyCode::Char(' ')
+                            | KeyCode::Esc
+                    )));
+        if !frozen_copy_key && self.selection.take().is_some() && key.code == KeyCode::Esc {
             self.notice = Some("Text selection cancelled.".into());
             return false;
         }
@@ -875,6 +997,50 @@ impl View {
                 _ => (),
             }
             return false;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.is_empty() {
+            self.copy_focus = true;
+            self.focused_copy = self.visible_copies().first().copied();
+            self.notice = Some(
+                if self.focused_copy.is_some() {
+                    "Code copies · Tab/Shift-Tab select · Enter/Space copy · Esc leave"
+                } else {
+                    "No code copy buttons visible; scroll to code, then press c."
+                }
+                .into(),
+            );
+            return false;
+        }
+        if self.copy_focus {
+            match key.code {
+                KeyCode::Esc => {
+                    self.clear_copy_focus();
+                    self.notice = None;
+                    return false;
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let ids = self.visible_copies();
+                    if !ids.is_empty() {
+                        let backwards = key.code == KeyCode::BackTab
+                            || key.modifiers.contains(KeyModifiers::SHIFT);
+                        let current = self
+                            .focused_copy
+                            .and_then(|id| ids.iter().position(|value| *value == id));
+                        let next = match (current, backwards) {
+                            (Some(index), true) => (index + ids.len() - 1) % ids.len(),
+                            (Some(index), false) => (index + 1) % ids.len(),
+                            (None, _) => 0,
+                        };
+                        self.focused_copy = Some(ids[next]);
+                    }
+                    return false;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.queue_focused_copy();
+                    return false;
+                }
+                _ => self.clear_copy_focus(),
+            }
         }
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -934,13 +1100,81 @@ impl View {
             KeyCode::Char('w') => self.wrap = !self.wrap,
             _ => (),
         }
+        self.code_cells.clear();
         false
+    }
+    fn clear_copy_focus(&mut self) {
+        self.copy_focus = false;
+        self.focused_copy = None;
+    }
+    fn displayed_copy_cells(&self) -> &HashMap<Position, usize> {
+        self.selection
+            .as_ref()
+            .map_or(&self.code_cells, Selection::copy_cells)
+    }
+    fn displayed_copy_payload(&self, id: usize) -> Option<&str> {
+        if let Some(selection) = &self.selection {
+            selection.copy_payload(id)
+        } else {
+            self.code_payloads.get(id).map(String::as_str)
+        }
+    }
+    fn visible_copies(&self) -> Vec<usize> {
+        let mut positions: Vec<_> = self.displayed_copy_cells().iter().collect();
+        positions.sort_by_key(|(position, _)| (position.y, position.x));
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for (_, &id) in positions {
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+    fn queue_focused_copy(&mut self) {
+        if let Some(id) = self.focused_copy.filter(|id| {
+            self.displayed_copy_cells()
+                .values()
+                .any(|visible| visible == id)
+        }) {
+            self.pending_copy = self.displayed_copy_payload(id).map(str::to_owned);
+        }
+    }
+    fn send_copy(&mut self, text: &str) {
+        if text.is_empty() {
+            self.notice = Some("Code block is empty; clipboard unchanged.".into());
+            return;
+        }
+        self.notice = Some(match crate::board_clipboard::copy_to_terminal(text) {
+            Ok(()) => format!(
+                "Copy sent to terminal ({} bytes). Press m for native selection if needed.",
+                text.len()
+            ),
+            Err(error) => format!("Cannot send copy to terminal: {error:#}"),
+        });
     }
     fn mouse(&mut self, event: MouseEvent) -> (bool, Option<String>) {
         if !self.mouse_enabled || self.picker.is_some() {
             return (false, None);
         }
         let point = Position::new(event.column, event.row);
+        if self.editor.is_none()
+            && self
+                .selection
+                .as_ref()
+                .is_none_or(|selection| !selection.is_dragging())
+            && event.modifiers.is_empty()
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(id) = self.displayed_copy_cells().get(&point).copied()
+        {
+            let payload = self.displayed_copy_payload(id).map(str::to_owned);
+            self.selection = None;
+            self.clear_copy_focus();
+            // The next draw may reveal a newer snapshot behind the frozen body.
+            self.code_cells.clear();
+            return (true, payload);
+        }
+
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // A duplicate press while dragging cancels rather than selecting
@@ -977,6 +1211,8 @@ impl View {
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 self.selection = None;
+                self.clear_copy_focus();
+                self.code_cells.clear();
                 self.scroll.0 = if event.kind == MouseEventKind::ScrollUp {
                     self.scroll.0.saturating_sub(3)
                 } else {
@@ -1246,6 +1482,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     let previous_generation = view.generation;
                     let previous_mouse_mode = view.mouse_enabled;
                     if view.key(key, terminal.size()?.height.saturating_sub(5)) { break; }
+                    if let Some(text) = view.pending_copy.take() { view.send_copy(&text); }
                     if view.pick_requested {
                         view.pick_requested = false;
                         let _ = lists.try_send(());
@@ -1271,15 +1508,10 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                 Some(Ok(Event::Paste(text))) => { view.paste(&text); dirty = true; }
                 Some(Ok(Event::Mouse(event))) => {
                     let (changed, copy) = view.mouse(event);
-                    if let Some(text) = copy {
-                        view.notice = Some(match crate::board_clipboard::copy_to_terminal(&text) {
-                            Ok(()) => format!("Copy sent to terminal ({} bytes). Press m for native selection if needed.", text.len()),
-                            Err(error) => format!("Cannot send copy to terminal: {error:#}"),
-                        });
-                    }
+                    if let Some(text) = copy { view.send_copy(&text); }
                     dirty |= changed;
                 }
-                Some(Ok(Event::Resize(..))) => { view.selection = None; view.viewport = None; dirty = true; },
+                Some(Ok(Event::Resize(..))) => { view.selection = None; view.viewport = None; view.code_cells.clear(); view.clear_copy_focus(); dirty = true; },
                 Some(Ok(_)) => (),
                 Some(Err(error)) => return Err(error).context("Cannot read terminal input"),
                 None => break,
@@ -2063,17 +2295,16 @@ mod tests {
     }
 
     #[test]
-    fn table_links_with_escaped_pipes_keep_the_original_display_and_copy() {
+    fn table_code_links_with_escaped_pipes_keep_parsed_text_and_independent_copy() {
         let markdown = "| H |\n|---|\n| [`a\\|b`](https://example.com) |";
         let mut view = View::default();
         view.update(Ok(snapshot(markdown, "one")));
         let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
         terminal.draw(|frame| view.draw(frame)).unwrap();
-        assert!(view.link_urls.is_empty());
-        assert!(hyperlink_segments(terminal.backend().buffer()).is_empty());
+        assert_eq!(view.link_urls, ["https://example.com"]);
         assert!(view.rendered.to_string().contains("a|b"));
         assert!(!view.rendered.to_string().contains("a\\|b"));
-        assert!(view.rendered.to_string().contains("(https://example.com)"));
+        assert!(!view.rendered.to_string().contains("(https://example.com)"));
         let area = view.viewport.as_ref().unwrap().area();
         let start = Position::new(area.x + 2, area.y + 3);
         let end = Position::new(start.x + 2, start.y);
@@ -2083,7 +2314,7 @@ mod tests {
         assert_eq!(copied.as_deref(), Some("a|b"));
         let (text, _, _, urls) = rendered_markdown("[`a\\|b`](https://example.com)", 80);
         assert_eq!(urls, ["https://example.com"]);
-        assert_eq!(text.to_string(), "a\\|b");
+        assert_eq!(text.to_string(), "a\\|b[Copy]");
     }
 
     #[test]
@@ -2097,7 +2328,8 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].1, "https://a.example");
         assert_eq!(links[0].2, "x");
-        assert!(view.rendered.to_string().contains("```\u{f0000}"));
+        assert!(view.rendered.to_string().contains("[Copy block]"));
+        assert_eq!(view.code_payloads, ["code\n"]);
     }
 
     #[test]
@@ -2542,5 +2774,256 @@ mod tests {
             ),
             10
         ));
+    }
+    fn button_position(view: &View, id: usize) -> Position {
+        view.code_cells
+            .iter()
+            .filter(|(_, value)| **value == id)
+            .map(|(point, _)| *point)
+            .min_by_key(|point| (point.y, point.x))
+            .unwrap()
+    }
+
+    #[test]
+    fn code_copy_buttons_bind_exact_inline_list_table_and_offscreen_block_payloads() {
+        let block = (0..30)
+            .map(|index| format!("  echo '{index}'\\x\n"))
+            .collect::<String>();
+        let markdown = format!(
+            "Run `` a`b `` then `地球` and `地球`.\n\n- `list --flag`\n\n| cmd |\n|---|\n| `table\\|x` |\n\n```sh\n{block}```\n"
+        );
+        let mut view = View::default();
+        view.update(Ok(snapshot(&markdown, "one")));
+        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert_eq!(
+            view.code_payloads,
+            [
+                "a`b",
+                "地球",
+                "地球",
+                "list --flag",
+                "table|x",
+                block.as_str()
+            ]
+        );
+        for id in 0..view.code_payloads.len() {
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let point = button_position(&view, id);
+            let (_, copied) =
+                view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), point));
+            assert_eq!(copied.as_deref(), Some(view.code_payloads[id].as_str()));
+            assert!(
+                view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), point))
+                    .1
+                    .is_none()
+            );
+            assert!(view.pending.is_none());
+        }
+        assert!(!buffer_text(&terminal).contains("echo '29'"));
+        assert!(view.rendered.lines.iter().flat_map(|line| &line.spans).any(|span| span.content.contains("地球") && span.style.bg == Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn copy_focus_is_separate_from_responses_works_without_mouse_and_invalidates_on_changes() {
+        let mut view = View::default();
+        view.update(Ok(snapshot("`one` `two`\n\n- [ ] response", "one")));
+        let mut terminal = Terminal::new(TestBackend::new(50, 20)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(view.selected, Some(0));
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        press(&mut view, KeyCode::Char('m'), KeyModifiers::NONE);
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        press(&mut view, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(view.focused_copy, Some(0));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(view.focused_copy, Some(1));
+        assert_eq!(view.selected, Some(0));
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(view.pending_copy.take().as_deref(), Some("two"));
+        assert!(!view.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10));
+        assert!(!view.copy_focus);
+        press(&mut view, KeyCode::Char('c'), KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char('w'), KeyModifiers::NONE);
+        assert!(!view.copy_focus);
+        assert!(view.code_cells.is_empty());
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let old_point = button_position(&view, 0);
+        view.update(Ok(snapshot("`replacement`", "two")));
+        assert!(view.code_cells.is_empty());
+        view.mouse_enabled = true;
+        assert!(
+            view.mouse(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                old_point
+            ))
+            .1
+            .is_none()
+        );
+        view.selection = None;
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert_eq!(view.code_payloads, ["replacement"]);
+        assert!(view.switch("other".parse().unwrap()));
+        assert!(view.code_cells.is_empty());
+        assert!(view.code_payloads.is_empty());
+    }
+
+    #[test]
+    fn code_buttons_are_not_hyperlinks_or_drag_selection_text() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(
+            "before [`cmd --flag`](https://example.com) after",
+            "one",
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(80, 15)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let links = hyperlink_segments(terminal.backend().buffer());
+        assert_eq!(
+            links
+                .iter()
+                .map(|(_, _, text)| text.as_str())
+                .collect::<String>(),
+            "cmd --flag"
+        );
+        let area = view.viewport.as_ref().unwrap().area();
+        let start = Position::new(area.x, area.y);
+        let end = Position::new(area.right() - 1, area.y);
+        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), start));
+        view.mouse(mouse_event(MouseEventKind::Drag(MouseButton::Left), end));
+        let (_, copied) = view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), end));
+        assert_eq!(copied.as_deref(), Some("before cmd --flag after"));
+        assert!(view.pending.is_none());
+    }
+
+    #[test]
+    fn narrow_wrap_pan_scroll_and_resize_use_the_same_visible_button_mask() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(
+            "`long command with 地球 and --flag` then `next`\n\n```\nline1\nline2\n```",
+            "one",
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(18, 13)).unwrap();
+        for wrap in [true, false] {
+            view.wrap = wrap;
+            for scroll in [(0, 0), (1, 4), (3, 8)] {
+                view.scroll = scroll;
+                terminal.draw(|frame| view.draw(frame)).unwrap();
+                for id in view.visible_copies() {
+                    terminal.draw(|frame| view.draw(frame)).unwrap();
+                    let point = button_position(&view, id);
+                    assert_eq!(
+                        view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), point))
+                            .1
+                            .as_deref(),
+                        Some(view.code_payloads[id].as_str())
+                    );
+                }
+            }
+        }
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 28, 16))
+            .unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        for id in view.visible_copies() {
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let point = button_position(&view, id);
+            assert_eq!(
+                view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), point))
+                    .1
+                    .as_deref(),
+                Some(view.code_payloads[id].as_str())
+            );
+        }
+    }
+    #[test]
+    fn completed_selection_buttons_copy_displayed_old_payload_on_first_click_and_keyboard() {
+        for keyboard in [false, true] {
+            let mut view = View::default();
+            view.update(Ok(snapshot("prose `displayed old` tail", "one")));
+            let mut terminal = Terminal::new(TestBackend::new(70, 15)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let button = button_position(&view, 0);
+            let area = view.viewport.as_ref().unwrap().area();
+            let start = Position::new(area.x, area.y);
+            let end = Position::new(area.x + 3, area.y);
+            view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), start));
+            view.mouse(mouse_event(MouseEventKind::Drag(MouseButton::Left), end));
+            view.mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), end));
+            assert!(!view.selection.as_ref().unwrap().is_dragging());
+            view.update(Ok(snapshot("prose `NEW wrong payload` tail", "two")));
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            assert!(buffer_text(&terminal).contains("displayed old"));
+            assert_eq!(view.code_payloads, ["NEW wrong payload"]);
+            if keyboard {
+                press(&mut view, KeyCode::Char('c'), KeyModifiers::NONE);
+                assert_eq!(view.focused_copy, Some(0));
+                terminal.draw(|frame| view.draw(frame)).unwrap();
+                press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+                assert_eq!(view.pending_copy.take().as_deref(), Some("displayed old"));
+                assert!(view.selection.is_some());
+            } else {
+                let (_, copied) =
+                    view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), button));
+                assert_eq!(copied.as_deref(), Some("displayed old"));
+                assert!(view.selection.is_none());
+            }
+            assert!(view.pending.is_none());
+            assert_eq!(view.snapshot.as_ref().unwrap().revision, "two");
+        }
+    }
+
+    #[test]
+    fn empty_block_reports_unchanged_clipboard_without_claiming_a_copy() {
+        let mut view = View::default();
+        view.update(Ok(snapshot("```sh\n```\n", "one")));
+        let mut terminal = Terminal::new(TestBackend::new(50, 15)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let button = button_position(&view, 0);
+        let (_, copied) = view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), button));
+        assert_eq!(copied.as_deref(), Some(""));
+        view.send_copy(copied.as_deref().unwrap());
+        assert_eq!(
+            view.notice.as_deref(),
+            Some("Code block is empty; clipboard unchanged.")
+        );
+        assert!(view.pending.is_none());
+    }
+    #[test]
+    fn indented_code_blocks_render_copy_buttons_in_top_level_and_container_contexts() {
+        for (markdown, expected) in [
+            (
+                "# Indented\n\n    first\n      second\n    third\n",
+                "first\n  second\nthird\n",
+            ),
+            ("# Tabs\n\n\tfirst\n\t  second\n", "first\n  second\n"),
+            (
+                ">     first\n>       second\n>     third\n",
+                "first\n  second\nthird\n",
+            ),
+            (
+                "- before\n\n      first\n        second\n      third\n",
+                "first\n  second\nthird\n",
+            ),
+            (
+                "> - before\n>\n>       first\n>         second\n>       third\n",
+                "first\n  second\nthird\n",
+            ),
+        ] {
+            let mut view = View::default();
+            view.update(Ok(snapshot(markdown, "one")));
+            let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let screen = buffer_text(&terminal);
+            assert!(screen.contains("[Copy block]"), "{markdown:?}: {screen}");
+            assert!(!screen.contains("&#"), "{markdown:?}: {screen}");
+            assert!(!screen.contains("```"), "{markdown:?}: {screen}");
+            assert_eq!(view.code_payloads, [expected], "{markdown:?}");
+            let point = button_position(&view, 0);
+            let (_, copied) =
+                view.mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), point));
+            assert_eq!(copied.as_deref(), Some(expected), "{markdown:?}");
+            assert!(view.pending.is_none());
+        }
     }
 }
