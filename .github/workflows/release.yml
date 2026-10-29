@@ -92,6 +92,7 @@ jobs:
           python3 tools/test_installer.py
           python3 tools/test_packaging.py
           python3 tools/test_release.py
+          python3 tools/test_qualification.py
       - name: Build portable release executable
         if: needs.metadata.outputs.release == 'true'
         env:

@@ -180,6 +180,9 @@ remote sharing or native peer cards are introduced.
 
 ## Validation
 
+The [compatibility matrix](compatibility.md) describes reproducible real-client
+qualification, precise evidence boundaries and outstanding platform/UI checks.
+
 See the plugin README for frozen dependency installation, type checks, supplied
 in-process-client tests, and the disposable native compatibility harness. Tests
 use temporary directories and local processes; they do not use owner sessions,
