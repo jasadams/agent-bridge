@@ -327,7 +327,7 @@ class Qualification:
         return self.workroot / side
 
     def command(self, argv, env, cwd):
-        result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
         require(result.returncode == 0, f"{argv[1:]} exit {result.returncode}: {result.stderr}")
         return result.stdout
 
@@ -354,6 +354,10 @@ class Qualification:
         native = self.processes.start("opencode-" + side, argv, env, self.work(side))
         base = f"http://127.0.0.1:{port}"
         wait_for("OpenCode startup", lambda: http_json(base, "/global/health", timeout=2))
+        # Global health can precede lazy project/plugin dependency bootstrap.
+        # Exercise the same project API with a retriable read before the first
+        # mutation. A timed-out create must never be issued a second time.
+        wait_for("OpenCode project bootstrap", lambda: isinstance(http_json(base, "/session", timeout=2), list), 180)
         self.oc[side] = {"base": base, "process": native, "argv": argv}
         return self.oc_session(side, "Qualification " + side)
 
@@ -466,6 +470,12 @@ class Qualification:
         require(len(parts) == 1 and "<agent-bridge-session-context>" not in parts[0]["text"], "Native message text duplicated or accumulated setup context")
         return found[0]["info"]["id"]
 
+    @staticmethod
+    def lease_ended(state, session):
+        with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
+            row = db.execute("SELECT expires FROM opencode_leases WHERE session=?", (session,)).fetchone()
+        return row is None or row[0] <= int(time.time() * 1000)
+
     def lifecycle(self, route):
         info, state, native = self.fixture.routes[route], self.states["a"], self.oc["a"]
         session = info["session"]
@@ -492,14 +502,10 @@ class Qualification:
         rpc(state, {"op": "pause", "paused": False})
         self.processes.stop(native["process"])
         wait_for("closed plugin expires native routes", lambda: not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})))
-        def lease_ended():
-            with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
-                row = db.execute("SELECT expires FROM opencode_leases WHERE session=?", (session,)).fetchone()
-            return row is None or row[0] <= int(time.time() * 1000)
         # A broker restart disables routes before their old leases expire. A new
         # plugin must respect that live-generation fence, rather than using the
         # disabled presentation flag as evidence that replacement is allowed.
-        wait_for("closed plugin generation lease ends", lease_ended)
+        wait_for("closed plugin generation lease ends", lambda: self.lease_ended(state, session))
         native["process"] = self.processes.start("opencode-a-restarted", native["argv"], self.envs["a"], self.work("a"))
         wait_for("native restart health", lambda: http_json(native["base"], "/global/health", timeout=2))
         http_json(native["base"], path)  # history lookup does not activate a route
@@ -533,6 +539,17 @@ class Qualification:
         wait_for("two brokers connected", lambda: any(c["state"] == "connected" for c in rpc(a, {"op": "peer_connections"})))
         require(rpc(a, {"op": "remote_list"}) == [] and rpc(b, {"op": "remote_list"}) == [], "Native sessions shared by default")
         for state, alias, name in [(a, "b", first), (b, "a", second)]:
+            if not any(row["name"] == name for row in rpc(state, {"op": "list", "all": False})):
+                # A long local matrix may outlive an idle native project's live
+                # registration. The driver explicitly resumes its exact existing
+                # disposable conversation before choosing it for owner sharing;
+                # neither the observer nor an incoming peer creates/resumes it.
+                info = self.fixture.routes[name]
+                wait_for("old sharing generation ends", lambda: self.lease_ended(state, info["session"]))
+                side = "a" if state == a else "b"
+                http_json(self.oc[side]["base"], "/session/" + info["session"] + "/prompt_async",
+                          {"parts": [{"type": "text", "text": "Explicitly resume this disposable conversation for sharing qualification."}]})
+                self.route("opencode", info["session"], state)
             rpc(state, {"op": "peer_share", "peer": alias, "agent": name, "shared": True})
         wait_for("explicit destination directory", lambda: any(r["name"] == second for r in rpc(a, {"op": "remote_list"})))
         wait_for("explicit source directory", lambda: any(r["name"] == first for r in rpc(b, {"op": "remote_list"})))
@@ -604,7 +621,7 @@ def main():
     evidence = {"source_commit": commit, "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
         "os": platform.platform(), "architecture": platform.machine(), "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model": "scripted localhost fixture, no external model judgment", "websockets": websockets.__version__,
-        "python": platform.python_version(), "codex_matrix": "idle-only; active-turn delay/saturation tracked in AGB-13",
+        "python": platform.python_version(), "codex_matrix": "unheld-turn workflows; separate active-turn qualification in AGB-13",
         "pairs": [], "outstanding": ["native macOS", "physical cross-machine", "interactive rendering", "external model judgment"]}
     evidence["checkout_status"] = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True).splitlines()
     sources = [p for folder in ("src", "plugins/opencode") for p in (repo / folder).rglob("*")

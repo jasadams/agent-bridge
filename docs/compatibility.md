@@ -82,11 +82,13 @@ do not prove a real systemd or launchd installation.
 | Existing Claude/Codex discovery and typed controls, retained grants/data | Actual Codex discovery and matrix; Rust adapter/discovery/native-control/store/migration suites | Claude live hooks/title discovery and typed pairing/board behavior have protocol coverage, with actual interactive owner flows still outstanding |
 | Linux/macOS install/package | Installer/packaging/release tests and current-head four-platform CI | Native macOS clients, actual managed installation and optimized tagged package/signing are outstanding unless separately recorded |
 
-The Codex matrix is **idle-only**. Active-turn queue delay and saturation are a
-known defect tracked in AGB-13; this matrix does
-not establish active-turn delivery or fix it. The pinned queue accepts input for
-processing after the current whole turn finishes. See the repository's merged
-[Codex delivery diagnosis](codex-delivery-diagnosis.md) for the independently measured behavior.
+The Codex matrix exercises **unheld-turn workflows**. It does not independently
+qualify held active turns or queue saturation. AGB-13's merged adapter fix and
+[production regression evidence](codex-active-delivery-regression.md) cover those
+separate cases. [Current delivery semantics](codex-delivery.md) distinguish active
+steering from idle/compatibility queue delivery; the
+[original diagnosis](codex-delivery-diagnosis.md) records the earlier queue-only
+behavior. No owner deployment is implied by source qualification.
 
 `submitted` means adapter acceptance/insertion, `acknowledged` requires an explicit
 recipient tool call, and neither state alone proves task completion. Native final

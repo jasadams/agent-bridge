@@ -8,27 +8,29 @@ commands and boundaries. The checked-in [native evidence](diagnostics/native-com
 pins the executable, source, harness hashes, exact native artifacts, synthetic
 message/session references, observations and cleanup.
 
-Executable source: `343fed4028e8a349af418f89c712d602b0cd05eb`.
-Binary SHA-256: `1d2d3a458dffbdde16a02af9b4c665b0ec4115d7c35669d92ea61c260b064ab1`.
+Executable source: `07c2b3af68e253b15a47a732b8165b8dabd7d62a`.
+Binary SHA-256: `6a88ff69e72e6737ff7fb19d06d0da82b2ba305a4357e9188f8edbb1da087994`.
 The source commit identifies the built executable; qualification files were
 uncommitted when measured and are identified by their recorded hashes. The
 production source was clean. Earlier `7cc4cfe`/`e7347b4` inventories were retained as intermediate evidence.
 After the named-board merge, the executable was rebuilt at `a00d963` and both the
 combined matrix and separate native/setup harnesses were run against that source.
 After the CI cleanup repair, all three native harnesses passed again against the
-rebuilt `343fed4` executable. Its Rust/plugin source trees are identical to `a00d963`;
-the new hashes identify the repaired qualification code.
+rebuilt `343fed4` executable. After AGB-13 merged at `ccc11b4`, the executable
+was rebuilt at `07c2b3a`; the full local gates and all three native harnesses
+were repeated against the merged implementation. The recorded hashes identify
+the exact qualification code used for that run.
 
 | Check | Observed result |
 | --- | --- |
 | Claude 2.1.300↔OpenCode 1.18.35 | Both directions passed; actual native MCP ack/reply and reply ack; sender/body/reference visible to local scripted model |
-| Standalone Codex 0.165.0↔OpenCode 1.18.35 | Both idle directions passed through actual private native queue and broker MCP; active turns are a separate known AGB-13 defect |
+| Standalone Codex 0.165.0↔OpenCode 1.18.35 | Both unheld-turn directions passed through the actual private native input adapter and broker MCP; held-turn/capacity qualification is recorded separately in the merged AGB-13 proof |
 | OpenCode↔OpenCode on one broker | Both directions passed; exact native session and one matching user text part per insertion |
 | OpenCode↔OpenCode on two brokers | Both directions passed over real same-host QUIC, with private directories before independent exact-session sharing and correlated remote/local parent IDs |
 | Native lifecycle and durability | Rename, broker restart retaining identity/history/grants/pause, plugin close, inactive history lookup, explicit same-session resume, replacement generation, retained native user-message uniqueness and delete unregister passed |
 | Busy/permission/recovery native harness | Exit 0; nine scripted provider requests; explicit ack/reply, read-only reconciliation, busy-tool deferral, pause/cancel and unanswered permission wait passed; no cancel/permission-response calls |
 | Installed-asset native harness | Exit 0; 18 scripted provider requests; exact system context on 17 tool-bearing requests, actual MCP discovery/ack/reply/board read/update, compaction/reload, notice coalescing/own-write suppression/unsubscribe/delete cleanup passed |
-| Rust gates | Formatting, all-target check and Clippy, full package `--no-fail-fast` each exited 0; 390 tests passed, three multicast-LAN scenarios remained intentionally ignored |
+| Rust gates | Formatting, all-target check and Clippy, full package `--no-fail-fast` each exited 0; 407 tests passed, three multicast-LAN scenarios remained intentionally ignored |
 | Plugin gates | Frozen install, TypeScript and 52 Bun tests passed |
 | Installer/package/release | Shell syntax, 21 installer tests, seven packaging tests and release tests exited 0 |
 | Harness safety | Nine CI-safe Python tests passed, including credential isolation, route identity, startup filesystem failure, exited-leader descendant cleanup, teardown-failure nonpass, HTTP/process cleanup and Darwin zombie/live/unverifiable group permission cases |
@@ -58,6 +60,17 @@ their whole readiness budget despite a fresh independent health request returnin
 HTTP 200. The runner now matches the existing SDK harness: two-second retriable
 read-only health probes and a 60-second request bound for native operations,
 without retrying timed-out mutations. These failed runs remain recorded.
+On the merged AGB-13 source, a cold project bootstrap again exceeded the
+native operation bound before any pair row. Global health can precede project
+bootstrap, so readiness now includes a retriable read of the project session API
+before any create mutation. Another attempt passed six local directions, then
+found a disabled destination registration before sharing. The driver now waits
+for the old lease and explicitly resumes the exact existing disposable session
+before selecting it for sharing; the reason the registration expired was not
+independently established. A later private installer command exceeded its initial
+30-second bound before any pairs. Setup commands now have a bounded 120 seconds
+and are never automatically retried. All failed attempts retain separate evidence.
+
 Review also repaired descendant-process and startup-failure
 cleanup, with regression tests. The reported updater throttle test passed in the
 initial unchanged full suite; no updater test or implementation was changed.
@@ -104,8 +117,10 @@ rendering/notification dismissal and external-model judgment remain **outstandin
 Four-platform CI covers source/plugin/installer/package fixtures, not those native
 or physical checks. Existing Claude/Codex title/hook/typed-control and registry
 migration regressions passed their protocol/store suites; interactive owner
-pairing behavior was not inferred from those tests. AGB-13 tracks Codex active-turn
-delay and queue saturation separately; AGB-7 does not fix or qualify that path.
+pairing behavior was not inferred from those tests. The measured source includes
+the merged AGB-13 active-turn and saturation changes. This unheld-turn matrix
+does not independently repeat its held-turn/capacity scenarios; see the
+[delivery contract](codex-delivery.md) and [active-delivery proof](codex-active-delivery-regression.md).
 
 No release, publication, owner service replacement, private configuration,
 credentials or owner native-session changes were made. Only disposable broker

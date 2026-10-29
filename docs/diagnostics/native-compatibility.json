@@ -1,25 +1,25 @@
 {
   "native_matrix": {
-    "source_commit": "343fed4028e8a349af418f89c712d602b0cd05eb",
-    "binary_sha256": "1d2d3a458dffbdde16a02af9b4c665b0ec4115d7c35669d92ea61c260b064ab1",
+    "source_commit": "07c2b3af68e253b15a47a732b8165b8dabd7d62a",
+    "binary_sha256": "6a88ff69e72e6737ff7fb19d06d0da82b2ba305a4357e9188f8edbb1da087994",
     "os": "Linux-7.0.9-204.fc44.x86_64-x86_64-with-glibc2.43",
     "architecture": "x86_64",
-    "started_utc": "2026-10-29T06:12:46Z",
+    "started_utc": "2026-10-29T06:50:28Z",
     "model": "scripted localhost fixture, no external model judgment",
     "websockets": "15.0.1",
     "python": "3.14.4",
-    "codex_matrix": "idle-only; active-turn delay/saturation tracked in AGB-13",
+    "codex_matrix": "unheld-turn workflows; separate active-turn qualification in AGB-13",
     "pairs": [
       {
-        "sender": "claude-397d8f87-78e3-49c6-94d4-672303892518",
-        "recipient": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-766a9d8b-3d41-4541-b64e-ccc83a85270f",
-        "id": "90cbd9fd-e049-47d8-a555-2e4db568ab45",
-        "reply_id": "c7afe054-691b-471c-82a4-66569c30e382",
+        "sender": "claude-da1ca9c6-313a-4895-9e04-33bc25d46010",
+        "recipient": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-67a9dca0-5d54-4bf8-8683-a40d63d7fdca",
+        "id": "d4398dd9-0348-46b6-9655-fd2ede5f9e73",
+        "reply_id": "504a0836-ca6c-431a-9ca4-2e3e5850fa12",
         "two_broker": false,
-        "incoming_id": "90cbd9fd-e049-47d8-a555-2e4db568ab45",
-        "reply_local_id": "c7afe054-691b-471c-82a4-66569c30e382",
-        "parent": "90cbd9fd-e049-47d8-a555-2e4db568ab45",
+        "incoming_id": "d4398dd9-0348-46b6-9655-fd2ede5f9e73",
+        "reply_local_id": "504a0836-ca6c-431a-9ca4-2e3e5850fa12",
+        "parent": "d4398dd9-0348-46b6-9655-fd2ede5f9e73",
         "original_state": "acknowledged",
         "reply_state": "acknowledged",
         "source_model_receipt": true,
@@ -28,15 +28,15 @@
         "task_completion": "not established by ack/reply; scripted tools only"
       },
       {
-        "sender": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "recipient": "claude-397d8f87-78e3-49c6-94d4-672303892518",
-        "marker": "MATRIX-77182672-f19e-43ec-ad8c-178818ab4277",
-        "id": "52c07c11-7d5f-4f20-b60c-bbca5a14ff46",
-        "reply_id": "9d4861d4-534b-4752-9afb-c23d22674ee8",
+        "sender": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "recipient": "claude-da1ca9c6-313a-4895-9e04-33bc25d46010",
+        "marker": "MATRIX-bf635403-9525-48a4-b4e3-a11c5a89216b",
+        "id": "ef15c464-6314-4cb7-84c7-6c3e5f564842",
+        "reply_id": "7d274fb0-e94e-446c-9d48-d3c249df23f0",
         "two_broker": false,
-        "incoming_id": "52c07c11-7d5f-4f20-b60c-bbca5a14ff46",
-        "reply_local_id": "9d4861d4-534b-4752-9afb-c23d22674ee8",
-        "parent": "52c07c11-7d5f-4f20-b60c-bbca5a14ff46",
+        "incoming_id": "ef15c464-6314-4cb7-84c7-6c3e5f564842",
+        "reply_local_id": "7d274fb0-e94e-446c-9d48-d3c249df23f0",
+        "parent": "ef15c464-6314-4cb7-84c7-6c3e5f564842",
         "original_state": "acknowledged",
         "reply_state": "acknowledged",
         "source_model_receipt": true,
@@ -45,15 +45,15 @@
         "task_completion": "not established by ack/reply; scripted tools only"
       },
       {
-        "sender": "codex-01a1864a-9835-7f40-a8c0-167f78e0f7dd",
-        "recipient": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-e7e6d735-c9ac-488f-899f-7d9c7fb90736",
-        "id": "53734697-6c0e-4198-93d5-c5c26c0ce890",
-        "reply_id": "441d9378-ee9a-47a1-83e0-a219f26e996e",
+        "sender": "codex-01a1866d-0f30-7330-ab98-76a00122496c",
+        "recipient": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-e99c39d4-0c80-4d5c-925b-3d2c2f8f2aa2",
+        "id": "a14c8ae1-41c4-47a4-813c-ed3c8cd607d9",
+        "reply_id": "9eb25e04-e746-497e-89e5-bde66660435f",
         "two_broker": false,
-        "incoming_id": "53734697-6c0e-4198-93d5-c5c26c0ce890",
-        "reply_local_id": "441d9378-ee9a-47a1-83e0-a219f26e996e",
-        "parent": "53734697-6c0e-4198-93d5-c5c26c0ce890",
+        "incoming_id": "a14c8ae1-41c4-47a4-813c-ed3c8cd607d9",
+        "reply_local_id": "9eb25e04-e746-497e-89e5-bde66660435f",
+        "parent": "a14c8ae1-41c4-47a4-813c-ed3c8cd607d9",
         "original_state": "acknowledged",
         "reply_state": "acknowledged",
         "source_model_receipt": true,
@@ -62,15 +62,15 @@
         "task_completion": "not established by ack/reply; scripted tools only"
       },
       {
-        "sender": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "recipient": "codex-01a1864a-9835-7f40-a8c0-167f78e0f7dd",
-        "marker": "MATRIX-fd969338-d2c8-48e4-a1bd-f6071ec68ea8",
-        "id": "bde7ca52-4d1b-4420-93f1-785c257607ae",
-        "reply_id": "2b0afc76-f27f-4a97-8196-6e035d52ac8a",
+        "sender": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "recipient": "codex-01a1866d-0f30-7330-ab98-76a00122496c",
+        "marker": "MATRIX-69c1fd2a-2746-46f5-8f9b-12d31fb7f0ce",
+        "id": "098b26df-c0b0-40d4-9f0d-c997c90a3d30",
+        "reply_id": "bd97ca57-4958-4923-925e-ad9ba85996a1",
         "two_broker": false,
-        "incoming_id": "bde7ca52-4d1b-4420-93f1-785c257607ae",
-        "reply_local_id": "2b0afc76-f27f-4a97-8196-6e035d52ac8a",
-        "parent": "bde7ca52-4d1b-4420-93f1-785c257607ae",
+        "incoming_id": "098b26df-c0b0-40d4-9f0d-c997c90a3d30",
+        "reply_local_id": "bd97ca57-4958-4923-925e-ad9ba85996a1",
+        "parent": "098b26df-c0b0-40d4-9f0d-c997c90a3d30",
         "original_state": "acknowledged",
         "reply_state": "acknowledged",
         "source_model_receipt": true,
@@ -79,15 +79,15 @@
         "task_completion": "not established by ack/reply; scripted tools only"
       },
       {
-        "sender": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "recipient": "opencode-ses_e79b571d2ffe7TcdNhuL8MQhlc",
-        "marker": "MATRIX-79713910-5621-401a-afd8-6b99ce960283",
-        "id": "517a57a2-e309-4acd-a55b-aff2cd16ad06",
-        "reply_id": "ecd71008-d7a2-43d3-9dae-ddf1c26f9c4b",
+        "sender": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "recipient": "opencode-ses_e7992f501ffeXfhGkapCXHzVAS",
+        "marker": "MATRIX-9ad4c28f-0733-4654-88cb-db0644bf29b9",
+        "id": "fd23f969-64d3-4a0b-9d01-96e9c099ef67",
+        "reply_id": "0717b6b6-de06-42d3-8de8-c88afd890c1c",
         "two_broker": false,
-        "incoming_id": "517a57a2-e309-4acd-a55b-aff2cd16ad06",
-        "reply_local_id": "ecd71008-d7a2-43d3-9dae-ddf1c26f9c4b",
-        "parent": "517a57a2-e309-4acd-a55b-aff2cd16ad06",
+        "incoming_id": "fd23f969-64d3-4a0b-9d01-96e9c099ef67",
+        "reply_local_id": "0717b6b6-de06-42d3-8de8-c88afd890c1c",
+        "parent": "fd23f969-64d3-4a0b-9d01-96e9c099ef67",
         "original_state": "acknowledged",
         "reply_state": "acknowledged",
         "source_model_receipt": true,
@@ -96,15 +96,15 @@
         "task_completion": "not established by ack/reply; scripted tools only"
       },
       {
-        "sender": "opencode-ses_e79b571d2ffe7TcdNhuL8MQhlc",
-        "recipient": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-6ba63851-a1ce-495d-a69c-63490b66dd83",
-        "id": "052d6ec0-c866-4a90-8950-c4224a4ef701",
-        "reply_id": "b0aa59f3-a2e1-4474-bffa-f1d3ca2c1b0f",
+        "sender": "opencode-ses_e7992f501ffeXfhGkapCXHzVAS",
+        "recipient": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-188c2239-ea29-4fbe-b4eb-4774a681f295",
+        "id": "f27e7c10-4fc6-457b-8630-56321092a7d2",
+        "reply_id": "ee84a892-7d6a-4bbf-9f17-7a5ea3e8cbb9",
         "two_broker": false,
-        "incoming_id": "052d6ec0-c866-4a90-8950-c4224a4ef701",
-        "reply_local_id": "b0aa59f3-a2e1-4474-bffa-f1d3ca2c1b0f",
-        "parent": "052d6ec0-c866-4a90-8950-c4224a4ef701",
+        "incoming_id": "f27e7c10-4fc6-457b-8630-56321092a7d2",
+        "reply_local_id": "ee84a892-7d6a-4bbf-9f17-7a5ea3e8cbb9",
+        "parent": "f27e7c10-4fc6-457b-8630-56321092a7d2",
         "original_state": "acknowledged",
         "reply_state": "acknowledged",
         "source_model_receipt": true,
@@ -113,15 +113,15 @@
         "task_completion": "not established by ack/reply; scripted tools only"
       },
       {
-        "sender": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "recipient": "opencode-ses_e79b5724affeK6nKMkJT0zI1kC",
-        "marker": "MATRIX-95b68a8c-0f5f-40a4-9aa9-d0c7864dadb0",
-        "id": "04fe4428-ea39-4cb7-9c2b-fae87e088139",
-        "reply_id": "81aad96f-b00b-4d58-ad11-c0a6d4d6dd44",
+        "sender": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "recipient": "opencode-ses_e7992f579ffeeFi3DBO7Ek90iv",
+        "marker": "MATRIX-57a0c15f-8c49-47e6-ac4f-5bff649b7f52",
+        "id": "c175700a-50a7-4551-9902-54650df12e79",
+        "reply_id": "7d684490-68ea-454f-9f91-1adbc016564c",
         "two_broker": true,
-        "incoming_id": "a06fc984-7db7-4776-902a-2729a44b5920",
-        "reply_local_id": "e4b35fbb-3978-424d-ac29-83cd6747fefb",
-        "parent": "04fe4428-ea39-4cb7-9c2b-fae87e088139",
+        "incoming_id": "fcf984e6-06e4-404f-b6d5-67f867815b70",
+        "reply_local_id": "eff1fae4-0a22-4f35-908e-af08dca69bc2",
+        "parent": "c175700a-50a7-4551-9902-54650df12e79",
         "original_state": "acknowledged",
         "reply_state": "acknowledged",
         "source_model_receipt": true,
@@ -130,15 +130,15 @@
         "task_completion": "not established by ack/reply; scripted tools only"
       },
       {
-        "sender": "opencode-ses_e79b5724affeK6nKMkJT0zI1kC",
-        "recipient": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-cdb954ab-8335-4752-a124-68b1b908cfc3",
-        "id": "e6c973e8-3852-4413-b167-c406ebe03569",
-        "reply_id": "14098762-c46b-4454-b4a7-296379fc2ac2",
+        "sender": "opencode-ses_e7992f579ffeeFi3DBO7Ek90iv",
+        "recipient": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-46183ae3-0014-42d4-92ca-c7fe51bb0eba",
+        "id": "ab4f0ea0-ffc7-4a4f-b97c-e4b4bc9fa377",
+        "reply_id": "518680ad-5c3f-4f72-9546-2152bbb8269d",
         "two_broker": true,
-        "incoming_id": "3983b53b-2cb6-498a-bb54-4176c350a9ee",
-        "reply_local_id": "b273b045-4566-40cc-8654-6168f013034b",
-        "parent": "e6c973e8-3852-4413-b167-c406ebe03569",
+        "incoming_id": "6a7e4cd2-ff71-4822-9096-0c20bb228354",
+        "reply_local_id": "c91e8973-5aa6-44c8-aef4-aac5b7999fbd",
+        "parent": "ab4f0ea0-ffc7-4a4f-b97c-e4b4bc9fa377",
         "original_state": "acknowledged",
         "reply_state": "acknowledged",
         "source_model_receipt": true,
@@ -154,9 +154,8 @@
       "external model judgment"
     ],
     "checkout_status": [
-      " M docs/compatibility-2026-10-29.md",
-      " M tools/qualification_native.py",
-      " M tools/test_qualification.py"
+      " M docs/compatibility.md",
+      " M tools/qualification_native.py"
     ],
     "source_sha256": {
       "Cargo.lock": "88d82fc971cb3fce9c26e4234f1bd1f24adca119ea8a005bd0d78b2ab0dd14d3",
@@ -173,25 +172,26 @@
       "src/board.rs": "a7b9ad87af441f690634b3deae67308268a9c4e053738c40623b9c459712b322",
       "src/board_clipboard.rs": "f405635af94f152d8be23a00fccc071a2872d51a532e6701a7fb2cbd24166952",
       "src/board_interaction.rs": "77275138b1cea101cbb86ea912d41960debbbf283cb7d4797c3f5754910fac0f",
-      "src/board_notifications.rs": "4290c577f01db7bbe1c54fdc615bce89e93f941414ba6f002a75aa7e9ae2b094",
+      "src/board_notifications.rs": "12c7282895148f6f72b5659f51f9a12aa3e89ee5527976cc300e4fd3fe159f73",
       "src/board_selection.rs": "10187d97fb806063c677bf3d6822a3311a437527a3825cc64fb74e53bd41b31f",
       "src/board_tui.rs": "e8bd45dfb60468606bc0cb4bbef846620cd4930475a41f56521c57ca7ab204c8",
-      "src/broker.rs": "86487f09b3564b79bc62957e5b27ca86a13e047efe314cc15aca08e2b127757c",
+      "src/broker.rs": "d185e3234ce4d5b17a7a4f796fcf7231ec30c39906972f4de07444b0a33dd67e",
       "src/clients/claude.rs": "437635ce585357e6e66ef42dcdbfcc8b0195504c06cbb32cbea9f1eadd93a5ff",
       "src/clients/claude_discovery.rs": "58887a0ad691753789fb5873084771566c9959cf8b3790030d74a21240a9b541",
-      "src/clients/codex.rs": "e876e98f55300b2bfe8ab69b942604e62eda3d7a37422eaf11401356aafaf769",
+      "src/clients/codex.rs": "9e1f200784810ee5728864e6906031cabc9ea7156e65acce4289b986516ebe52",
       "src/clients/codex_discovery.rs": "0de762af5503c77513189068d13fc748e51c73edebfa6daf11985be3661eac00",
       "src/clients/lifecycle.rs": "cde3a72ed6fce9d165604a8e9da4b6b17e0e7054ebd7e7a7f1e502db4272b87a",
-      "src/clients/mod.rs": "a9bb4a53b514f09e317f47c7b68d2ab046431cdaa90a31df19918670e62819e6",
+      "src/clients/mod.rs": "3144988d36b6ed7caa2d46efa15eb4fe5a87029b624a4d85a1904250cb2e0647",
       "src/clients/opencode.rs": "d5607ef7c5f7db31a3a3a0cf6712b3fdf606c16c046e24b00c1103e348f1fb6f",
       "src/clients/tests.rs": "08ab01016cdc3e9f572eae06104709bd1742aa5d69cc570a9c424bed22f67732",
-      "src/db.rs": "b7ba818573383a980652042c7ea9cca4a86c9b7af8da22dff3b1a57bb4dcc4b6",
-      "src/delivery.rs": "da1875b41d3ce837b73b45bc7a13bf79f1929a4a8874b829ac6b7638df81be90",
-      "src/lib.rs": "8cadaa8ca933f7ebbc75bc9e74194be6a2da06dd2c8b3ed1b5881596fe594c5c",
+      "src/codex_admission.rs": "be9abdeb33b2a692ef0b701e98fd2ae84c682a6d6d69f7a4a9ae65d33c2edfb5",
+      "src/db.rs": "819ab5d0561e314ede20c23ccc53141c7fb89b84daaf5d4b3adaf73495ef153a",
+      "src/delivery.rs": "450f31e5f574e3d69d5bfa05014a2b17e178ff976847d675e8fbb7290d8d8cc5",
+      "src/lib.rs": "8edea37064c9ed9d7580355516178301b3522d4bc074b3fe3bbd120ed7fc51ea",
       "src/main.rs": "c833563d7d61753b76a11ff001a1353c7991387ce8268ee22e021478aef24291",
       "src/mcp.rs": "3829147ca5c983d5a4998b8a66f0918ccd7e252bddf63dff738ce0d3fd554e57",
       "src/mcp_output.rs": "b65470d12c90f831b0820b1a16e422926633932c9e9e6a6b7c6cca073dbf285c",
-      "src/migrations.rs": "856dfb27ea0040b37708c179d90915c610d65f47d9b45c27053efe9cdcf9bcce",
+      "src/migrations.rs": "3a217906a5c3b57f6362969cb3158614245a0e8ef3bed158be73e85edca38ec0",
       "src/monitor.rs": "044fbb178842f36bdc565a1a474de659248d010d7517058d8d1bf48d0b7b0fb9",
       "src/monitor_data.rs": "7788667e55e5e610597889c27fc4f8caf0c37c0306199069e0c68abac74da853",
       "src/network/contact.rs": "ad4747a95fecaf026ec20e4dc312730f221aca8b618331723a90d3a8c8ad9dc3",
@@ -206,7 +206,7 @@
       "src/network/relay_config.rs": "4c4c3ea82e331f7dea367779e12e077546faf0092af02481951ebcb15a838dfd",
       "src/network/relay_node.rs": "6304a3654423f7df3b38f6f71dde04e492d72609e8cceb4fb097f30f751f21f7",
       "src/network/sharing.rs": "f480fd9722c5a4131c85a8d93b0d1c35ba000479ea68aa8179a3a84d1be43d2e",
-      "src/network/store.rs": "628bada54ab9feb005105bd4a2c31a42e987725d9e173d758223be366dc31cd5",
+      "src/network/store.rs": "e583ba753547d961f1ca2ca078191e06df89c1df36ee1539d7d472f4b7140b63",
       "src/network/transport.rs": "5e0bb3077764dc0c09fc6074c88a1eec76a9fd101ffc9aeb330f8a2cd67101c1",
       "src/network/trust.rs": "fab0c35f1d40f69ad4d2b13fdc4b9de2bc96f727b2f3255e2229d2a47ff46d9d",
       "src/network/wire.rs": "11dd68fc810b5f424f27483eeb7a61298cf4578f1c0e07ed73a57633ed8cc264",
@@ -214,13 +214,13 @@
       "src/opencode_install/config.rs": "58cdd3493610bc9384029f42d0923628c0a5c68e8c6ad3337852d1ea79acbe44",
       "src/opencode_install/tests.rs": "f2d0cdf06849e5aa85cfd3b75377705fa5d238fb2373b337ba61808eb7b35d89",
       "src/opencode_install.rs": "e98ca38e711f090c96da66d2f7c48b0d046804a950679e7de9cd754b575a5fbe",
-      "src/opencode_state.rs": "8095b2950ee6874216434b7e0af8f8183ef8f847ffac5b7db9af023613bf652f",
+      "src/opencode_state.rs": "017ee97aeb8d9ed141a79e9532ce9fa1aacc36cd6a1f4edcc9ed5f4a7b95024c",
       "src/pairing_notifications.rs": "2a524084d4c834cdebd6f665bab647d4150e7cd7f5b9495b3bbaad961141e0e3",
-      "src/protocol.rs": "00f56f4ab89505f12cbaefe220f3746c458266b24206ebeb2689d3c9b07249dc",
+      "src/protocol.rs": "8992177b6ef3863698c3f8fc23145d858220f24805ab74cf594f13acce52f9bb",
       "src/service.rs": "56d83d8880d0ee789f8e83ecfe1018017f8c0bc51b5e516d54272189dbefd70a",
       "src/update.rs": "02ed054621e1cd3d25c7786051a5e2040ca848f1bb42c54c70dd9fa92e470bea",
       "src/update_install.rs": "d8614d4205cca40042d99e0a41f6d55f9c8ef7a4972cffd33cb7e0ba177827b1",
-      "tools/qualification_native.py": "d51db0e54f7ff7f32cd787b17c1fb0c2ee2dda39bb49198746af754693555466",
+      "tools/qualification_native.py": "65e082d443e88ab7b3a29aee85ae3a96ea9241b06719eeac2ba482d248bba4ca",
       "tools/test_qualification.py": "4316e47a0c2995627bc5b0974c70ab5ba4d53616885b309778f43bd30f849f7c"
     },
     "claude": {
@@ -254,193 +254,193 @@
     },
     "model_receipts": [
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-766a9d8b-3d41-4541-b64e-ccc83a85270f",
-        "message": "90cbd9fd-e049-47d8-a555-2e4db568ab45",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-67a9dca0-5d54-4bf8-8683-a40d63d7fdca",
+        "message": "d4398dd9-0348-46b6-9655-fd2ede5f9e73",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-766a9d8b-3d41-4541-b64e-ccc83a85270f",
-        "message": "90cbd9fd-e049-47d8-a555-2e4db568ab45",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-67a9dca0-5d54-4bf8-8683-a40d63d7fdca",
+        "message": "d4398dd9-0348-46b6-9655-fd2ede5f9e73",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "send_message"
       },
       {
-        "route": "claude-397d8f87-78e3-49c6-94d4-672303892518",
-        "marker": "MATRIX-766a9d8b-3d41-4541-b64e-ccc83a85270f",
-        "message": "c7afe054-691b-471c-82a4-66569c30e382",
+        "route": "claude-da1ca9c6-313a-4895-9e04-33bc25d46010",
+        "marker": "MATRIX-67a9dca0-5d54-4bf8-8683-a40d63d7fdca",
+        "message": "504a0836-ca6c-431a-9ca4-2e3e5850fa12",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "claude-397d8f87-78e3-49c6-94d4-672303892518",
-        "marker": "MATRIX-77182672-f19e-43ec-ad8c-178818ab4277",
-        "message": "52c07c11-7d5f-4f20-b60c-bbca5a14ff46",
+        "route": "claude-da1ca9c6-313a-4895-9e04-33bc25d46010",
+        "marker": "MATRIX-bf635403-9525-48a4-b4e3-a11c5a89216b",
+        "message": "ef15c464-6314-4cb7-84c7-6c3e5f564842",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "claude-397d8f87-78e3-49c6-94d4-672303892518",
-        "marker": "MATRIX-77182672-f19e-43ec-ad8c-178818ab4277",
-        "message": "52c07c11-7d5f-4f20-b60c-bbca5a14ff46",
+        "route": "claude-da1ca9c6-313a-4895-9e04-33bc25d46010",
+        "marker": "MATRIX-bf635403-9525-48a4-b4e3-a11c5a89216b",
+        "message": "ef15c464-6314-4cb7-84c7-6c3e5f564842",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "send_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-77182672-f19e-43ec-ad8c-178818ab4277",
-        "message": "9d4861d4-534b-4752-9afb-c23d22674ee8",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-bf635403-9525-48a4-b4e3-a11c5a89216b",
+        "message": "7d274fb0-e94e-446c-9d48-d3c249df23f0",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-e7e6d735-c9ac-488f-899f-7d9c7fb90736",
-        "message": "53734697-6c0e-4198-93d5-c5c26c0ce890",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-e99c39d4-0c80-4d5c-925b-3d2c2f8f2aa2",
+        "message": "a14c8ae1-41c4-47a4-813c-ed3c8cd607d9",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-e7e6d735-c9ac-488f-899f-7d9c7fb90736",
-        "message": "53734697-6c0e-4198-93d5-c5c26c0ce890",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-e99c39d4-0c80-4d5c-925b-3d2c2f8f2aa2",
+        "message": "a14c8ae1-41c4-47a4-813c-ed3c8cd607d9",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "send_message"
       },
       {
-        "route": "codex-01a1864a-9835-7f40-a8c0-167f78e0f7dd",
-        "marker": "MATRIX-e7e6d735-c9ac-488f-899f-7d9c7fb90736",
-        "message": "441d9378-ee9a-47a1-83e0-a219f26e996e",
+        "route": "codex-01a1866d-0f30-7330-ab98-76a00122496c",
+        "marker": "MATRIX-e99c39d4-0c80-4d5c-925b-3d2c2f8f2aa2",
+        "message": "9eb25e04-e746-497e-89e5-bde66660435f",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "codex-01a1864a-9835-7f40-a8c0-167f78e0f7dd",
-        "marker": "MATRIX-fd969338-d2c8-48e4-a1bd-f6071ec68ea8",
-        "message": "bde7ca52-4d1b-4420-93f1-785c257607ae",
+        "route": "codex-01a1866d-0f30-7330-ab98-76a00122496c",
+        "marker": "MATRIX-69c1fd2a-2746-46f5-8f9b-12d31fb7f0ce",
+        "message": "098b26df-c0b0-40d4-9f0d-c997c90a3d30",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "codex-01a1864a-9835-7f40-a8c0-167f78e0f7dd",
-        "marker": "MATRIX-fd969338-d2c8-48e4-a1bd-f6071ec68ea8",
-        "message": "bde7ca52-4d1b-4420-93f1-785c257607ae",
+        "route": "codex-01a1866d-0f30-7330-ab98-76a00122496c",
+        "marker": "MATRIX-69c1fd2a-2746-46f5-8f9b-12d31fb7f0ce",
+        "message": "098b26df-c0b0-40d4-9f0d-c997c90a3d30",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "send_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-fd969338-d2c8-48e4-a1bd-f6071ec68ea8",
-        "message": "2b0afc76-f27f-4a97-8196-6e035d52ac8a",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-69c1fd2a-2746-46f5-8f9b-12d31fb7f0ce",
+        "message": "bd97ca57-4958-4923-925e-ad9ba85996a1",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b571d2ffe7TcdNhuL8MQhlc",
-        "marker": "MATRIX-79713910-5621-401a-afd8-6b99ce960283",
-        "message": "517a57a2-e309-4acd-a55b-aff2cd16ad06",
+        "route": "opencode-ses_e7992f501ffeXfhGkapCXHzVAS",
+        "marker": "MATRIX-9ad4c28f-0733-4654-88cb-db0644bf29b9",
+        "message": "fd23f969-64d3-4a0b-9d01-96e9c099ef67",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b571d2ffe7TcdNhuL8MQhlc",
-        "marker": "MATRIX-79713910-5621-401a-afd8-6b99ce960283",
-        "message": "517a57a2-e309-4acd-a55b-aff2cd16ad06",
+        "route": "opencode-ses_e7992f501ffeXfhGkapCXHzVAS",
+        "marker": "MATRIX-9ad4c28f-0733-4654-88cb-db0644bf29b9",
+        "message": "fd23f969-64d3-4a0b-9d01-96e9c099ef67",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "send_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-79713910-5621-401a-afd8-6b99ce960283",
-        "message": "ecd71008-d7a2-43d3-9dae-ddf1c26f9c4b",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-9ad4c28f-0733-4654-88cb-db0644bf29b9",
+        "message": "0717b6b6-de06-42d3-8de8-c88afd890c1c",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-6ba63851-a1ce-495d-a69c-63490b66dd83",
-        "message": "052d6ec0-c866-4a90-8950-c4224a4ef701",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-188c2239-ea29-4fbe-b4eb-4774a681f295",
+        "message": "f27e7c10-4fc6-457b-8630-56321092a7d2",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-6ba63851-a1ce-495d-a69c-63490b66dd83",
-        "message": "052d6ec0-c866-4a90-8950-c4224a4ef701",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-188c2239-ea29-4fbe-b4eb-4774a681f295",
+        "message": "f27e7c10-4fc6-457b-8630-56321092a7d2",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "send_message"
       },
       {
-        "route": "opencode-ses_e79b571d2ffe7TcdNhuL8MQhlc",
-        "marker": "MATRIX-6ba63851-a1ce-495d-a69c-63490b66dd83",
-        "message": "b0aa59f3-a2e1-4474-bffa-f1d3ca2c1b0f",
+        "route": "opencode-ses_e7992f501ffeXfhGkapCXHzVAS",
+        "marker": "MATRIX-188c2239-ea29-4fbe-b4eb-4774a681f295",
+        "message": "ee84a892-7d6a-4bbf-9f17-7a5ea3e8cbb9",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5724affeK6nKMkJT0zI1kC",
-        "marker": "MATRIX-95b68a8c-0f5f-40a4-9aa9-d0c7864dadb0",
-        "message": "a06fc984-7db7-4776-902a-2729a44b5920",
+        "route": "opencode-ses_e7992f579ffeeFi3DBO7Ek90iv",
+        "marker": "MATRIX-57a0c15f-8c49-47e6-ac4f-5bff649b7f52",
+        "message": "fcf984e6-06e4-404f-b6d5-67f867815b70",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5724affeK6nKMkJT0zI1kC",
-        "marker": "MATRIX-95b68a8c-0f5f-40a4-9aa9-d0c7864dadb0",
-        "message": "a06fc984-7db7-4776-902a-2729a44b5920",
+        "route": "opencode-ses_e7992f579ffeeFi3DBO7Ek90iv",
+        "marker": "MATRIX-57a0c15f-8c49-47e6-ac4f-5bff649b7f52",
+        "message": "fcf984e6-06e4-404f-b6d5-67f867815b70",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "send_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-95b68a8c-0f5f-40a4-9aa9-d0c7864dadb0",
-        "message": "e4b35fbb-3978-424d-ac29-83cd6747fefb",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-57a0c15f-8c49-47e6-ac4f-5bff649b7f52",
+        "message": "eff1fae4-0a22-4f35-908e-af08dca69bc2",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-cdb954ab-8335-4752-a124-68b1b908cfc3",
-        "message": "3983b53b-2cb6-498a-bb54-4176c350a9ee",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-46183ae3-0014-42d4-92ca-c7fe51bb0eba",
+        "message": "6a7e4cd2-ff71-4822-9096-0c20bb228354",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
       },
       {
-        "route": "opencode-ses_e79b5a8dcffeJL3kF8GvBfdb5N",
-        "marker": "MATRIX-cdb954ab-8335-4752-a124-68b1b908cfc3",
-        "message": "3983b53b-2cb6-498a-bb54-4176c350a9ee",
+        "route": "opencode-ses_e79932839ffeywhTMgX6ns7tz9",
+        "marker": "MATRIX-46183ae3-0014-42d4-92ca-c7fe51bb0eba",
+        "message": "6a7e4cd2-ff71-4822-9096-0c20bb228354",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "send_message"
       },
       {
-        "route": "opencode-ses_e79b5724affeK6nKMkJT0zI1kC",
-        "marker": "MATRIX-cdb954ab-8335-4752-a124-68b1b908cfc3",
-        "message": "b273b045-4566-40cc-8654-6168f013034b",
+        "route": "opencode-ses_e7992f579ffeeFi3DBO7Ek90iv",
+        "marker": "MATRIX-46183ae3-0014-42d4-92ca-c7fe51bb0eba",
+        "message": "c91e8973-5aa6-44c8-aef4-aac5b7999fbd",
         "sender_label_visible": true,
         "correlation_visible": true,
         "tool": "acknowledge_message"
@@ -465,8 +465,8 @@
     }
   },
   "components": {
-    "source_commit": "343fed4028e8a349af418f89c712d602b0cd05eb",
-    "binary_sha256": "1d2d3a458dffbdde16a02af9b4c665b0ec4115d7c35669d92ea61c260b064ab1",
+    "source_commit": "07c2b3af68e253b15a47a732b8165b8dabd7d62a",
+    "binary_sha256": "6a88ff69e72e6737ff7fb19d06d0da82b2ba305a4357e9188f8edbb1da087994",
     "runs": [
       {
         "command": [
@@ -474,7 +474,7 @@
           "<repository>/target/debug/agent-bridge"
         ],
         "exit": 0,
-        "log": "<local-evidence>/agb7-ci-repair-components/opencode-native.log",
+        "log": "<local-evidence>/agb7-ccc-final-components/opencode-native.log",
         "observed": {
           "result": "passed",
           "opencode": "1.18.35",
@@ -482,11 +482,11 @@
           "embedded_bun": "1.3.14",
           "model": "scripted localhost OpenAI-compatible fixture",
           "model_requests": 9,
-          "exact_session": "ses_e79b43e14ffeeyZ0JPRxoklK8j",
-          "native_message_id": "msg_6183cde1a52f99180403ea1b5d4b199a0b25736eef7bf80b920909dacf450474",
-          "broker_id": "7f6eee77-8f25-452b-98ea-60880c0ab930",
-          "reply_id": "0c3d9237-7834-4324-b370-425286bf0881",
-          "parent": "7f6eee77-8f25-452b-98ea-60880c0ab930",
+          "exact_session": "ses_e79929079ffej2Bpfi1OhgIGSs",
+          "native_message_id": "msg_d919e7d1d9896571b3c5b221023e7dcd9ae8ed434c0b3ce0d41a83a11dc6ac28",
+          "broker_id": "3bef1c0c-7f07-4361-9810-8575e205dfd8",
+          "reply_id": "4f87b679-1092-48fb-80f1-3556992f73de",
+          "parent": "3bef1c0c-7f07-4361-9810-8575e205dfd8",
           "explicit_acknowledgement": true,
           "correlated_reply": true,
           "readonly_reconciliation": true,
@@ -506,16 +506,16 @@
           "<repository>/target/debug/agent-bridge"
         ],
         "exit": 0,
-        "log": "<local-evidence>/agb7-ci-repair-components/opencode-setup-native.log",
+        "log": "<local-evidence>/agb7-ccc-final-components/opencode-setup-native.log",
         "observed": {
           "result": "passed",
           "opencode": "1.18.35",
           "installed_assets": true,
           "installed_mcp": true,
-          "exact_session": "ses_e79b3dee5ffetiaESylqLYflou",
-          "incoming": "f384078a-03d1-4b4f-83d0-87d54e27084a",
-          "reply": "9a9181c2-0d3a-420d-b96b-a0e6ffa9103a",
-          "parent": "f384078a-03d1-4b4f-83d0-87d54e27084a",
+          "exact_session": "ses_e79924185ffejUnPczkUNwrfqJ",
+          "incoming": "07defd26-0901-4891-9a92-4a602efbfefa",
+          "reply": "c5374311-c070-4203-b14d-bb59913f8db2",
+          "parent": "07defd26-0901-4891-9a92-4a602efbfefa",
           "model_requests": 18,
           "context_requests": 17,
           "compaction_context": true,
@@ -691,10 +691,10 @@
       "--evidence",
       "<disk-evidence-path>"
     ],
-    "source_commit": "343fed4028e8a349af418f89c712d602b0cd05eb"
+    "source_commit": "07c2b3af68e253b15a47a732b8165b8dabd7d62a"
   },
   "source_trees": {
-    "src": "f9b3bfaf9304bd86baa2b473b5745e4f8540e3a0",
+    "src": "ebf36eeab66180ccf6bc08a79a49b54fd15989c9",
     "plugins/opencode": "0595b060ab63431eecf9e81da0b553c903f25759"
   },
   "initial_a00_failure_details": {
@@ -745,11 +745,6 @@
     "standalone_bun": "1.3.11",
     "embedded_bun": "1.3.14"
   },
-  "rust_validation_source_equivalence": {
-    "tested_commit": "a00d963ab1782192b53c290d3779ac7f0906a6f5",
-    "measured_binary_commit": "343fed4028e8a349af418f89c712d602b0cd05eb",
-    "rust_and_plugin_tree_unchanged": true
-  },
   "ci_attempt_1": {
     "url": "https://github.com/jasadams/agent-bridge/actions/runs/40825764415",
     "head": "343fed4028e8a349af418f89c712d602b0cd05eb",
@@ -760,5 +755,180 @@
     "repair": "always attempt bounded reap; accept Darwin EPERM only for verified owned zombie-only group; preserve live/unverified permission failures",
     "new_regressions": 3,
     "local_safety_tests_passed": 9
-  }
+  },
+  "current_full_gate_inventory": [
+    {
+      "command": [
+        "cargo",
+        "+1.98.0",
+        "fmt",
+        "--check"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 1.27,
+      "log": "<local-evidence>/agb7-ccc-gates/0.log"
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.98.0",
+        "check",
+        "--locked",
+        "-p",
+        "agent-bridge",
+        "--all-targets"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 21.35,
+      "log": "<local-evidence>/agb7-ccc-gates/1.log"
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.98.0",
+        "clippy",
+        "--locked",
+        "-p",
+        "agent-bridge",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 37.42,
+      "log": "<local-evidence>/agb7-ccc-gates/2.log"
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.98.0",
+        "test",
+        "--locked",
+        "-p",
+        "agent-bridge",
+        "--no-fail-fast"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 344.85,
+      "log": "<local-evidence>/agb7-ccc-gates/3.log"
+    },
+    {
+      "command": [
+        "sh",
+        "-n",
+        "install.sh"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 0.0,
+      "log": "<local-evidence>/agb7-ccc-gates/4.log"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/test_installer.py"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 45.51,
+      "log": "<local-evidence>/agb7-ccc-gates/5.log"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/test_packaging.py"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 9.98,
+      "log": "<local-evidence>/agb7-ccc-gates/6.log"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/test_release.py"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 2.61,
+      "log": "<local-evidence>/agb7-ccc-gates/7.log"
+    },
+    {
+      "command": [
+        "python3",
+        "tools/test_qualification.py"
+      ],
+      "exit": 0,
+      "TMPDIR": "/var/tmp",
+      "seconds": 4.4,
+      "log": "<local-evidence>/agb7-ccc-gates/8.log"
+    }
+  ],
+  "current_rust_result": {
+    "source_commit": "07c2b3af68e253b15a47a732b8165b8dabd7d62a",
+    "passed": 407,
+    "failed": 0,
+    "ignored_lan": 3
+  },
+  "merged_agb13_attempts": [
+    {
+      "artifact": "agb7-ccc-native-final.json",
+      "source_commit": "07c2b3af68e253b15a47a732b8165b8dabd7d62a",
+      "result": "failed",
+      "error": "timed out",
+      "pairs_completed": 0,
+      "cleanup": {
+        "children_exited": {
+          "broker-a": 0,
+          "broker-b": 0,
+          "opencode-a": -9
+        },
+        "http_thread_alive": false,
+        "owned_codex_socket_exists": false,
+        "errors": []
+      }
+    },
+    {
+      "artifact": "agb7-ccc-native-final-2.json",
+      "source_commit": "07c2b3af68e253b15a47a732b8165b8dabd7d62a",
+      "result": "failed",
+      "error": "Broker peer_share: Session registration changed or is disabled; select an enabled session before sharing",
+      "pairs_completed": 6,
+      "cleanup": {
+        "children_exited": {
+          "broker-a": -9,
+          "broker-b": 0,
+          "opencode-a": -15,
+          "opencode-b": -15,
+          "claude": -9,
+          "codex": 0
+        },
+        "http_thread_alive": false,
+        "owned_codex_socket_exists": false,
+        "errors": []
+      }
+    },
+    {
+      "artifact": "agb7-ccc-native-final-3.json",
+      "source_commit": "07c2b3af68e253b15a47a732b8165b8dabd7d62a",
+      "result": "failed",
+      "error": "Command '['<repository>/target/debug/agent-bridge', '--state-dir', '/var/tmp/abq-gardegzh/b/broker', 'opencode', 'install']' timed out after 30 seconds",
+      "pairs_completed": 0,
+      "cleanup": {
+        "children_exited": {
+          "broker-a": 0,
+          "broker-b": 0,
+          "opencode-a": -15
+        },
+        "http_thread_alive": false,
+        "owned_codex_socket_exists": false,
+        "errors": []
+      }
+    }
+  ]
 }
