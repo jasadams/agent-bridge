@@ -101,3 +101,19 @@ provider proves transport, safe-boundary consumption and tool correlation, not
 external-model judgment. Native macOS, physical-network and interactive UI
 qualification are outside this Linux fixture. Source qualification does not deploy
 or replace the running owner broker, configure owner sessions, or publish a release.
+
+## Initial CI portability repair
+
+The initial PR head `936e968fe9345126575941926e69cf5d5373b449` completed
+[run 40977086142](https://github.com/jasadams/agent-bridge/actions/runs/40977086142).
+Both macOS jobs passed. Both Linux jobs failed only the new readiness-observation
+unit test: their Python 3.10 has no `asyncio.timeout`. The preceding Rust, vendor,
+Clippy and other Python checks passed. Both failed job logs are retained as
+`/var/tmp/agb20-linux-arm-ci.log` and `/var/tmp/agb20-linux-x86-ci.log`.
+
+The readiness helper now uses portable `asyncio.wait_for` around the unchanged
+nonreaping observation loop. The production deadline remains 15 seconds; timeout
+and immediate-child-exit tests both assert no `poll()` or `wait()` reaping. The
+native fixture's other APIs still require Python 3.11+. No platform is skipped.
+The earlier native measurement above retains its exact source and harness hashes;
+refreshed measurements after this harness repair are attributed separately.

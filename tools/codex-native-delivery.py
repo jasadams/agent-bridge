@@ -176,14 +176,15 @@ class Probe:
                 self.server = None
             raise
 
-    async def wait_path(self, path):
-        async with asyncio.timeout(15):
+    async def wait_path(self, path, seconds=15):
+        async def observe():
             while not path.exists():
                 # Observe exit without reaping: cleanup must reserve every owned
                 # process-group ID until its final group signal is complete.
                 assert all(os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None
                            for _, proc in self.children), "child exited"
                 await asyncio.sleep(.05)
+        await asyncio.wait_for(observe(), timeout=seconds)
 
     async def proxy(self, ws):
         from websockets.asyncio.client import unix_connect

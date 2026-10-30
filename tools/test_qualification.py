@@ -38,6 +38,20 @@ class Isolation(unittest.TestCase):
         child.poll.assert_not_called()
         child.wait.assert_not_called()
 
+    def test_codex_probe_startup_deadline_does_not_reap_owned_leader(self):
+        probe = codex_probe.Probe.__new__(codex_probe.Probe)
+        child = Mock(pid=12345)
+        probe.children = [("native", child)]
+        native_os = Mock(P_PID=1, WEXITED=2, WNOWAIT=4, WNOHANG=8)
+        native_os.waitid.return_value = None
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(codex_probe, "os", native_os):
+                with self.assertRaises(asyncio.TimeoutError):
+                    asyncio.run(probe.wait_path(Path(directory) / "missing.sock", seconds=.01))
+        self.assertGreater(native_os.waitid.call_count, 0)
+        child.poll.assert_not_called()
+        child.wait.assert_not_called()
+
     def test_codex_probe_provider_start_failure_closes_without_shutdown(self):
         probe = codex_probe.Probe.__new__(codex_probe.Probe)
         server, worker = Mock(), Mock()
