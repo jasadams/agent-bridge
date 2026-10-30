@@ -17,7 +17,14 @@ const NAMESPACE = "aabbccdd-1234-4234-8234-123456789abc";
 const NATIVE = nativeID(NAMESPACE, A, ID);
 const routes = new Map<string, { namespace: string; generation: string }>();
 const cleanups: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+// One fixture per test. Disposal can finish an in-flight observe, compensate
+// that registration with a close, then close existing leases in parallel. Jobs
+// behind the in-flight event see disposed and return without native/broker work.
+// Each broker RPC permits 5s; then allow bounded socket drainage and another
+// second for listener/directory teardown.
+const SOCKET_DRAIN_TIMEOUT_MS = 1000;
+const CLEANUP_TIMEOUT_MS = 3 * 5000 + SOCKET_DRAIN_TIMEOUT_MS + 1000;
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); }, CLEANUP_TIMEOUT_MS);
 
 async function frame(endpoint: string, value: unknown, raw = false, sent?: () => void): Promise<any> {
   if (!raw && value && typeof value === "object" && ["deliver", "reconcile"].includes((value as any).op)) {
@@ -40,6 +47,9 @@ async function setup(tmpOverride?: string) {
   await chmod(directory, 0o700);
   const registrations = new Map<string, any>();
   const requests: any[] = [];
+  let brokerResponse: ((request: any) => Promise<void | false>) | undefined;
+  const brokerSockets = new Map<Bun.Socket<{ buffer: string }>, { closed: Promise<void>; resolve: () => void }>();
+  let acceptedSockets = 0, closedSockets = 0, endedSockets = 0;
   let admissionDenied = false;
   let admissionHook: (() => void) | undefined;
   let admissionGate: { enter: () => void; release: Promise<void> } | undefined;
@@ -51,7 +61,19 @@ async function setup(tmpOverride?: string) {
     return { entered, release };
   }
   const listener = Bun.listen<{ buffer: string }>({ unix: join(directory, "bridge.sock"), socket: {
-    open(socket) { socket.data = { buffer: "" }; },
+    open(socket) {
+      socket.data = { buffer: "" };
+      let resolve!: () => void;
+      const closed = new Promise<void>(done => { resolve = done; });
+      brokerSockets.set(socket, { closed, resolve }); acceptedSockets++;
+    },
+    // A client-side timeout destroys its socket before the server observes FIN.
+    // Complete that half-close and retain the server socket until close fires.
+    end(socket) { endedSockets++; socket.end(); },
+    close(socket) {
+      brokerSockets.get(socket)?.resolve();
+      brokerSockets.delete(socket); closedSockets++;
+    },
     async data(socket, data) {
       socket.data.buffer += data.toString();
       if (!socket.data.buffer.includes("\n")) return;
@@ -75,6 +97,7 @@ async function setup(tmpOverride?: string) {
         if (admissionGate) { const gate = admissionGate; admissionGate = undefined; gate.enter(); await gate.release; }
       }
       if (request.op === "opencode_admit" && (admissionDenied || registrations.get(request.session)?.generation !== request.generation)) { socket.end(JSON.stringify({ ok: false, error: "stale attempt" }) + "\n"); return; }
+      if (await brokerResponse?.(request) === false) return;
       socket.end(JSON.stringify({ ok: true, result }) + "\n");
     },
   }});
@@ -140,7 +163,31 @@ async function setup(tmpOverride?: string) {
   try { hooks = await AgentBridge({ client, directory, worktree: directory, project: { id: "project" }, serverUrl: new URL("http://127.0.0.1:1") } as PluginInput, { stateDir: directory });
   } finally { if (savedTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = savedTmp; }
   const reload = async () => { await hooks.dispose?.(); hooks = await AgentBridge({ client, directory, worktree: directory } as PluginInput, { stateDir: directory }); };
-  cleanups.push(async () => { try { await hooks.dispose?.(); } finally { listener.stop(true); await rm(directory, { recursive: true, force: true }); } });
+  const cleanup = async () => {
+    const errors: unknown[] = [];
+    try { await hooks.dispose?.(); } catch (error) { errors.push(error); }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.all([...brokerSockets.values()].map(socket => socket.closed)),
+        new Promise<never>((_, reject) => { timeout = setTimeout(() => {
+          for (const socket of brokerSockets.keys()) socket.terminate();
+          reject(new Error("Fixture broker sockets did not close within teardown budget"));
+        }, SOCKET_DRAIN_TIMEOUT_MS); }),
+      ]);
+    } catch (error) { errors.push(error); }
+    finally {
+      if (timeout) clearTimeout(timeout);
+      // Both normal close and guard-triggered terminate can resume a microtask
+      // inside a native callback. Let it unwind before releasing the listener.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      listener.stop();
+      try { await rm(directory, { recursive: true, force: true }); } catch (error) { errors.push(error); }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "Plugin fixture cleanup failed");
+  };
+  cleanups.push(cleanup);
   const event = async (type: string, properties: any) => hooks.event?.({ event: { type, properties } as any });
   const created = async (id = A) => event("session.created", { info: sessions.get(id) });
   const endpoint = () => registrations.get(A)?.endpoint ?? registrations.get(B)?.endpoint;
@@ -148,8 +195,79 @@ async function setup(tmpOverride?: string) {
     const db = new Database(join(directory, "opencode-receipts.sqlite3"), { readonly: true });
     try { return db.query("SELECT namespace,id,session,state FROM receipts ORDER BY id").all(); } finally { db.close(); }
   };
-  return { directory, registrations, requests, denyAdmission: (denied: boolean, hook?: () => void) => { admissionDenied = denied; admissionHook = hook; }, sessions, native, prompts, statuses, sdkReads, get hooks() { return hooks; }, reload, journalState, event, created, endpoint, blockNext, blockAdmission, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; }, lookupFailure: () => { lookupFailure = true; } };
+  return { directory, registrations, requests, cleanup, socketState: () => ({ accepted: acceptedSockets, ended: endedSockets, closed: closedSockets, active: brokerSockets.size }), brokerResponse: (hook: typeof brokerResponse) => { brokerResponse = hook; }, denyAdmission: (denied: boolean, hook?: () => void) => { admissionDenied = denied; admissionHook = hook; }, sessions, native, prompts, statuses, sdkReads, get hooks() { return hooks; }, reload, journalState, event, created, endpoint, blockNext, blockAdmission, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; }, lookupFailure: () => { lookupFailure = true; } };
 }
+
+describe("fixture cleanup deadline", () => {
+  test("awaits queued observation, compensating close and live close before removing resources", async () => {
+    // Run these checks after the actual registered fixture cleanup, so a hook
+    // timeout (including the former 5s limit) cannot count as successful cleanup.
+    let s: Awaited<ReturnType<typeof setup>>, endpoint: string;
+    let pending: Promise<unknown>;
+    cleanups.push(async () => {
+      await pending;
+      expect(s.registrations.size).toBe(0);
+      expect(s.socketState()).toMatchObject({ accepted: 4, closed: 4, active: 0 });
+      expect(s.requests.filter(r => r.op === "opencode_close").map(r => r.session).sort()).toEqual([A, B].sort());
+      await expect(stat(s.directory)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(endpoint)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+    s = await setup(); await s.created(A); endpoint = s.endpoint();
+    let entered!: () => void;
+    const observing = new Promise<void>(resolve => { entered = resolve; });
+    s.brokerResponse(async request => {
+      if (request.op === "opencode_observe" && request.session === B) entered();
+      // Three sequential, individually valid responses total >5s. No RPC's
+      // production timeout is changed, and the test body keeps its default limit.
+      await Bun.sleep(1800);
+    });
+    pending = s.created(B);
+    await observing;
+  });
+  test("a lingering broker connection fails bounded drainage and still removes resources", async () => {
+    const s = await setup(); await s.created(); const endpoint = s.endpoint();
+    // This extra accepted client deliberately never sends a request or FIN.
+    const idle = connect(join(s.directory, "bridge.sock"));
+    const disconnected = new Promise<void>(resolve => idle.on("close", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => { idle.on("connect", resolve); idle.on("error", reject); });
+      // Plain await keeps Bun 1.3.11's rejection matcher from entering a nested
+      // native event loop while socket/context cleanup is still pending.
+      const outcome = await s.cleanup().then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      expect(outcome.ok).toBe(false);
+      if (outcome.ok) throw new Error("Expected fixture cleanup to reject");
+      expect(outcome.error).toBeInstanceOf(Error);
+      expect((outcome.error as Error).message).toBe("Fixture broker sockets did not close within teardown budget");
+      await disconnected;
+      expect(s.socketState()).toMatchObject({ accepted: 3, closed: 3, active: 0 });
+      await expect(stat(s.directory)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(endpoint)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { idle.destroy(); await disconnected; }
+  });
+  test("missing close response still rejects after awaited private resource cleanup", async () => {
+    const s = await setup(); await s.created(); const endpoint = s.endpoint();
+    s.brokerResponse(async request => request.op === "opencode_close" ? false : undefined);
+    // Plain await keeps Bun 1.3.11's rejection matcher from entering a nested
+    // native event loop while socket/context cleanup is still pending.
+    const outcome = await s.cleanup().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) throw new Error("Expected fixture cleanup to reject");
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect((outcome.error as Error).message).toBe("Some native leases could not be closed; expiry fences them");
+    expect(s.socketState()).toMatchObject({ accepted: 2, closed: 2, active: 0 });
+    expect(s.socketState().ended).toBeGreaterThanOrEqual(1);
+    expect(s.requests.filter(r => r.op === "opencode_close")).toHaveLength(1);
+    expect(s.registrations.size).toBe(0);
+    await expect(stat(s.directory)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(endpoint)).rejects.toMatchObject({ code: "ENOENT" });
+  }, CLEANUP_TIMEOUT_MS);
+});
 
 describe("V1 supplied-client plugin with real private Unix sockets", () => {
   test("missing and invalid connected descriptors fail peer authentication", () => {
