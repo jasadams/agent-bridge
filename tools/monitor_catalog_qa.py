@@ -136,9 +136,23 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         expect(page.locator("#board-document")).to_contain_text("Discovered content")
         expect(page.locator("#selected-board-name")).to_have_text("catalog-alpha")
 
-    def case_drafts():
-        page.get_by_role("button", name="Respond: answer", exact=True).click()
+    def open_response():
+        # Both UIs activate the same revision-bound editor; never bypass the UI
+        # or weaken the draft/pending-save assertions for the inline layout.
+        inline = page.locator('.board-inline-response[data-field-id="answer"] .board-inline-text')
+        if inline.count():
+            expect(inline).to_have_count(1)
+            expect(inline).to_be_visible()
+            inline.focus()
+        else:
+            page.get_by_role("button", name="Respond: answer", exact=True).click()
         response = page.locator("#response-text")
+        expect(response).to_be_visible()
+        expect(response).to_be_focused()
+        return response
+
+    def case_drafts():
+        response = open_response()
         message = page.locator(".message-composer[data-field-id=compose] textarea")
         message.fill("Independent unsent message")
         response.fill("Retained ordinary response")
@@ -161,8 +175,7 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         assert not any(path.startswith("/api/boards/") and path not in (f"/api/boards/{board}", f"/api/boards/{board}/events") for _, path in requests[start:]), "Discovery fetched board content"
 
     def case_pending_response():
-        page.get_by_role("button", name="Respond: answer", exact=True).click()
-        page.locator("#response-text").fill("Pending catalog response")
+        open_response().fill("Pending catalog response")
         gate(f"/api/boards/{board}/responses")
         page.locator("#response-save").click()
         wait("actual committed response gate", lambda: page.evaluate("!!window.__catalogGate.decoded"))
