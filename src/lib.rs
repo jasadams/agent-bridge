@@ -2,6 +2,11 @@ pub mod board;
 mod board_clipboard;
 mod board_code_copy;
 pub mod board_interaction;
+mod board_lifecycle;
+#[cfg(test)]
+mod board_lifecycle_reuse_tests;
+#[cfg(test)]
+mod board_lifecycle_tests;
 mod board_links;
 pub mod board_messages;
 mod board_metadata;

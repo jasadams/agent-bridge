@@ -547,6 +547,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
         broker.request_async(observe()).await.unwrap();
         let route = format!("opencode-{SESSION}");
         let subscribe = || Request::Subscribe {
+            board_revisions: Default::default(),
             agent: route.clone(),
             events: vec![EventSelector::AgentOpened {}],
         };
@@ -641,6 +642,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
         );
         let removed = broker
             .request(Request::Unsubscribe {
+                board_revisions: Default::default(),
                 agent: route.clone(),
                 events: None,
             })

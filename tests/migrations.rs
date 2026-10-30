@@ -314,7 +314,7 @@ fn schema_thirteen_unknown_local_codex_queue_is_blocked_without_replay_and_is_id
     )
     .unwrap();
     conn.execute_batch(
-        "DROP TABLE board_message_receipts; DROP TABLE codex_notices; PRAGMA user_version=13;",
+        "DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; PRAGMA user_version=13;",
     )
     .unwrap();
     drop(conn);

@@ -259,7 +259,10 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
     }
     if request.method() == hyper::Method::POST
         && path.starts_with("/api/boards/")
-        && (path.ends_with("/responses") || path.ends_with("/messages"))
+        && (path.ends_with("/responses")
+            || path.ends_with("/messages")
+            || path.ends_with("/archive")
+            || path.ends_with("/restore"))
     {
         return Ok(board_response(request, app).await);
     }
@@ -323,7 +326,7 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                 Err(_) => error(StatusCode::BAD_REQUEST, "Invalid message filters"),
             }
         }
-        "/api/boards" => {
+        "/api/boards" | "/api/archived-boards" => {
             let Ok(permit) = app.reads.clone().try_acquire_owned() else {
                 return Ok(error(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -332,9 +335,14 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
             };
             let broker = app.broker.clone();
             let generation = app.generation;
+            let archived = path == "/api/archived-boards";
             match tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                broker.monitor_boards(generation)
+                if archived {
+                    broker.monitor_archived_boards(generation)
+                } else {
+                    broker.monitor_boards(generation)
+                }
             })
             .await
             {
@@ -424,7 +432,15 @@ fn board_reply(reply: crate::monitor_board::Reply) -> Response<Body> {
 }
 async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> {
     const MAX_BODY: usize = 512 * 1024;
-    let message = request.uri().path().ends_with("/messages");
+    let action = request
+        .uri()
+        .path()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    let message = action == "messages";
+    let lifecycle = matches!(action.as_str(), "archive" | "restore");
     if request.uri().query().is_some() {
         return error(StatusCode::BAD_REQUEST, "Unexpected query");
     }
@@ -432,7 +448,7 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         .uri()
         .path()
         .strip_prefix("/api/boards/")
-        .and_then(|s| s.strip_suffix(if message { "/messages" } else { "/responses" }))
+        .and_then(|s| s.strip_suffix(format!("/{action}").as_str()))
         .and_then(|s| s.parse::<crate::board::Name>().ok())
     else {
         return error(StatusCode::BAD_REQUEST, "Invalid board name");
@@ -507,8 +523,16 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
     enum Write {
         Response(crate::monitor_board::ResponseRequest),
         Message(crate::board_messages::Submission),
+        Lifecycle(crate::monitor_board::LifecycleRequest, bool),
     }
-    let request = if message {
+    let request = if lifecycle {
+        let request = match serde_json::from_slice::<crate::monitor_board::LifecycleRequest>(&bytes)
+        {
+            Ok(request) if request.valid(&name) => request,
+            _ => return error(StatusCode::BAD_REQUEST, "Invalid board lifecycle request"),
+        };
+        Write::Lifecycle(request, action == "restore")
+    } else if message {
         let request = match serde_json::from_slice::<crate::board_messages::Submission>(&bytes) {
             Ok(value) => value,
             Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid board message JSON"),
@@ -547,6 +571,7 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         match request {
             Write::Response(request) => broker.monitor_board_response(generation, &name, request),
             Write::Message(request) => broker.monitor_board_message(generation, &name, request),
+            Write::Lifecycle(request, restore) => broker.monitor_board_lifecycle(generation, &name, request, restore),
         }
     }).await {
         Ok(reply) if app.current()=>board_reply(reply),
@@ -633,10 +658,10 @@ async fn board_events(app: App, name: crate::board::Name) -> Response<Body> {
             if state.initial {
                 state.initial = false;
                 state.heartbeat = Instant::now();
-                let bytes = Bytes::from(format!(
-                    "event: board-revision\ndata: {}\n\n",
-                    json!({"name":state.name,"revision":state.revision.revision,"exists":state.revision.exists,"last_updated":state.revision.last_updated,"last_updated_source":state.revision.last_updated_source})
-                ));
+                let mut metadata = serde_json::to_value(&state.revision)
+                    .expect("Board identity metadata serializes");
+                metadata["name"] = json!(state.name);
+                let bytes = Bytes::from(format!("event: board-revision\ndata: {}\n\n", metadata));
                 return Some((Ok::<_, Infallible>(Frame::data(bytes)), state));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;

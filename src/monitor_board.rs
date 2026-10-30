@@ -16,6 +16,18 @@ pub(crate) struct ResponseRequest {
     pub control_id: String,
     pub value: Desired,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LifecycleRequest {
+    pub board: Name,
+    pub expected_revision: String,
+}
+impl LifecycleRequest {
+    pub(crate) fn valid(&self, name: &Name) -> bool {
+        &self.board == name && hash(&self.expected_revision)
+    }
+}
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Desired {
@@ -270,8 +282,8 @@ pub(crate) fn view(snapshot: &Snapshot) -> Value {
         let id=control_id(snapshot,&control);
         match &control.kind {
             Kind::Checkbox{checked}=>json!({"id":id,"kind":"checkbox","line":control.line,"label":control.label,"checked":checked}),
-            Kind::Message{id:field_id,owner,..}=>json!({"id":id,"kind":"message","line":control.line,"label":control.label,"field_id":field_id,"owner":owner,"rebase_key":control.message_key(&snapshot.name)}),
-            Kind::Text{id:field_id,value,..}=>json!({"id":id,"kind":"text","line":control.line,"label":control.label,"field_id":field_id,"value":value,"rebase_key":control.text_rebase_key(&snapshot.name)}),
+            Kind::Message{id:field_id,owner,..}=>json!({"id":id,"kind":"message","line":control.line,"label":control.label,"field_id":field_id,"owner":owner,"rebase_key":control.message_key(&snapshot.control_scope())}),
+            Kind::Text{id:field_id,value,..}=>json!({"id":id,"kind":"text","line":control.line,"label":control.label,"field_id":field_id,"value":value,"rebase_key":control.text_rebase_key(&snapshot.control_scope())}),
         }
     }).collect::<Vec<_>>();
     let display = board_interaction::display_markdown(&snapshot.markdown);
@@ -299,7 +311,21 @@ pub(crate) fn view(snapshot: &Snapshot) -> Value {
         result["render_notice"] =
             json!("This document is complex; showing plain text. Raw Markdown remains available.");
     }
+    lifecycle_metadata(&mut result, snapshot);
     result
+}
+
+fn lifecycle_metadata(value: &mut Value, snapshot: &Snapshot) {
+    let metadata =
+        serde_json::to_value(&snapshot.lifecycle).expect("Scalar lifecycle metadata serializes");
+    let Value::Object(metadata) = metadata else {
+        unreachable!("Lifecycle DTO is an object")
+    };
+    value
+        .as_object_mut()
+        .expect("Board view is an object")
+        .extend(metadata);
+    value["read_only"] = json!(!snapshot.writable());
 }
 pub(crate) struct Reply {
     pub status: u16,
@@ -324,6 +350,9 @@ pub(crate) struct BoardIdentity {
     pub exists: bool,
     pub last_updated: Option<i64>,
     pub last_updated_source: board::LastUpdatedSource,
+    pub read_only: bool,
+    #[serde(flatten)]
+    pub lifecycle: board::Lifecycle,
 }
 
 impl Broker {
@@ -337,12 +366,14 @@ impl Broker {
         if !access.current(generation) {
             return Err(reply(401, "unauthorized", "Monitor access expired"));
         }
-        self.read_board_locked(&db, name)
+        crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now())
             .map(|snapshot| BoardIdentity {
                 revision: snapshot.revision,
                 exists: snapshot.exists,
                 last_updated: snapshot.last_updated,
                 last_updated_source: snapshot.last_updated_source,
+                read_only: snapshot.lifecycle.state != board::LifecycleState::Active,
+                lifecycle: snapshot.lifecycle,
             })
             .map_err(|_| {
                 reply(
@@ -366,6 +397,106 @@ impl Broker {
             Err(_) => reply(500, "unavailable", "Boards unavailable"),
         }
     }
+    pub(crate) fn monitor_archived_boards(&self, generation: u64) -> Reply {
+        let db = self.db.lock().unwrap();
+        let access = self.monitor_control.lock().unwrap();
+        if !access.current(generation) {
+            return reply(401, "unauthorized", "Monitor access expired");
+        }
+        match crate::board_lifecycle::archived(&db, &self.state_dir, crate::db::now()) {
+            Ok(boards) => Reply {
+                status: 200,
+                body: json!({"boards":boards}),
+            },
+            Err(_) => reply(500, "unavailable", "Archived boards unavailable"),
+        }
+    }
+
+    pub(crate) fn monitor_board_lifecycle(
+        &self,
+        generation: u64,
+        name: &Name,
+        request: LifecycleRequest,
+        restore: bool,
+    ) -> Reply {
+        let db = self.db.lock().unwrap();
+        let access = self.monitor_control.lock().unwrap();
+        if !access.current(generation) {
+            return reply(401, "unauthorized", "Monitor access expired");
+        }
+        if !request.valid(name) {
+            return reply(400, "invalid", "Invalid board lifecycle request");
+        }
+        if !restore && name.is_main() {
+            return reply(
+                422,
+                "protected",
+                "Main is always available and cannot be archived",
+            );
+        }
+        let now = crate::db::now();
+        let current = match crate::board_lifecycle::inspect(&db, &self.state_dir, name, now) {
+            Ok(board) => board,
+            Err(_) => {
+                return reply(
+                    404,
+                    "not_found",
+                    "Board unavailable; it may have been permanently deleted",
+                );
+            }
+        };
+        if restore && current.lifecycle.state == board::LifecycleState::Purging {
+            return Reply {
+                status: 410,
+                body: json!({"code":"expired","error":"Archive expired; restoration is no longer available","board":view(&current)}),
+            };
+        }
+        if (restore && current.writable())
+            || (!restore && current.writable() && current.revision != request.expected_revision)
+        {
+            return conflict(&current);
+        }
+        let result = if restore {
+            crate::board_lifecycle::restore(
+                &db,
+                &self.state_dir,
+                name,
+                &request.expected_revision,
+                now,
+            )
+        } else {
+            self.archive_board_locked(&db, name, &request.expected_revision, now)
+        };
+        match result {
+            Ok(board) => Reply {
+                status: 200,
+                body: json!({"applied":true,"board":view(&board)}),
+            },
+            Err(error) => {
+                if let Some(conflict_error) = error.downcast_ref::<board::Conflict>() {
+                    return conflict(&conflict_error.current);
+                }
+                let observed =
+                    crate::board_lifecycle::inspect(&db, &self.state_dir, name, now).ok();
+                let pending = observed
+                    .as_ref()
+                    .is_some_and(|board| board.lifecycle.state == board::LifecycleState::Restoring);
+                let mut response = reply(
+                    if pending { 503 } else { 500 },
+                    if pending { "pending" } else { "uncertain" },
+                    if pending {
+                        "Restore is pending recovery; inspect this board before an explicit retry"
+                    } else {
+                        "The lifecycle operation was not confirmed; inspect this board before retrying"
+                    },
+                );
+                if let Some(board) = observed {
+                    response.body["board"] = view(&board);
+                }
+                response
+            }
+        }
+    }
     pub(crate) fn monitor_board(
         &self,
         generation: u64,
@@ -377,11 +508,13 @@ impl Broker {
         if !access.current(generation) {
             return reply(401, "unauthorized", "Monitor access expired");
         }
-        match self.read_board_locked(&db, name) {
+        match crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now()) {
             Ok(snapshot) => Reply {
                 status: 200,
                 body: if conditional == Some(snapshot.revision.as_str()) {
-                    json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"last_updated":snapshot.last_updated,"last_updated_source":snapshot.last_updated_source,"unchanged":true})
+                    let mut value = json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"last_updated":snapshot.last_updated,"last_updated_source":snapshot.last_updated_source,"unchanged":true});
+                    lifecycle_metadata(&mut value, &snapshot);
+                    value
                 } else {
                     view(&snapshot)
                 },
@@ -409,8 +542,9 @@ impl Broker {
         }
         let result = self.board_message_submit_locked(&db, &request);
         let mut body = result.body;
-        if body["code"] == "conflict"
-            && let Ok(snapshot) = self.read_board_locked(&db, name)
+        if matches!(body["code"].as_str(), Some("conflict" | "archived"))
+            && let Ok(snapshot) =
+                crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now())
         {
             body["board"] = view(&snapshot);
         }
@@ -436,6 +570,15 @@ impl Broker {
         let current = match self.read_board_locked(&db, name) {
             Ok(v) => v,
             Err(_) => {
+                if let Ok(board) =
+                    crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now())
+                    && !board.writable()
+                {
+                    return Reply {
+                        status: 409,
+                        body: json!({"code":"archived","error":"This board is not active; the response was not saved","board":view(&board)}),
+                    };
+                }
                 return reply(
                     404,
                     "not_found",
@@ -521,6 +664,8 @@ mod tests {
             exists: true,
             last_updated: None,
             last_updated_source: board::LastUpdatedSource::Unknown,
+            lifecycle: Default::default(),
+            file_identity: None,
         };
         super::structure(&snapshot, &board_interaction::controls(markdown))
     }
@@ -554,6 +699,8 @@ mod tests {
             exists: true,
             last_updated: None,
             last_updated_source: board::LastUpdatedSource::Unknown,
+            lifecycle: Default::default(),
+            file_identity: None,
             path: std::path::PathBuf::new(),
         };
         let result = view(&snapshot);

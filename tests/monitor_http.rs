@@ -33,6 +33,30 @@ impl Drop for Running {
         self.task.abort();
     }
 }
+fn board_snapshot(
+    running: &Running,
+    name: &agent_bridge::board::Name,
+) -> agent_bridge::board::Snapshot {
+    serde_json::from_value(
+        running
+            .broker
+            .request(Request::board_read(name.clone()))
+            .unwrap(),
+    )
+    .unwrap()
+}
+fn board_metadata(running: &Running, name: &agent_bridge::board::Name) -> Value {
+    let board = board_snapshot(running, name);
+    let mut value = serde_json::to_value(&board.lifecycle).unwrap();
+    value["name"] = serde_json::json!(board.name);
+    value["revision"] = serde_json::json!(board.revision);
+    value["exists"] = serde_json::json!(board.exists);
+    value["last_updated"] = serde_json::json!(board.last_updated);
+    value["last_updated_source"] = serde_json::json!(board.last_updated_source);
+    value["read_only"] = serde_json::json!(!board.writable());
+    value
+}
+
 fn host(access: &Value) -> String {
     access["url"]
         .as_str()
@@ -153,12 +177,9 @@ async fn board_events_follow_only_selected_revision_including_external_edits_and
     let first = timeout(Duration::from_secs(3), board_event(&mut stream))
         .await
         .unwrap();
-    assert_eq!(
-        first,
-        serde_json::json!({"name":"alpha", "revision":board::read_named(root.path(), &alpha).unwrap().revision, "exists":true, "last_updated":board::read_named(root.path(), &alpha).unwrap().last_updated, "last_updated_source":"file_mtime"})
-    );
+    assert_eq!(first, board_metadata(&running, &alpha));
     // Another board and unrelated broker activity must not invalidate alpha.
-    let before = board::read_named(root.path(), &beta).unwrap();
+    let before = board_snapshot(&running, &beta);
     running
         .broker
         .request(Request::NamedBoardUpdate {
@@ -181,10 +202,7 @@ async fn board_events_follow_only_selected_revision_including_external_edits_and
     let changed = timeout(Duration::from_secs(3), board_event(&mut stream))
         .await
         .unwrap();
-    assert_eq!(
-        changed,
-        serde_json::json!({"name":"alpha", "revision":board::read_named(root.path(), &alpha).unwrap().revision, "exists":true, "last_updated":board::read_named(root.path(), &alpha).unwrap().last_updated, "last_updated_source":"file_mtime"})
-    );
+    assert_eq!(changed, board_metadata(&running, &alpha));
     assert_ne!(changed["revision"], first["revision"]);
     assert!(!changed.to_string().contains("Private external content"));
     assert!(!changed.to_string().contains(key(&access)));
@@ -510,7 +528,7 @@ async fn board_http_reads_controls_save_conditional_conflict_and_narrow_security
             .unwrap();
     }
     let alpha: board::Name = "alpha".parse().unwrap();
-    let before = board::read_named(root.path(), &alpha).unwrap();
+    let before = board_snapshot(&running, &alpha);
     running.broker.request(Request::NamedBoardUpdate { board: alpha.clone(), expected_revision: before.revision, edits: vec![board::Edit::Set { markdown: "# Title\n- [ ] task\n\n<!-- board-input: answer -->\n> old\n<!-- /board-input -->\nTail\n".into() }], actor: None }).unwrap();
     let listed = json_body(&get(&access, "/api/boards", &auth(&access)).await);
     assert_eq!(
@@ -712,7 +730,7 @@ async fn http_response_notifies_only_the_selected_boards_native_subscriber() {
                 board: board.clone(),
             })
             .unwrap();
-        let snapshot = board::read_named(root.path(), &board).unwrap();
+        let snapshot = board_snapshot(&running, &board);
         running
             .broker
             .request(Request::NamedBoardUpdate {
@@ -743,6 +761,10 @@ async fn http_response_notifies_only_the_selected_boards_native_subscriber() {
         running
             .broker
             .request(Request::Subscribe {
+                board_revisions: std::collections::BTreeMap::from([(
+                    board.clone(),
+                    board_snapshot(&running, &board).revision,
+                )]),
                 events: vec![agent_bridge::protocol::EventSelector::BoardChanged { board }],
                 agent: name.into(),
             })
@@ -836,6 +858,188 @@ async fn slow_bodies_have_a_deadline_and_share_a_bounded_write_budget() {
     }
     assert_eq!((timed_out, denied), (4, 1));
     assert!(!root.path().join("boards").exists());
+}
+
+#[tokio::test]
+async fn archive_http_actions_share_security_and_emit_readonly_lifecycle_events() {
+    use agent_bridge::{
+        board::{Edit, Name},
+        protocol::Request,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let name: Name = "archive-test".parse().unwrap();
+    let created = running
+        .broker
+        .request(Request::BoardCreate {
+            board: name.clone(),
+        })
+        .unwrap();
+    let updated = running
+        .broker
+        .request(Request::board_update(
+            name.clone(),
+            created["revision"].as_str().unwrap().into(),
+            vec![Edit::Set {
+                markdown: "- [ ] Keep exact\n".into(),
+            }],
+            None,
+        ))
+        .unwrap();
+    assert_eq!(updated["applied"], true);
+    let before = board_snapshot(&running, &name);
+    let access = running.enable(0).await;
+    assert!(
+        get(&access, "/api/archived-boards", "")
+            .await
+            .starts_with("HTTP/1.1 401")
+    );
+    let payload = serde_json::json!({"board":name,"expected_revision":before.revision}).to_string();
+    let mut wrong = access.clone();
+    wrong["access_token"] = Value::String("wrong-token".into());
+    assert!(
+        post(
+            &wrong,
+            "/api/boards/archive-test/archive",
+            &post_headers(&access),
+            &payload
+        )
+        .await
+        .starts_with("HTTP/1.1 401")
+    );
+    assert!(
+        post(
+            &access,
+            "/api/boards/archive-test/archive",
+            "Content-Type: application/json\r\n",
+            &payload
+        )
+        .await
+        .starts_with("HTTP/1.1 403")
+    );
+    let mismatch =
+        serde_json::json!({"board":"other","expected_revision":before.revision}).to_string();
+    assert!(
+        post(
+            &access,
+            "/api/boards/archive-test/archive",
+            &post_headers(&access),
+            &mismatch
+        )
+        .await
+        .starts_with("HTTP/1.1 400")
+    );
+    let forged =
+        serde_json::json!({"board":name,"expected_revision":before.revision,"archived_at":0})
+            .to_string();
+    assert!(
+        post(
+            &access,
+            "/api/boards/archive-test/archive",
+            &post_headers(&access),
+            &forged
+        )
+        .await
+        .starts_with("HTTP/1.1 400")
+    );
+    let main = board_snapshot(&running, &Name::default());
+    let protected =
+        serde_json::json!({"board":"main","expected_revision":main.revision}).to_string();
+    assert!(
+        post(
+            &access,
+            "/api/boards/main/archive",
+            &post_headers(&access),
+            &protected
+        )
+        .await
+        .starts_with("HTTP/1.1 422")
+    );
+    let mut live = connect(&access, "/api/boards/archive-test/events", &auth(&access)).await;
+    let initial = timeout(Duration::from_secs(3), board_event(&mut live))
+        .await
+        .unwrap();
+    assert_eq!(initial["read_only"], false);
+    let response = post(
+        &access,
+        "/api/boards/archive-test/archive",
+        &post_headers(&access),
+        &payload,
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"));
+    let saved = json_body(&response)["board"].clone();
+    assert_eq!(saved["state"], "archived");
+    assert_eq!(saved["read_only"], true);
+    let event = timeout(Duration::from_secs(3), board_event(&mut live))
+        .await
+        .unwrap();
+    assert_eq!(event["read_only"], true);
+    assert_eq!(event["state"], "archived");
+    assert_eq!(event["revision"], saved["revision"]);
+    assert_eq!(event["incarnation"], saved["incarnation"]);
+    let active = json_body(&get(&access, "/api/boards", &auth(&access)).await);
+    assert!(
+        !active["boards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["name"] == "archive-test")
+    );
+    let archived = json_body(&get(&access, "/api/archived-boards", &auth(&access)).await);
+    assert_eq!(archived["boards"][0]["name"], "archive-test");
+    assert!(archived["boards"][0].get("markdown").is_none());
+    let conditional = json_body(
+        &get(
+            &access,
+            &format!(
+                "/api/boards/archive-test?if_revision={}",
+                saved["revision"].as_str().unwrap()
+            ),
+            &auth(&access),
+        )
+        .await,
+    );
+    assert_eq!(conditional["unchanged"], true);
+    assert_eq!(conditional["read_only"], true);
+    assert_eq!(conditional["expires_at"], saved["expires_at"]);
+    let restore =
+        serde_json::json!({"board":name,"expected_revision":saved["revision"]}).to_string();
+    let response = post(
+        &access,
+        "/api/boards/archive-test/restore",
+        &post_headers(&access),
+        &restore,
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"));
+    let restored = json_body(&response)["board"].clone();
+    assert_eq!(restored["state"], "active");
+    assert_eq!(restored["markdown"], before.markdown);
+    assert_eq!(
+        restored["last_updated"],
+        serde_json::json!(before.last_updated)
+    );
+    assert_ne!(
+        restored["lifecycle_generation"],
+        initial["lifecycle_generation"]
+    );
+    let event = timeout(Duration::from_secs(3), board_event(&mut live))
+        .await
+        .unwrap();
+    assert_eq!(event["read_only"], false);
+    assert_eq!(event["revision"], restored["revision"]);
+    assert!(
+        post(
+            &access,
+            "/api/boards/archive-test/archive",
+            &post_headers(&access),
+            &payload
+        )
+        .await
+        .starts_with("HTTP/1.1 409")
+    );
+    drop(live);
 }
 
 #[tokio::test]

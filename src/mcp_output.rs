@@ -25,7 +25,17 @@ fn fields(value: Value, names: &[&str]) -> Value {
 pub(super) fn board_revision(value: Value) -> Value {
     fields(
         value,
-        &["name", "revision", "last_updated", "last_updated_source"],
+        &[
+            "name",
+            "revision",
+            "last_updated",
+            "last_updated_source",
+            "incarnation",
+            "lifecycle_generation",
+            "state",
+            "archived_at",
+            "expires_at",
+        ],
     )
 }
 

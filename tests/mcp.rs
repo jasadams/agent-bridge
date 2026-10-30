@@ -1261,7 +1261,8 @@ async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
                 json!({"expected_revision":revision,"edits":[{"op":"set","markdown":body}]}),
             )
             .await;
-        assert_eq!(structured(&updated)["result"].as_object().unwrap().len(), 4);
+        assert_eq!(structured(&updated)["result"].as_object().unwrap().len(), 5);
+        assert_eq!(structured(&updated)["result"]["state"], "active");
         let timestamp = structured(&updated)["result"]["last_updated"].clone();
         assert!(timestamp.is_i64());
         assert_eq!(
@@ -1270,14 +1271,14 @@ async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
         );
         revision = structured(&updated)["result"]["revision"].clone();
         board_sizes.push(updated["result"].to_string().len());
-        // Two fixed metadata fields extend the receipt, never its Markdown body.
+        // Fixed timestamp and lifecycle fields extend the receipt, never its Markdown body.
         assert!(updated.to_string().len() < 600);
         let unchanged = mcp
             .call("read_board", json!({"if_revision":revision}))
             .await;
         assert_eq!(
             structured(&unchanged)["result"],
-            json!({"name":"main","revision":revision,"unchanged":true,"last_updated":timestamp,"last_updated_source":"file_mtime"})
+            json!({"name":"main","revision":revision,"unchanged":true,"last_updated":timestamp,"last_updated_source":"file_mtime","state":"active"})
         );
         let changed = mcp.call("read_board", json!({"if_revision":"stale"})).await;
         assert_eq!(structured(&changed)["result"]["markdown"], body);
@@ -1400,7 +1401,7 @@ async fn named_boards_keep_mcp_revisions_results_and_writes_isolated() {
         let subscribed = mcp
             .call(
                 "subscribe",
-                json!({"events":[{"event":"board.changed","board":name}],"agent":native.name}),
+                json!({"events":[{"event":"board.changed","board":name}],"agent":native.name,"board_revisions":{(name):revisions[if name=="alpha" {0} else {1}]}}),
             )
             .await;
         let events = structured(&subscribed)["result"]["events"]
@@ -1411,7 +1412,7 @@ async fn named_boards_keep_mcp_revisions_results_and_writes_isolated() {
     let unsubscribed = mcp
         .call(
             "unsubscribe",
-            json!({"events":[{"event":"board.changed","board":"alpha"}],"agent":native.name}),
+            json!({"events":[{"event":"board.changed","board":"alpha"}],"agent":native.name,"board_revisions":{"alpha":revisions[0]}}),
         )
         .await;
     assert_eq!(
@@ -1439,7 +1440,9 @@ async fn named_boards_keep_mcp_revisions_results_and_writes_isolated() {
         structured(&unchanged)["result"],
         json!({"name":"beta","revision":revisions[1],"unchanged":true,
             "last_updated":structured(&wrong_cache)["result"]["last_updated"],
-            "last_updated_source":structured(&wrong_cache)["result"]["last_updated_source"]})
+            "last_updated_source":structured(&wrong_cache)["result"]["last_updated_source"],
+            "incarnation":structured(&wrong_cache)["result"]["incarnation"],
+            "lifecycle_generation":structured(&wrong_cache)["result"]["lifecycle_generation"],"state":"active"})
     );
     let conflict = mcp.call("update_board", json!({"board":"beta","expected_revision":revisions[0],"edits":[{"op":"set","markdown":"wrong board"}]})).await;
     assert_eq!(conflict["result"]["isError"], true);
@@ -1479,4 +1482,189 @@ async fn named_boards_keep_mcp_revisions_results_and_writes_isolated() {
     let main = mcp.call("read_board", json!({})).await;
     assert_eq!(structured(&main)["result"]["exists"], false);
     assert_eq!(structured(&main)["result"]["markdown"], "");
+}
+
+#[tokio::test]
+async fn archive_tools_preserve_fixed_deadlines_contents_and_lifecycle_fences() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let created = mcp
+        .call("create_board", json!({"board":"archive-test"}))
+        .await;
+    let original = "# Exact\n\n雪\tcontent\n";
+    let updated=mcp.call("update_board",json!({"board":"archive-test","expected_revision":structured(&created)["result"]["revision"],"edits":[{"op":"set","markdown":original}]})).await;
+    assert_ne!(updated["result"]["isError"], true);
+    let read = mcp
+        .call("read_board", json!({"board":"archive-test"}))
+        .await;
+    let before = structured(&read)["result"].clone();
+    let main = mcp.call("read_board", json!({})).await;
+    assert_eq!(
+        mcp.call(
+            "archive_board",
+            json!({"board":"main","expected_revision":structured(&main)["result"]["revision"]})
+        )
+        .await["result"]["isError"],
+        true
+    );
+    let archived = mcp
+        .call(
+            "archive_board",
+            json!({"board":"archive-test","expected_revision":before["revision"]}),
+        )
+        .await;
+    assert_ne!(archived["result"]["isError"], true);
+    let saved = structured(&archived)["result"].clone();
+    assert_eq!(saved["state"], "archived");
+    assert_eq!(saved["markdown"], original);
+    assert_eq!(
+        saved["expires_at"].as_i64().unwrap() - saved["archived_at"].as_i64().unwrap(),
+        30 * 24 * 60 * 60 * 1000
+    );
+    let repeat = mcp
+        .call(
+            "archive_board",
+            json!({"board":"archive-test","expected_revision":before["revision"]}),
+        )
+        .await;
+    assert_eq!(
+        structured(&repeat)["result"]["expires_at"],
+        saved["expires_at"]
+    );
+    let active = mcp.call("list_boards", json!({})).await;
+    assert_eq!(structured(&active)["result"].as_array().unwrap().len(), 1);
+    assert_eq!(structured(&active)["result"][0]["name"], "main");
+    let listed = mcp.call("list_archived_boards", json!({})).await;
+    assert_eq!(structured(&listed)["result"][0]["name"], "archive-test");
+    assert!(structured(&listed)["result"][0].get("markdown").is_none());
+    assert_eq!(
+        mcp.call("read_board", json!({"board":"archive-test"}))
+            .await["result"]["isError"],
+        true
+    );
+    let inspected = mcp
+        .call("inspect_board", json!({"board":"archive-test"}))
+        .await;
+    assert_eq!(structured(&inspected)["result"]["markdown"], original);
+    let rejected=mcp.call("update_board",json!({"board":"archive-test","expected_revision":before["revision"],"edits":[{"op":"append","text":"forbidden"}]})).await;
+    assert_eq!(rejected["result"]["isError"], true);
+    let restored = mcp
+        .call(
+            "restore_board",
+            json!({"board":"archive-test","expected_revision":saved["revision"]}),
+        )
+        .await;
+    assert_ne!(restored["result"]["isError"], true);
+    let restored = structured(&restored)["result"].clone();
+    assert_eq!(restored["state"], "active");
+    assert_eq!(restored["markdown"], original);
+    assert_eq!(restored["last_updated"], before["last_updated"]);
+    assert_eq!(restored["incarnation"], before["incarnation"]);
+    assert_ne!(
+        restored["lifecycle_generation"],
+        before["lifecycle_generation"]
+    );
+    let stale=mcp.call("update_board",json!({"board":"archive-test","expected_revision":before["revision"],"edits":[{"op":"append","text":"stale"}]})).await;
+    assert_eq!(stale["result"]["isError"], true);
+    let injected=mcp.call("archive_board",json!({"board":"archive-test","expected_revision":restored["revision"],"archived_at":0})).await;
+    assert!(injected.get("error").is_some() || injected["result"]["isError"] == true);
+    let active = running.request(Request::NamedBoardRead {
+        board: "archive-test".parse().unwrap(),
+    });
+    assert_eq!(active["markdown"], original);
+    assert_eq!(active["state"], "active");
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn cli_archive_restore_and_explicit_inspection_use_the_same_broker_contract() {
+    async fn cli(state: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
+            .current_dir(home)
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(args)
+            .kill_on_drop(true);
+        timeout(Duration::from_secs(8), command.output())
+            .await
+            .expect("CLI request timed out")
+            .unwrap()
+    }
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    let created = cli(&state, root.path(), &["board", "--create", "cli-archive"]).await;
+    assert!(created.status.success());
+    let name = "cli-archive".parse().unwrap();
+    let current = running.request(Request::board_read(name));
+    running.request(Request::board_update(
+        "cli-archive".parse().unwrap(),
+        current["revision"].as_str().unwrap().into(),
+        vec![agent_bridge::board::Edit::Set {
+            markdown: "exact CLI bytes\n雪\n".into(),
+        }],
+        None,
+    ));
+    let metadata = cli(&state, root.path(), &["board", "cli-archive", "--metadata"]).await;
+    assert!(metadata.status.success());
+    let before: Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    assert!(before.get("markdown").is_none());
+    let missing = cli(&state, root.path(), &["board", "--archive", "cli-archive"]).await;
+    assert!(!missing.status.success());
+    let archived = cli(
+        &state,
+        root.path(),
+        &[
+            "board",
+            "--archive",
+            "cli-archive",
+            "--expected-revision",
+            before["revision"].as_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(archived.status.success());
+    let saved: Value = serde_json::from_slice(&archived.stdout).unwrap();
+    assert_eq!(saved["state"], "archived");
+    assert!(saved.get("markdown").is_none());
+    let listed = cli(&state, root.path(), &["board", "--list", "--archived"]).await;
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["name"], "cli-archive");
+    assert_eq!(listed[0]["expires_at"], saved["expires_at"]);
+    let ordinary = cli(&state, root.path(), &["board", "cli-archive", "--raw"]).await;
+    assert!(!ordinary.status.success());
+    let exact = cli(
+        &state,
+        root.path(),
+        &["board", "cli-archive", "--archived", "--raw"],
+    )
+    .await;
+    assert!(exact.status.success());
+    assert_eq!(exact.stdout, "exact CLI bytes\n雪\n".as_bytes());
+    let restored = cli(
+        &state,
+        root.path(),
+        &[
+            "board",
+            "--restore",
+            "cli-archive",
+            "--expected-revision",
+            saved["revision"].as_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(restored.status.success());
+    let restored: Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(restored["state"], "active");
+    assert_eq!(restored["last_updated"], before["last_updated"]);
+    let raw = cli(&state, root.path(), &["board", "cli-archive", "--raw"]).await;
+    assert_eq!(raw.stdout, exact.stdout);
 }

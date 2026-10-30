@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -188,6 +188,19 @@ UPDATE messages SET state='blocked',detail='Original native provider is unknown;
     if version < 15 {
         tx.execute_batch("CREATE TABLE board_message_receipts(id TEXT PRIMARY KEY REFERENCES messages(id),submission TEXT NOT NULL,owner TEXT NOT NULL,receipt TEXT NOT NULL);")?;
         tx.pragma_update(None, "user_version", 15)?;
+    }
+    if version < 16 {
+        tx.execute_batch(
+            "CREATE TABLE board_lifecycle(
+ name TEXT PRIMARY KEY,
+ incarnation TEXT NOT NULL,
+ generation TEXT NOT NULL,
+ phase TEXT NOT NULL CHECK(phase IN ('active','archived','restoring','purging')),
+ archive TEXT CHECK(archive IS NULL OR length(CAST(archive AS BLOB))<=65536),
+ metadata TEXT NOT NULL CHECK(length(CAST(metadata AS BLOB))<=8192)
+);",
+        )?;
+        tx.pragma_update(None, "user_version", 16)?;
     }
     tx.commit()?;
     Ok(())

@@ -3,8 +3,9 @@
 The same `agent-bridge` executable contains the HTTP server and all HTML, CSS and
 JavaScript. It reads the running broker's existing message database; there is no
 separate web process, Node.js runtime, CDN, asset download or model call. Messages
-shows delivery history; Boards reads local named boards and accepts only changes
-to their existing checkbox and marked text response controls.
+shows delivery history; Boards displays local named boards, accepts responses and
+agent-directed messages through their existing controls, and provides explicit
+Archive and Restore for named boards.
 
 Each board has a **Last Updated** footer outside both rendered and raw Markdown.
 It presents the broker's nullable UTC Unix millisecond `last_updated` metadata in
@@ -31,7 +32,8 @@ monitor automatically. The link carries the access token in a URL fragment
 removes it from the address bar and current history entry before authenticating.
 A plain loopback `url` and separate `access_token` remain available for manual
 entry. Treat the complete access link like a password: anyone with it can read
-messages and edit existing board responses while the monitor is enabled. Browser
+messages, edit board responses, send through board message inputs, and archive or
+restore named boards while the monitor is enabled. Browser
 extensions, copied links, bookmarks and browser history/sync may expose it; removing
 the current entry cannot guarantee erasure from browser records. The default chooses an
 available port; use `monitor enable --port 44002` for a fixed one. It binds only
@@ -89,7 +91,6 @@ while retaining the existing draft-review protections. If discovery fails, known
 options stay available while it retries with bounded backoff. A selected board
 missing from the catalog keeps its identity visible with an availability notice.
 Leaving Boards or locking stops catalog requests and rejects late responses.
-
 
 The view renders headings, tables, lists and code, with bounded wrapping/overflow
 and a readable source fallback for complex Markdown. Raw Markdown shows the exact
@@ -149,6 +150,45 @@ and selected message content, updates changed fields in place, and preserves
 selection instead of flashing a loading placeholder. Message refresh work pauses
 while Boards is visible and catches up when switching back.
 
+## Archive and restore
+
+Use **Archive** in the board toolbar for the selected named board. The action
+first applies the existing draft and pending-operation protections, then asks for
+confirmation that the archive will be permanently deleted after **30 days
+(30 × 24 hours)** unless restored. Cancel keeps the board unchanged. Archive is
+disabled for `main`, with an explanation; active boards are never removed solely
+because they have been idle.
+
+**Archived boards** opens the explicit archive list. Each record shows its archive
+date, scheduled permanent-deletion date and current state. **View archived board**
+opens its read-only content; **Restore** is available only before expiry. Restoration
+returns the exact Markdown to the active catalog and preserves its Last Updated
+metadata. Normal active-board discovery excludes archived boards and picks up a
+restored board without automatically switching your current selection.
+
+If another session archives the displayed board, its archived/read-only state
+prevents response saves and new message sends while preserving displayed content,
+selection and recoverable drafts. Restoring identical content does not silently
+reattach or rebase drafts from the old lifecycle. Review the new board and reopen
+the intended controls; old pending requests cannot redirect to a same-name replacement.
+An already accepted message is not cancelled by archive. Exact receipt recovery
+for an uncertain message remains separate from sending a new message.
+
+Before local archive or navigation, finish pending operations and use the existing
+Save/Keep, Discard or Cancel decisions for drafts. A failed save cannot authorize
+archive. An uncertain archive/restore keeps its original target; use **Inspect current
+board state** for readback. Mutations are never automatically replayed. `restoring` remains
+read-only while recovery completes; `purging` is expired and cannot be restored.
+
+Retention uses the broker's fixed persisted UTC deadline, shown in the browser's
+timezone. Reading, refreshing, restarting or repeating Archive never extends it.
+The broker checks at startup and every five minutes, independently of open viewers,
+and catches up after time offline. Restore is refused at or after expiry even
+before physical cleanup. Failed cleanup retains its record and reserved name,
+reports diagnostics through `agent-bridge status`, and retries. Permanent deletion
+affects only broker-managed archives and their metadata, never user-managed
+external backups. See [retention and recovery details](board.md#archive-and-restore).
+
 ## Browser access
 
 API requests carry a random access token in an Authorization header. The page
@@ -165,10 +205,12 @@ Exact Host validation, Origin and browser fetch-metadata checks reject DNS rebin
 and cross-origin requests. The server supplies no CORS permission, uses restrictive
 content-security/frame/referrer policies and disables caching. Message text
 renders as text, including HTML-like content. The write routes are authenticated
-`POST /api/boards/{name}/responses` and `POST /api/boards/{name}/messages`;
-other non-GET routes remain rejected. Both routes require exact same-origin mutation context and accepts only an existing
-control identity, expected revision and typed desired value, never a path,
-replacement document, attribution or arbitrary broker command. Access generation
+`POST /api/boards/{name}/responses`, `POST /api/boards/{name}/messages`,
+`POST /api/boards/{name}/archive` and `POST /api/boards/{name}/restore`.
+All require exact same-origin mutation context. Response/message routes accept
+an existing control identity, expected revision and typed value; lifecycle routes
+accept only the exact board name and expected revision. None accepts a filesystem
+path, replacement document, attribution or arbitrary broker command. Access generation
 is checked again at the shared transaction boundary; completed revocation prevents
 later commits. An admitted change can finish before revocation completes.
 
@@ -193,7 +235,9 @@ disable/re-enable the monitor to invalidate a copied token.
 
 Schema 9 adds local message context snapshots and an ordered monitor index without
 rewriting message bodies or delivery state. Follow the [backup/rollback guidance](peer-trust.md#upgrade-and-rollback)
-before running this version on existing state. Reads share the broker's existing
+before running this version on existing state. Archive metadata is migrated
+automatically; existing Markdown remains active without manual file moves.
+Reads share the broker's existing
 connection and never open a second database through startup recovery.
 
 Automated HTTP tests check authentication, origins/Host, read-only methods, bounded

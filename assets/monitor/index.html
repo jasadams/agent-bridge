@@ -62,8 +62,13 @@
           <select id="board-selector" aria-label="Choose board"></select>
           <button id="board-refresh" type="button">Refresh</button>
           <button id="board-raw-toggle" type="button" aria-pressed="false">Raw Markdown</button>
+          <button id="board-archive" type="button" disabled aria-describedby="board-archive-help">Archive</button>
+          <button id="board-archived-open" type="button">Archived boards</button>
           <span id="board-status" class="help" role="status" aria-live="polite">Loading boards…</span>
         </div>
+        <p id="board-archive-help" class="help">Archive keeps a named board for 30 days, then permanently deletes its managed content. Main cannot be archived.</p>
+        <p id="board-lifecycle-status" class="help" role="status" aria-live="polite"></p>
+        <button id="board-lifecycle-review" type="button" hidden>Inspect current board state</button>
         <p id="board-catalog-feedback" class="help" role="status" aria-live="polite" hidden></p>
         <p id="board-copy-feedback" class="help board-copy-feedback" role="status" aria-live="polite"></p>
         <p id="board-error" class="error notice" role="alert" hidden></p>
@@ -80,6 +85,8 @@
     </section>
   </main>
   <dialog id="unsaved-dialog" aria-labelledby="unsaved-title" aria-describedby="unsaved-description"><h2 id="unsaved-title">Keep your response?</h2><p id="unsaved-description">Save the response before leaving, discard it, or cancel to keep editing.</p><div class="response-actions"><button id="unsaved-save" class="primary" type="button">Save and continue</button><button id="unsaved-discard" type="button">Discard and continue</button><button id="unsaved-cancel" type="button">Cancel navigation</button></div></dialog>
+  <dialog id="archive-confirm-dialog" aria-labelledby="archive-confirm-title" aria-describedby="archive-confirm-description"><h2 id="archive-confirm-title">Archive board?</h2><p id="archive-confirm-description"></p><div class="response-actions"><button id="archive-confirm-submit" type="button">Archive for 30 days</button><button id="archive-confirm-cancel" type="button">Cancel</button></div></dialog>
+  <dialog id="archived-dialog" aria-labelledby="archived-title"><h2 id="archived-title">Archived boards</h2><p class="help">Restore before the scheduled permanent deletion. Times use your browser’s timezone.</p><p id="archived-feedback" role="status" aria-live="polite"></p><div id="archived-list"></div><div class="response-actions"><button id="archived-refresh" type="button">Refresh archives</button><button id="archived-close" type="button">Close</button></div></dialog>
   <noscript><p class="notice">Enable JavaScript to authenticate and view the local message monitor.</p></noscript>
 </body>
 </html>

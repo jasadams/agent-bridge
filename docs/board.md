@@ -108,13 +108,106 @@ Use `--create NAME` (or MCP `create_board`) explicitly before using a non-main
 board. Creation works without a terminal and never overwrites an existing board.
 Unknown names fail without creating a file or falling back to main.
 `--list` and MCP `list_boards` return deterministic name-ordered metadata
-(name, existence and revision), without Markdown. They include absent `main`.
-There are at most 256 boards, including lazy `main`; listing scans at most
-1,024 directory entries and errors explicitly on excess instead of truncating.
-Existing `boards/main.md` stays in place; no migration is needed. A read of absent
+(name, existence and revision), without Markdown. They show active boards and include
+absent `main`. Archived names remain reserved and count toward the 256-board limit,
+including lazy `main`; listing scans at most 1,024 directory entries and errors
+explicitly on excess instead of truncating. Existing boards are migrated automatically
+without changing their Markdown or requiring manual file moves. `boards/main.md`
+stays in place. A read of absent
 `main` returns empty Markdown and its revision;
 the first successful update creates it. Backups of the broker's state include the
 board. Print its exact Markdown once with `agent-bridge board --raw`.
+
+## Archive and restore
+
+Archive removes a named board from active lists and makes it read-only. Its exact
+Markdown remains available for explicit inspection and restoration for **30 days
+(30 × 24 hours)**. `main` is protected and cannot be archived. Active boards are
+never archived or deleted merely because they are old or inactive.
+
+In the terminal, outside an editor, press `a` to request Archive for the selected
+named board. The confirmation explains the retention window and permanent deletion;
+Enter confirms and Escape cancels. Press `b` to open the picker, then Tab/Shift-Tab
+to switch between active and archived boards. Select with `j`/`k` or arrows and
+Enter to inspect. Archived entries show their archive and scheduled deletion dates.
+On a restorable archived board, `r` opens Restore confirmation; Enter confirms and
+Escape cancels. On an active board, `r` retains its refresh behavior.
+
+Save successfully or explicitly discard retained response/message drafts before
+archiving or navigating. Pending and uncertain operations keep their original
+board and block a new lifecycle action. External archive keeps recoverable local
+drafts and the displayed content, but prevents writes. Restore does not make an
+old draft safe to save: read the current board and reopen its controls explicitly.
+Ctrl-R cannot rebase a draft across an archive/restore or same-name replacement.
+If an archive/restore outcome is uncertain, inspect the originating board rather
+than automatically repeating it. In the TUI, Ctrl-D explicitly releases uncertain
+tracking; it does not cancel an operation that may already have committed.
+
+The [web viewer](local-monitor.md#archive-and-restore) has the same Archive,
+Archived boards and Restore operations. Agents and scripts use the same broker
+through CLI or [MCP lifecycle tools](mcp.md#archive-and-restore):
+
+```sh
+agent-bridge board streamr --metadata
+agent-bridge board --archive streamr --expected-revision "CURRENT_ACTIVE_REVISION"
+agent-bridge board --list --archived
+agent-bridge board streamr --archived --metadata
+agent-bridge board streamr --archived --raw
+agent-bridge board --restore streamr --expected-revision "CURRENT_ARCHIVED_REVISION"
+```
+
+Read the exact current revision before either mutation. `--list --archived`
+prints JSON metadata, including lifecycle state, `archived_at` and `expires_at`;
+`--archived --raw` prints the exact inspected Markdown. Normal agent reads and
+updates accept active boards only. Explicit inspection can read an archived board
+without restoring it. Concurrent updates and lifecycle changes use revision checks;
+a stale request fails instead of overwriting, recreating or targeting another board.
+
+The successful archive persists `archived_at` and `expires_at` as UTC Unix
+milliseconds, with `expires_at = archived_at + 30 × 24 hours`. Viewers format the
+dates in their local timezone. Reads, listing, restarts and repeated archive requests
+do not extend that deadline. Restore before expiry preserves the exact archived
+Markdown and its original Last Updated metadata, removes the pending deletion and
+returns the board to active lists. Archiving it again starts a new retention window.
+A restore durably admitted before expiry can finish through recovery after the
+deadline; a new restore at or after the deadline is refused even if cleanup has
+not yet physically removed the archive.
+
+The broker recovers archive operations and cleans up expired archives at startup,
+then checks every five minutes while running. Both viewers may be closed. Time
+offline counts toward retention, and the next startup catches up. Cleanup never
+deletes before the persisted deadline; once expiry has been recorded, rolling the
+clock back does not make the archive restorable again. Permanent cleanup removes
+only broker-managed archived content and its archive-specific metadata. User-managed
+external backups are outside this retention job and are neither scanned nor deleted.
+
+A failed cleanup retains a retryable record and name reservation. Inspect
+`board_archives` in `agent-bridge status` for the board's state, expiry and
+`last_error`; the broker retries on subsequent cleanup passes. `restoring` is
+read-only while a committed restore is recovered; `purging` means expiry is final
+and cleanup is pending, so Restore is unavailable. Resolve the reported storage
+problem rather than manually moving managed files or assuming deletion succeeded.
+Archive and restore staging require filesystem creation-time metadata, captured
+from the validated file descriptor together with device and inode. Filesystems
+that cannot expose it are refused explicitly; ordinary board reads still work.
+Cleanup and restore also compare the original file's recorded change time, size
+and exact archived bytes. A changed or replaced path is left untouched with a
+retryable diagnostic. These checks protect managed paths across offline retention;
+they are not an ownership boundary against the operating-system user who owns the
+broker state. Coordinate external file edits instead of modifying archived files.
+The name can be reused only after permanent cleanup completes, and receives a new
+identity. Old revisions, controls, drafts and named-board subscription requests
+cannot target that replacement, even when its Markdown is identical.
+
+Archive invalidates that board's subscriptions and pending notices. Restore does
+not resubscribe agents or replay obsolete notices; read the restored board and opt
+in again explicitly. Already admitted native notice delivery may finish. Archive
+and Restore send no agent messages, grant no approval and do not cancel messages
+already accepted by the broker. Exact accepted-message receipt recovery remains
+available without sending another message; new sends from archived controls fail.
+
+See the [archive regression evidence](board-archive-regression.md) for controlled
+time, recovery, API and actual browser/terminal validation and its limits.
 
 ## Copy code
 
@@ -248,8 +341,14 @@ opt in with the generic `subscribe` MCP tool, selecting its exact registration
 and an explicit board selector:
 
 ```json
-{"agent":"codex-<this-session-UUID>","events":[{"event":"board.changed","board":"streamr"}]}
+{"agent":"codex-<this-session-UUID>","events":[{"event":"board.changed","board":"streamr"}],"board_revisions":{"streamr":"CURRENT_REVISION_FROM_READ_BOARD"}}
 ```
+
+Read each named board first and include its current revision in `board_revisions`
+for both `subscribe` and selector-specific `unsubscribe`. Missing or stale named
+fences fail clearly. `main` may omit this map; unsubscribe-all may omit it too.
+The CLI obtains current named-board revisions automatically before subscribing or
+unsubscribing. Archive removes the watch, and Restore requires fresh opt-in.
 
 Use the real exact route supplied in the session's native context. `subscribe`
 adds selectors idempotently and returns the effective `events`. `unsubscribe`
@@ -328,7 +427,8 @@ approval.
 `update_board` requires that exact revision and an ordered array of edits.
 `read_board` and `update_board` accept optional `board`, default `main`;
 `create_board` requires it. Event subscriptions require explicit board selectors. Named-board revisions bind the board identity
-as well as content, so a revision from another board cannot authorize a write.
+as well as content, including archive/restore generation and same-name replacement,
+so an old revision cannot authorize a write to another lifecycle of that board.
 Compact write receipts include `board`; conflict snapshots and unchanged reads
 include the selected identity. Keep conditional-read revisions scoped by board.
 For example, to edit `streamr`:

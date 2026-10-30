@@ -31,23 +31,6 @@ pub(crate) fn enrich(db: &Db, state_dir: &Path, mut board: Snapshot) -> Result<S
     Ok(board)
 }
 
-pub(crate) fn enrich_summary(
-    db: &Db,
-    state_dir: &Path,
-    mut board: board::Summary,
-) -> Result<board::Summary> {
-    board.last_updated = recorded_time(
-        db,
-        state_dir,
-        board.name.clone(),
-        &board.revision,
-        board.exists,
-        board.last_updated,
-    )?;
-    board.last_updated_source = source(board.last_updated);
-    Ok(board)
-}
-
 fn source(time: Option<i64>) -> LastUpdatedSource {
     if time.is_some() {
         LastUpdatedSource::FileMtime
@@ -119,6 +102,29 @@ fn recorded_time(
     );
     db.conn.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![KEY, serde_json::to_string(&records)?]).context("Cannot persist board timestamp metadata")?;
     Ok(last_updated)
+}
+
+/// Remove metadata only after a lifecycle purge durably unlinked its file.
+pub(crate) fn forget(db: &Db, name: &Name) -> Result<()> {
+    let stored: Option<String> = db
+        .conn
+        .query_row("SELECT value FROM settings WHERE key=?", [KEY], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if let Some(stored) = stored {
+        let mut records: BTreeMap<Name, Recorded> = serde_json::from_str(&stored)?;
+        ensure!(
+            records.len() <= board::MAX_BOARDS,
+            "Board timestamp metadata exceeds board limit"
+        );
+        records.remove(name);
+        db.conn.execute(
+            "UPDATE settings SET value=? WHERE key=?",
+            rusqlite::params![serde_json::to_string(&records)?, KEY],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
