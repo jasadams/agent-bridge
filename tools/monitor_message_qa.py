@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -471,6 +472,61 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             assert not history("direct click draft")
             record("desktop/mobile/short many-input dock stays pinned, independently scrolls, reveals focused boxes and edits on click")
 
+        def case_real_friendly_metadata():
+            native_session = "885b5a56-af8d-4a72-9b43-8ad930e945b6"
+            canonical = "claude-" + native_session
+            rpc(state, "register", agent={"name": canonical, "provider": "claude", "session": native_session, "endpoint": str(endpoint), "enabled": True})
+            rpc(state, "board_create", board="web-friendly")
+            add("web-friendly", canonical, "friendly", "Support desk")
+            add("web-friendly", canonical, "unknown", "Message " + canonical)
+            def title(session, value):
+                # Existing private test DB metadata; no public title-write API exists.
+                with sqlite3.connect(Path(state) / "messages.sqlite3") as db:
+                    db.execute("INSERT INTO session_metadata(provider,session,display_name) VALUES('claude',?,?) ON CONFLICT(provider,session) DO UPDATE SET display_name=excluded.display_name", (session, value))
+            pick("web-friendly")
+            expect(row("friendly").locator("label")).to_have_text("Support desk")
+            expect(row("unknown").locator("label")).to_have_text("Claude")
+            before = read("web-friendly")
+            title(native_session, "Coordinator")
+            expect(row("friendly").locator("label")).to_have_text("Coordinator", timeout=10000)
+            textarea = row("friendly").locator("textarea")
+            textarea.fill("friendly pinned draft"); textarea.evaluate("e => {e.setSelectionRange(4,4);window.__friendlyInput=e;}")
+            page.screenshot(path=str(output / "message-canonical-friendly-title.png"), full_page=False)
+            reads = []
+            watch_reads = lambda request: reads.append(request.url) if request.method == "GET" and "/api/boards/web-friendly" in request.url and "/events" not in request.url else None
+            page.on("request", watch_reads)
+            try:
+                title(native_session, "Planner")
+                expect(row("friendly").locator("label")).to_have_text("Planner", timeout=10000)
+                assert textarea.evaluate("e => e === window.__friendlyInput && e === document.activeElement && e.selectionStart === 4")
+                expect(textarea).to_have_value("friendly pinned draft")
+                assert not reads, "Presentation-only title changes fetched board snapshots"
+            finally:
+                page.remove_listener("request", watch_reads)
+            assert read("web-friendly") == before, "Reading/renaming labels changed the board"
+            page.screenshot(path=str(output / "message-canonical-renamed-title.png"), full_page=False)
+            textarea.press("Enter")
+            wait("canonical recipient accepted", lambda: len(history("friendly pinned draft")) == 1)
+            accepted = history("friendly pinned draft")[0]
+            assert accepted["recipient"] == canonical and accepted["recipient_session"] == native_session
+            wait("canonical recipient native delivery", lambda: any(frame.get("msg_id") == accepted["id"] and frame.get("session_id") == native_session for frame in frames))
+            expect(textarea).to_have_value("")
+            textarea.fill("replacement pinned draft")
+            replacement = str(uuid.uuid4())
+            rpc(state, "register", agent={"name": canonical, "provider": "claude", "session": replacement, "endpoint": str(endpoint), "enabled": True}, replace=True)
+            title(replacement, "Wrong replacement")
+            expect(row("friendly").locator("label")).to_have_text("Support desk", timeout=10000)
+            assert "Wrong replacement" not in page.locator("#message-controls").text_content()
+            textarea.press("Enter")
+            expect(row("friendly").locator(".message-feedback")).to_contain_text("closed, disabled or replaced")
+            expect(textarea).to_have_value("replacement pinned draft")
+            assert not history("replacement pinned draft")
+            assert read("web-friendly") == before
+            page.screenshot(path=str(output / "message-canonical-replaced-title.png"), full_page=False)
+            (output / "friendly-label-fixture.json").write_text(json.dumps({"canonical": canonical, "session": native_session, "title": "Coordinator", "renamed": "Planner", "replacement_title": "Wrong replacement", "authored_fallback": "Support desk", "board_revision": before["revision"]}, indent=2))
+            row("friendly").get_by_role("button", name="Discard draft").click()
+            record("real canonical Claude ID uses native friendly metadata; live title rename keeps input/caret/draft without snapshot polling; missing metadata honors authored/provider fallbacks; replacement cannot lend a title or receive old draft")
+
         def case_lock_and_layout():
             textarea = row().locator("textarea")
             row().locator("textarea").fill("lock private draft")
@@ -508,6 +564,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             ("queue_capacity", case_queue_capacity),
             ("client_render_fallback", case_client_render_fallback),
             ("dock_layout", case_dock_layout),
+            ("real_friendly_metadata", case_real_friendly_metadata),
             ("lock_and_layout", case_lock_and_layout),
         ]:
             ready = False

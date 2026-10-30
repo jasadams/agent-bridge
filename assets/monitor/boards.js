@@ -228,6 +228,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
               !(data.last_updated === null || Number.isSafeInteger(data.last_updated) && Math.abs(data.last_updated) <= 8640000000000000) ||
               !["file_mtime", "unknown"].includes(data.last_updated_source))) throw new Error("Invalid board metadata event");
           observeAuthority(data);
+          receiveMessageLabels(data);
           backoff = 1000;
           const currentView = latest || shown;
           if (data.revision !== currentView?.revision || metadata &&
@@ -345,6 +346,27 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   const messageDirty = () => Array.from(messageDrafts.values()).some(m => m.value || m.submission || m.pending);
   const messagePending = () => Array.from(messageDrafts.values()).some(m => m.pending);
   const messageIdentity = control => JSON.stringify([board, control.field_id, control.rebase_key]);
+  let messageLabels = {};
+  const compactMessageLabel = value => {
+    const clean = value.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g, "").trim();
+    let label = "";
+    for (const ch of clean) { if (new TextEncoder().encode(label + ch).length > 64) break; label += ch; }
+    return label;
+  };
+  const messageLabel = control => {
+    const known = messageLabels[control.rebase_key];
+    if (typeof known === "string" && compactMessageLabel(known)) return compactMessageLabel(known);
+    const owner = control.owner;
+    const generated = value => /(claude|codex|opencode)-[0-9a-f-]{36}|opencode-ses_/i.test(value);
+    if (!generated(owner.name) && owner.name !== `${owner.provider}-${owner.session}`) return compactMessageLabel(owner.name);
+    if (control.label && !control.label.includes(owner.name) && !generated(control.label) && compactMessageLabel(control.label)) return compactMessageLabel(control.label);
+    return ({claude:"Claude", codex:"Codex", opencode:"OpenCode", inbox:"Agent"})[owner.provider] || "Agent";
+  };
+  function receiveMessageLabels(value) {
+    if (!value.message_labels || typeof value.message_labels !== "object" || Array.isArray(value.message_labels)) return;
+    messageLabels = value.message_labels;
+    for (const m of messageDrafts.values()) if (m.name === board) text(m.label, messageLabel(m.control));
+  }
   function renderMessage(m) {
     m.row.hidden = m.name !== board;
     m.input.readOnly = m.pending || m.state === "uncertain";
@@ -425,12 +447,12 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       const key = messageIdentity(control);
       let m = messageDrafts.get(key);
       if (!m) {
-        const row = node("section", undefined, "message-composer"), label = node("label", control.owner.name), input = node("textarea"), feedback = node("p", "", "message-feedback help"), actions = node("div", undefined, "response-actions"), send = node("button", "Send"), review = node("button", "Review current input"), discard = node("button", "Discard draft");
+        const row = node("section", undefined, "message-composer"), label = node("label", messageLabel(control)), input = node("textarea"), feedback = node("p", "", "message-feedback help"), actions = node("div", undefined, "response-actions"), send = node("button", "Send"), review = node("button", "Review current input"), discard = node("button", "Discard draft");
         input.id = "message-" + crypto.randomUUID(); input.rows = 1; input.maxLength = 65536; label.htmlFor = input.id;
         feedback.id = input.id + "-feedback"; feedback.setAttribute("role", "status"); feedback.setAttribute("aria-live", "polite"); input.setAttribute("aria-describedby", feedback.id);
         for (const button of [send, review, discard]) button.type = "button";
         actions.append(send, review, discard); row.append(label, input, actions, feedback); row.dataset.fieldId = control.field_id;
-        m = { key, name: board, incarnation: view.incarnation, lifecycle_generation: view.lifecycle_generation, owner: control.owner, value: "", version: 0, revision: view.revision, controlId: control.id, row, input, feedback, send, review, discard, state: "editing", pending: false, submission: null, composing: false };
+        m = { key, name: board, incarnation: view.incarnation, lifecycle_generation: view.lifecycle_generation, owner: control.owner, value: "", version: 0, revision: view.revision, controlId: control.id, row, label, input, feedback, send, review, discard, state: "editing", pending: false, submission: null, composing: false };
         const state = m;
         input.addEventListener("focus", () => { input.scrollIntoView({block:"nearest"}); });
         input.addEventListener("compositionstart", () => { state.composing = true; });
@@ -445,7 +467,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
         discard.addEventListener("click", () => discardMessage(state));
         messageDrafts.set(key, m); $("message-controls").append(row);
       }
-      m.present = true; m.control = control; m.currentRevision = view.revision;
+      m.present = true; m.control = control; text(m.label, messageLabel(control)); m.currentRevision = view.revision;
       if (m.revision !== view.revision) {
         if (m.value || m.submission || m.pending) m.stale = true;
         else { m.revision = view.revision; m.controlId = control.id; m.stale = false; }
@@ -516,7 +538,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     }
     renderEditor(); lifecycleUI();
   }
-  function show(view) { shown = view; $("board-controls").append($("response-editor")); controlRows.clear(); renderDocument(view); controls(view); $("board-newer").hidden = !latest; }
+  function show(view) { receiveMessageLabels(view); shown = view; $("board-controls").append($("response-editor")); controlRows.clear(); renderDocument(view); controls(view); $("board-newer").hidden = !latest; }
   function makeDraft(control, value) {
     return { name: board, incarnation: shown.incarnation, lifecycle_generation: shown.lifecycle_generation, id: control.id, kind: control.kind, fieldId: control.field_id, key: control.rebase_key, revision: shown.revision, original: control.kind === "text" ? control.value : control.checked, value, state: "editing", reviewed: false, label: control.label };
   }
@@ -565,6 +587,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       if (!authorityCurrent(c) || id !== sequence || !active) return null;
       if (result.name !== c.name) throw new Error("Mismatched board snapshot");
       observeAuthority(result);
+      receiveMessageLabels(result);
       backoff = 1000; error("");
       if (result.unchanged) { receiveTimestamp(result); status(latest && latest.revision !== shown?.revision ? "Live · newer content is available" : draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return latest || shown; }
       if (!validView(result, c.name)) throw new Error("Invalid board snapshot");
@@ -652,7 +675,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     if (!validName(name) || name === board) return;
     const c = capture();
     if (!await allowLeave() || !current(c)) return;
-    stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; authorityEpoch++; authority = null; board = name; shown = null; latest = null; draft = null; backoff = 1000;
+    stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; authorityEpoch++; authority = null; messageLabels = {}; board = name; shown = null; latest = null; draft = null; backoff = 1000;
     for (const m of messageDrafts.values()) m.row.hidden = true;
     $("board-messages").hidden = true;
     $("selected-board-name").textContent = board; $("board-selector").value = board;
@@ -673,7 +696,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   async function leave(action, clearsPrivate = false) { const c = capture(); if (await allowLeave(clearsPrivate) && current(c)) { active = false; stopCatalog(); stop(); boardEpoch++; action(); } }
   function clear() {
     active = false; authEpoch++; boardEpoch++; stopCatalog(); catalogNames = null; catalogDelay = 2000; catalogFeedback(""); stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
-    messageDrafts.clear(); $("message-controls").replaceChildren(); $("board-messages").hidden = true;
+    messageLabels = {}; messageDrafts.clear(); $("message-controls").replaceChildren(); $("board-messages").hidden = true;
     authorityEpoch++; authority = null; lifecycleOperation?.controller?.abort(); lifecycleOperation = null; archiveIntent = null; closeArchives();
     if ($("archive-confirm-dialog").open) $("archive-confirm-dialog").close();
     $("archive-confirm-description").textContent = ""; text($("board-lifecycle-status"), "");

@@ -575,12 +575,18 @@ impl Broker {
                     &self.state_dir,
                     crate::db::now()
                 )?),
-                Request::BoardInspect { board } => json!(crate::board_lifecycle::inspect(
-                    &db,
-                    &self.state_dir,
-                    &board,
-                    crate::db::now()
-                )?),
+                Request::BoardInspect { board } => {
+                    let snapshot = crate::board_lifecycle::inspect(
+                        &db,
+                        &self.state_dir,
+                        &board,
+                        crate::db::now(),
+                    )?;
+                    let labels = crate::board_messages::display_labels(&db, &snapshot)?;
+                    let mut value = json!(snapshot);
+                    value["message_labels"] = json!(labels);
+                    value
+                }
                 Request::BoardArchive {
                     board,
                     expected_revision,

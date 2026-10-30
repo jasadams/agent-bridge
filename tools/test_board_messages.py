@@ -13,6 +13,7 @@ import signal
 import struct
 import termios
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -250,6 +251,82 @@ def run(binary, output=None):
                 assert viewer.process.wait(timeout=1) == 0
                 assert b"\x1b[?1049l" in viewer.output, "normal quit restores alternate screen"
                 assert b"\x1b[?2004l" in viewer.output, "normal quit disables bracketed paste"
+                # Real canonical registration IDs and separate native titles must
+                # render differently, without changing the pinned owner or board.
+                viewer.close()
+                canonical_session = "885b5a56-af8d-4a72-9b43-8ad930e945b6"
+                canonical = "claude-" + canonical_session
+                rpc({"op": "register", "agent": {"name": canonical, "provider": "claude", "session": canonical_session, "endpoint": str(endpoint), "enabled": True}})
+                rpc({"op": "board_create", "board": "friendly"})
+                for field, label in (("friendly", "Support desk"), ("unknown", "Message " + canonical)):
+                    snapshot = rpc({"op": "named_board_read", "board": "friendly"})
+                    rpc({"op": "add_board_message_input", "board": "friendly", "expected_revision": snapshot["revision"], "agent": canonical, "id": field, "label": label})
+                baseline = rpc({"op": "named_board_read", "board": "friendly"})
+                def native_title(session, value):
+                    with sqlite3.connect(state / "messages.sqlite3") as db:
+                        db.execute("INSERT INTO session_metadata(provider,session,display_name) VALUES('claude',?,?) ON CONFLICT(provider,session) DO UPDATE SET display_name=excluded.display_name", (session, value))
+                viewer = Viewer(binary, state, "friendly")
+                viewer.wait(lambda: "Support desk" in viewer.screen.text() and "Claude" in viewer.screen.text())
+                assert canonical not in viewer.screen.text()
+                capture(viewer, "message-canonical-no-title-fallback")
+                native_title(canonical_session, "Coordinator")
+                viewer.wait(lambda: "Coordinator" in viewer.screen.text())
+                capture(viewer, "message-canonical-friendly-title")
+                viewer.keys(b"\tretained native draft\x1b[D\x1b[D")
+                native_title(canonical_session, "Planner")
+                viewer.wait(lambda: "Planner" in viewer.screen.text())
+                viewer.keys(b"_")
+                viewer.wait(lambda: "retained native dra_ft" in viewer.screen.text().replace("▏", ""))
+                capture(viewer, "message-canonical-renamed-title-caret")
+                assert rpc({"op": "named_board_read", "board": "friendly"}) == baseline
+                viewer.keys(b"\r")
+                viewer.wait(lambda: len(frames) == 4)
+                assert frames[3]["session_id"] == canonical_session
+                history = rpc({"op": "history", "agent": canonical, "limit": 100})
+                assert len(history) == 1 and history[0]["recipient"] == canonical
+                assert history[0]["body"] == "retained native dra_ft"
+                viewer.wait(lambda: "retained native" not in viewer.screen.text())
+                viewer.keys(b"old owner draft")
+                replacement = str(uuid.uuid4())
+                rpc({"op": "register", "agent": {"name": canonical, "provider": "claude", "session": replacement, "endpoint": str(endpoint), "enabled": True}, "replace": True})
+                native_title(replacement, "Wrong replacement")
+                viewer.wait(lambda: "Support desk" in viewer.screen.text())
+                assert "Wrong replacement" not in viewer.screen.text()
+                viewer.keys(b"\r")
+                viewer.wait(lambda: "closed, disabled or replaced" in viewer.screen.text())
+                assert len(frames) == 4 and "old owner draft" in viewer.screen.text()
+                assert rpc({"op": "named_board_read", "board": "friendly"}) == baseline
+                capture(viewer, "message-canonical-replaced-owner")
+                if output is not None:
+                    (output / "friendly-label-fixture.json").write_text(json.dumps({"canonical": canonical, "session": canonical_session, "friendly_title": "Coordinator", "renamed_title": "Planner", "replacement_title": "Wrong replacement", "authored_fallback": "Support desk", "board_revision": baseline["revision"]}, indent=2))
+                viewer.keys(b"\x1b")
+                viewer.keys(b"\x04")
+                os.write(viewer.master, b"q")
+                viewer.process.wait(timeout=5)
+                # Default main must use the metadata-capable inspection path too.
+                viewer.close()
+                rpc({"op": "register", "agent": {"name": canonical, "provider": "claude", "session": canonical_session, "endpoint": str(endpoint), "enabled": True}, "replace": True})
+                native_title(canonical_session, "Main coordinator")
+                rpc({"op": "board_create", "board": "main"})
+                main_before = rpc({"op": "named_board_read", "board": "main"})
+                rpc({"op": "add_board_message_input", "board": "main", "expected_revision": main_before["revision"], "agent": canonical, "id": "main-friendly", "label": "Message " + canonical})
+                main_before = rpc({"op": "named_board_read", "board": "main"})
+                viewer = Viewer(binary, state, "main")
+                viewer.wait(lambda: "Main coordinator" in viewer.screen.text())
+                assert canonical not in viewer.screen.text()
+                capture(viewer, "message-main-canonical-friendly-title")
+                viewer.keys(b"\tmain retained draft")
+                native_title(canonical_session, "Main planner")
+                viewer.wait(lambda: "Main planner" in viewer.screen.text())
+                assert "main retained draft" in viewer.screen.text()
+                assert rpc({"op": "named_board_read", "board": "main"}) == main_before
+                capture(viewer, "message-main-canonical-renamed-title")
+                if output is not None:
+                    (output / "friendly-main-fixture.json").write_text(json.dumps({"board": "main", "canonical": canonical, "session": canonical_session, "friendly_title": "Main coordinator", "renamed_title": "Main planner", "board_revision": main_before["revision"], "last_updated": main_before["last_updated"]}, indent=2))
+                viewer.keys(b"\x1b")
+                viewer.keys(b"\x04")
+                os.write(viewer.master, b"q")
+                viewer.process.wait(timeout=5)
                 assert not failures, failures
                 print("PASS: real native delivery, Enter send/Ctrl-J newline, repeated Enter, focus, draft refresh/review, exact board, graceful quit/reset")
             finally:
