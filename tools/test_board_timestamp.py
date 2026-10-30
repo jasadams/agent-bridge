@@ -159,7 +159,7 @@ def run(binary, output):
                     assert "15 Jan 11:00 AEDT" in viewer.screen.text() and "15 Jul 10:00 AEST" not in viewer.screen.text()
                     count = len(copies())
                     if mode == "mouse":
-                        x, y = point("[Copy]")
+                        x, y = point("[⧉]")
                         viewer.keys(f"\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m".encode())
                     else:
                         viewer.keys(b"c\r")
@@ -172,7 +172,7 @@ def run(binary, output):
                         viewer.keys(b"\x1b")
                         viewer.keys(b"\x1b")
                     viewer.wait(lambda: "NEW_COMMAND" in viewer.screen.text() and "15 Jul 10:00 AEST" in viewer.screen.text())
-                    x, y = point("[Copy]")
+                    x, y = point("[⧉]")
                     count = len(copies())
                     viewer.keys(f"\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m".encode())
                     viewer.wait(lambda: len(copies()) > count)

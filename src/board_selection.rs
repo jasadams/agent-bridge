@@ -304,11 +304,11 @@ mod tests {
     }
     #[test]
     fn copy_affordances_and_their_own_rows_are_excluded_from_selection() {
-        let mut body = viewport(&["prose cmd[Copy] end", "[Copy block]", "  code"]);
+        let mut body = viewport(&["prose cmd[⧉] end", "[⧉]", "  code"]);
         body.exclude_copy_buttons(
-            (11..17)
+            (11..14)
                 .map(|x| Position::new(x, 3))
-                .chain((2..14).map(|x| Position::new(x, 4))),
+                .chain((2..5).map(|x| Position::new(x, 4))),
         );
         let text = Selection::start(body, Position::new(2, 3))
             .unwrap()

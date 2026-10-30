@@ -96,7 +96,7 @@ def run(binary, output):
                     write(name, markdown)
                     before = read(name)
                     viewer = Viewer(binary, state, name, env=env)
-                    viewer.wait(lambda: bool(positions(viewer, "[Copy")))
+                    viewer.wait(lambda: bool(positions(viewer, "[⧉")))
                     assert not payloads(viewer), "opening board wrote clipboard"
                     check(viewer, name)
                     if not mutates:
@@ -120,28 +120,28 @@ def run(binary, output):
             inline = "# Inline\nLEFT `printf 'λ'` RIGHT and `same` / `same`\n\n- list ``echo `literal` \\path``\n\n| Command | Note |\n|---|---|\n| `echo 地球` | cell |\n"
             def inline_check(viewer, _name):
                 expected = ["printf 'λ'", "same", "same", "echo `literal` \\path", "echo 地球"]
-                viewer.wait(lambda: len(positions(viewer, "[Copy]")) == len(expected))
+                viewer.wait(lambda: len(positions(viewer, "[⧉]")) == len(expected))
                 for index, value in enumerate(expected):
-                    click(viewer, positions(viewer, "[Copy]")[index], value)
+                    click(viewer, positions(viewer, "[⧉]")[index], value)
             case("inline", inline, inline_check)
 
             block = "  printf '%s\\n' \"first\"\n\techo '地球'\n" + "".join(f"echo row-{n}\n" for n in range(65))
             case("block", "# Block\n\n```sh\n" + block + "```\n",
-                 lambda viewer, _name: click(viewer, positions(viewer, "[Copy block]")[0], block))
+                 lambda viewer, _name: click(viewer, positions(viewer, "[⧉]")[0], block))
             case("indented", "# Indented\n\n    first\n      second\n    third\n",
-                 lambda viewer, _name: click(viewer, positions(viewer, "[Copy block]")[0], "first\n  second\nthird\n"))
+                 lambda viewer, _name: click(viewer, positions(viewer, "[⧉]")[0], "first\n  second\nthird\n"))
 
             case("quoted", "# Quoted\n\n> ```sh\n> printf 'quote'\n>   echo second\n> ```\n\noutside tail\n",
-                 lambda viewer, _name: click(viewer, positions(viewer, "[Copy block]")[0], "printf 'quote'\n  echo second\n"))
+                 lambda viewer, _name: click(viewer, positions(viewer, "[⧉]")[0], "printf 'quote'\n  echo second\n"))
             case("listed", "# Listed\n\n- before\n\n  ```sh\n  echo 'list'\n    echo nested\n  ```\n\noutside tail\n",
-                 lambda viewer, _name: click(viewer, positions(viewer, "[Copy block]")[0], "echo 'list'\n  echo nested\n"))
+                 lambda viewer, _name: click(viewer, positions(viewer, "[⧉]")[0], "echo 'list'\n  echo nested\n"))
 
             case("quoted-indented", "# Quoted indented\n\n>     printf 'quote-indent'\n>       echo second\n",
-                 lambda viewer, _name: click(viewer, positions(viewer, "[Copy block]")[0], "printf 'quote-indent'\n  echo second\n"))
+                 lambda viewer, _name: click(viewer, positions(viewer, "[⧉]")[0], "printf 'quote-indent'\n  echo second\n"))
             case("listed-indented", "# Listed indented\n\n- item\n\n      printf 'list-indent'\n        echo second\n",
-                 lambda viewer, _name: click(viewer, positions(viewer, "[Copy block]")[0], "printf 'list-indent'\n  echo second\n"))
+                 lambda viewer, _name: click(viewer, positions(viewer, "[⧉]")[0], "printf 'list-indent'\n  echo second\n"))
             case("tab-indented", "# Tab indented\n\n\tprintf 'tab'\n\t  echo second\n",
-                 lambda viewer, _name: click(viewer, positions(viewer, "[Copy block]")[0], "printf 'tab'\n  echo second\n"))
+                 lambda viewer, _name: click(viewer, positions(viewer, "[⧉]")[0], "printf 'tab'\n  echo second\n"))
 
             def linked_check(viewer, _name):
                 target = "https://example.test/code"
@@ -151,7 +151,7 @@ def run(binary, output):
                 assert label == "a|b", repr(label)
                 x, y = positions(viewer, "SENTINEL")[0]
                 assert all(viewer.screen.cells[(x+i, y)][1] is None for i in range(len("SENTINEL")))
-                click(viewer, positions(viewer, "[Copy]")[0], "a|b")
+                click(viewer, positions(viewer, "[⧉]")[0], "a|b")
             case("linked", "# Linked\n\n| Command | Neighbor |\n|---|---|\n| [`a\\|b`](https://example.test/code) | SENTINEL |\n", linked_check)
 
             def keyboard_check(viewer, _name):
@@ -171,22 +171,22 @@ def run(binary, output):
                 fcntl.ioctl(viewer.master, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 32, 0, 0))
                 os.kill(viewer.process.pid, signal.SIGWINCH)
                 viewer.pump(.3)
-                viewer.wait(lambda: bool(positions(viewer, "[Copy]")))
-                click(viewer, positions(viewer, "[Copy]")[0], long_command)
+                viewer.wait(lambda: bool(positions(viewer, "[⧉]")))
+                click(viewer, positions(viewer, "[⧉]")[0], long_command)
                 viewer.keys(b"w")
                 for _ in range(90):
-                    if positions(viewer, "[Copy]"):
+                    if positions(viewer, "[⧉]"):
                         break
                     viewer.keys(b"l")
-                assert positions(viewer, "[Copy]"), viewer.screen.text()
-                click(viewer, positions(viewer, "[Copy]")[0], long_command)
+                assert positions(viewer, "[⧉]"), viewer.screen.text()
+                click(viewer, positions(viewer, "[⧉]")[0], long_command)
             case("layout", "# Layout\n`" + long_command + "`\n", layout_check)
 
             def live_check(viewer, name):
                 write(name, "# Live\n`updated-payload`\n")
                 viewer.wait(lambda: "updated-payload" in viewer.screen.text())
                 observed = read(name)
-                click(viewer, positions(viewer, "[Copy]")[0], "updated-payload")
+                click(viewer, positions(viewer, "[⧉]")[0], "updated-payload")
                 assert read(name) == observed, "copy rewrote live-updated board"
                 rpc({"op": "board_create", "board": "switch-beta"})
                 write("switch-beta", "# Beta\n`other-board`\n")
@@ -195,7 +195,7 @@ def run(binary, output):
                 viewer.keys(b"j\r")
                 viewer.wait(lambda: "other-board" in viewer.screen.text())
                 observed = read("switch-beta")
-                click(viewer, positions(viewer, "[Copy]")[0], "other-board")
+                click(viewer, positions(viewer, "[⧉]")[0], "other-board")
                 assert read("switch-beta") == observed, "copy rewrote switched board"
             case("switch-alpha", "# Live\n`original-payload`\n", live_check, mutates=True)
 
@@ -207,7 +207,7 @@ def run(binary, output):
                 viewer.wait(lambda: bool(payloads(viewer)))
                 selected = payloads(viewer)[-1].decode()
                 assert "LEFT" in selected and "cmd" in selected and "RIGHT" in selected, repr(selected)
-                assert "Copy" not in selected and "[" not in selected and "]" not in selected, repr(selected)
+                assert "⧉" not in selected and "Copy" not in selected and "[" not in selected and "]" not in selected, repr(selected)
                 write(name, "# Selection\nLEFT `new-payload` RIGHT\n")
                 changed = read(name)
                 viewer.pump(1.3)
@@ -219,14 +219,14 @@ def run(binary, output):
                     assert len(payloads(viewer)) == count + 1
                     assert payloads(viewer)[-1] == b"cmd", "keyboard used live payload for frozen old control"
                 else:
-                    click(viewer, positions(viewer, "[Copy]")[0], "cmd")
+                    click(viewer, positions(viewer, "[⧉]")[0], "cmd")
                 assert read(name) == changed, "frozen copy changed updated board"
             case("selection", "# Selection\nLEFT `cmd` RIGHT\n", selection_check, mutates=True)
             case("selection-keyboard", "# Selection\nLEFT `cmd` RIGHT\n",
                  lambda viewer, name: selection_check(viewer, name, keyboard=True), mutates=True)
 
             def empty_check(viewer, _name):
-                x, y = positions(viewer, "[Copy block]")[0]
+                x, y = positions(viewer, "[⧉]")[0]
                 viewer.keys(f"\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m".encode())
                 viewer.wait(lambda: "clipboard unchanged" in viewer.screen.text().lower())
                 assert not payloads(viewer), "empty copy cleared clipboard"
@@ -235,7 +235,7 @@ def run(binary, output):
 
             hostile = "echo '\x1b]52;c;INJECTED\x07' 地球"
             case("hostile", "# Hostile\n`" + hostile + "`\n",
-                 lambda viewer, _name: click(viewer, positions(viewer, "[Copy]")[0], hostile))
+                 lambda viewer, _name: click(viewer, positions(viewer, "[⧉]")[0], hostile))
             result["complete"] = all(item["passed"] for item in result["checks"])
         finally:
             if broker is not None:

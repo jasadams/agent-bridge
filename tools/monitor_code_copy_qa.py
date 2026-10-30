@@ -43,7 +43,7 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
         expect(page.locator("#board-status")).to_contain_text("Live")
         before = read("copy-alpha")
     except Exception as error:
-        results.extend({"case": name, "status": "blocked", "reason": "Shared real-broker setup failed: " + str(error)} for name in ['parsed-payloads-selection-keyboard', 'inline-code-visual-style', 'clipboard-denied', 'clipboard-unavailable', 'constructed-dom-utf8-size-boundary', 'pending-switch-live-refresh-mobile', 'pending-lock'])
+        results.extend({"case": name, "status": "blocked", "reason": "Shared real-broker setup failed: " + str(error)} for name in ['parsed-payloads-selection-keyboard', 'success-icon-feedback', 'inline-code-visual-style', 'clipboard-denied', 'clipboard-unavailable', 'constructed-dom-utf8-size-boundary', 'pending-switch-live-refresh-mobile', 'pending-lock'])
         save()
         raise
 
@@ -96,8 +96,20 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
         blocks.nth(1).focus(); page.keyboard.press("Enter")
         assert page.evaluate("window.__copyWrites.at(-1)") == "indented --code\n"
         assert page.evaluate("document.activeElement.classList.contains('board-code-copy')")
-        # CSS labels are visible without polluting manual text selection.
-        assert inline.nth(0).evaluate("e => getComputedStyle(e, '::before').content") == '"Copy"'
+        # Both code variants show a local icon without selectable button text.
+        for controls, label in ((inline, "Copy inline code"), (blocks, "Copy code block")):
+            for button in controls.all():
+                expect(button).to_have_attribute("aria-label", label)
+                expect(button).to_have_attribute("title", label)
+                expect(button.locator("svg[aria-hidden=true] path")).to_have_count(1)
+                assert button.evaluate("""e => {
+                  const svg = e.querySelector('svg'), bounds = svg.getBoundingClientRect();
+                  const style = getComputedStyle(svg);
+                  return e.textContent === '' && bounds.width >= 16 && bounds.height >= 16 &&
+                    style.display !== 'none' && style.visibility === 'visible' &&
+                    Number(style.opacity) > 0 && style.stroke !== 'none' &&
+                    ['none', 'normal', '\"\"'].includes(getComputedStyle(e, '::before').content);
+                }""")
         selected = page.locator("#board-document p").first.evaluate("""p => {
           const r = document.createRange(); r.selectNodeContents(p);
           const s = getSelection(); s.removeAllRanges(); s.addRange(r); return s.toString();
@@ -111,6 +123,41 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
         page.evaluate("getSelection().removeAllRanges()")
         assert read("copy-alpha") == before, "Copy actions wrote the board"
         record("real parsed inline/table/list/repeated/hostile code and offscreen fenced/indented blocks send exact writeText payloads; keyboard and manual selection stay independent")
+
+    def success_feedback_case():
+        button = inline.nth(0)
+        geometry = """e => {
+          const rect = element => {
+            const {x, y, width, height} = element.getBoundingClientRect();
+            return {x, y, width, height};
+          };
+          return {button:rect(e), document:rect(document.querySelector('#board-document'))};
+        }"""
+        button.scroll_into_view_if_needed()
+        before_geometry = button.evaluate(geometry)
+        button.click()
+        expect(button).to_have_attribute("data-copied", "")
+        expect(button.locator("svg path")).to_have_attribute("d", "M5 12l4 4L19 6")
+        expect(page.locator("#board-copy-feedback")).to_have_text("Code copied.")
+        assert page.locator("#board-copy-feedback").evaluate("e => e.getBoundingClientRect().height") == 1
+        assert button.evaluate(geometry) == before_geometry, "Success moved the button or document"
+        page.wait_for_timeout(700)
+        button.click()
+        page.wait_for_timeout(700)
+        expect(button).to_have_attribute("data-copied", "")  # First timeout must not reset a newer copy.
+        inline.nth(1).click()
+        expect(inline.nth(1)).to_have_attribute("data-copied", "")
+        page.evaluate("window.__copyMode = 'denied'")
+        inline.nth(1).click()
+        expect(inline.nth(1)).not_to_have_attribute("data-copied", "")
+        feedback = page.locator("#board-copy-feedback")
+        expect(feedback).to_contain_text("denied")
+        expect(feedback).to_be_visible()
+        assert feedback.evaluate("e => e.getBoundingClientRect().height") > 1
+        expect(button).not_to_have_attribute("data-copied", "")
+        expect(button.locator("svg path")).to_have_attribute("d", "M9 9h12v12H9z M15 9V3H3v12h6")
+        expect(feedback).to_contain_text("denied")  # Other-button reset cannot erase newer errors.
+        record("success check preserves geometry, repeated copies renew its timer, independent reset preserves visible failures")
 
     def visual_style_case():
         styles = page.evaluate("""() => {
@@ -137,11 +184,15 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
         page.evaluate("window.__copyMode = 'denied'")
         inline.nth(0).click()
         expect(page.locator("#board-copy-feedback")).to_contain_text("denied")
+        expect(page.locator("#board-copy-feedback")).to_be_visible()
+        expect(inline.nth(0)).not_to_have_attribute("data-copied", "")
 
     def case_2():
         page.evaluate("Object.defineProperty(navigator, 'clipboard', {configurable:true,value:undefined})")
         inline.nth(0).click()
         expect(page.locator("#board-copy-feedback")).to_contain_text("unavailable")
+        expect(page.locator("#board-copy-feedback")).to_be_visible()
+        expect(inline.nth(0)).not_to_have_attribute("data-copied", "")
 
     def case_3():
         # Explicit UI-boundary fixture: backend board limits make a parsed snippet
@@ -206,6 +257,7 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
 
     for name, check in [
         ('parsed-payloads-selection-keyboard', case_0),
+        ('success-icon-feedback', success_feedback_case),
         ('inline-code-visual-style', visual_style_case),
         ('clipboard-denied', case_1),
         ('clipboard-unavailable', case_2),
