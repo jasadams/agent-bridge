@@ -14,6 +14,44 @@ same used request properties and response. Their steer schema difference is an
 unused optional `AdditionalContextEntry.name` field. Schema comparison supports
 the protocol analysis; it does not replace runtime qualification.
 
+## Exercised source and result
+
+Between 2026-10-29 23:59:50 and 2026-10-30 00:00:07 UTC, all six production
+cases passed against committed source
+`dd925b57a1a2cef2ff98594298e35be3af3c2782`, built on main
+`b682ddcbd26fddc8990e1fedde9e2d089987a6c1`. The executable SHA-256 was
+`9cce1468869f88131502bd27fe2c7d8777bb6eabd607b7eadd0076ab26658523`;
+installed `codex-cli 0.166.0` was
+`b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8`.
+The broker's status independently matched the source commit. The build reports
+the repository's development version `0.2.0`; it is not the running owner install.
+
+The [evidence manifest](diagnostics/codex-capability-delivery.json) records exact
+source-file hashes, binary hashes, message/thread IDs, timestamps and raw-artifact
+hashes. Raw evidence remains at `/var/tmp/agb13-codex-1p8zp7cp`; the legacy directory
+prefix does not change its measured source. No native cases failed in this run.
+Offline replay accepted all six cases, and all eight independent corruptions were
+rejected. Both owned native/broker leaders exited 0, with no cleanup errors or
+surviving non-zombie group members.
+
+| Case | Observed result |
+| --- | --- |
+| Idle | One native queue write; input consumed, acknowledged and replied to |
+| Generating | One steer; input consumed before the original turn completed |
+| Held tool | Steer accepted while command ran; command completed successfully, then input was consumed in the same turn |
+| Long turn | One steer at a later safe boundary; original turn completed successfully |
+| Disconnected observer | Production delivery and MCP correlation worked after observer reconnect |
+| Saturation | 100 entries accepted; one further queue write definitely rejected, then the disposable queue drained |
+
+The integrated local gates on base `44d0c4437a297944acea3f98e5059c04326dc237`
+passed formatting, all-target check, strict Clippy, 479 Rust tests (three intentional
+LAN ignores) and 12 Python safety tests. Main's subsequent code-copy integration
+changed board UI files; the native proof used the rebased commit above. Current-head
+platform CI is recorded with the PR, separately from these local measurements.
+Later evidence/report-only commits do not relabel this native run: compiled inputs
+and the harness must retain the manifest hashes, while report hashes describe the
+measurement-time text.
+
 ## Reproduce the native proof
 
 Use Linux, Python 3.11+ and already installed `websockets==15.0.1`. No tools,
