@@ -114,7 +114,7 @@ def run(binary):
                 payloads = lambda: [base64.b64decode(value[5:], validate=True) for value in viewer.screen.other_osc if value.startswith("52;c;")]
                 assert payloads() == [b"printf hello"] and not frames
                 viewer.keys(b"\x1b")
-                point = next((x, y) for (x, y) in viewer.screen.cells if all(viewer.screen.cells.get((x+i, y), ("", None))[0] == ch for i, ch in enumerate("[Copy")))
+                point = next((x, y) for (x, y) in viewer.screen.cells if all(viewer.screen.cells.get((x+i, y), ("", None))[0] == ch for i, ch in enumerate("[⧉")))
                 x, y = point
                 viewer.keys(f"\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m".encode())
                 viewer.wait(lambda: len(payloads()) == 2)

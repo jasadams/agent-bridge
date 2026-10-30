@@ -9,6 +9,12 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   let liveAbort = null, liveSequence = 0, refreshRequested = false;
   const controlRows = new Map();
   let copySequence = 0, savedControl = null;
+  const copyAttempts = new WeakMap();
+  const copyIconPath = "M9 9h12v12H9z M15 9V3H3v12h6";
+  const copyIcon = (button, copied) => {
+    button.toggleAttribute("data-copied", copied);
+    button.querySelector("svg path").setAttribute("d", copied ? "M5 12l4 4L19 6" : copyIconPath);
+  };
   const node = (tag, text, className) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = String(text); if (className) n.className = className; return n; };
   const text = (element, value) => { if (element.textContent !== value) element.textContent = value; };
   const status = value => { text($("board-status"), value); };
@@ -282,6 +288,18 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
         button.type = "button";
         button.setAttribute("aria-label", value.tag === "pre" ? "Copy code block" : "Copy inline code");
         button.title = button.getAttribute("aria-label");
+        const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        icon.setAttribute("viewBox", "0 0 24 24");
+        icon.setAttribute("aria-hidden", "true");
+        icon.setAttribute("focusable", "false");
+        icon.setAttribute("fill", "none");
+        icon.setAttribute("stroke", "currentColor");
+        icon.setAttribute("stroke-width", "2");
+        icon.setAttribute("stroke-linejoin", "round");
+        const sheets = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        sheets.setAttribute("d", copyIconPath);
+        icon.append(sheets);
+        button.append(icon);
         wrapper.append(element, button);
         return wrapper;
       }
@@ -811,8 +829,15 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     const code = adjacent?.tagName === "A" ? adjacent.querySelector("code") : adjacent;
     if (!code || !["CODE", "PRE"].includes(code.tagName)) return;
     const payload = code.textContent, c = capture(), revision = shown.revision, id = ++copySequence;
+    copyAttempts.set(button, id);
+    copyIcon(button, false);
     const live = () => current(c) && active && shown?.revision === revision && id === copySequence && button.isConnected;
-    const feedback = value => { if (live()) text($("board-copy-feedback"), value); };
+    const feedback = (value, success = false) => {
+      if (!live()) return;
+      $("board-copy-feedback").classList.toggle("board-copy-success", success);
+      text($("board-copy-feedback"), value);
+    };
+    feedback("");
     if (new TextEncoder().encode(payload).length > 65536) {
       feedback("Code exceeds the 64 KiB copy limit. Select a smaller portion manually."); return;
     }
@@ -821,7 +846,14 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     }
     try {
       await navigator.clipboard.writeText(payload);
-      feedback("Code copied.");
+      if (!live()) return;
+      feedback("Code copied.", true);
+      copyIcon(button, true);
+      // Reset this button independently of later copies elsewhere. A repeated
+      // attempt on this button owns its own timeout and cannot be reset early.
+      setTimeout(() => {
+        if (button.isConnected && copyAttempts.get(button) === id) copyIcon(button, false);
+      }, 1200);
     } catch {
       feedback("Clipboard permission denied or copy failed. Select and copy the code manually.");
     }

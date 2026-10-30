@@ -163,7 +163,7 @@ impl Prepared {
             let displayed = clean(&payload);
             result.payloads.push(payload);
             if block {
-                result.markers("[Copy block]", id, true, &mut used, &mut narrow, &mut wide);
+                result.markers("[⧉]", id, true, &mut used, &mut narrow, &mut wide);
                 result.source.push_str("  \n");
                 for line in displayed.split_inclusive('\n') {
                     result.markers(
@@ -179,7 +179,7 @@ impl Prepared {
                 result.source.push('\n');
             } else {
                 result.markers(&displayed, id, false, &mut used, &mut narrow, &mut wide);
-                result.markers("[Copy]", id, true, &mut used, &mut narrow, &mut wide);
+                result.markers("[⧉]", id, true, &mut used, &mut narrow, &mut wide);
             }
             copied = range.end;
         }

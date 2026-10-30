@@ -215,14 +215,15 @@ time, recovery, API and actual browser/terminal validation and its limits.
 
 ## Copy code
 
-Rendered inline code has a contrasting background and an adjacent **Copy** control.
+Rendered inline code has a contrasting background and an adjacent overlapping-sheets copy icon.
 Click that control once to copy the complete parsed code span; selecting or clicking
 the code text keeps ordinary selection and link behavior. Each rendered code block
-has a **Copy block** control at its top. It copies the entire block, including lines
+has the same copy icon at its top. It copies the entire block, including lines
 outside the viewport, indentation and its logical trailing newline. Copies omit
 Markdown delimiters, language labels, display wrapping and button labels. They never
 execute commands or write to the board, its timestamp or subscriptions.
 
+The TUI shows copy icons as `[⧉]`; browser icons have accessible labels and tooltips.
 In the TUI, outside an editor or board picker, press `c` to focus the visible code
 copy controls. Tab/Shift-Tab cycles them, Enter or Space copies, and Escape leaves
 copy focus. Normal Tab navigation still belongs to response fields. Scroll or pan to
@@ -233,7 +234,8 @@ omits copy-control cells while retaining selected code and prose.
 
 The TUI sends a bounded, write-only OSC 52 clipboard request and reports **Copy sent
 to terminal**; it cannot confirm terminal clipboard acceptance. The browser uses its
-clipboard write API and reports success, denial or unavailable support honestly;
+clipboard write API and briefly changes the copy icon to a checkmark on success,
+with an accessible announcement. Denial or unavailable support appears as visible feedback;
 manual selection remains available. Neither interface reads the clipboard. Copy
 requests over 64 KiB of UTF-8 are rejected rather than truncated. Empty blocks leave
 the terminal clipboard unchanged and report that no copy was sent. Raw Markdown and

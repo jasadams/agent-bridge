@@ -3866,7 +3866,7 @@ mod tests {
         assert_eq!(copied.as_deref(), Some("a|b"));
         let (text, _, _, urls) = rendered_markdown("[`a\\|b`](https://example.com)", 80);
         assert_eq!(urls, ["https://example.com"]);
-        assert_eq!(text.to_string(), "a\\|b[Copy]");
+        assert_eq!(text.to_string(), "a\\|b[⧉]");
     }
 
     #[test]
@@ -3880,7 +3880,7 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].1, "https://a.example");
         assert_eq!(links[0].2, "x");
-        assert!(view.rendered.to_string().contains("[Copy block]"));
+        assert!(view.rendered.to_string().contains("[⧉]"));
         assert_eq!(view.code_payloads, ["code\n"]);
     }
 
@@ -4699,7 +4699,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
             terminal.draw(|frame| view.draw(frame)).unwrap();
             let screen = buffer_text(&terminal);
-            assert!(screen.contains("[Copy block]"), "{markdown:?}: {screen}");
+            assert!(screen.contains("[⧉]"), "{markdown:?}: {screen}");
             assert!(!screen.contains("&#"), "{markdown:?}: {screen}");
             assert!(!screen.contains("```"), "{markdown:?}: {screen}");
             assert_eq!(view.code_payloads, [expected], "{markdown:?}");

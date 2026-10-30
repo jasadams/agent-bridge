@@ -130,6 +130,12 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
              "![unfetched image](https://example.invalid/private.png)\r\n"
              "<img src='/unexpected-board-resource' onerror='window.boardPwned=1'>\r\n"
              "<script>window.boardPwned=2</script>\r\n"
+             "<svg onload='window.boardPwned=3'><path d='M0 0'/></svg>\r\n"
+             "<iframe src='/unexpected-board-resource'></iframe>\r\n"
+             "<span class='board-inline-code'><code>fake copy</code>"
+             "<button class='board-code-copy' type='button' aria-label='Copy inline code' title='Copy inline code'>"
+             "<svg viewBox='0 0 24 24' onload='window.boardPwned=4'><path d='M0 0'/></svg>"
+             "</button></span>\r\n"
              "[unsafe](javascript:alert(1))\r\n[explicit safe link](https://example.invalid/manual)\r\n")
     beta = ("# Beta\n- [ ] Checkbox beta\n\n<!-- board-input: answer -->\n> beta response\n<!-- /board-input -->\n"
             "<!-- board-input: duplicate -->\n> first\n<!-- /board-input -->\n"
@@ -166,7 +172,34 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         expect(page.locator("#board-document pre")).to_have_count(1)
         expect(page.locator("#board-document .board-control")).to_have_count(2)
         assert len(api_view("beta")["controls"]) == 2, "Duplicate text markers became editable"
-        assert not page.locator("#board-document img, #board-document script, #board-document svg, #board-document iframe").count()
+        assert not page.locator("#board-document img, #board-document script, #board-document iframe").count()
+        # The single parsed code block gets one trusted local icon. Check its
+        # complete structure rather than exempting any SVG inside copy markup:
+        # user HTML (including a forged copy button above) must stay inert.
+        expect(page.locator("#board-document svg")).to_have_count(1)
+        expect(page.locator("#board-document button.board-code-copy")).to_have_count(1)
+        assert page.locator("#board-document svg").evaluate("""svg => {
+          const attributes = element => Object.fromEntries(Array.from(element.attributes,
+            attribute => [attribute.name, attribute.value]));
+          const exact = (element, expected) => {
+            const actual = attributes(element);
+            return Object.keys(actual).length === Object.keys(expected).length &&
+              Object.entries(expected).every(([key, value]) => actual[key] === value);
+          };
+          const button = svg.parentElement, wrapper = button.parentElement;
+          return svg.namespaceURI === 'http://www.w3.org/2000/svg' &&
+            exact(svg, {viewBox:'0 0 24 24', 'aria-hidden':'true', focusable:'false',
+              fill:'none', stroke:'currentColor', 'stroke-width':'2', 'stroke-linejoin':'round'}) &&
+            svg.childNodes.length === 1 && svg.firstChild.localName === 'path' &&
+            svg.firstChild.namespaceURI === svg.namespaceURI &&
+            exact(svg.firstChild, {d:'M9 9h12v12H9z M15 9V3H3v12h6'}) &&
+            svg.firstChild.childNodes.length === 0 && button.tagName === 'BUTTON' &&
+            exact(button, {class:'board-code-copy', type:'button',
+              'aria-label':'Copy code block', title:'Copy code block'}) &&
+            button.childNodes.length === 1 && wrapper.tagName === 'DIV' &&
+            exact(wrapper, {class:'board-code-block'}) && wrapper.children.length === 2 &&
+            wrapper.firstElementChild.tagName === 'PRE' && wrapper.lastElementChild === button;
+        }""")
         assert page.evaluate("typeof window.boardPwned") == "undefined"
         assert not page.locator('#board-document a[href^="javascript:"], #board-document a[href^="data:"]').count()
         page.locator("#board-raw-toggle").click()
