@@ -564,11 +564,19 @@ again. Reusing a UUID with another board, revision, control or text is rejected;
 a UUID already used by an ordinary message cannot be adopted. A new deliberate
 send uses a new UUID. Queue rejection and errors retain the draft.
 
-In the terminal, Tab/Shift-Tab selects a message input; Enter opens its composer.
+Both interfaces keep compact message boxes stacked at the bottom, below the
+independently scrollable board. Each box shows the pinned agent's friendly name,
+an editable input and Send. Click an input or Tab/Shift-Tab into it to type directly;
+there is no activation step. A bounded stack scrolls when many inputs are present,
+and keyboard focus brings the selected input into view. Errors and pending or stale
+targets appear only when relevant; ordinary inputs reserve no feedback rows.
+
+In the terminal, Tab/Shift-Tab focuses a message box directly.
 While composing, **Enter sends** and **Shift-Enter inserts a newline**. Legacy
 terminals may encode Shift-Enter as ordinary Enter; use **Ctrl-J for newline**
-there. Page Up/Down still scrolls the board. The exact provider, session and
-endpoint are shown above the draft. Ctrl-O opens exact owner details in the board
+there. Page Up/Down still scrolls the board. Mouse wheel over the board scrolls
+the document; wheel over the input stack scrolls the boxes. Ctrl-O opens exact
+provider, session and endpoint details in the board
 area; arrows or Page Up/Down scroll them, and Escape/Ctrl-O returns to the
 unchanged draft. The original marker is also available in
 `board NAME --raw` for inspection.

@@ -3,11 +3,15 @@
 import argparse
 import base64
 import errno
+import fcntl
 import json
 import os
 import re
 from pathlib import Path
 import select
+import signal
+import struct
+import termios
 import socket
 import subprocess
 import tempfile
@@ -18,7 +22,14 @@ import uuid
 from test_board_links import Viewer, stop
 
 
-def run(binary):
+def run(binary, output=None):
+    if output is not None:
+        output.mkdir(parents=True, exist_ok=True)
+
+    def capture(viewer, name):
+        if output is not None:
+            (output / (name + ".txt")).write_text(viewer.screen.text() + "\n")
+
     with tempfile.TemporaryDirectory(prefix="ab-msg-", dir="/tmp") as directory:
         root = Path(directory)
         native = root / "native"
@@ -94,11 +105,11 @@ def run(binary):
                     for byte in data:
                         original_feed(bytes([byte]))
                         if byte in (32, ord("e")):
-                            status = "".join(viewer.screen.cells.get((x, viewer.screen.rows - 3), (" ", None))[0] for x in range(viewer.screen.columns))
+                            status = "\n".join("".join(viewer.screen.cells.get((x, y), (" ", None))[0] for x in range(viewer.screen.columns)) for y in range(viewer.screen.rows - 3, viewer.screen.rows))
                             accepted_ids.update(re.findall(r"Accepted message ([0-9a-f-]{36})", status))
 
                 viewer.screen.feed = record_rendered_acceptance
-                viewer.wait(lambda: "Message coordinator" in viewer.screen.text())
+                viewer.wait(lambda: "coordinator" in viewer.screen.text() and "[Send]" in viewer.screen.text())
                 viewer.wait(lambda: "Last Updated:" in viewer.screen.text())
                 assert isinstance(original["last_updated"], int)
                 def timestamp_footer():
@@ -126,7 +137,8 @@ def run(binary):
                 assert rpc({"op": "named_board_read", "board": "alpha"}) == original
                 assert timestamp_footer() == original_footer
                 viewer.keys(b"\x1b")
-                viewer.keys(b"\t\r")
+                viewer.keys(b"\t")  # Tab enters the editable box directly, without activation Enter.
+                capture(viewer, "message-single-tab-focus")
                 viewer.keys("Exact first 🦀".encode())
                 viewer.keys(b"\n")  # Ctrl-J: newline on legacy terminal key encoding.
                 viewer.keys(b"second line")
@@ -153,8 +165,68 @@ def run(binary):
                 assert rpc({"op": "named_board_read", "board": "alpha"}) == changed["board"]
                 history = rpc({"op": "history", "agent": "coordinator", "limit": 100})
                 assert len(history) == 2 and len(frames) == 2, "rapid Enter must not create duplicate messages or native deliveries"
-                # Leave the empty reusable composer and quit normally while draining.
+                # Mouse Send must dispatch immediately, without a later keyboard event.
+                viewer.keys(b"mouse send without keyboard")
+                x, y = next((x, y) for (x, y) in viewer.screen.cells if all(
+                    viewer.screen.cells.get((x+i, y), ("", None))[0] == ch
+                    for i, ch in enumerate("[Send]")))
+                viewer.keys(f"\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m".encode())
+                # Only drain PTY output and inspect RPCs from here until accepted.
+                viewer.wait(lambda: len(frames) == 3)
+                viewer.wait(lambda: frames[2]["msg_id"] in accepted_ids)
+                viewer.wait(lambda: "mouse send without keyboard" not in viewer.screen.text())
+                assert frames[2]["session_id"] == session
+                history = rpc({"op": "history", "agent": "coordinator", "limit": 100})
+                assert len(history) == 3 and any(message["body"] == "mouse send without keyboard" for message in history)
+                assert rpc({"op": "named_board_read", "board": "alpha"}) == changed["board"]
+                capture(viewer, "message-mouse-send-accepted-without-key")
+                # Real multi-owner layout, click focus, overflow reveal and independent scroll.
                 viewer.keys(b"\x1b")
+                for owner in ("reviewer", "planner", "builder", "tester", "writer"):
+                    rpc({"op": "register", "agent": {"name": owner, "provider": "inbox", "session": str(uuid.uuid4()), "endpoint": "", "enabled": True}})
+                    current = rpc({"op": "named_board_read", "board": "alpha"})
+                    rpc({"op": "add_board_message_input", "board": "alpha", "expected_revision": current["revision"], "agent": owner, "id": owner, "label": "Message " + owner})
+                current = rpc({"op": "named_board_read", "board": "alpha"})
+                layout_board = rpc({"op": "named_board_update", "board": "alpha", "expected_revision": current["revision"], "edits": [{"op": "append", "text": "\n" + "Scrollable context\n\n" * 80}]})["board"]
+                viewer.wait(lambda: layout_board["revision"][:12] in viewer.screen.text() and "/6" in viewer.screen.text())
+
+                def title_y(label):
+                    return next(y for y, line in enumerate(viewer.screen.text().splitlines()) if label in line)
+
+                y = title_y("coordinator") + 1
+                viewer.keys(f"\x1b[<0;3;{y+1}M\x1b[<0;3;{y+1}m".encode())
+                viewer.keys(b"click coordinator draft")
+                viewer.wait(lambda: "click coordinator draft" in viewer.screen.text())
+                capture(viewer, "message-stacked-90x30-click")
+                dock_y = title_y("coordinator")
+                before_dock = viewer.screen.text().splitlines()[dock_y:-2]
+                viewer.keys(b"\x1b[6~")  # Page Down scrolls only the board while composing.
+                assert viewer.screen.text().splitlines()[dock_y:-2] == before_dock
+                capture(viewer, "message-stacked-90x30-board-scroll")
+                viewer.keys(b"\tsecond owner draft")
+                viewer.wait(lambda: "second owner draft" in viewer.screen.text())
+                viewer.keys(b"\x1b[Z")
+                viewer.wait(lambda: "click coordinator draft" in viewer.screen.text())
+                viewer.keys(b"\t\t\t\t\t")
+                viewer.wait(lambda: "writer" in viewer.screen.text())
+                for width, height in ((80, 16), (40, 18)):
+                    viewer.screen.columns, viewer.screen.rows = width, height
+                    fcntl.ioctl(viewer.master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+                    os.kill(viewer.process.pid, signal.SIGWINCH)
+                    viewer.pump(.4)
+                    viewer.wait(lambda: "writer" in viewer.screen.text() and "[Send]" in viewer.screen.text())
+                    assert title_y("writer") >= 4, "Composer stack hid the board"
+                    capture(viewer, f"message-stacked-{width}x{height}-last-focus")
+                # Refresh a nonempty exact target draft: show honest stale feedback.
+                viewer.keys(b"draft for stale check")
+                current = rpc({"op": "named_board_read", "board": "alpha"})
+                rpc({"op": "named_board_update", "board": "alpha", "expected_revision": current["revision"], "edits": [{"op": "append", "text": "\nChanged context\n"}]})
+                viewer.wait(lambda: "Review target" in viewer.screen.text())
+                capture(viewer, "message-stacked-stale-target")
+                assert len(frames) == 3, "Layout/focus checks unexpectedly submitted a message"
+                # Explicitly discard the private test drafts, then quit normally.
+                viewer.keys(b"\x1b")
+                viewer.keys(b"\x04")
                 os.write(viewer.master, b"q")
                 deadline = time.monotonic() + 5
                 while viewer.process.poll() is None:
@@ -195,4 +267,6 @@ def run(binary):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/agent-bridge"))
-    run(parser.parse_args().binary.resolve())
+    parser.add_argument("--output", type=Path, help="Persist actual PTY screen evidence")
+    args = parser.parse_args()
+    run(args.binary.resolve(), args.output.resolve() if args.output else None)

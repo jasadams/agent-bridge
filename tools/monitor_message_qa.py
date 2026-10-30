@@ -207,7 +207,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             textarea.dispatch_event("compositionend")
             textarea.dispatch_event("keydown", {"key": "Enter", "code": "Enter", "keyCode": 229})
             assert len(posts) == count
-            row().get_by_role("button", name="Discard draft").click()
+            textarea.fill("")
             record("blank and IME composition Enter never submit")
 
         def case_pending_refresh():
@@ -233,6 +233,10 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             expect(row().get_by_role("button", name="Review current input")).to_be_visible(timeout=15000)
             expect(textarea).to_be_focused(); expect(textarea).to_have_value("stable caret draft")
             assert textarea.evaluate("e => e.selectionStart") == 4
+            page.set_viewport_size({"width": 390, "height": 640})
+            textarea.focus()
+            page.screenshot(path=str(output / "message-composers-stale-390.png"), full_page=False)
+            page.set_viewport_size({"width": 1440, "height": 900})
             page.keyboard.press("Enter"); assert not history("stable caret draft")
             row().get_by_role("button", name="Review current input").click()
             expect(textarea).to_be_focused(); page.keyboard.press("Enter"); sent("stable caret draft")
@@ -249,6 +253,10 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             page.keyboard.press("Enter")
             expect(row().locator(".message-feedback")).to_contain_text("uncertain")
             expect(textarea).to_have_value("accepted but lost response")
+            page.set_viewport_size({"width": 390, "height": 640})
+            textarea.focus()
+            page.screenshot(path=str(output / "message-composers-uncertain-390.png"), full_page=False)
+            page.set_viewport_size({"width": 1440, "height": 900})
             old = posts[-1].copy(); count = len(posts)
             page.wait_for_timeout(300); assert len(posts) == count
             # An accepted retry remains safe after a board revision change.
@@ -289,7 +297,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             release_gate(); wait("delayed accepted draft cleared", lambda: textarea.input_value() == "")
             expect(other).to_be_focused(); expect(other).to_have_value("typing for second owner")
             assert other.evaluate("e => e.selectionStart") == 5
-            row("second").get_by_role("button", name="Discard draft").click()
+            other.fill("")
             record("delayed acceptance leaves another composer focus/caret/draft undisturbed")
 
         def case_boards_and_owners():
@@ -312,8 +320,8 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             pick("web-compose", keep_drafts=True)
             expect(row().locator("textarea")).to_have_value("main retained unsent")
             expect(row("second").locator("textarea")).to_have_value("second owner retained unsent")
-            row().get_by_role("button", name="Discard draft").click()
-            row("second").get_by_role("button", name="Discard draft").click()
+            row().locator("textarea").fill("")
+            row("second").locator("textarea").fill("")
             assert not history("main retained unsent") and not history("second owner retained unsent")
             record("per-input drafts survive explicit keep/navigation; two boards and two pinned owners never cross-route or send on switch")
 
@@ -340,7 +348,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             expect(orphan.locator(".message-feedback")).to_contain_text("unavailable or changed")
             orphan.get_by_role("button", name="Discard draft").click()
             write(old_markdown); page.locator("#board-refresh").click()
-            wait("restored exact target", lambda: "web-coordinator" in row().locator(".message-target").text_content())
+            wait("restored exact target", lambda: "web-coordinator" in row().locator("label").text_content())
             record("retargeted control leaves old draft visible and unavailable; review cannot silently substitute the new recipient")
 
         def case_closed_owner():
@@ -413,6 +421,56 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             expect(row().locator("textarea")).to_be_visible()
             record("actual client depth-limit fallback hides valid metadata while raw source and reusable composers stay intact")
 
+        def case_dock_layout():
+            write(read()["markdown"] + "\n" + "Board scroll context\n\n" * 80)
+            for index in range(6):
+                add("web-compose", "web-second", f"stack-{index}", f"Stack {index}")
+            expect(page.locator("#message-controls .message-composer:visible")).to_have_count(8)
+            layout_metrics = []
+            for width, height in ((1440, 900), (390, 640), (320, 640), (900, 400)):
+                page.set_viewport_size({"width": width, "height": height})
+                dock = page.locator("#board-messages")
+                document = page.locator(".board-layout")
+                bounds = dock.bounding_box()
+                reading = document.bounding_box()
+                metrics = {"width": width, "height": height, "dock": bounds, "document": reading}
+                layout_metrics.append(metrics)
+                (output / "message-dock-metrics.json").write_text(json.dumps(layout_metrics, indent=2))
+                page.screenshot(path=str(output / f"message-composers-before-{width}x{height}.png"), full_page=False)
+                assert bounds["y"] + bounds["height"] <= height + 1
+                assert reading["height"] >= 48 and reading["y"] + reading["height"] <= bounds["y"] + 1
+                assert dock.evaluate("e => e.scrollHeight > e.clientHeight"), "Many inputs need a bounded scroll stack"
+                document.evaluate("e => e.scrollTop = 200")
+                assert document.evaluate("e => e.scrollTop") > 0
+                assert dock.bounding_box() == bounds, "Board scroll moved the pinned stack"
+                last = row("stack-5").locator("textarea")
+                last.focus()
+                expect(last).to_be_focused()
+                assert dock.evaluate("e => e.scrollTop") > 0
+                # Already-focused boxes must also be revealed after viewport resize.
+                page.wait_for_function("""() => {
+                  const input = document.activeElement, dock = document.querySelector('#board-messages');
+                  if (!input?.matches('#message-controls textarea')) return false;
+                  const box = input.getBoundingClientRect(), bounds = dock.getBoundingClientRect();
+                  return box.top >= bounds.top && box.bottom <= bounds.bottom + 1;
+                }""")
+                box = last.bounding_box()
+                metrics.update({"focused_input": box, "dock_scroll_top": dock.evaluate("e => e.scrollTop")})
+                (output / "message-dock-metrics.json").write_text(json.dumps(layout_metrics, indent=2))
+                assert box["y"] >= bounds["y"] and box["y"] + box["height"] <= bounds["y"] + bounds["height"] + 1, metrics
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+                page.screenshot(path=str(output / f"message-composers-stacked-{width}x{height}.png"), full_page=False)
+            page.set_viewport_size({"width": 1440, "height": 900})
+            first = row().locator("textarea")
+            first.click(); page.keyboard.type("direct click draft")
+            expect(first).to_have_value("direct click draft")
+            expect(row().locator("label")).to_have_text("web-coordinator")
+            assert row().locator(".message-feedback").text_content() == ""
+            assert not row().get_by_role("button", name="Discard draft").is_visible()
+            first.fill("")
+            assert not history("direct click draft")
+            record("desktop/mobile/short many-input dock stays pinned, independently scrolls, reveals focused boxes and edits on click")
+
         def case_lock_and_layout():
             textarea = row().locator("textarea")
             row().locator("textarea").fill("lock private draft")
@@ -449,6 +507,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             ("replaced_session", case_replaced_session),
             ("queue_capacity", case_queue_capacity),
             ("client_render_fallback", case_client_render_fallback),
+            ("dock_layout", case_dock_layout),
             ("lock_and_layout", case_lock_and_layout),
         ]:
             ready = False
