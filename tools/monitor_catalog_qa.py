@@ -236,7 +236,10 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         wait("held actual catalog", lambda: page.evaluate("!!window.__catalogGate.decoded"))
         page.locator("#messages-tab").click()
         expect(page.locator("#boards-view")).to_be_hidden()
-        Path(rpc(state, "named_board_read", board="catalog-retired")["path"]).unlink()
+        # Deliberately remove only this fixture's file in the private test state.
+        board_path = Path(state) / "boards" / "catalog-retired.md"
+        assert board_path.is_file(), "Missing disposable catalog-retired backing file"
+        board_path.unlink()
         start = sum(path == "/api/boards" for _, path in requests)
         page.wait_for_timeout(4200)
         assert sum(path == "/api/boards" for _, path in requests) == start
@@ -266,7 +269,10 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         page.locator("#board-selector").select_option("catalog-missing")
         expect(page.locator("#selected-board-name")).to_have_text("catalog-missing")
 
-        Path(rpc(state, "named_board_read", board="catalog-missing")["path"]).unlink()
+        # Deliberately remove only this fixture's file in the private test state.
+        board_path = Path(state) / "boards" / "catalog-missing.md"
+        assert board_path.is_file(), "Missing disposable catalog-missing backing file"
+        board_path.unlink()
         request_catalog()
         expect(page.locator("#board-catalog-feedback")).to_contain_text("no longer listed")
         assert "catalog-missing" in names()
