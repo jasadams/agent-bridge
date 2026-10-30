@@ -19,7 +19,7 @@ use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Parser, Tag, TagEnd}
 use ratatui::{
     Frame,
     buffer::Buffer,
-    layout::{Constraint, Layout, Position},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
@@ -540,6 +540,9 @@ struct View {
     saving: bool,
     uncertain_save: Option<Save>,
     message_drafts: BTreeMap<String, Editor>,
+    message_regions: Vec<(Rect, usize, bool)>,
+    message_area: Rect,
+    message_scroll: usize,
     pending_message: Option<Submission>,
     owner_details: bool,
     owner_scroll: u16,
@@ -588,6 +591,9 @@ impl Default for View {
             saving: false,
             uncertain_save: None,
             message_drafts: BTreeMap::new(),
+            message_regions: Vec::new(),
+            message_area: Rect::default(),
+            message_scroll: 0,
             pending_message: None,
             owner_details: false,
             owner_scroll: 0,
@@ -749,10 +755,7 @@ impl View {
             in_flight: false,
             uncertain: false,
         }));
-        self.notice = Some(
-            "Enter sends · Shift-Enter or Ctrl-J newline · Esc retains draft · Ctrl-X discards."
-                .into(),
-        );
+        self.notice = None;
     }
     fn message_key(&mut self, key: KeyEvent, page: u16) -> bool {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -775,7 +778,9 @@ impl View {
             }
             return false;
         }
-        if self.editor.as_ref().unwrap().in_flight {
+        if self.editor.as_ref().unwrap().in_flight
+            && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc)
+        {
             if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
                 self.scroll.0 = if key.code == KeyCode::PageUp {
                     self.scroll.0.saturating_sub(page.max(1))
@@ -1118,22 +1123,195 @@ impl View {
             paragraph
         }
     }
+    fn draw_messages(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.message_area = area;
+        self.message_regions.clear();
+        let mut rows: Vec<_> = self
+            .controls
+            .iter()
+            .enumerate()
+            .filter(|(_, control)| matches!(control.kind, Kind::Message { .. }))
+            .collect();
+        if let Some(editor) = &self.editor
+            && matches!(editor.control.kind, Kind::Message { .. })
+            && !rows.iter().any(|(_, control)| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|snapshot| control.message_key(&snapshot.control_scope()))
+                    == editor.control.message_key(&editor.base.control_scope())
+            })
+        {
+            rows.push((usize::MAX, &editor.control));
+        }
+        if area.height < 3 || rows.is_empty() {
+            return;
+        }
+        let visible = usize::from(area.height / 3).max(1);
+        self.message_scroll = self.message_scroll.min(rows.len().saturating_sub(visible));
+        if let Some(position) = rows
+            .iter()
+            .position(|(index, _)| self.selected == Some(*index) || *index == usize::MAX)
+        {
+            if position < self.message_scroll {
+                self.message_scroll = position;
+            }
+            if position >= self.message_scroll + visible {
+                self.message_scroll = position + 1 - visible;
+            }
+        }
+        for (slot, (index, control)) in rows
+            .iter()
+            .skip(self.message_scroll)
+            .take(visible)
+            .enumerate()
+        {
+            let Kind::Message { owner, .. } = &control.kind else {
+                continue;
+            };
+            let row = Rect::new(area.x, area.y + slot as u16 * 3, area.width, 3);
+            let focused = (self.selected == Some(*index) || *index == usize::MAX)
+                && self.editor.as_ref().is_some_and(|editor| {
+                    *index == usize::MAX
+                        || editor.control.message_key(&editor.base.control_scope())
+                            == self
+                                .snapshot
+                                .as_ref()
+                                .and_then(|snapshot| control.message_key(&snapshot.control_scope()))
+                });
+            let key = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| control.message_key(&snapshot.control_scope()));
+            let editor = if focused {
+                self.editor.as_ref()
+            } else {
+                self.message_drafts
+                    .values()
+                    .find(|editor| editor.control.message_key(&editor.base.control_scope()) == key)
+            };
+            let mut title = if rows.len() > visible {
+                format!(
+                    "{} · {}/{}",
+                    safe_line(&owner.name),
+                    self.message_scroll + slot + 1,
+                    rows.len()
+                )
+            } else {
+                safe_line(&owner.name)
+            };
+            if let Some(editor) = editor {
+                if editor.in_flight {
+                    title.push_str(" · Sending…");
+                } else if editor.uncertain {
+                    title.push_str(" · Uncertain");
+                } else if self.snapshot.as_ref().is_none_or(|snapshot| {
+                    snapshot.revision != editor.base.revision
+                        || snapshot.control_scope() != editor.base.control_scope()
+                }) {
+                    title.push_str(" · Review target");
+                }
+            }
+            let block = Block::bordered()
+                .title(title)
+                .border_style(Style::default().fg(if focused {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }));
+            let inner = block.inner(row);
+            frame.render_widget(block, row);
+            let send_width = inner.width.min(7);
+            let input = Rect::new(
+                inner.x,
+                inner.y,
+                inner.width.saturating_sub(send_width),
+                inner.height,
+            );
+            let send = Rect::new(input.right(), inner.y, send_width, inner.height);
+            let content = editor.map_or_else(String::new, |editor| {
+                if focused {
+                    format!(
+                        "{}▏{}",
+                        safe_markdown(&editor.draft[..editor.cursor]),
+                        safe_markdown(&editor.draft[editor.cursor..])
+                    )
+                } else {
+                    safe_markdown(&editor.draft)
+                }
+            });
+            let before = editor.map_or_else(String::new, |editor| {
+                safe_markdown(&editor.draft[..editor.cursor])
+            });
+            let cursor_line = Paragraph::new(format!("{before}▏"))
+                .wrap(Wrap { trim: false })
+                .line_count(input.width.max(1));
+            let scroll = cursor_line
+                .saturating_sub(usize::from(input.height))
+                .min(u16::MAX as usize) as u16;
+            frame.render_widget(
+                Paragraph::new(content)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                input,
+            );
+            frame.render_widget(
+                Paragraph::new(if editor.is_some_and(|editor| editor.uncertain) {
+                    "[Retry]"
+                } else {
+                    "[Send]"
+                })
+                .style(Style::default().fg(Color::Green)),
+                send,
+            );
+            self.message_regions.push((input, *index, false));
+            self.message_regions.push((send, *index, true));
+        }
+    }
     fn draw(&mut self, frame: &mut Frame<'_>) {
         let mut links_limited = false;
-        let response_height = if self.editor.is_some() {
-            9
-        } else if self.controls.is_empty() {
-            0
+        let text_editor = self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| !matches!(editor.control.kind, Kind::Message { .. }));
+        let ordinary_controls = self
+            .controls
+            .iter()
+            .filter(|control| !matches!(control.kind, Kind::Message { .. }))
+            .count();
+        let message_count = self
+            .controls
+            .iter()
+            .filter(|control| matches!(control.kind, Kind::Message { .. }))
+            .count()
+            + usize::from(self.editor.as_ref().is_some_and(|editor| {
+                matches!(editor.control.kind, Kind::Message { .. }) && self.selected.is_none()
+            }));
+        let available = frame.area().height.saturating_sub(7);
+        let response_height = if text_editor {
+            7.min(available / 2)
+        } else if ordinary_controls > 0 {
+            3.min(available / 3)
         } else {
-            5
+            0
         };
-        let [header, body, responses, footer] = Layout::vertical([
+        let message_height = (message_count.saturating_mul(3).min(u16::MAX as usize) as u16)
+            .min(available.saturating_sub(response_height).div_ceil(2).max(3))
+            .min(available.saturating_sub(response_height))
+            / 3
+            * 3;
+        let message_editing = self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| matches!(editor.control.kind, Kind::Message { .. }));
+        let footer_height = if message_count > 0 { 2 } else { 3 };
+        let [header, body, responses, messages, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(response_height),
+            Constraint::Length(message_height),
             // Reserve the release-notice line even before a check completes so
             // availability changes never move the document or a mouse selection.
-            Constraint::Length(3),
+            Constraint::Length(footer_height),
         ])
         .areas(frame.area());
         let document_area = Block::bordered().inner(body);
@@ -1406,35 +1584,19 @@ impl View {
             frame.render_widget(block, body);
             frame.render_widget(paragraph.scroll((self.owner_scroll, 0)), inner);
         }
-        if let Some(editor) = &self.editor {
-            let title = if let Kind::Message { owner, .. } = &editor.control.kind {
-                format!(
-                    "Message: {} → {} · Enter send · Shift-Enter/Ctrl-J newline · Ctrl-R review · Ctrl-X discard",
-                    safe_line(&editor.control.label),
-                    safe_line(&owner.name)
-                )
-            } else {
-                format!(
-                    "Text response: {} · Ctrl-S save · Esc discard · Ctrl-R rebase",
-                    safe_line(&editor.control.label)
-                )
-            };
+        if let Some(editor) = &self.editor
+            && !matches!(editor.control.kind, Kind::Message { .. })
+        {
+            let title = format!(
+                "Text response: {} · Ctrl-S save · Esc discard · Ctrl-R rebase",
+                safe_line(&editor.control.label)
+            );
             let block = Block::bordered().title(title);
             let inner = block.inner(responses);
             let before = safe_markdown(&editor.draft[..editor.cursor]);
             let after = safe_markdown(&editor.draft[editor.cursor..]);
-            let owner = if let Kind::Message { owner, .. } = &editor.control.kind {
-                format!(
-                    "To {}:{} ({})\n",
-                    owner.provider.label(),
-                    safe_line(&owner.session),
-                    safe_line(&owner.endpoint)
-                )
-            } else {
-                String::new()
-            };
-            let content = format!("{owner}{before}▏{after}");
-            let cursor_line = Paragraph::new(format!("{owner}{before}▏"))
+            let content = format!("{before}▏{after}");
+            let cursor_line = Paragraph::new(format!("{before}▏"))
                 .wrap(Wrap { trim: false })
                 .line_count(inner.width);
             let scroll = cursor_line
@@ -1447,7 +1609,7 @@ impl View {
                     .scroll((scroll, 0)),
                 inner,
             );
-        } else if !self.controls.is_empty() {
+        } else if ordinary_controls > 0 {
             let title = format!(
                 "Responses{} · Tab/Shift-Tab select · Space checkbox · Enter text · {} controls",
                 if self.writable() { "" } else { " (read-only)" },
@@ -1456,11 +1618,18 @@ impl View {
             let block = Block::bordered().title(title);
             let inner = block.inner(responses);
             let selected = self.selected.unwrap_or(0);
-            let first = selected.saturating_sub(1);
+            let first = self
+                .controls
+                .iter()
+                .take(selected)
+                .filter(|control| !matches!(control.kind, Kind::Message { .. }))
+                .count()
+                .saturating_sub(1);
             let lines = self
                 .controls
                 .iter()
                 .enumerate()
+                .filter(|(_, control)| !matches!(control.kind, Kind::Message { .. }))
                 .skip(first)
                 .take(usize::from(inner.height))
                 .map(|(index, control)| {
@@ -1492,6 +1661,7 @@ impl View {
             frame.render_widget(block, responses);
             frame.render_widget(Paragraph::new(lines), inner);
         }
+        self.draw_messages(frame, messages);
         let status = if self.selection.as_ref().is_some_and(Selection::is_dragging) {
             "Selecting text · view frozen · release mouse to copy · Esc cancels".into()
         } else if self.selection.is_some() {
@@ -1532,12 +1702,15 @@ impl View {
                 usize::from(self.scroll.0) + 1
             )
         };
-        frame.render_widget(Paragraph::new(vec![
-            Line::from(safe_line(&status)),
-            Line::from(if self.editor.as_ref().is_some_and(|editor| matches!(editor.control.kind, Kind::Message { .. })) { "Enter send · Shift-Enter/Ctrl-J newline · Tab/Shift-Tab next · Esc retain · Ctrl-X discard · Ctrl-R review · Ctrl-O owner" } else if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "a archive · r restore/refresh · b boards · c code copies · m mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "a archive · r restore/refresh · b boards · c code copies · m mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
+        let mut footer_lines = vec![Line::from(safe_line(&status))];
+        if message_count == 0 && !message_editing {
+            footer_lines.push(Line::from(if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "a archive · r restore/refresh · b boards · c code copies · m mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "a archive · r restore/refresh · b boards · c code copies · m mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }));
+        }
+        footer_lines.push(
             Line::from(safe_line(self.update_notice.as_deref().unwrap_or("")))
                 .style(Style::default().fg(Color::Yellow)),
-        ]), footer);
+        );
+        frame.render_widget(Paragraph::new(footer_lines), footer);
     }
     fn key(&mut self, key: KeyEvent, page: u16) -> bool {
         if key.kind == KeyEventKind::Release {
@@ -1834,6 +2007,11 @@ impl View {
                     (None, false) => 0,
                 });
                 self.notice = None;
+                if let Some(index) = self.selected
+                    && matches!(self.controls[index].kind, Kind::Message { .. })
+                {
+                    self.open_message(self.controls[index].clone());
+                }
             }
             KeyCode::Char(' ') if !self.saving => self.toggle(),
             KeyCode::Enter if !self.saving => {
@@ -1941,6 +2119,70 @@ impl View {
             return (false, None);
         }
         let point = Position::new(event.column, event.row);
+        if self.message_area.contains(point) {
+            if matches!(
+                event.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) {
+                if self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| matches!(editor.control.kind, Kind::Message { .. }))
+                {
+                    self.retain_message();
+                }
+                self.selected = None;
+                self.message_scroll = if event.kind == MouseEventKind::ScrollUp {
+                    self.message_scroll.saturating_sub(1)
+                } else {
+                    self.message_scroll.saturating_add(1)
+                };
+                return (true, None);
+            }
+            if event.kind == MouseEventKind::Down(MouseButton::Left)
+                && let Some((_, index, send)) = self
+                    .message_regions
+                    .iter()
+                    .find(|(area, _, _)| area.contains(point))
+                    .copied()
+            {
+                if self.saving
+                    || self
+                        .editor
+                        .as_ref()
+                        .is_some_and(|editor| !matches!(editor.control.kind, Kind::Message { .. }))
+                {
+                    self.notice =
+                        Some("Save or cancel the response before composing a message.".into());
+                    return (true, None);
+                }
+                if index != usize::MAX && (self.selected != Some(index) || self.editor.is_none()) {
+                    if self.editor.is_some() {
+                        self.retain_message();
+                    }
+                    self.selected = Some(index);
+                    self.open_message(self.controls[index].clone());
+                }
+                self.selection = None;
+                self.clear_copy_focus();
+                if send {
+                    self.prepare_message();
+                }
+                return (true, None);
+            }
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && self
+                .viewport
+                .as_ref()
+                .is_some_and(|viewport| viewport.area().contains(point))
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| matches!(editor.control.kind, Kind::Message { .. }))
+        {
+            self.retain_message();
+        }
         if self.editor.is_none()
             && self
                 .selection
@@ -2340,17 +2582,6 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                         }
                     }
                     if key.code == KeyCode::Char('r') && view.editor.is_none() { let _ = refresh.try_send(()); }
-                    if let Some(action) = view.pending_lifecycle.take() {
-                        view.lifecycle_flight = Some(action.clone());
-                        if lifecycle.try_send(action.clone()).is_err() { view.lifecycle_result(action, Err(anyhow::anyhow!("Lifecycle worker unavailable"))); }
-                    }
-                    if let Some(request) = view.pending_message.take()
-                        && messages.try_send(request.clone()).is_err() {
-                        view.message_result(request, Err(anyhow::anyhow!("Submission worker unavailable")));
-                    }
-                    if let Some(save) = view.pending.take() {
-                        if writes.try_send(save).is_ok() { view.saving = true; } else { view.notice = Some("Another save is pending; draft retained.".into()); }
-                    }
                     dirty = true;
                 }
                 Some(Ok(Event::Paste(text))) => { view.paste(&text); dirty = true; }
@@ -2410,6 +2641,28 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     Update::Saved(save, result) => { view.saved(save, result); dirty = true; },
                     Update::Message(request, result) => { view.message_result(request, result); dirty = true; },
                 }
+            }
+        }
+        // Drain actions after every event source, including mouse Send clicks.
+        if let Some(action) = view.pending_lifecycle.take() {
+            view.lifecycle_flight = Some(action.clone());
+            if lifecycle.try_send(action.clone()).is_err() {
+                view.lifecycle_result(action, Err(anyhow::anyhow!("Lifecycle worker unavailable")));
+            }
+        }
+        if let Some(request) = view.pending_message.take()
+            && messages.try_send(request.clone()).is_err()
+        {
+            view.message_result(
+                request,
+                Err(anyhow::anyhow!("Submission worker unavailable")),
+            );
+        }
+        if let Some(save) = view.pending.take() {
+            if writes.try_send(save).is_ok() {
+                view.saving = true;
+            } else {
+                view.notice = Some("Another save is pending; draft retained.".into());
             }
         }
     }
@@ -2816,8 +3069,51 @@ mod tests {
             &"a".repeat(64),
         )));
         press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
-        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            view.editor.is_some(),
+            "Tab focuses an editable box directly"
+        );
         view
+    }
+    #[test]
+    fn stacked_message_boxes_click_switch_and_scroll_without_moving_the_board() {
+        let markdown = "# Context\n\n".to_owned()
+            + &"Board content\n\n".repeat(30)
+            + &message_field("one", "alpha")
+            + &message_field("two", "beta")
+            + &message_field("three", "gamma");
+        let mut view = View::default();
+        view.update(Ok(snapshot(&markdown, &"a".repeat(64))));
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        let board = view.viewport.as_ref().unwrap().area();
+        assert!(board.height >= 3);
+        let (input, _, _) = view.message_regions[0];
+        view.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: input.x,
+            row: input.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        view.paste("alpha draft");
+        assert_eq!(view.editor.as_ref().unwrap().draft, "alpha draft");
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        view.paste("beta draft");
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(view.message_regions.iter().any(|(_, index, _)| *index == 2));
+        assert_eq!(view.viewport.as_ref().unwrap().area(), board);
+        press(&mut view, KeyCode::PageDown, KeyModifiers::NONE);
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(view.scroll.0 > 0);
+        assert_eq!(view.viewport.as_ref().unwrap().area(), board);
+        assert_eq!(view.message_drafts.len(), 2);
+        assert!(buffer_text(&terminal).contains("gamma"));
+        terminal.resize(Rect::new(0, 0, 30, 12)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(view.viewport.as_ref().unwrap().area().height >= 2);
+        assert!(buffer_text(&terminal).contains("gamma"));
+        assert!(!buffer_text(&terminal).contains("[message]"));
     }
     #[test]
     fn message_enter_submits_exact_multiline_and_pending_enter_cannot_duplicate() {
@@ -3113,7 +3409,12 @@ mod tests {
         for width in [18, 40, 100] {
             let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
             terminal.draw(|frame| view.draw(frame)).unwrap();
-            assert!(buffer_text(&terminal).contains("inbox:alpha"));
+            assert!(buffer_text(&terminal).contains("alpha"));
+            assert!(!buffer_text(&terminal).contains("inbox:alpha"));
+            assert!(
+                matches!(&view.editor.as_ref().unwrap().control.kind, Kind::Message { owner, .. } if owner.name == "alpha" && owner.session == "alpha" && owner.provider == crate::protocol::Provider::Inbox)
+            );
+            assert_eq!(view.editor.as_ref().unwrap().draft, "retain edited");
         }
     }
 

@@ -78,8 +78,8 @@
           <section class="board-responses" hidden aria-labelledby="responses-heading"><h2 id="responses-heading">Response draft</h2><p class="help">Responses are shared board data, not owner approval.</p><div id="board-controls"></div>
             <section id="response-editor" aria-labelledby="response-heading" hidden><h3 id="response-heading">Edit response</h3><label id="response-label" for="response-text">Response</label><textarea id="response-text" rows="5" maxlength="65536"></textarea><p id="response-intent" class="help" hidden></p><p id="response-feedback" role="status" aria-live="polite"></p><div class="response-actions"><button id="response-save" class="primary" type="button">Save response</button><button id="response-cancel" type="button">Cancel response</button><button id="response-review" type="button" hidden>Review current board</button><button id="response-rebase" type="button" hidden>Rebase unchanged field</button></div></section>
           </section>
-          <section id="board-messages" class="board-responses" hidden aria-labelledby="message-heading"><h2 id="message-heading">Message agents</h2><p class="help">Send directly to the exact agent shown. Enter sends; Shift+Enter adds a newline.</p><div id="message-controls"></div></section>
         </div>
+        <section id="board-messages" hidden aria-label="Message agents"><div id="message-controls"></div></section>
       </section>
       <p class="privacy-note">Local and served by Agent Bridge. Message history remains read only; board message inputs send explicit user messages, and responses edit existing controls. Access is not isolated from other programs running as your OS user.</p>
     </section>

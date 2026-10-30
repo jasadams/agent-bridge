@@ -353,12 +353,18 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     m.review.hidden = !m.stale || m.state === "uncertain";
     m.review.disabled = m.pending || !writable(m);
     m.discard.disabled = m.pending;
-    m.discard.hidden = !m.value && !m.submission;
-    const target = m.owner;
-    text(m.target, `To ${target.name} · ${target.provider} · session ${target.session}${target.endpoint ? ` · ${target.endpoint}` : ""}`);
-    text(m.feedback, m.pending ? "Sending to broker…" : m.feedbackText || (m.stale ? "The board or input changed. Your draft is kept. Review before sending." : "Enter sends · Shift+Enter adds a newline."));
+    m.discard.hidden = (!m.value && !m.submission) || (!m.stale && m.state === "editing");
+    text(m.feedback, m.pending ? "Sending to broker…" : m.feedbackText || (m.stale ? "The board or input changed. Your draft is kept. Review before sending." : ""));
     $("board-messages").hidden = !Array.from(messageDrafts.values()).some(d => d.name === board);
   }
+  // Resizing can clip a box that was already focused: focus events do not fire
+  // again when the viewport or the bounded stack changes size.
+  const messageResize = new ResizeObserver(() => {
+    const input = document.activeElement;
+    if (active && input?.matches("#message-controls textarea")) input.scrollIntoView({block:"nearest"});
+  });
+  messageResize.observe($("board-messages"));
+  messageResize.observe($("message-controls"));
   function discardMessage(m) {
     if (m.pending) return;
     const uncertain = m.state === "uncertain";
@@ -419,13 +425,14 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       const key = messageIdentity(control);
       let m = messageDrafts.get(key);
       if (!m) {
-        const row = node("section", undefined, "message-composer"), label = node("label", control.label), input = node("textarea"), target = node("p", "", "message-target help"), feedback = node("p", "", "message-feedback help"), actions = node("div", undefined, "response-actions"), send = node("button", "Send"), review = node("button", "Review current input"), discard = node("button", "Discard draft");
-        input.id = "message-" + crypto.randomUUID(); input.rows = 3; input.maxLength = 65536; label.htmlFor = input.id;
+        const row = node("section", undefined, "message-composer"), label = node("label", control.owner.name), input = node("textarea"), feedback = node("p", "", "message-feedback help"), actions = node("div", undefined, "response-actions"), send = node("button", "Send"), review = node("button", "Review current input"), discard = node("button", "Discard draft");
+        input.id = "message-" + crypto.randomUUID(); input.rows = 1; input.maxLength = 65536; label.htmlFor = input.id;
         feedback.id = input.id + "-feedback"; feedback.setAttribute("role", "status"); feedback.setAttribute("aria-live", "polite"); input.setAttribute("aria-describedby", feedback.id);
         for (const button of [send, review, discard]) button.type = "button";
-        actions.append(send, review, discard); row.append(label, target, input, feedback, actions); row.dataset.fieldId = control.field_id;
-        m = { key, name: board, incarnation: view.incarnation, lifecycle_generation: view.lifecycle_generation, owner: control.owner, value: "", version: 0, revision: view.revision, controlId: control.id, row, input, target, feedback, send, review, discard, state: "editing", pending: false, submission: null, composing: false };
+        actions.append(send, review, discard); row.append(label, input, actions, feedback); row.dataset.fieldId = control.field_id;
+        m = { key, name: board, incarnation: view.incarnation, lifecycle_generation: view.lifecycle_generation, owner: control.owner, value: "", version: 0, revision: view.revision, controlId: control.id, row, input, feedback, send, review, discard, state: "editing", pending: false, submission: null, composing: false };
         const state = m;
+        input.addEventListener("focus", () => { input.scrollIntoView({block:"nearest"}); });
         input.addEventListener("compositionstart", () => { state.composing = true; });
         input.addEventListener("compositionend", () => { state.composing = false; });
         input.addEventListener("input", () => { if (!state.pending && state.state !== "uncertain") { state.value = input.value; state.version++; state.submission = null; state.feedbackText = ""; renderMessage(state); } });
