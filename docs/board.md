@@ -88,7 +88,9 @@ The broker must be running. Agents use the existing persistent MCP server and it
 
 The existing [local web monitor](local-monitor.md) also has a Boards view. It
 lists named boards, renders their Markdown and lets you answer the same existing
-checkbox and marked text controls. Browser selection is local to that tab; it
+checkbox and marked text controls inline, beside their questions. Valid text
+fields offer multiline editing with Save and Cancel; Raw Markdown keeps every
+marker and original response byte. Browser selection is local to that tab; it
 does not change terminal or agent selection. Creation and general Markdown edits
 remain CLI/MCP operations. Browser drafts stay in memory and use explicit
 save/discard/cancel choices, revision checks and current-board review on conflicts.

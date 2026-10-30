@@ -74,7 +74,7 @@ monitoring does not establish that a model ran or completed a task.
 
 Unlocking opens Boards first. Select a board from the compact toolbar, or switch
 to Messages using the navigation. The document fills the available width; response
-controls appear below it only when present. The first selection
+controls appear inline beside their questions. The first selection
 is `main`, including its empty virtual entry before a file exists. Lists are in
 name order. Board names, existence and revisions come from the same broker used
 by CLI/MCP; unknown names never fall back or create documents. Create boards and
@@ -97,16 +97,23 @@ source. HTML and scripts do not execute, images do not fetch resources, and safe
 external links require an explicit click. Board layout is user-authored; no task
 table schema is required.
 
-The Responses pane uses the terminal's Rust control parser and source mapping.
-Code examples, ordinary bracket text, malformed/nested/duplicate marked fields
-and response contents never create controls. A checkbox save sends its intended
-checked state. Text responses have Save and Cancel. Changes preserve bytes
+Ordinary response controls use the terminal's Rust control parser and validated
+source mapping. Supported task markers become native checkboxes in the document;
+valid ordinary `board-input` blocks become multiline text areas with **Save** and
+**Cancel** in place of their marker comments and quoted response. Raw Markdown
+retains the exact source. Code examples, ordinary bracket text, arbitrary HTML and
+malformed/nested/duplicate marked fields remain readable and noninteractive.
+A checkbox save sends its intended checked state. Save updates only the selected
+response; Cancel restores its last confirmed value without writing. Changes preserve bytes
 outside that response and use the same revision checks and notification behavior
 as the terminal. Browser writes are unattributed user-interface changes, so the
 appropriate board's subscribers can receive a change notice. Reading never
 subscribes a native agent or changes a board.
 
-Drafts stay in memory and remain pinned to their board, control and revision.
+Only one ordinary response is edited at a time; finish or cancel it before
+editing another. Drafts stay in memory and remain pinned to their board, control
+and revision. Agent-owned message inputs keep their separate Send and retry flow;
+ordinary Save never sends an agent message.
 Switching boards, leaving Boards or explicitly locking with an unsaved response
 offers Save and continue, Discard and continue, or Cancel navigation. Saving must
 succeed before continuing; a save already in flight must finish first. Closing

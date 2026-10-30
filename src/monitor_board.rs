@@ -42,6 +42,9 @@ use board_interaction::control_id;
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Node {
+    Control {
+        id: String,
+    },
     Text {
         text: String,
     },
@@ -97,16 +100,56 @@ fn safe_url(value: &str) -> Option<String> {
         None
     }
 }
-fn structure(markdown: &str) -> Option<Vec<Node>> {
+fn structure(snapshot: &Snapshot, controls: &[board_interaction::Control]) -> Option<Vec<Node>> {
+    let mut bytes = snapshot.markdown.as_bytes().to_vec();
+    let mut fields = Vec::new();
+    for control in controls {
+        match control.kind {
+            Kind::Text { .. } => {
+                let start = snapshot.markdown[..control.range.start.saturating_sub(1)]
+                    .rfind('\n')
+                    .map_or(0, |n| n + 1);
+                let end = snapshot.markdown[control.range.end..]
+                    .find('\n')
+                    .map_or(bytes.len(), |n| control.range.end + n + 1);
+                fields.push((start, control));
+                for byte in &mut bytes[start..end] {
+                    if *byte != b'\n' && *byte != b'\r' {
+                        *byte = b' ';
+                    }
+                }
+                bytes[start..start + 8].copy_from_slice(b"<!-- -->");
+            }
+            Kind::Message { .. } => {
+                for byte in &mut bytes[control.range.clone()] {
+                    if *byte != b'\n' && *byte != b'\r' {
+                        *byte = b' ';
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    let markdown = String::from_utf8(bytes).ok()?;
     const MAX_NODES: usize = 4096;
     const MAX_DEPTH: usize = 48;
     let mut stack = vec![Container::plain("span")];
     let mut count = 0;
-    for event in Parser::new_ext(
-        markdown,
+    for (event, range) in Parser::new_ext(
+        &markdown,
         Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH,
-    ) {
+    )
+    .into_offset_iter()
+    {
         count += 1;
+        if matches!(event, Event::Html(_))
+            && let Some((_, control)) = fields.iter().find(|(start, _)| *start == range.start)
+        {
+            stack.last_mut()?.children.push(Node::Control {
+                id: control_id(snapshot, control),
+            });
+            continue;
+        }
         if count > MAX_NODES || stack.len() > MAX_DEPTH {
             return None;
         }
@@ -190,15 +233,37 @@ fn structure(markdown: &str) -> Option<Vec<Node>> {
                 href: None,
                 start: None,
             }),
-            Event::TaskListMarker(checked) => stack.last_mut()?.children.push(Node::Text {
-                text: if checked { "☑ " } else { "☐ " }.into(),
-            }),
+            Event::TaskListMarker(checked) => {
+                let control = controls.iter().find(|control| {
+                    matches!(control.kind, Kind::Checkbox { .. })
+                        && range.contains(&control.range.start)
+                });
+                stack
+                    .last_mut()?
+                    .children
+                    .push(if let Some(control) = control {
+                        Node::Control {
+                            id: control_id(snapshot, control),
+                        }
+                    } else {
+                        Node::Text {
+                            text: if checked { "☑ " } else { "☐ " }.into(),
+                        }
+                    });
+            }
         }
     }
     if stack.len() != 1 {
         return None;
     }
     Some(stack.pop()?.children)
+}
+fn nodes_text_contains_input(nodes: &[Node]) -> bool {
+    nodes.iter().any(|node| match node {
+        Node::Text { text } => text.contains("<!-- board-input:"),
+        Node::Element { children, .. } => nodes_text_contains_input(children),
+        Node::Control { .. } => false,
+    })
 }
 pub(crate) fn view(snapshot: &Snapshot) -> Value {
     let controls=board_interaction::controls(&snapshot.markdown).into_iter().map(|control|{
@@ -210,7 +275,8 @@ pub(crate) fn view(snapshot: &Snapshot) -> Value {
         }
     }).collect::<Vec<_>>();
     let display = board_interaction::display_markdown(&snapshot.markdown);
-    let rendered = structure(display.as_ref());
+    let parsed_controls = board_interaction::controls(&snapshot.markdown);
+    let rendered = structure(snapshot, &parsed_controls);
     let notice = rendered.is_none();
     let nodes = rendered.unwrap_or_else(|| {
         vec![Node::Element {
@@ -222,7 +288,13 @@ pub(crate) fn view(snapshot: &Snapshot) -> Value {
             start: None,
         }]
     });
+    let invalid_fields = nodes_text_contains_input(&nodes);
     let mut result = json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"last_updated":snapshot.last_updated,"last_updated_source":snapshot.last_updated_source,"markdown":snapshot.markdown,"display_markdown":display.as_ref(),"nodes":nodes,"controls":controls});
+    if invalid_fields {
+        result["control_notice"] = json!(
+            "Unrecognized input markers and code examples remain readable and cannot be edited here."
+        );
+    }
     if notice {
         result["render_notice"] =
             json!("This document is complex; showing plain text. Raw Markdown remains available.");
@@ -402,7 +474,7 @@ impl Broker {
         if updated == current.markdown {
             return Reply {
                 status: 200,
-                body: json!({"applied":true,"board":view(&current),"unchanged":true}),
+                body: json!({"applied":true,"board":view(&current),"unchanged":true,"saved_control_id":control_id(&current, &control)}),
             };
         }
         match self.update_board_locked(
@@ -412,10 +484,16 @@ impl Broker {
             &[board::Edit::Set { markdown: updated }],
             None,
         ) {
-            Ok(snapshot) => Reply {
-                status: 200,
-                body: json!({"applied":true,"board":view(&snapshot)}),
-            },
+            Ok(snapshot) => {
+                let saved = board_interaction::controls(&snapshot.markdown)
+                    .into_iter()
+                    .find(|candidate| candidate.range.start == control.range.start)
+                    .map(|candidate| control_id(&snapshot, &candidate));
+                Reply {
+                    status: 200,
+                    body: json!({"applied":true,"board":view(&snapshot),"saved_control_id":saved}),
+                }
+            }
             Err(error) => {
                 if let Some(conflict_error) = error.downcast_ref::<board::Conflict>() {
                     conflict(&conflict_error.current)
@@ -434,6 +512,18 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn structure(markdown: &str) -> Option<Vec<Node>> {
+        let snapshot = Snapshot {
+            name: "main".into(),
+            markdown: markdown.into(),
+            revision: "a".repeat(64),
+            path: std::path::PathBuf::new(),
+            exists: true,
+            last_updated: None,
+            last_updated_source: board::LastUpdatedSource::Unknown,
+        };
+        super::structure(&snapshot, &board_interaction::controls(markdown))
+    }
     fn setup() -> (tempfile::TempDir, crate::broker::BoundServer, Snapshot) {
         let root = tempfile::tempdir().unwrap();
         let bound = Broker::bind(root.path().into(), "/missing/codex".into()).unwrap();
@@ -452,6 +542,40 @@ mod tests {
                 &board_interaction::controls(&snapshot.markdown)[index],
             ),
             value,
+        }
+    }
+    #[test]
+    fn inline_controls_are_validated_and_source_associated() {
+        let source = "# 世界\r\n- [ ] one\r\n  - [x] nested\r\n\r\n<!-- board-input: a -->\r\n> old\r\n<!-- /board-input -->\r\n<!-- board-input: b -->\r\n<!-- /board-input -->\r\n\r\n```md\r\n- [ ] inert\r\n<!-- board-input: example -->\r\n```\r\n";
+        let snapshot = Snapshot {
+            name: "main".into(),
+            revision: "a".repeat(64),
+            markdown: source.into(),
+            exists: true,
+            last_updated: None,
+            last_updated_source: board::LastUpdatedSource::Unknown,
+            path: std::path::PathBuf::new(),
+        };
+        let result = view(&snapshot);
+        let nodes = result["nodes"].to_string();
+        assert_eq!(result["controls"].as_array().unwrap().len(), 4);
+        for control in result["controls"].as_array().unwrap() {
+            assert_eq!(nodes.matches(control["id"].as_str().unwrap()).count(), 1);
+        }
+        assert!(!nodes.contains("board-input: a"));
+        assert!(!nodes.contains("board-input: b"));
+        assert!(nodes.contains("board-input: example"));
+        assert_eq!(result["markdown"], source);
+        for source in [
+            "<!-- board-input: a -->\n> one\n<!-- /board-input -->\n<!-- board-input: a -->\n> two\n<!-- /board-input -->\n",
+            "<!-- board-input: a -->\n<!-- board-input: b -->\n> nested\n<!-- /board-input -->\n",
+            "<!-- board-input: a -->\n> unclosed\n",
+        ] {
+            let mut snapshot = snapshot.clone();
+            snapshot.markdown = source.into();
+            let result = view(&snapshot);
+            assert!(result["controls"].as_array().unwrap().is_empty());
+            assert!(result["nodes"].to_string().contains("board-input:"));
         }
     }
     #[tokio::test]
@@ -563,8 +687,9 @@ mod tests {
             "<!-- board-message: {} -->",
             serde_json::to_string(&marker).unwrap()
         );
-        let source =
-            format!("# Friendly board\n{declaration}\nVisible text\n<!-- literal comment -->\n");
+        let source = format!(
+            "# Friendly board 世界\r\n{declaration}\r\nVisible text\r\n<!-- literal comment -->\r\n- [ ] Approval 世界\r\n\r\n<!-- board-input: answer -->\r\n> unchanged 世界\r\n<!-- /board-input -->\r\n"
+        );
         let snapshot = board::update_named(
             root.path(),
             &Name::default(),
@@ -579,6 +704,14 @@ mod tests {
         assert_eq!(result["controls"][0]["kind"], "message");
         let rendered = result["nodes"].to_string();
         assert!(!rendered.contains("board-message:"));
+        assert_eq!(result["controls"].as_array().unwrap().len(), 3);
+        assert_eq!(result["controls"][1]["kind"], "checkbox");
+        assert_eq!(result["controls"][2]["kind"], "text");
+        for control in &result["controls"].as_array().unwrap()[1..] {
+            assert_eq!(rendered.matches(control["id"].as_str().unwrap()).count(), 1);
+        }
+        assert!(!rendered.contains("board-input: answer"));
+        assert!(!rendered.contains("unchanged 世界"));
         assert!(
             !result["display_markdown"]
                 .as_str()
