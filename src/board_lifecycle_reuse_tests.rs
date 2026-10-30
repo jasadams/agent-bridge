@@ -138,7 +138,11 @@ fn purge_and_recreate(fixture: &Fixture, archived_at: i64) -> (Snapshot, Snapsho
         archived
     };
     assert!(
-        !fixture.original.path.exists(),
+        !broker
+            .state_dir
+            .join("boards")
+            .join(format!("{}.md", fixture.name))
+            .exists(),
         "Purge must remove the managed file"
     );
     assert!(
@@ -160,7 +164,13 @@ fn purge_and_recreate(fixture: &Fixture, archived_at: i64) -> (Snapshot, Snapsho
     let recreated = set(broker, &fixture.name, &fixture.original.markdown);
     assert_eq!(recreated.markdown, fixture.original.markdown);
     assert_eq!(
-        std::fs::read(&recreated.path).unwrap().as_slice(),
+        std::fs::read(
+            crate::board::read_named(&broker.state_dir, &fixture.name)
+                .unwrap()
+                .path
+        )
+        .unwrap()
+        .as_slice(),
         fixture.original.markdown.as_bytes()
     );
     assert_ne!(
@@ -307,7 +317,10 @@ async fn identical_name_and_bytes_do_not_reauthorize_old_controls_or_message_int
     assert_eq!(untouched.lifecycle, recreated.lifecycle);
     assert_eq!(untouched.markdown, recreated.markdown);
     assert!(
-        untouched.path.exists(),
+        crate::board::read_named(&broker.state_dir, &fixture.name)
+            .unwrap()
+            .path
+            .exists(),
         "An old cleanup deadline cannot delete a new active board"
     );
 

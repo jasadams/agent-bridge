@@ -40,7 +40,12 @@ reply and shared-board read/update. Board notifications remain off by default;
 subscribe with the exact session identity, attribute own writes, and unsubscribe
 when no longer needed. Keep board task/status/blocker or user-action entries
 brief and revise the current entry; leave detailed logs in the native terminal.
-The board has no required table schema. See [board behavior](board.md).
+The board has no required table schema. The system context directs agents to use
+broker board/lifecycle tools only, never shell/editor writes to backing files. On
+conflict, review the latest returned snapshot and retry only intended edits while
+preserving other writers. If tools are unavailable, report the blocker rather than
+writing files directly. Backing paths are internal metadata; authored Markdown
+paths remain unchanged. See [board behavior](board.md).
 
 Native owner pairing prompts are unavailable for OpenCode: no supported V1 owner
 Yes/No input workflow has been established. CLI/MCP pairing selectors reject an

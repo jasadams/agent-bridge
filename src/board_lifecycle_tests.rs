@@ -288,6 +288,9 @@ async fn startup_and_periodic_cleanup_do_not_depend_on_a_viewer() {
     let (root, bound, name) = setup();
     let broker = &bound.broker;
     let before = set(broker, &name, "offline archive");
+    let before_path = crate::board::read_named(&broker.state_dir, &name)
+        .unwrap()
+        .path;
     archive(
         broker,
         &name,
@@ -295,10 +298,10 @@ async fn startup_and_periodic_cleanup_do_not_depend_on_a_viewer() {
         crate::db::now() - board_lifecycle::RETENTION_MS - 1,
     )
     .unwrap();
-    assert!(before.path.exists());
+    assert!(before_path.exists());
     drop(bound);
     let rebound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
-    assert!(!before.path.exists());
+    assert!(!before_path.exists());
     assert!(
         rebound
             .broker
@@ -315,6 +318,9 @@ async fn startup_and_periodic_cleanup_do_not_depend_on_a_viewer() {
         })
         .unwrap();
     let current = set(broker, &name, "periodic archive");
+    let current_path = crate::board::read_named(&broker.state_dir, &name)
+        .unwrap()
+        .path;
     archive(
         broker,
         &name,
@@ -326,7 +332,7 @@ async fn startup_and_periodic_cleanup_do_not_depend_on_a_viewer() {
     let task =
         tokio::spawn(async move { worker.board_cleanup_loop(Duration::from_millis(10)).await });
     let observed = tokio::time::timeout(Duration::from_secs(3), async {
-        while current.path.exists() {
+        while current_path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

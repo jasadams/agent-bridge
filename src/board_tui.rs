@@ -1242,10 +1242,10 @@ impl View {
             );
             return;
         }
-        let path = self
+        let identity = self
             .snapshot
             .as_ref()
-            .map(|snapshot| safe_line(&snapshot.path.to_string_lossy()))
+            .map(|snapshot| format!("Board {}", safe_line(&snapshot.name)))
             .unwrap_or_default();
         let updated = crate::board_time::footer(
             match self.selection.as_ref().and(self.viewport_metadata.as_ref()) {
@@ -1269,7 +1269,7 @@ impl View {
                     crate::board_time::archive_date(snapshot.lifecycle.expires_at)
                 )
             })
-            .unwrap_or(path);
+            .unwrap_or(identity);
         let block = Block::bordered()
             .title(lifecycle_title)
             .title_bottom(Line::from(updated).centered());
@@ -2379,12 +2379,15 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                 };
                 if !relevant { continue; }
                 let snapshot = match &update { Update::Read(_, _, Ok(snapshot), _) | Update::Saved(_, Ok((snapshot, _))) => Some(snapshot), _ => None };
-                if let Some(snapshot) = snapshot {
-                    let root = snapshot.path.parent().filter(|parent| parent.is_dir()).unwrap_or(&state_dir);
+                if snapshot.is_some() {
+                    // RPC snapshots carry logical identity only. The private file
+                    // watcher is an internal optimization, never a display value.
+                    let path = state_dir.join("boards").join(format!("{}.md", view.board));
+                    let root = path.parent().filter(|parent| parent.is_dir()).unwrap_or(&state_dir);
                     if watch.as_ref().is_none_or(|watch| watch.root != root) {
                         // Watching is an optimization; the bounded periodic refresh also
                         // handles unsupported filesystems and atomic replacement races.
-                        watch = file_watch(&snapshot.path, &state_dir, refresh.clone()).ok();
+                        watch = file_watch(&path, &state_dir, refresh.clone()).ok();
                     }
                 }
                 match update {

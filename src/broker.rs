@@ -2250,6 +2250,41 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     result
 }
 
+/// Project only documented board snapshot locations from older brokers. Keep
+/// unrelated records and authored Markdown byte-exact.
+fn logical_board_rpc_result(request: &Request, mut value: Value) -> Value {
+    fn snapshot(value: &mut Value) {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("path");
+        }
+    }
+    match request {
+        Request::BoardRead
+        | Request::NamedBoardRead { .. }
+        | Request::BoardCreate { .. }
+        | Request::BoardInspect { .. }
+        | Request::BoardArchive { .. }
+        | Request::BoardRestore { .. } => snapshot(&mut value),
+        Request::BoardUpdate { .. }
+        | Request::NamedBoardUpdate { .. }
+        | Request::AddBoardMessageInput { .. }
+        | Request::BoardMessageSend { .. } => {
+            if let Some(board) = value.get_mut("board") {
+                snapshot(board);
+            }
+        }
+        Request::BoardList | Request::BoardArchivedList => {
+            if let Some(boards) = value.as_array_mut() {
+                for board in boards {
+                    snapshot(board);
+                }
+            }
+        }
+        _ => (),
+    }
+    value
+}
+
 pub async fn rpc(state_dir: &Path, req: &Request) -> Result<Value> {
     let path = state_dir.join("bridge.sock");
     let operation = async {
@@ -2279,7 +2314,10 @@ pub async fn rpc(state_dir: &Path, req: &Request) -> Result<Value> {
         if !response.ok {
             anyhow::bail!("{}", response.error.unwrap_or_default())
         }
-        Ok(response.result.unwrap_or(Value::Null))
+        Ok(logical_board_rpc_result(
+            req,
+            response.result.unwrap_or(Value::Null),
+        ))
     };
     let seconds = if matches!(
         req,
@@ -2794,5 +2832,69 @@ mod board_timestamp_integration_tests {
         let after = broker.request(Request::BoardRead).unwrap();
         assert_ne!(after["revision"], before["revision"]);
         assert!(after["last_updated"].is_i64());
+    }
+}
+
+#[cfg(test)]
+mod board_rpc_projection_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_projection_is_limited_to_known_request_snapshot_positions() {
+        let snapshot = json!({"name":"logical","path":"/private/boards/logical.md","markdown":"Authored /work/report.md and {\"path\":\"example\"}","revision":"current","exists":true});
+        for operation in [
+            "board_read",
+            "named_board_read",
+            "board_create",
+            "board_inspect",
+            "board_archive",
+            "board_restore",
+        ] {
+            let mut request = json!({"op":operation});
+            if operation != "board_read" {
+                request["board"] = json!("logical");
+            }
+            if matches!(operation, "board_archive" | "board_restore") {
+                request["expected_revision"] = json!("current");
+            }
+            let request: Request = serde_json::from_value(request).unwrap();
+            let result = logical_board_rpc_result(&request, snapshot.clone());
+            assert!(result.get("path").is_none(), "{operation}");
+            assert_eq!(result["markdown"], snapshot["markdown"]);
+        }
+        for operation in [
+            "board_update",
+            "named_board_update",
+            "add_board_message_input",
+            "board_message_send",
+        ] {
+            let request = match operation {
+                "board_update" => json!({"op":operation,"expected_revision":"current","edits":[]}),
+                "named_board_update" => {
+                    json!({"op":operation,"board":"logical","expected_revision":"current","edits":[]})
+                }
+                "add_board_message_input" => {
+                    json!({"op":operation,"board":"logical","expected_revision":"current","agent":"owner","id":"compose","label":"Message owner"})
+                }
+                _ => {
+                    json!({"op":operation,"request":{"board":"logical","expected_revision":"current","control_id":"control","id":"id","text":"Authored path text"}})
+                }
+            };
+            let request: Request = serde_json::from_value(request).unwrap();
+            let envelope = json!({"board":snapshot,"message":{"path":"/unrelated/endpoint","body":"Authored /work/report.md"}});
+            let result = logical_board_rpc_result(&request, envelope.clone());
+            assert!(result["board"].get("path").is_none(), "{operation}");
+            assert_eq!(result["board"]["markdown"], snapshot["markdown"]);
+            assert_eq!(result["message"], envelope["message"]);
+        }
+        for request in [Request::BoardList, Request::BoardArchivedList] {
+            let result = logical_board_rpc_result(&request, json!([snapshot]));
+            assert!(result[0].get("path").is_none());
+        }
+        let unrelated = json!({"path":"/unrelated/connection","state_dir":"/private/state","endpoint":"/private/socket","board":snapshot});
+        assert_eq!(
+            logical_board_rpc_result(&Request::Status, unrelated.clone()),
+            unrelated
+        );
     }
 }
