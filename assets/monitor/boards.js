@@ -54,6 +54,80 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       }
     }
   }
+  // Catalog discovery has its own lifecycle: document switches and frozen
+  // response snapshots must neither restart polling nor invalidate its results.
+  let catalogEpoch = 0, catalogTimer = null, catalogFlight = null;
+  let catalogDelay = 2000, catalogAgain = false, catalogNames = null;
+  const catalogCurrent = epoch => active && authenticated() && epoch === catalogEpoch;
+  function catalogFeedback(value) {
+    const element = $("board-catalog-feedback");
+    text(element, value); element.hidden = !value;
+  }
+  function stopCatalog() {
+    catalogEpoch++; clearTimeout(catalogTimer); catalogTimer = null;
+    catalogFlight?.abort(); catalogFlight = null; catalogAgain = false;
+  }
+  function reconcileCatalog(names) {
+    const selector = $("board-selector"), desired = Array.from(new Set([...names, board])).sort();
+    const existing = new Map(Array.from(selector.options, option => [option.value, option]));
+    for (let index = 0; index < desired.length; index++) {
+      const name = desired[index];
+      let option = existing.get(name);
+      if (!option) { option = node("option", name); option.value = name; }
+      if (selector.options[index] !== option) selector.insertBefore(option, selector.options[index] || null);
+    }
+    while (selector.options.length > desired.length) selector.lastElementChild.remove();
+    // Setting the same value needlessly can close native selector popups.
+    if (selector.value !== board) selector.value = board;
+  }
+  function validateCatalog(data) {
+    if (!data || !Array.isArray(data.boards) || data.boards.length > 256) throw new Error("Invalid board list");
+    const rows = new Map();
+    for (const row of data.boards) {
+      if (!row || !validName(row.name) || typeof row.exists !== "boolean" || typeof row.revision !== "string" || !/^[a-f0-9]{64}$/.test(row.revision)) throw new Error("Invalid board list");
+      const prior = rows.get(row.name);
+      if (prior && (prior.exists !== row.exists || prior.revision !== row.revision)) throw new Error("Inconsistent board list");
+      rows.set(row.name, row);
+    }
+    if (!rows.has("main")) throw new Error("Board list is missing main");
+    return Array.from(rows.keys()).sort();
+  }
+  function scheduleCatalog(epoch, delay) {
+    if (!catalogCurrent(epoch)) return;
+    clearTimeout(catalogTimer);
+    catalogTimer = setTimeout(() => { catalogTimer = null; void refreshCatalog(); }, delay);
+  }
+  async function refreshCatalog(catchUp = false) {
+    if (!active || !authenticated()) return;
+    if (catchUp) { catalogDelay = 2000; clearTimeout(catalogTimer); catalogTimer = null; }
+    if (catalogFlight) { if (catchUp) catalogAgain = true; return; }
+    const epoch = catalogEpoch, controller = new AbortController(), started = Date.now();
+    catalogFlight = controller;
+    let deadline, delay = 4000;
+    try {
+      const timeout = new Promise((_, reject) => { deadline = setTimeout(() => {
+        controller.abort(); reject(new Error("Board list timed out"));
+      }, 4000); });
+      const data = await Promise.race([request("/api/boards", { signal: controller.signal }), timeout]);
+      if (!catalogCurrent(epoch) || catalogFlight !== controller) return;
+      const names = validateCatalog(data);
+      reconcileCatalog(names); catalogNames = names; catalogDelay = 2000;
+      catalogFeedback(names.includes(board) ? "" : "The selected board is no longer listed. Its identity is kept; refresh it to check availability.");
+      delay = Math.max(0, 4000 - (Date.now() - started));
+    } catch (e) {
+      if (!catalogCurrent(epoch) || catalogFlight !== controller) return;
+      catalogFeedback("Board list unavailable. Known boards are kept; retrying automatically.");
+      delay = catalogDelay; catalogDelay = Math.min(catalogDelay * 2, 30000);
+    } finally {
+      clearTimeout(deadline);
+      if (catalogCurrent(epoch) && catalogFlight === controller) {
+        catalogFlight = null;
+        const again = catalogAgain; catalogAgain = false;
+        scheduleCatalog(epoch, again ? 0 : delay);
+      }
+    }
+  }
+  function catchUpCatalog() { if (active && authenticated()) void refreshCatalog(true); }
   function selectionHeld() {
     const selection = window.getSelection();
     return !!selection && !selection.isCollapsed && ["board-document", "board-raw", "board-controls"].some(id => $(id).contains(selection.anchorNode) || $(id).contains(selection.focusNode));
@@ -83,6 +157,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       const response = await connect(`/api/boards/${encodeURIComponent(c.name)}/events`, { signal: controller.signal });
       if (!live()) { await response.body?.cancel(); return; }
       if (!response.ok || !response.body) throw new Error("Board live connection unavailable");
+      catchUpCatalog();
       // Catch changes between the initial snapshot and connecting, including reconnect gaps.
       await refresh();
       if (!live()) { await response.body.cancel(); return; }
@@ -484,20 +559,14 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     if (active) return;
     const c = capture(); if (active && !await allowLeave() || !current(c)) return;
     active = true; onViewChange("boards"); status("Loading boards…");
-    try {
-      const data = await request("/api/boards");
-      if (!current(c) || !active) return;
-      if (!Array.isArray(data.boards)) throw new Error("Invalid board list");
-      const names = data.boards.filter(row => validName(row.name)).map(row => row.name).sort();
-      $("board-selector").replaceChildren(...names.map(name => { const option = node("option", name); option.value = name; return option; }));
-      $("board-selector").value = board;
-      await refresh();
-      if (current(c) && active) void startLive();
-    } catch (e) { if (current(c) && active && e.name !== "AbortError") { error("The board list could not be loaded. Refresh or return to Messages and try again."); status("Stale · reconnecting"); } }
+    reconcileCatalog(catalogNames || []);
+    catchUpCatalog();
+    await refresh();
+    if (current(c) && active) void startLive();
   }
-  async function leave(action, clearsPrivate = false) { const c = capture(); if (await allowLeave(clearsPrivate) && current(c)) { active = false; stop(); boardEpoch++; action(); } }
+  async function leave(action, clearsPrivate = false) { const c = capture(); if (await allowLeave(clearsPrivate) && current(c)) { active = false; stopCatalog(); stop(); boardEpoch++; action(); } }
   function clear() {
-    active = false; authEpoch++; boardEpoch++; stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
+    active = false; authEpoch++; boardEpoch++; stopCatalog(); catalogNames = null; catalogDelay = 2000; catalogFeedback(""); stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
     messageDrafts.clear(); $("message-controls").replaceChildren(); $("board-messages").hidden = true;
     board = "main"; shown = null; latest = null; draft = null; saving = false; raw = false; backoff = 1000;
     $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); $("board-selector").replaceChildren();
@@ -534,7 +603,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     }
   });
   $("board-selector").addEventListener("change", e => { const name = e.target.value; e.target.value = board; void choose(name); });
-  $("board-refresh").addEventListener("click", () => { if (draft || selectionHeld()) void review(); else void readSnapshot(true); });
+  $("board-refresh").addEventListener("click", () => { catchUpCatalog(); if (draft || selectionHeld()) void review(); else void readSnapshot(true); });
   $("board-review-refresh").addEventListener("click", () => { void review(); });
   $("board-raw-toggle").addEventListener("click", () => { raw = !raw; $("board-raw-toggle").setAttribute("aria-pressed", String(raw)); $("board-document").hidden = raw; $("board-raw").hidden = !raw; });
   $("response-text").addEventListener("input", e => { if (draft && !saving && draft.kind === "text") draft.value = e.target.value; });
@@ -549,6 +618,9 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   document.addEventListener("selectionchange", () => {
     if (active && latest && !draft && !saving && !selectionHeld()) { const view = latest; latest = null; show(view); status("Live · up to date"); }
   });
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") catchUpCatalog(); });
+  window.addEventListener("online", catchUpCatalog);
+  window.addEventListener("focus", catchUpCatalog);
   window.addEventListener("beforeunload", e => { if (dirty() || saving || messageDirty() || messagePending()) { e.preventDefault(); e.returnValue = ""; } });
   return { open, leave, clear, hasDraft: () => dirty() || messageDirty() };
 };
