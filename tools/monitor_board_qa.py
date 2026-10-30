@@ -69,15 +69,15 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#board-selector").select_option(name)
         expect(page.locator("#selected-board-name")).to_have_text(name)
         wait("selected board snapshot", lambda: page.locator("#board-raw").text_content() == read(name)["markdown"])
-        wait("board controls loaded", lambda: page.locator("#board-controls .board-control").count() > 0)
+        wait("board controls loaded", lambda: page.locator("#board-document .board-control").count() > 0)
 
     def edit(value):
-        page.get_by_role("button", name="Respond: answer", exact=True).click()
+        page.locator("#board-document .board-inline-text").first.focus()
         page.locator("#response-text").fill(value)
 
     def saved(value):
         wait("response persisted", lambda: "> " + value in read("alpha")["markdown"])
-        expect(page.locator("#response-editor")).to_be_hidden()
+        expect(page.locator("#response-text")).to_be_hidden()
 
     def refresh():
         page.locator("#board-refresh").click()
@@ -164,7 +164,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         expect(page.locator("#board-document h1")).to_have_text("Alpha 世界")
         expect(page.locator("#board-document table")).to_have_count(1)
         expect(page.locator("#board-document pre")).to_have_count(1)
-        expect(page.locator("#board-controls .board-control")).to_have_count(2)
+        expect(page.locator("#board-document .board-control")).to_have_count(2)
         assert len(api_view("beta")["controls"]) == 2, "Duplicate text markers became editable"
         assert not page.locator("#board-document img, #board-document script, #board-document svg, #board-document iframe").count()
         assert page.evaluate("typeof window.boardPwned") == "undefined"
@@ -191,7 +191,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         assert abs(document["width"] - board_view["width"]) <= 2, "Board loses width to an unused sidebar"
         page.screenshot(path=str(output / "boards-read-only-desktop.png"), full_page=True)
         pick("alpha")
-        expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_visible()
+        expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_hidden()
         record("read-only board opens near the top at full content width without empty response chrome; editable controls return on navigation")
 
         snapshot_reads = []
@@ -203,12 +203,16 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         assert len(snapshot_reads) == idle_count, "Idle board still polls snapshots"
         page.evaluate("""() => {
           window.__stableHeading = document.querySelector('#board-document h1');
-          window.__stableControl = document.querySelector('#board-controls input');
+          window.__stableControl = document.querySelector('#board-document input');
         }""")
         write("alpha", alpha.replace("| native | ready |", "| native | live push |"))
         expect(page.locator("#board-document table")).to_contain_text("live push")
         assert page.evaluate("window.__stableHeading === document.querySelector('#board-document h1')")
-        assert page.evaluate("window.__stableControl === document.querySelector('#board-controls input')")
+        assert page.evaluate("window.__stableControl !== document.querySelector('#board-document input')"), "Revision-bound checkbox handler unexpectedly reused"
+        checkpoint = read("alpha")
+        page.evaluate("window.__stableControl.dispatchEvent(new Event('change', {bubbles:true}))")
+        page.wait_for_timeout(100)
+        assert read("alpha") == checkpoint, "Detached previous-revision checkbox wrote the board"
         write("alpha", alpha)
         expect(page.locator("#board-document table")).to_contain_text("ready")
         page.evaluate("""() => {
@@ -222,9 +226,9 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.evaluate("getSelection().removeAllRanges()")
         expect(page.locator("#board-document table")).to_contain_text("ready")
         assert "transient" not in page.locator("#board-document table").inner_text()
-        record("board push stream stays idle without snapshot polling, patches changed cells, preserves controls and drops reverted deferred snapshots")
+        record("board push stream stays idle without snapshot polling, patches changed cells, rejects previous-revision checkbox events and drops reverted deferred snapshots")
 
-        checkbox = page.locator('#board-controls input[type="checkbox"]')
+        checkbox = page.locator('#board-document input[type="checkbox"]')
         checkbox.check()
         wait("desired checkbox checked", lambda: "- [x] Checkbox alpha" in read("alpha")["markdown"])
         expect(checkbox).to_be_enabled()
@@ -308,7 +312,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#response-review").click(); expect(page.locator("#response-rebase")).to_be_hidden()
         expect(page.locator("#response-text")).to_have_value("deleted field draft"); page.locator("#response-cancel").click()
         write("alpha", alpha); refresh()
-        expect(page.get_by_role("button", name="Respond: answer", exact=True)).to_be_visible()
+        expect(page.locator("#board-document .board-inline-text")).to_be_visible()
         record("revision conflicts retain intent; explicit unchanged-field rebase is revision-reviewed; changed/deleted fields require reopening")
 
         # The real POST commits before its JSON continuation is released. While
@@ -319,8 +323,8 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#response-save").click(); gate_wait()
         assert "> one pending browser save" in read("alpha")["markdown"]
         expect(page.locator("#response-save")).to_be_disabled()
-        expect(page.locator('#board-controls input[type="checkbox"]')).to_be_disabled()
-        expect(page.get_by_role("button", name="Respond: answer", exact=True)).to_be_disabled()
+        expect(page.locator('#board-document input[type="checkbox"]')).to_be_disabled()
+        expect(page.locator("#response-text")).to_be_disabled()
         page.locator("#response-save").evaluate("button => { button.click(); button.click(); }")
         page.locator("#board-selector").select_option("beta")
         expect(page.locator("#selected-board-name")).to_have_text("alpha")
@@ -375,8 +379,12 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         # then release the old result. Private old data must remain cleared.
         arm_gate("beta"); gate_wait()
         page.locator("#lock-button").click(); expect(page.locator("#workspace")).to_be_hidden()
-        assert not page.locator("#board-raw").text_content() and not page.locator("#board-controls").text_content()
+        assert not page.locator("#board-raw").text_content()
+        expect(page.locator("#response-editor")).to_be_hidden()
+        expect(page.locator("#response-heading")).to_have_text("Edit response")
+        expect(page.locator("#response-feedback")).to_have_text("")
         assert not page.locator("#response-text").input_value()
+        assert page.locator("#response-text").get_attribute("aria-label") in (None, "", "Response"), "Lock retained the private response question in its accessible name"
         assert not page.locator("#board-last-updated").text_content()
         page.locator("#access-token").fill(token); page.locator("#login-form button[type=submit]").click()
         expect(page.locator("#boards-view")).to_be_visible()
@@ -385,7 +393,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         release_gate(); page.wait_for_timeout(150)
         expect(page.locator("#board-document h1")).to_have_text("Ticket board")
         assert "Beta" not in page.locator("#board-raw").text_content()
-        assert not page.locator("#board-controls .board-control").count()
+        assert not page.locator("#board-document .board-control").count()
         record("late decoded snapshots are fenced across board switches and lock/new authentication generations")
 
         pick("alpha")
@@ -397,7 +405,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         expect(page.locator("#board-error")).to_be_hidden(timeout=15000)
         page.locator("#board-selector").focus(); page.keyboard.press("Tab")
         assert page.locator("#board-refresh").evaluate("e => e === document.activeElement")
-        page.get_by_role("button", name="Respond: answer", exact=True).focus(); page.keyboard.press("Enter")
+        page.locator("#board-document .board-inline-text").focus()
         expect(page.locator("#response-text")).to_be_focused()
         page.locator("#response-text").fill("keyboard draft"); page.keyboard.press("Tab")
         expect(page.locator("#response-save")).to_be_focused()
@@ -409,11 +417,11 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             page.evaluate("window.scrollTo(0, 0)")
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1"), "Page overflow hides response controls"
             document = page.locator(".board-document-panel").bounding_box()
-            responses = page.locator('.board-responses[aria-labelledby="responses-heading"]').bounding_box()
+            responses = page.locator("#board-document .board-inline-text").bounding_box()
             board_view = page.locator("#boards-view").bounding_box()
             assert document and responses and board_view
             assert abs(document["width"] - board_view["width"]) <= 2, "Editable board reserves document width for responses"
-            assert responses["y"] >= document["y"] + document["height"] - 1, "Responses displace the board into a sidebar layout"
+            assert responses["y"] >= document["y"] and responses["y"] < document["y"] + document["height"], "Response is outside the document"
             if width >= 1000:
                 assert document["y"] < 230, "Editable board content is pushed below excessive header space"
             page.screenshot(path=str(output / filename), full_page=True)
@@ -439,6 +447,9 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             other.locator("#boards-tab").click()
             expect(other.locator("#board-selector option")).to_have_count(1)
             expect(other.locator("#board-raw")).to_contain_text("REVOKED_PRIVATE_BOARD_DATA")
+            other.locator("#board-document .board-inline-text").focus()
+            other.locator("#response-text").fill("REVOKED_PRIVATE_DRAFT_DATA")
+            expect(other.locator("#response-text")).to_have_attribute("aria-label", "secret")
             arm_gate("main", other); gate_wait(other)
             rpc(second_state, "monitor_disable")
             renewed = rpc(second_state, "monitor_enable", port=urlsplit(second["url"]).port)
@@ -446,12 +457,18 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             release_gate(other)
             other.wait_for_timeout(150)
             assert not other.locator("#board-raw").text_content()
-            assert not other.locator("#board-controls").text_content()
+            expect(other.locator("#response-editor")).to_be_hidden()
+            expect(other.locator("#response-text")).to_have_value("")
+            assert other.locator("#response-text").get_attribute("aria-label") in (None, "", "Response"), "Revocation retained the private response question in its accessible name"
+            expect(other.locator("#response-heading")).to_have_text("Edit response")
+            expect(other.locator("#response-feedback")).to_have_text("")
             assert other.locator("#access-token").input_value() == ""
             assert renewed["access_token"] != second["access_token"]
         finally:
             isolated.close(); rpc(second_state, "monitor_disable")
         record("actual private monitor credential rotation clears boards and invalidates delayed old-auth data")
+        inline_control_checks(page=page, context=context, rpc=rpc, state=state,
+                              origin=origin, token=token, record=record, output=output)
         from monitor_code_copy_qa import code_copy_browser_checks
         code_copy_browser_checks(page=page, rpc=rpc, state=state, token=token, record=record, output=output)
         # Real file timestamps, real HTTP snapshots, and a viewer-zone context:
@@ -549,3 +566,153 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         # Never leave a deliberate JSON-decode gate suspended after assertions.
         if not page.is_closed():
             page.evaluate("() => { window.__boardGate?.release?.(); }")
+
+
+def inline_control_checks(*, page, context, rpc, state, origin, token, record, output):
+    """Extra source-position/identity cases using real parsed broker metadata."""
+    from playwright.sync_api import expect
+
+    name = "inline-fixture"
+    source = ("# Inline controls 世界\r\n\r\n- [ ] First choice\r\n- Parent\r\n  - [ ] Nested choice\r\n\r\n"
+              "| Context | Marker |\r\n| --- | --- |\r\n| Table | - [ ] table-like |\r\n\r\n"
+              "## First question\r\n<!-- board-input: first -->\r\n> first original\r\n<!-- /board-input -->\r\n\r\n"
+              "## Second question\r\n<!-- board-input: second -->\r\n> second original\r\n<!-- /board-input -->\r\n\r\n"
+              "Inline `- [ ] code` and `echo safe`.\r\n\r\n```md\r\n- [ ] fenced\r\n<!-- board-input: fenced -->\r\n> fenced example\r\n<!-- /board-input -->\r\n```\r\n\r\n"
+              "<!-- board-input: duplicate -->\r\n> duplicate one\r\n<!-- /board-input -->\r\n\r\n"
+              "<!-- board-input: duplicate -->\r\n> duplicate two\r\n<!-- /board-input -->\r\n\r\n"
+              "<!-- board-input: invalid id -->\r\n> invalid visible\r\n<!-- /board-input -->\r\n\r\n"
+              "<!-- board-input: outer -->\r\n<!-- board-input: inner -->\r\n> nested visible\r\n<!-- /board-input -->\r\n<!-- /board-input -->\r\n\r\n"
+              "<input type=checkbox checked onclick='window.boardPwned=3'>\r\n\r\n"
+              "<!-- board-input: unclosed -->\r\n> unclosed visible\r\n")
+
+    def read():
+        return rpc(state, "named_board_read", board=name)
+
+    def write(markdown):
+        return rpc(state, "named_board_update", board=name,
+                   expected_revision=read()["revision"], actor=None,
+                   edits=[{"op": "set", "markdown": markdown}])
+
+    def view():
+        response = context.request.get(origin + "/api/boards/" + name,
+                                       headers={"Authorization": "Bearer " + token})
+        assert response.ok
+        return response.json()
+
+    def field(field_id):
+        return page.locator('#board-document .board-inline-response[data-field-id="' + field_id + '"]')
+
+    rpc(state, "board_create", board=name)
+    write(source)
+    page.locator("#messages-tab").click()
+    page.locator("#boards-tab").click()
+    page.locator("#board-selector").select_option(name)
+    expect(page.locator("#board-document h1")).to_have_text("Inline controls 世界")
+    controls = view()["controls"]
+    assert [c.get("field_id") for c in controls if c["kind"] == "text"] == ["first", "second"]
+    expect(page.locator('#board-document input[type="checkbox"]')).to_have_count(sum(c["kind"] == "checkbox" for c in controls))
+    expect(page.locator("#board-document li li input[type=checkbox]")).to_have_count(1)
+    expect(page.locator("#board-document .board-inline-text")).to_have_count(2)
+    assert not page.locator("#board-controls textarea:visible, #board-controls input:visible").count()
+    visible = page.locator("#board-document").inner_text()
+    for value in ("duplicate one", "duplicate two", "invalid visible", "nested visible", "unclosed visible", "fenced example"):
+        assert value in visible, value
+    assert "first original" not in visible and "second original" not in visible
+    assert page.evaluate("typeof window.boardPwned") == "undefined"
+    page.locator("#board-raw-toggle").click()
+    assert page.locator("#board-raw").text_content() == source
+    page.locator("#board-raw-toggle").click()
+
+    before = read()
+    field("second").locator(".board-inline-text").focus()
+    page.locator("#response-text").fill("cancel this")
+    page.locator("#response-cancel").click()
+    assert read() == before, "Cancel wrote the board"
+    expect(field("second").locator(".board-inline-text")).to_have_value("second original")
+    field("second").locator(".board-inline-text").focus()
+    page.locator("#response-text").fill("saved 世界\nsecond line")
+    page.locator("#response-save").click()
+    expected = source.replace("> second original\r\n", "> saved 世界\r\n> second line\r\n", 1)
+    expect(field("second").locator(".board-inline-text")).to_have_value("saved 世界\nsecond line")
+    assert read()["markdown"] == expected
+    assert rpc(state, "named_board_read", board="beta")["markdown"].startswith("# Beta\n")
+    record("inline multiple fields retain source context; multiline Save touches only the selected named-board range and Cancel writes nothing; invalid/code/HTML inputs stay inert")
+
+    # Keep a real detached checkbox, then reorder the document. Dispatching its
+    # stale native event must never redirect the write to the new first control.
+    old = page.locator('#board-document input[type="checkbox"]').first.element_handle()
+    reordered = expected.replace("- [ ] First choice\r\n- Parent\r\n  - [ ] Nested choice", "- Parent\r\n  - [ ] Nested choice\r\n- [ ] First choice")
+    write(reordered)
+    expect(page.locator("#board-raw")).to_have_text(reordered, use_inner_text=False)
+    checkpoint = read()
+    old.evaluate("e => { e.checked = true; e.dispatchEvent(new Event('change', {bubbles:true})); }")
+    page.wait_for_timeout(700)
+    assert read() == checkpoint, "A stale checkbox event wrote after reorder"
+    if page.locator("#response-cancel").is_visible():
+        page.locator("#response-cancel").click()
+    record("a retained stale native checkbox event after real source reorder cannot redirect or write")
+
+    field("first").locator(".board-inline-text").focus()
+    page.locator("#response-text").fill("live draft with caret")
+    expect(field("second").locator(".board-inline-text")).to_be_disabled()
+    assert not page.locator("#board-controls textarea:visible").count(), "Ordinary editor duplicated in fallback panel"
+    page.locator("#response-text").evaluate("e => e.setSelectionRange(5,9)")
+    page.evaluate("window.scrollTo(0, 240)")
+    scroll = page.evaluate("scrollY")
+    write(read()["markdown"] + "External tail update\r\n")
+    expect(page.locator("#board-newer")).to_be_visible(timeout=15000)
+    expect(page.locator("#response-text")).to_have_value("live draft with caret")
+    expect(page.locator("#response-text")).to_be_focused()
+    assert page.locator("#response-text").evaluate("e => [e.selectionStart,e.selectionEnd]") == [5, 9]
+    assert page.evaluate("scrollY") == scroll
+    page.locator("#board-raw-toggle").click()
+    expect(page.locator("#response-text")).to_have_value("live draft with caret")
+    page.locator("#board-raw-toggle").click()
+    page.locator("#response-save").click()
+    expect(page.locator("#response-review")).to_be_visible()
+    page.locator("#response-review").click()
+    expect(page.locator("#response-rebase")).to_be_visible()
+    page.locator("#response-review").click()
+    expect(page.locator("#response-rebase")).to_be_visible()
+    expect(page.locator("#response-text")).to_have_value("live draft with caret")
+    page.locator("#response-cancel").click()
+    # Explicit same-revision refresh must leave newly mapped inline handlers live.
+    page.locator("#board-refresh").click()
+    expect(field("first").locator(".board-inline-text")).to_be_enabled()
+    field("first").locator(".board-inline-text").focus()
+    expect(page.locator("#response-text")).to_be_focused()
+    page.locator("#response-text").fill("same revision reopened")
+    page.locator("#response-cancel").click()
+    field("first").locator(".board-inline-text").focus()
+    expect(page.locator("#response-text")).to_be_focused()
+    page.locator("#response-cancel").click()
+    for width in (1440, 320):
+        page.set_viewport_size({"width": width, "height": 844})
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+        alignment = page.locator('#board-document input[type="checkbox"]').evaluate_all("""inputs => inputs.map(input => {
+          const item = input.closest('li');
+          if (!item) throw new Error('Native task checkbox lost its list context');
+          const walker = document.createTreeWalker(item, NodeFilter.SHOW_TEXT);
+          let text;
+          while ((text = walker.nextNode())) {
+            if (!text.textContent.trim() || text.parentElement.closest('.board-control')) continue;
+            const range = document.createRange(); range.selectNodeContents(text);
+            const firstLine = Array.from(range.getClientRects()).find(rect => rect.width && rect.height);
+            if (!firstLine) continue;
+            const box = input.getBoundingClientRect();
+            return {label:text.textContent.trim(), checkbox:{x:box.x,y:box.y,width:box.width,height:box.height},
+              minHeight:getComputedStyle(input).minHeight,
+              labelLine:{x:firstLine.x,y:firstLine.y,width:firstLine.width,height:firstLine.height}};
+          }
+          throw new Error('Checkbox has no visible adjacent source label');
+        })""")
+        for item in alignment:
+            checkbox, label = item["checkbox"], item["labelLine"]
+            assert checkbox["height"] == 19 and item["minHeight"] == "19px", item
+            assert abs((checkbox["y"] + checkbox["height"] / 2) - (label["y"] + label["height"] / 2)) <= 8, (
+                f"Checkbox is not alongside its first label line at {width}px: {item}")
+            assert checkbox["x"] + checkbox["width"] <= label["x"] + 2, (
+                f"Checkbox does not precede its source label at {width}px: {item}")
+        page.screenshot(path=str(output / f"boards-inline-{width}.png"), full_page=True)
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    record("inline draft focus, selection range and page scroll survive real live edits and raw-view changes; checkboxes sit alongside source labels and controls fit narrow and desktop layouts")

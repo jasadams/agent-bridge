@@ -8,7 +8,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   let timer = null, readAbort = null, reading = false, backoff = 1000, raw = false, leaveChoice = null;
   let liveAbort = null, liveSequence = 0, refreshRequested = false;
   const controlRows = new Map();
-  let copySequence = 0;
+  let copySequence = 0, savedControl = null;
   const node = (tag, text, className) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = String(text); if (className) n.className = className; return n; };
   const text = (element, value) => { if (element.textContent !== value) element.textContent = value; };
   const status = value => { text($("board-status"), value); };
@@ -126,6 +126,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     let work = 0;
     function build(value, depth) {
       if (++work > 20000 || depth > 32 || !value || typeof value !== "object") throw new Error("Complex document");
+      if (value.kind === "control" && typeof value.id === "string") return inlineControl(value.id);
       if (value.kind === "text" && typeof value.text === "string") return document.createTextNode(value.text);
       if (value.kind !== "element" || !tags.has(value.tag) || !Array.isArray(value.children)) throw new Error("Unsupported document node");
       const element = node(value.tag);
@@ -180,7 +181,9 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     for (let index = 0; index < children.length; index++) {
       const desired = children[index], existing = parent.childNodes[index];
       if (!existing) { parent.append(desired); continue; }
-      if (existing.isEqualNode(desired)) continue;
+      if (existing === desired) continue;
+      if (desired.nodeType === Node.ELEMENT_NODE && desired.classList.contains("board-control")) { existing.replaceWith(desired); continue; }
+      if (existing.isEqualNode(desired) && !(desired.nodeType === Node.ELEMENT_NODE && desired.querySelector(".board-control"))) continue;
       if (existing.nodeType !== desired.nodeType || existing.nodeName !== desired.nodeName) { existing.replaceWith(desired); continue; }
       if (existing.nodeType === Node.TEXT_NODE) { existing.nodeValue = desired.nodeValue; continue; }
       for (const attribute of Array.from(existing.attributes)) if (!desired.hasAttribute(attribute.name)) existing.removeAttribute(attribute.name);
@@ -198,6 +201,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     try { document = renderNodes(view.nodes, !view.render_notice); }
     catch { document = window.document.createDocumentFragment(); document.append(node("pre", typeof view.display_markdown === "string" ? view.display_markdown : "This document exceeds the rendering limit. Use Raw Markdown to inspect its exact source.", "board-render-fallback")); }
     if (!view.markdown) document.append(node("p", view.exists ? "This board is empty." : "main has not been written yet.", "help"));
+    if (view.control_notice) document.prepend(node("p", view.control_notice, "help notice"));
     if (view.render_notice) document.prepend(node("p", view.render_notice, "help notice"));
     reconcile($("board-document"), document);
     $("board-document").hidden = raw; $("board-raw").hidden = !raw;
@@ -313,53 +317,62 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     }
     $("board-messages").hidden = !Array.from(messageDrafts.values()).some(m => m.name === board);
   }
+  function inlineControl(id) {
+    const control = shown.controls.find(c => c.id === id && ["checkbox", "text"].includes(c.kind));
+    if (!control) throw new Error("Invalid control reference");
+    const row = node(control.kind === "checkbox" ? "span" : "div", undefined, "board-control board-inline-response");
+    row.control = control; row.dataset.controlId = id;
+    if (control.field_id) row.dataset.fieldId = control.field_id;
+    const pinned = capture(), revision = shown.revision;
+    const live = () => current(pinned) && active && row.isConnected && shown?.revision === revision && shown.controls.includes(control);
+    const input = node(control.kind === "checkbox" ? "input" : "textarea");
+    input.setAttribute("aria-label", `${control.label || "Response"} (line ${control.line})`);
+    if (control.kind === "checkbox") {
+      input.type = "checkbox"; input.checked = control.checked;
+      input.addEventListener("change", () => {
+        if (!live() || draft || saving) { input.checked = control.checked; return; }
+        draft = makeDraft(control, input.checked); renderEditor(); void saveDraft();
+      });
+    } else {
+      input.className = "board-inline-text"; input.value = control.value; input.rows = 5; input.maxLength = 65536;
+      input.addEventListener("focus", () => {
+        if (!live() || saving || draft) return;
+        draft = makeDraft(control, input.value); controls(shown); $("response-text").focus();
+      });
+      row.append(node("label", control.label || "Response", "response-name"));
+    }
+    row.append(input);
+    const feedback = node("span", savedControl === id ? "Saved response" : "", "inline-response-feedback");
+    feedback.id = `feedback-${id}`; feedback.setAttribute("role", "status");
+    input.setAttribute("aria-describedby", feedback.id); row.append(feedback);
+    if (control.kind === "text") {
+      const actions = node("div", undefined, "response-actions passive-actions");
+      for (const label of ["Save", "Cancel"]) {
+        const button = node("button", label); button.type = "button";
+        button.addEventListener("click", () => {
+          if (!live() || draft || saving) return;
+          if (label === "Cancel") { input.value = control.value; return; }
+          draft = makeDraft(control, input.value); renderEditor(); void saveDraft();
+        });
+        actions.append(button);
+      }
+      row.append(actions);
+    }
+    controlRows.set(id, row);
+    return row;
+  }
   function controls(view) {
     syncMessages(view);
-    const responseControls = view.controls.filter(control => control.kind !== "message");
-    document.querySelector(".board-responses").hidden = !responseControls.length && !draft;
-    if (view.controls.length > 4096) { controlRows.clear(); $("board-controls").replaceChildren(node("p", "Too many response controls to display safely.", "error")); return; }
-    const retained = new Set();
-    let index = 0;
-    for (const control of responseControls) {
-      if (!control || typeof control.id !== "string" || typeof control.label !== "string" || !["text", "checkbox"].includes(control.kind)) continue;
-      if (control.kind === "checkbox" && typeof control.checked !== "boolean") continue;
-      if (control.kind === "text" && (typeof control.value !== "string" || typeof control.rebase_key !== "string" || typeof control.field_id !== "string")) continue;
-      const key = JSON.stringify([control.kind, control.field_id || control.line, control.label]);
-      let row = controlRows.get(key);
-      if (!row) {
-        row = node("div", undefined, "board-control");
-        if (control.kind === "checkbox") {
-          const wrapper = node("label"), input = node("input"), caption = node("span"); input.type = "checkbox";
-          input.addEventListener("change", () => { const target = row.control, checked = input.checked; draft = makeDraft(target, checked); renderEditor(); void saveDraft(); });
-          wrapper.append(input, caption); row.append(wrapper);
-        } else {
-          const edit = node("button"); edit.type = "button";
-          edit.addEventListener("click", () => { draft = makeDraft(row.control, row.control.value); renderEditor(); controls(shown); $("response-text").focus(); });
-          row.append(node("p", "", "response-name"), node("p", "", "response-value"), edit);
-        }
-        controlRows.set(key, row);
-      }
-      row.control = control; row.dataset.controlId = control.id;
-      const label = `${control.label || "Response"} (line ${Number(control.line)})`;
-      if (control.kind === "checkbox") {
-        const input = row.querySelector("input"); input.checked = draft?.kind === "checkbox" && draft.id === control.id ? draft.value : control.checked; input.disabled = saving || !!draft; input.setAttribute("aria-label", label);
-        text(row.querySelector("span"), label);
-      } else {
-        text(row.querySelector(".response-name"), label); text(row.querySelector(".response-value"), control.value || "(No response)");
-        const edit = row.querySelector("button"); text(edit, `Respond: ${control.label || "Text field"}`); edit.disabled = saving || !!draft;
-      }
-      const existing = $("board-controls").childNodes[index++];
-      if (existing !== row) $("board-controls").insertBefore(row, existing || null);
-      retained.add(key);
+    for (const row of controlRows.values()) {
+      const input = row.querySelector("input, textarea.board-inline-text");
+      if (!input) continue;
+      input.disabled = saving || (!!draft && draft.id !== row.control.id);
+      for (const button of row.querySelectorAll(".passive-actions button")) button.disabled = saving || !!draft;
+      if (row.control.kind === "checkbox") input.checked = draft?.id === row.control.id ? draft.value : row.control.checked;
     }
-    for (const [key, row] of controlRows) if (!retained.has(key)) { row.remove(); controlRows.delete(key); }
-    if (!retained.size) {
-      if (!$("board-controls").querySelector(".help")) $("board-controls").replaceChildren(node("p", "This board has no editable response fields.", "help"));
-    } else {
-      for (const child of Array.from($("board-controls").children)) if (!child.classList.contains("board-control")) child.remove();
-    }
+    renderEditor();
   }
-  function show(view) { shown = view; renderDocument(view); controls(view); $("board-newer").hidden = !latest; }
+  function show(view) { shown = view; $("board-controls").append($("response-editor")); controlRows.clear(); renderDocument(view); controls(view); $("board-newer").hidden = !latest; }
   function makeDraft(control, value) {
     return { name: board, id: control.id, kind: control.kind, fieldId: control.field_id, key: control.rebase_key, revision: shown.revision, original: control.kind === "text" ? control.value : control.checked, value, state: "editing", reviewed: false, label: control.label };
   }
@@ -369,10 +382,21 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     return found.length === 1 ? found[0] : null;
   }
   function renderEditor() {
-    document.querySelector(".board-responses").hidden = !draft && !shown?.controls.some(control => control.kind !== "message");
+    const row = draft && controlRows.get(draft.id);
+    const host = row?.isConnected && !raw ? row : $("board-controls");
+    if ($("response-editor").parentNode !== host) host.append($("response-editor"));
+    document.querySelector(".board-responses").hidden = !draft || host !== $("board-controls");
+    for (const entry of controlRows.values()) {
+      const passive = entry.querySelector("textarea.board-inline-text");
+      if (passive) passive.hidden = !!draft && entry === row && !raw;
+      const actions = entry.querySelector(".passive-actions");
+      if (actions) actions.hidden = !!draft && entry === row && !raw;
+    }
     $("response-editor").hidden = !draft;
-    if (!draft) { $("response-text").value = ""; $("response-feedback").textContent = ""; return; }
+    if (!draft) { $("board-controls").append($("response-editor")); $("response-text").removeAttribute("aria-label"); $("response-text").value = ""; $("response-feedback").textContent = ""; return; }
     $("response-heading").textContent = draft.label || "Edit response";
+    $("response-text").setAttribute("aria-label", draft.label || "Response");
+    $("response-text").setAttribute("aria-describedby", "response-feedback");
     $("response-text").hidden = draft.kind !== "text"; $("response-label").hidden = draft.kind !== "text";
     if (draft.kind === "text" && $("response-text").value !== draft.value) $("response-text").value = draft.value;
     $("response-text").disabled = saving;
@@ -384,7 +408,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     let feedback = saving ? "Saving response…" : "Edit the response, then Save or Cancel.";
     if (!saving && draft.state !== "editing") feedback = draft.state === "uncertain" ? "The save may have applied. Do not repeat it yet. Review the current board first." : "The board changed. Your response is kept. Review the current board before continuing.";
     if (!saving && draft.reviewed) feedback += rebaseCandidate() ? " This exact text field is unchanged; you may explicitly rebase, review and save." : " The field changed, moved or is no longer editable. Cancel this response, then reopen the intended control after review.";
-    $("response-feedback").textContent = feedback;
+    $("response-feedback").textContent = draft.error || feedback;
   }
   async function readSnapshot(force = false) {
     if (!active || !authenticated() || saving) return null;
@@ -438,16 +462,16 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   }
   async function saveDraft() {
     if (!draft || saving || draft.state !== "editing" || !shown || !active) return false;
-    const d = draft, c = capture(); stopRead(); saving = true; controls(shown); renderEditor(); error("");
+    const d = draft, c = capture(); d.error = ""; stopRead(); saving = true; controls(shown); renderEditor(); error("");
     try {
       const result = await request(`/api/boards/${encodeURIComponent(d.name)}/responses`, { method: "POST", body: JSON.stringify({ board: d.name, expected_revision: d.revision, control_id: d.id, value: d.kind === "text" ? { type: "text", text: d.value } : { type: "checkbox", checked: d.value } }) });
       if (!current(c) || draft !== d || !active) return false;
       if (!result.applied || !validView(result.board, d.name)) throw new Error("Unconfirmed save result");
-      draft = null; latest = null; show(result.board); renderEditor(); status("Saved response"); return true;
+      savedControl = result.saved_control_id; draft = null; latest = null; show(result.board); renderEditor(); status("Saved response"); return true;
     } catch (e) {
       if (!current(c) || draft !== d || !active) return false;
       if (e.status === 409 && validView(e.data?.board, d.name)) { latest = e.data.board; d.state = "conflict"; }
-      else if (e.status && e.status < 500 && e.status !== 429 && !e.data?.uncertain) { error(e.data?.error || "This response could not be saved. Review it before trying again."); }
+      else if (e.status && e.status < 500 && e.status !== 429 && !e.data?.uncertain) { d.error = e.data?.error || "This response could not be saved. Review it before trying again."; error(d.error); }
       else { d.state = "uncertain"; latest = null; }
       d.reviewed = false; renderEditor(); return false;
     } finally { if (current(c) && draft === d || current(c) && !draft) { saving = false; if (shown) controls(shown); renderEditor(); flushRefresh(); } }
@@ -475,7 +499,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     for (const m of messageDrafts.values()) m.row.hidden = true;
     $("board-messages").hidden = true;
     $("selected-board-name").textContent = board; $("board-selector").value = board;
-    $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); renderEditor(); error(""); status("Loading board…");
+    $("board-controls").append($("response-editor")); $("board-document").replaceChildren(); $("board-raw").textContent = ""; controlRows.clear(); renderEditor(); error(""); status("Loading board…");
     const selected = capture();
     await refresh();
     if (active && current(selected)) void startLive();
@@ -500,7 +524,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     active = false; authEpoch++; boardEpoch++; stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
     messageDrafts.clear(); $("message-controls").replaceChildren(); $("board-messages").hidden = true;
     board = "main"; shown = null; latest = null; draft = null; saving = false; raw = false; backoff = 1000;
-    $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); $("board-selector").replaceChildren();
+    $("board-controls").append($("response-editor")); $("board-document").replaceChildren(); $("board-raw").textContent = ""; controlRows.clear(); $("board-selector").replaceChildren();
     $("selected-board-name").textContent = "main"; $("response-heading").textContent = "Edit response"; $("response-intent").textContent = "";
     $("board-newer").hidden = true; $("board-raw-toggle").setAttribute("aria-pressed", "false"); renderEditor(); error(""); status("Choose Boards to load main.");
   }
@@ -536,12 +560,12 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   $("board-selector").addEventListener("change", e => { const name = e.target.value; e.target.value = board; void choose(name); });
   $("board-refresh").addEventListener("click", () => { if (draft || selectionHeld()) void review(); else void readSnapshot(true); });
   $("board-review-refresh").addEventListener("click", () => { void review(); });
-  $("board-raw-toggle").addEventListener("click", () => { raw = !raw; $("board-raw-toggle").setAttribute("aria-pressed", String(raw)); $("board-document").hidden = raw; $("board-raw").hidden = !raw; });
+  $("board-raw-toggle").addEventListener("click", () => { raw = !raw; $("board-raw-toggle").setAttribute("aria-pressed", String(raw)); $("board-document").hidden = raw; $("board-raw").hidden = !raw; renderEditor(); });
   $("response-text").addEventListener("input", e => { if (draft && !saving && draft.kind === "text") draft.value = e.target.value; });
   $("response-save").addEventListener("click", () => { void saveDraft(); });
   $("response-cancel").addEventListener("click", () => { if (!saving) { discard(); status("Response cancelled; nothing was saved by Cancel."); } });
   $("response-review").addEventListener("click", () => { void review(); });
-  $("response-rebase").addEventListener("click", () => { const candidate = rebaseCandidate(); if (!candidate || !draft) return; draft.id = candidate.id; draft.revision = latest.revision; draft.original = candidate.value; draft.state = "editing"; draft.reviewed = false; latest = null; $("board-newer").hidden = true; renderEditor(); status("Rebased unchanged field. Review your response, then Save explicitly."); });
+  $("response-rebase").addEventListener("click", () => { const candidate = rebaseCandidate(); if (!candidate || !draft) return; draft.id = candidate.id; draft.revision = latest.revision; draft.original = candidate.value; draft.state = "editing"; draft.error = ""; draft.reviewed = false; latest = null; $("board-newer").hidden = true; renderEditor(); status("Rebased unchanged field. Review your response, then Save explicitly."); });
   $("unsaved-save").addEventListener("click", async () => { const resolve = leaveChoice; if (!resolve || $("unsaved-save").disabled) return; if (!dirty() && messageDirty()) { finishChoice(true); return; } if ($("unsaved-dialog").open) $("unsaved-dialog").close(); const saved = await saveDraft(); if (leaveChoice === resolve) finishChoice(saved); });
   $("unsaved-discard").addEventListener("click", () => { for (const m of Array.from(messageDrafts.values())) discardMessage(m); discard(); finishChoice(true); });
   $("unsaved-cancel").addEventListener("click", () => finishChoice(false));
