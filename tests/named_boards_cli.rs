@@ -40,6 +40,12 @@ async fn noninteractive_create_list_and_raw_are_isolated_and_explicit() {
     assert!(initial.starts_with("main\tabsent\t"));
     assert_eq!(success(&state, &["board", "--raw"]).await, "");
     assert!(!state.join("boards/main.md").exists());
+    let metadata: Value =
+        serde_json::from_str(&success(&state, &["board", "--metadata"]).await).unwrap();
+    assert_eq!(metadata["name"], "main");
+    assert!(metadata["last_updated"].is_null());
+    assert_eq!(metadata["last_updated_source"], "unknown");
+    assert!(metadata.get("markdown").is_none());
     for name in ["zeta", "alpha"] {
         assert_eq!(
             success(&state, &["board", "--create", name]).await,
@@ -70,6 +76,15 @@ async fn noninteractive_create_list_and_raw_are_isolated_and_explicit() {
         success(&state, &["board", "alpha", "--raw"]).await,
         "alpha content\n"
     );
+    let metadata: Value =
+        serde_json::from_str(&success(&state, &["board", "alpha", "--metadata"]).await).unwrap();
+    let current = broker::rpc(&state, &Request::board_read("alpha".parse().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(metadata["revision"], current["revision"]);
+    assert_eq!(metadata["last_updated"], current["last_updated"]);
+    assert!(metadata["last_updated"].is_i64());
+    assert_eq!(metadata["last_updated_source"], "file_mtime");
     assert_eq!(
         success(&state, &["board", "zeta", "--raw"]).await,
         "zeta content\n"

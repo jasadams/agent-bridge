@@ -99,6 +99,15 @@ def run(binary):
 
                 viewer.screen.feed = record_rendered_acceptance
                 viewer.wait(lambda: "Message coordinator" in viewer.screen.text())
+                viewer.wait(lambda: "Last Updated:" in viewer.screen.text())
+                assert isinstance(original["last_updated"], int)
+                def timestamp_footer():
+                    match = re.search(r"Last Updated: ([^\n┘─]+)", viewer.screen.text())
+                    assert match, viewer.screen.text()
+                    return match.group(1).strip()
+                original_footer = timestamp_footer()
+                assert "unknown" not in original_footer.lower()
+                assert str(endpoint) not in viewer.screen.text(), "hidden composer endpoint leaked into rendered document"
                 # Copy controls and their mouse path coexist with composer focus.
                 viewer.keys(b"c\r")
                 viewer.wait(lambda: any(value.startswith("52;c;") for value in viewer.screen.other_osc))
@@ -110,6 +119,13 @@ def run(binary):
                 viewer.keys(f"\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m".encode())
                 viewer.wait(lambda: len(payloads()) == 2)
                 assert payloads() == [b"printf hello", b"printf hello"] and not frames
+                viewer.keys(b"c\t\r")
+                viewer.wait(lambda: len(payloads()) == 3)
+                assert payloads()[-1] == b"<!-- board-message: literal example -->\n"
+                assert not frames, "copying a literal example must not send a message"
+                assert rpc({"op": "named_board_read", "board": "alpha"}) == original
+                assert timestamp_footer() == original_footer
+                viewer.keys(b"\x1b")
                 viewer.keys(b"\t\r")
                 viewer.keys("Exact first 🦀".encode())
                 viewer.keys(b"\n")  # Ctrl-J: newline on legacy terminal key encoding.
@@ -122,6 +138,7 @@ def run(binary):
                 assert frames[0]["from"] == "user" and frames[0]["session_id"] == session
                 assert "Exact first 🦀\nsecond line" in frames[0]["message"]["content"]
                 assert rpc({"op": "named_board_read", "board": "alpha"}) == original, "send must not edit board"
+                assert timestamp_footer() == original_footer, "sending changed the displayed update time"
                 viewer.keys(b"retained draft")
                 changed = rpc({"op": "named_board_update", "board": "alpha", "expected_revision": original["revision"], "edits": [{"op": "append", "text": "\nNew context\n"}]})
                 viewer.wait(lambda: "Board changed" in viewer.screen.text())

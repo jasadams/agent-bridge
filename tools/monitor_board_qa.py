@@ -4,6 +4,7 @@ Backend responses are never fabricated. Gates delay decoding an actual response,
 and the uncertainty case commits a real POST before dropping its response.
 """
 import json
+import os
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -52,6 +53,15 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
                                        headers={"Authorization": "Bearer " + token})
         assert response.ok, response.status
         return response.json()
+
+    def footer_matches(name):
+        snapshot = api_view(name)
+        expected = page.evaluate("""value => 'Last Updated: ' + (Number.isSafeInteger(value)
+          ? new Intl.DateTimeFormat(undefined, {year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'short'}).format(new Date(value)) : 'Unknown')""", snapshot["last_updated"])
+        expect(page.locator("#board-last-updated")).to_have_text(expected)
+        expect(page.locator("#board-last-updated")).to_be_visible()
+        assert snapshot["last_updated"] == read(name)["last_updated"]
+        return snapshot["last_updated"]
 
     def pick(name):
         if page.locator("#boards-view").is_hidden():
@@ -130,14 +140,27 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         for name, markdown in (("alpha", alpha), ("beta", beta)):
             rpc(state, "board_create", board=name)
             write(name, markdown)
-        before = {name: read(name) for name in ("main", "alpha", "beta")}
         page.locator("#boards-tab").click()
         expect(page.locator("#selected-board-name")).to_have_text("main")
         expect(page.locator("#board-document")).to_contain_text("has not been written")
         expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_hidden()
+        expect(page.locator("#board-last-updated")).to_have_text("Last Updated: Unknown")
+        expect(page.locator("#board-status")).to_contain_text("Live")
+        virtual = read("main")
+        assert virtual["last_updated"] is None and virtual["markdown"] == ""
+        rpc(state, "board_create", board="main")
+        expect(page.locator("#board-last-updated")).not_to_have_text("Last Updated: Unknown", timeout=15000)
+        created = read("main")
+        assert created["exists"] and created["revision"] == virtual["revision"]
+        assert created["markdown"] == virtual["markdown"] == ""
+        footer_matches("main")
+        expect(page.locator("#board-document")).to_contain_text("This board is empty.")
+        before = {name: read(name) for name in ("main", "alpha", "beta")}
+        record("creating virtual empty main refreshes authoritative live metadata without changing Markdown or its content revision")
         names = page.locator("#board-selector option").all_text_contents()
         assert names == sorted(names) and names == ["alpha", "beta", "main"]
         pick("alpha")
+        footer_matches("alpha")
         expect(page.locator("#board-document h1")).to_have_text("Alpha 世界")
         expect(page.locator("#board-document table")).to_have_count(1)
         expect(page.locator("#board-document pre")).to_have_count(1)
@@ -210,6 +233,8 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#response-save").click()
         saved("Saved browser response 世界")
         assert read("alpha")["markdown"] == alpha.replace("- [ ] Checkbox alpha", "- [x] Checkbox alpha", 1).replace("> original\r\n", "> Saved browser response 世界\r\n", 1)
+        footer_matches("alpha")
+        assert read("beta")["last_updated"] == before["beta"]["last_updated"]
         record("browser desired checkbox and explicit text saves preserve unrelated Unicode/CRLF Markdown byte-for-byte via actual broker")
 
         # All application-controlled exits offer an explicit draft decision.
@@ -238,13 +263,16 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         # DOM selection and text/caret remain frozen through external-file updates.
         page.evaluate("""() => { const r=document.createRange();r.selectNodeContents(document.querySelector('#board-document h1'));const s=getSelection();s.removeAllRanges();s.addRange(r); }""")
         selected = page.evaluate("getSelection().toString()")
+        selected_footer = page.locator("#board-last-updated").text_content()
         source = read("alpha")["markdown"]
         Path(state / "boards" / "alpha.md").write_text(source + "External selection update\n", newline="")
         expect(page.locator("#board-newer")).to_be_visible(timeout=15000)
         assert page.evaluate("getSelection().toString()") == selected
+        assert page.locator("#board-last-updated").text_content() == selected_footer
         assert "External selection update" not in page.locator("#board-document").inner_text()
         page.locator("#board-review-refresh").click()
         expect(page.locator("#board-document")).to_contain_text("External selection update")
+        footer_matches("alpha")
         edit("draft stays stable")
         page.locator("#response-text").evaluate("e => e.setSelectionRange(3,3)")
         Path(state / "boards" / "alpha.md").write_text(read("alpha")["markdown"] + "External draft update\n", newline="")
@@ -349,6 +377,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#lock-button").click(); expect(page.locator("#workspace")).to_be_hidden()
         assert not page.locator("#board-raw").text_content() and not page.locator("#board-controls").text_content()
         assert not page.locator("#response-text").input_value()
+        assert not page.locator("#board-last-updated").text_content()
         page.locator("#access-token").fill(token); page.locator("#login-form button[type=submit]").click()
         expect(page.locator("#boards-view")).to_be_visible()
         expect(page.locator("#selected-board-name")).to_have_text("main")
@@ -425,6 +454,94 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         record("actual private monitor credential rotation clears boards and invalidates delayed old-auth data")
         from monitor_code_copy_qa import code_copy_browser_checks
         code_copy_browser_checks(page=page, rpc=rpc, state=state, token=token, record=record, output=output)
+        # Real file timestamps, real HTTP snapshots, and a viewer-zone context:
+        # July is Sydney winter; January is Sydney summer. Never fake API data.
+        rpc(state, "board_create", board="timezone")
+        write("timezone", "# Timestamp baseline\n")
+        zoned = browser.new_context(timezone_id="Australia/Sydney", locale="en-AU")
+        try:
+            local = zoned.new_page(); local.goto(url)
+            local.locator("#access-token").fill(token)
+            local.locator("#login-form button[type=submit]").click()
+            expect(local.locator("#workspace")).to_be_visible()
+            # Workspace visibility precedes completion of the initial Boards
+            # snapshot. Finish that open before navigating to the new fixture.
+            expect(local.locator("#boards-view")).to_be_visible()
+            expect(local.locator("#board-raw")).to_have_text(read("main")["markdown"])
+            expect(local.locator("#board-status")).to_contain_text("Live")
+            local.locator("#board-selector").select_option("timezone")
+            expect(local.locator("#selected-board-name")).to_have_text("timezone")
+            expect(local.locator("#board-document h1")).to_have_text("Timestamp baseline")
+            expect(local.locator("#board-status")).to_contain_text("Live")
+            for stamp, zone in ((1782864000000, ("AEST", "GMT+10")),
+                                (1767225600000, ("AEDT", "GMT+11"))):
+                path = Path(state / "boards" / "timezone.md")
+                pending = Path(state / "timezone-fixture.tmp")
+                pending.write_text("# Timestamp " + str(stamp) + "\n\n`code " + str(stamp) + "`\n")
+                pending.chmod(0o600)
+                os.utime(pending, ns=(stamp * 1000000, stamp * 1000000))
+                pending.replace(path)
+                expect(local.locator("#board-document h1")).to_have_text("Timestamp " + str(stamp), timeout=15000)
+                footer = local.locator("#board-last-updated")
+                expect(footer).to_contain_text("Last Updated:")
+                assert any(value in footer.inner_text() for value in zone), footer.inner_text()
+                actual = api_view("timezone")
+                assert actual["last_updated"] == stamp == read("timezone")["last_updated"]
+                local.locator("#board-raw-toggle").click()
+                expect(footer).to_be_visible()
+                local.locator("#board-raw-toggle").click()
+            # Freeze old January body/time/code together while July arrives.
+            local.evaluate("""() => {
+              window.__timestampCopy = [];
+              Object.defineProperty(navigator, 'clipboard', {configurable:true,
+                value:{writeText:async value => window.__timestampCopy.push(value)}});
+              const range = document.createRange(); range.selectNodeContents(document.querySelector('#board-document code'));
+              const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+            }""")
+            frozen_footer = local.locator("#board-last-updated").text_content()
+            stamp = 1782864000000
+            pending.write_text("# Timestamp " + str(stamp) + "\n\n`code " + str(stamp) + "`\n")
+            pending.chmod(0o600)
+            os.utime(pending, ns=(stamp * 1000000, stamp * 1000000))
+            pending.replace(path)
+            expect(local.locator("#board-newer")).to_be_visible(timeout=15000)
+            assert local.locator("#board-last-updated").text_content() == frozen_footer
+            local.locator("#board-document .board-code-copy").click()
+            assert local.evaluate("window.__timestampCopy.at(-1)") == "code 1767225600000"
+            current_snapshot = api_view("timezone")
+            local.evaluate("getSelection().removeAllRanges()")
+            expect(local.locator("#board-document code")).to_have_text("code " + str(stamp))
+            expect(local.locator("#board-last-updated")).not_to_have_text(frozen_footer)
+            local.locator("#board-document .board-code-copy").click()
+            assert local.evaluate("window.__timestampCopy.at(-1)") == "code " + str(stamp)
+            assert api_view("timezone") == current_snapshot, "Copy changed board content/revision/time"
+            local.locator("#lock-button").click()
+            assert not local.locator("#board-last-updated").text_content()
+        except Exception:
+            # Diagnostics must never replace the original acceptance failure.
+            try:
+                diagnostic = context.request.get(origin + "/api/boards/timezone",
+                    headers={"Authorization": "Bearer " + token})
+                authoritative = {"status": diagnostic.status, "body": diagnostic.text()}
+            except Exception as error:
+                authoritative = {"diagnostic_error": str(error)}
+            try:
+                local.screenshot(path=str(output / "boards-timezone-failure.png"), full_page=True)
+                (output / "boards-timezone-failure.json").write_text(json.dumps({
+                "view": local.locator("#boards-view").is_visible(),
+                "selected": local.locator("#selected-board-name").text_content(),
+                "status": local.locator("#board-status").text_content(),
+                "error": local.locator("#board-error").text_content(),
+                "raw": local.locator("#board-raw").text_content(),
+                "footer": local.locator("#board-last-updated").text_content(),
+                    "authoritative": authoritative,
+                }, indent=2))
+            except Exception:
+                pass  # Preserve the original assertion even if artifact capture fails.
+            raise
+        finally:
+            zoned.close()
+        record("authoritative footer follows actual saves/external edits, holds with selected content, clears on lock and displays Sydney winter/summer offsets without changing UTC metadata")
         page.locator("#messages-tab").click()
         expect(page.locator("#messages-view")).to_be_visible()
     finally:

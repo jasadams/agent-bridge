@@ -1261,16 +1261,23 @@ async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
                 json!({"expected_revision":revision,"edits":[{"op":"set","markdown":body}]}),
             )
             .await;
-        assert_eq!(structured(&updated)["result"].as_object().unwrap().len(), 2);
+        assert_eq!(structured(&updated)["result"].as_object().unwrap().len(), 4);
+        let timestamp = structured(&updated)["result"]["last_updated"].clone();
+        assert!(timestamp.is_i64());
+        assert_eq!(
+            structured(&updated)["result"]["last_updated_source"],
+            "file_mtime"
+        );
         revision = structured(&updated)["result"]["revision"].clone();
         board_sizes.push(updated["result"].to_string().len());
-        assert!(updated.to_string().len() < 400);
+        // Two fixed metadata fields extend the receipt, never its Markdown body.
+        assert!(updated.to_string().len() < 600);
         let unchanged = mcp
             .call("read_board", json!({"if_revision":revision}))
             .await;
         assert_eq!(
             structured(&unchanged)["result"],
-            json!({"name":"main","revision":revision,"unchanged":true})
+            json!({"name":"main","revision":revision,"unchanged":true,"last_updated":timestamp,"last_updated_source":"file_mtime"})
         );
         let changed = mcp.call("read_board", json!({"if_revision":"stale"})).await;
         assert_eq!(structured(&changed)["result"]["markdown"], body);
@@ -1430,7 +1437,9 @@ async fn named_boards_keep_mcp_revisions_results_and_writes_isolated() {
         .await;
     assert_eq!(
         structured(&unchanged)["result"],
-        json!({"name":"beta","revision":revisions[1],"unchanged":true})
+        json!({"name":"beta","revision":revisions[1],"unchanged":true,
+            "last_updated":structured(&wrong_cache)["result"]["last_updated"],
+            "last_updated_source":structured(&wrong_cache)["result"]["last_updated_source"]})
     );
     let conflict = mcp.call("update_board", json!({"board":"beta","expected_revision":revisions[0],"edits":[{"op":"set","markdown":"wrong board"}]})).await;
     assert_eq!(conflict["result"]["isError"], true);

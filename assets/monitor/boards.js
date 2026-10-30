@@ -18,6 +18,42 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   const validName = name => typeof name === "string" && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(name);
   const validView = (view, name) => view && view.name === name && typeof view.markdown === "string" && typeof view.revision === "string" && Array.isArray(view.nodes) && Array.isArray(view.controls);
   const dirty = () => !!draft && (draft.kind === "checkbox" || draft.value !== draft.original || draft.state !== "editing");
+  function renderTimestamp(view) {
+    const footer = $("board-last-updated"), value = view?.last_updated;
+    let formatted = "Unknown";
+    if (Number.isSafeInteger(value) && Math.abs(value) <= 8640000000000000) {
+      formatted = new Intl.DateTimeFormat(undefined, {
+        year: "numeric", month: "short", day: "numeric", hour: "2-digit",
+        minute: "2-digit", second: "2-digit", timeZoneName: "short"
+      }).format(new Date(value));
+    }
+    text(footer, view ? `Last Updated: ${formatted}` : "");
+    footer.hidden = !view;
+  }
+  // Metadata only moves with the matching visible/deferred content revision.
+  function receiveTimestamp(result) {
+    if (shown?.revision === result.revision && typeof result.exists === "boolean" &&
+        shown.exists !== result.exists && (draft || selectionHeld())) {
+      latest = { ...shown, exists: result.exists, last_updated: result.last_updated,
+        last_updated_source: result.last_updated_source };
+      $("board-newer").hidden = false;
+      return;
+    }
+    for (const view of [shown, latest]) {
+      if (view && view.revision === result.revision) {
+        if (typeof result.exists === "boolean") view.exists = result.exists;
+        view.last_updated = result.last_updated;
+        view.last_updated_source = result.last_updated_source;
+      }
+    }
+    if (shown?.revision === result.revision) {
+      renderTimestamp(shown);
+      if (!shown.markdown) {
+        const empty = $("board-document").querySelector("p.help");
+        if (empty) text(empty, shown.exists ? "This board is empty." : "main has not been written yet.");
+      }
+    }
+  }
   function selectionHeld() {
     const selection = window.getSelection();
     return !!selection && !selection.isCollapsed && ["board-document", "board-raw", "board-controls"].some(id => $(id).contains(selection.anchorNode) || $(id).contains(selection.focusNode));
@@ -66,8 +102,14 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
           if (!lines.includes("event: board-revision")) continue;
           const data = JSON.parse(lines.filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n"));
           if (data.name !== c.name || typeof data.revision !== "string" || !/^[a-f0-9]{64}$/.test(data.revision)) throw new Error("Invalid board revision event");
+          const metadata = ["exists", "last_updated", "last_updated_source"].some(key => Object.hasOwn(data, key));
+          if (metadata && (typeof data.exists !== "boolean" ||
+              !(data.last_updated === null || Number.isSafeInteger(data.last_updated) && Math.abs(data.last_updated) <= 8640000000000000) ||
+              !["file_mtime", "unknown"].includes(data.last_updated_source))) throw new Error("Invalid board metadata event");
           backoff = 1000;
-          if (data.revision !== (latest?.revision || shown?.revision)) {
+          const currentView = latest || shown;
+          if (data.revision !== currentView?.revision || metadata &&
+              (data.exists !== currentView?.exists || data.last_updated !== currentView?.last_updated || data.last_updated_source !== currentView?.last_updated_source)) {
             refreshRequested = true;
             flushRefresh();
           }
@@ -150,6 +192,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   function renderDocument(view) {
     copySequence++; text($("board-copy-feedback"), "");
     text($("selected-board-name"), view.name);
+    renderTimestamp(view);
     text($("board-raw"), view.markdown);
     let document;
     try { document = renderNodes(view.nodes, !view.render_notice); }
@@ -354,9 +397,10 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       if (!current(c) || id !== sequence || !active) return null;
       if (result.name !== c.name) throw new Error("Mismatched board snapshot");
       backoff = 1000; error("");
-      if (result.unchanged) { status(latest && latest.revision !== shown?.revision ? "Live · newer content is available" : draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return latest || shown; }
+      if (result.unchanged) { receiveTimestamp(result); status(latest && latest.revision !== shown?.revision ? "Live · newer content is available" : draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return latest || shown; }
       if (!validView(result, c.name)) throw new Error("Invalid board snapshot");
       if (result.revision === shown?.revision) {
+        receiveTimestamp(result);
         // An external edit may have returned byte-for-byte to the visible version.
         // Do not apply a superseded intermediate snapshot after selection ends.
         if (latest && latest.revision !== result.revision) {
@@ -365,7 +409,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
         }
         status(draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return shown;
       }
-      if (result.revision === latest?.revision) { status("Live · newer content is available"); return latest; }
+      if (result.revision === latest?.revision) { receiveTimestamp(result); status("Live · newer content is available"); return latest; }
       if (shown && (draft || selectionHeld())) {
         latest = result;
         if (draft && draft.reviewed !== result.revision) { draft.reviewed = false; renderEditor(); }
@@ -427,7 +471,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     if (!validName(name) || name === board) return;
     const c = capture();
     if (!await allowLeave() || !current(c)) return;
-    stop(); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; board = name; shown = null; latest = null; draft = null; backoff = 1000;
+    stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; board = name; shown = null; latest = null; draft = null; backoff = 1000;
     for (const m of messageDrafts.values()) m.row.hidden = true;
     $("board-messages").hidden = true;
     $("selected-board-name").textContent = board; $("board-selector").value = board;
@@ -453,7 +497,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   }
   async function leave(action, clearsPrivate = false) { const c = capture(); if (await allowLeave(clearsPrivate) && current(c)) { active = false; stop(); boardEpoch++; action(); } }
   function clear() {
-    active = false; authEpoch++; boardEpoch++; stop(); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
+    active = false; authEpoch++; boardEpoch++; stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
     messageDrafts.clear(); $("message-controls").replaceChildren(); $("board-messages").hidden = true;
     board = "main"; shown = null; latest = null; draft = null; saving = false; raw = false; backoff = 1000;
     $("board-document").replaceChildren(); $("board-raw").textContent = ""; $("board-controls").replaceChildren(); controlRows.clear(); $("board-selector").replaceChildren();

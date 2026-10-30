@@ -571,7 +571,7 @@ async fn read_board_revision(
     app: &App,
     name: &crate::board::Name,
     permit: OwnedSemaphorePermit,
-) -> Result<String, Box<Response<Body>>> {
+) -> Result<crate::monitor_board::BoardIdentity, Box<Response<Body>>> {
     let broker = app.broker.clone();
     let generation = app.generation;
     let name = name.clone();
@@ -599,7 +599,7 @@ struct BoardEventState {
     app: App,
     name: crate::board::Name,
     _permit: OwnedSemaphorePermit,
-    revision: String,
+    revision: crate::monitor_board::BoardIdentity,
     initial: bool,
     heartbeat: Instant,
 }
@@ -635,7 +635,7 @@ async fn board_events(app: App, name: crate::board::Name) -> Response<Body> {
                 state.heartbeat = Instant::now();
                 let bytes = Bytes::from(format!(
                     "event: board-revision\ndata: {}\n\n",
-                    json!({"name":state.name,"revision":state.revision})
+                    json!({"name":state.name,"revision":state.revision.revision,"exists":state.revision.exists,"last_updated":state.revision.last_updated,"last_updated_source":state.revision.last_updated_source})
                 ));
                 return Some((Ok::<_, Infallible>(Frame::data(bytes)), state));
             }
