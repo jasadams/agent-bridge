@@ -80,6 +80,17 @@ name order. Board names, existence and revisions come from the same broker used
 by CLI/MCP; unknown names never fall back or create documents. Create boards and
 perform general edits through [the CLI/MCP board tools](board.md).
 
+While Boards is open, its dropdown discovers new local boards automatically within
+five seconds on a healthy connection. Discovery reads only the board catalog and
+keeps the selected document, focus, selection and response/message drafts in place;
+it never switches boards automatically. Returning to the foreground or reconnecting
+catches up immediately. Refresh checks both the catalog and the selected document,
+while retaining the existing draft-review protections. If discovery fails, known
+options stay available while it retries with bounded backoff. A selected board
+missing from the catalog keeps its identity visible with an availability notice.
+Leaving Boards or locking stops catalog requests and rejects late responses.
+
+
 The view renders headings, tables, lists and code, with bounded wrapping/overflow
 and a readable source fallback for complex Markdown. Raw Markdown shows the exact
 source. HTML and scripts do not execute, images do not fetch resources, and safe
