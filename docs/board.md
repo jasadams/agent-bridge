@@ -83,8 +83,13 @@ separate from your Markdown, does not change its revision or notify agents, and
 does not interrupt drafts or text selection. See [update options](install.md#updates-backups-and-removal)
 for checking explicitly and disabling automatic checks.
 
-The broker must be running. Agents use the existing persistent MCP server and its
-`read_board` and `update_board` tools. There is no extra server or binary.
+The broker must be running. Agents must use `create_board`, `read_board`,
+`update_board` and the lifecycle tools through the existing persistent MCP server.
+Identify a board by name and revision; backing-file locations are internal storage
+metadata and are not part of normal responses, including verbose or conflict
+snapshots. Never modify board files directly through a shell or editor. If the
+tools are unavailable, report the blocker and restore the broker/MCP connection;
+do not bypass it with direct file writes. There is no extra server or binary.
 
 The existing [local web monitor](local-monitor.md) also has a Boards view. It
 lists named boards, renders their Markdown and lets you answer the same existing
@@ -101,8 +106,7 @@ For a custom broker state directory:
 agent-bridge --state-dir "/absolute/private/state" board
 ```
 
-Documents are stored as `boards/<name>.md` inside that private state directory.
-Names are 1–64 lowercase ASCII characters matching
+Board names are 1–64 lowercase ASCII characters matching
 `[a-z0-9][a-z0-9_-]{0,63}`; paths, dots and silent normalization are rejected.
 Use `--create NAME` (or MCP `create_board`) explicitly before using a non-main
 board. Creation works without a terminal and never overwrites an existing board.
@@ -112,8 +116,7 @@ Unknown names fail without creating a file or falling back to main.
 absent `main`. Archived names remain reserved and count toward the 256-board limit,
 including lazy `main`; listing scans at most 1,024 directory entries and errors
 explicitly on excess instead of truncating. Existing boards are migrated automatically
-without changing their Markdown or requiring manual file moves. `boards/main.md`
-stays in place. A read of absent
+without changing their Markdown or requiring manual file moves. A read of absent
 `main` returns empty Markdown and its revision;
 the first successful update creates it. Backups of the broker's state include the
 board. Print its exact Markdown once with `agent-bridge board --raw`.
@@ -194,7 +197,8 @@ Cleanup and restore also compare the original file's recorded change time, size
 and exact archived bytes. A changed or replaced path is left untouched with a
 retryable diagnostic. These checks protect managed paths across offline retention;
 they are not an ownership boundary against the operating-system user who owns the
-broker state. Coordinate external file edits instead of modifying archived files.
+broker state. These are owner storage safeguards, not an agent editing interface;
+all agent changes must go through broker board tools.
 The name can be reused only after permanent cleanup completes, and receives a new
 identity. Old revisions, controls, drafts and named-board subscription requests
 cannot target that replacement, even when its Markdown is identical.
@@ -400,7 +404,7 @@ for fields and limits. Reading diagnostics does not start native work.
 
 To avoid being notified of its own writes, an agent supplies its own registered
 name in the optional `agent` field of `update_board`. Unattributed updates,
-including TUI responses and direct file edits, notify all subscribers. A pending
+including TUI and web responses, notify all subscribers. A pending
 notification from another writer survives subsequent own writes. No-op edits do
 not generate notifications. Writer attribution is supplied by a local caller;
 it is not a separate authentication boundary between processes of the same OS user.
@@ -414,7 +418,10 @@ For example, the user can instruct their agents:
 > Keep the row short; leave detailed progress in your native session. Update your
 > own row when work changes. Preserve other agents' rows and notes.
 > Write links as `[label](url)`.
-> Read the latest board first, and retry conflicts against the returned revision.
+> Use broker board tools only; never edit backing files directly.
+> Read the latest board first. On conflict, review the returned snapshot and retry
+> only my intended edits while preserving other writers. If tools are unavailable,
+> report the blocker rather than writing files through a shell or editor.
 
 Those columns are a user convention, not an application schema. The same tools
 can instead maintain a release checklist, meeting notes or a project outline.
@@ -423,7 +430,9 @@ approval.
 
 ## Incremental updates
 
-`read_board` returns `markdown`, `revision`, `name`, `path` and `exists`.
+`read_board` returns `markdown`, `revision`, `name`, `exists` and supported metadata.
+Service-generated backing-file paths are omitted; paths written by the user inside
+Markdown remain exact document content.
 `update_board` requires that exact revision and an ordered array of edits.
 `read_board` and `update_board` accept optional `board`, default `main`;
 `create_board` requires it. Event subscriptions require explicit board selectors. Named-board revisions bind the board identity
@@ -475,13 +484,14 @@ synchronize files or grant board access to paired machines. CLI, terminal, MCP
 and browser views share storage and revision-checked updates without a required
 content schema.
 
-Manual file edits are possible, but external editors do not participate in the
-broker's revision transaction. Coordinate manual changes with active agents to
-avoid racing a file save against an MCP update. The TUI edits only the selected
-checkbox or marked text field. Terminal control sequences are removed for display,
-while the Markdown file
-retains its original text. Links, HTML and images do not execute commands or fetch
-network resources.
+Agents must not edit backing files directly: those writes bypass revision checks,
+lifecycle state and coordinated notifications. Use the broker tools and review the
+latest returned snapshot after conflicts. If tools are unavailable, report the
+blocker instead of using filesystem writes. Owner backup and storage administration
+remain separate operations, not an alternative agent mutation interface. The TUI
+edits only the selected checkbox or marked text field through the broker. Terminal
+control sequences are removed for display while document content remains exact.
+Links, HTML and images do not execute commands or fetch network resources.
 
 ## Broker compatibility
 

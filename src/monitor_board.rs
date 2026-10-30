@@ -756,7 +756,7 @@ mod tests {
         assert_eq!(added["applied"], true);
         let before: Snapshot = serde_json::from_value(added["board"].clone()).unwrap();
         assert!(before.last_updated.is_some());
-        let file_before = std::fs::metadata(&before.path).unwrap();
+        let file_before = std::fs::metadata(board::read(&broker.state_dir).unwrap().path).unwrap();
         broker.monitor_control.lock().unwrap().enable(0);
         let control = board_interaction::controls(&before.markdown)
             .into_iter()
@@ -807,7 +807,7 @@ mod tests {
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.last_updated, before.last_updated);
         assert_eq!(after.last_updated_source, before.last_updated_source);
-        let file_after = std::fs::metadata(&after.path).unwrap();
+        let file_after = std::fs::metadata(board::read(&broker.state_dir).unwrap().path).unwrap();
         assert_eq!(file_after.ino(), file_before.ino());
         assert_eq!(
             file_after.modified().unwrap(),

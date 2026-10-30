@@ -984,7 +984,7 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
     let current = mcp.call("read_board", json!({})).await;
     let current = &structured(&current)["result"];
     std::fs::write(
-        current["path"].as_str().unwrap(),
+        agent_bridge::board::read(&state).unwrap().path,
         format!("{}External editor\n", current["markdown"].as_str().unwrap()),
     )
     .unwrap();
@@ -1107,7 +1107,7 @@ async fn shared_markdown_board_updates_atomically_and_preserves_concurrent_agent
     assert!(contents.contains("complete ✓"));
     assert!(contents.contains("reviewing | yes"));
     assert_eq!(
-        std::fs::read_to_string(snapshot["path"].as_str().unwrap()).unwrap(),
+        std::fs::read_to_string(agent_bridge::board::read(&state).unwrap().path).unwrap(),
         contents
     );
 
@@ -1667,4 +1667,397 @@ async fn cli_archive_restore_and_explicit_inspection_use_the_same_broker_contrac
     assert_eq!(restored["last_updated"], before["last_updated"]);
     let raw = cli(&state, root.path(), &["board", "cli-archive", "--raw"]).await;
     assert_eq!(raw.stdout, exact.stdout);
+}
+
+fn assert_logical_board_response(value: &Value, private_state: &Path) {
+    let encoded = serde_json::to_string(value).unwrap();
+    assert!(
+        !encoded.contains(private_state.to_str().unwrap()),
+        "{encoded}"
+    );
+    fn assert_no_storage_key(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                assert!(
+                    !object.contains_key("path"),
+                    "Service-generated backing path escaped: {value}"
+                );
+                for child in object.values() {
+                    assert_no_storage_key(child);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    assert_no_storage_key(child);
+                }
+            }
+            _ => (),
+        }
+    }
+    assert_no_storage_key(value);
+}
+
+async fn logical_board_cli(state: &Path, args: &[&str]) -> String {
+    let output = timeout(
+        Duration::from_secs(8),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains(state.to_str().unwrap()), "{stdout}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(state.to_str().unwrap()));
+    stdout
+}
+
+#[tokio::test]
+async fn logical_board_projections_cover_mcp_rpc_cli_and_lifecycle_without_backing_paths() {
+    use agent_bridge::board::{Edit, Name, Snapshot};
+    let root = root();
+    let state = root
+        .path()
+        .join("distinctive-private-board-storage-never-in-responses");
+    let running = Running::start(&state);
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let main = mcp.call("read_board", json!({})).await;
+    assert_logical_board_response(&main, &state);
+    let absent: Snapshot = serde_json::from_value(structured(&main)["result"].clone()).unwrap();
+    assert!(absent.path.as_os_str().is_empty());
+    assert_eq!(absent.name, "main");
+    assert!(!absent.exists);
+    let created = mcp.call("create_board", json!({"board":"logical"})).await;
+    assert_logical_board_response(&created, &state);
+    let revision = structured(&created)["result"]["revision"].clone();
+    let authored = "# Logical board\nKeep the authored path /home/author/work/report.md exactly.\n```json\n{\"path\":\"/home/author/work/example.md\"}\n```\n";
+    let compact = mcp.call("update_board", json!({"board":"logical","expected_revision":revision,"edits":[{"op":"append","text":authored}]})).await;
+    assert_logical_board_response(&compact, &state);
+    assert!(structured(&compact)["result"]["revision"].is_string());
+    let read = mcp.call("read_board", json!({"board":"logical"})).await;
+    assert_logical_board_response(&read, &state);
+    let before = structured(&read)["result"].clone();
+    assert_eq!(before["markdown"], authored);
+    let unchanged = mcp
+        .call(
+            "read_board",
+            json!({"board":"logical","if_revision":before["revision"]}),
+        )
+        .await;
+    assert_logical_board_response(&unchanged, &state);
+    assert_eq!(structured(&unchanged)["result"]["unchanged"], true);
+    let verbose = mcp.call("update_board", json!({"board":"logical","expected_revision":before["revision"],"verbose":true,"edits":[{"op":"append","text":"Other writer\n"}]})).await;
+    assert_logical_board_response(&verbose, &state);
+    assert!(
+        structured(&verbose)["result"]["board"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains(authored)
+    );
+    for verbose in [false, true] {
+        let conflict = mcp.call("update_board", json!({"board":"logical","expected_revision":before["revision"],"verbose":verbose,"edits":[{"op":"append","text":"Intended edit\n"}]})).await;
+        assert_logical_board_response(&conflict, &state);
+        assert!(failed(&conflict));
+        let current = &conflict["result"]["structuredContent"]["result"];
+        assert_eq!(current["conflict"], true);
+        assert!(
+            current["board"]["markdown"]
+                .as_str()
+                .unwrap()
+                .contains(authored)
+        );
+    }
+    let latest = mcp.call("read_board", json!({"board":"logical"})).await;
+    let retry = mcp.call("update_board", json!({"board":"logical","expected_revision":structured(&latest)["result"]["revision"],"verbose":true,"edits":[{"op":"append","text":"Intended edit\n"}]})).await;
+    assert_logical_board_response(&retry, &state);
+    let content = structured(&retry)["result"]["board"]["markdown"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(content, format!("{authored}Other writer\nIntended edit\n"));
+    let name: Name = "logical".parse().unwrap();
+    let rpc_read = running.request(Request::board_read(name.clone()));
+    assert_logical_board_response(&rpc_read, &state);
+    let snapshot: Snapshot = serde_json::from_value(rpc_read.clone()).unwrap();
+    assert!(snapshot.path.as_os_str().is_empty());
+    let rpc_conflict = running.request(Request::board_update(
+        name.clone(),
+        before["revision"].as_str().unwrap().into(),
+        vec![Edit::Append {
+            text: "do not overwrite".into(),
+        }],
+        None,
+    ));
+    assert_logical_board_response(&rpc_conflict, &state);
+    assert_eq!(rpc_conflict["conflict"], true);
+    let listed = mcp.call("list_boards", json!({})).await;
+    assert_logical_board_response(&listed, &state);
+    let cli = timeout(
+        Duration::from_secs(8),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+            .args([
+                "--state-dir",
+                state.to_str().unwrap(),
+                "board",
+                "logical",
+                "--metadata",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let metadata: Value = serde_json::from_slice(&cli.stdout).unwrap();
+    assert_logical_board_response(&metadata, &state);
+    assert_eq!(metadata["name"], "logical");
+    let access = running
+        .broker
+        .request_async(Request::MonitorEnable { port: 0 })
+        .await
+        .unwrap();
+    let address = access["url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://")
+        .unwrap();
+    for route in [
+        "/api/boards".to_owned(),
+        "/api/boards/logical".to_owned(),
+        format!(
+            "/api/boards/logical?if_revision={}",
+            rpc_read["revision"].as_str().unwrap()
+        ),
+    ] {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(format!("GET {route} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", access["access_token"].as_str().unwrap()).as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(bytes).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains(state.to_str().unwrap()), "{response}");
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_logical_board_response(&body, &state);
+        if route == "/api/boards/logical" {
+            assert_eq!(body["markdown"], content);
+        }
+    }
+    assert_eq!(
+        logical_board_cli(&state, &["board", "logical", "--raw"]).await,
+        content
+    );
+    logical_board_cli(&state, &["board", "--create", "cli-logical"]).await;
+    logical_board_cli(&state, &["board", "--list"]).await;
+    let archived = mcp
+        .call(
+            "archive_board",
+            json!({"board":"logical","expected_revision":rpc_read["revision"]}),
+        )
+        .await;
+    assert_logical_board_response(&archived, &state);
+    assert_eq!(structured(&archived)["result"]["markdown"], content);
+    let inspected = mcp.call("inspect_board", json!({"board":"logical"})).await;
+    assert_logical_board_response(&inspected, &state);
+    let archives = mcp.call("list_archived_boards", json!({})).await;
+    assert_logical_board_response(&archives, &state);
+    let archive_metadata =
+        logical_board_cli(&state, &["board", "logical", "--archived", "--metadata"]).await;
+    assert_logical_board_response(&serde_json::from_str(&archive_metadata).unwrap(), &state);
+    let archive_list = logical_board_cli(&state, &["board", "--list", "--archived"]).await;
+    assert_logical_board_response(&serde_json::from_str(&archive_list).unwrap(), &state);
+    assert_eq!(
+        logical_board_cli(&state, &["board", "logical", "--archived", "--raw"]).await,
+        content
+    );
+    let restored = mcp.call("restore_board", json!({"board":"logical","expected_revision":structured(&inspected)["result"]["revision"]})).await;
+    assert_logical_board_response(&restored, &state);
+    assert_eq!(structured(&restored)["result"]["markdown"], content);
+    let internal = agent_bridge::board::read_named(&state, &name).unwrap();
+    assert!(!internal.path.as_os_str().is_empty());
+    assert_eq!(internal.markdown, content);
+    assert_logical_board_response(&serde_json::to_value(&internal).unwrap(), &state);
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn current_clients_project_legacy_broker_board_snapshots_before_mcp_and_cli_output() {
+    let root = root();
+    let listener = UnixListener::bind(root.path().join("bridge.sock")).unwrap();
+    let backing = root
+        .path()
+        .join("distinctive-private-legacy-storage/boards/logical.md");
+    let authored = "Keep authored /work/report.md and {\"path\":\"/work/example.md\"} exactly.";
+    let legacy = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let snapshot = json!({"name":request["board"].as_str().unwrap_or("main"),"markdown":authored,"revision":"current","exists":true,"path":backing});
+            let result = match request["op"].as_str().unwrap() {
+                "board_list" | "board_archived_list" => json!([snapshot]),
+                "board_update" | "named_board_update" | "add_board_message_input" => {
+                    if request["expected_revision"] == "stale" {
+                        json!({"applied":false,"conflict":true,"board":snapshot})
+                    } else {
+                        json!({"applied":true,"board":snapshot})
+                    }
+                }
+                "status" => json!({"state_dir":"/unrelated/service/configuration"}),
+                _ => snapshot,
+            };
+            writer
+                .write_all(format!("{}\n", json!({"ok":true,"result":result})).as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let mut mcp = Mcp::start(root.path());
+    mcp.initialize().await;
+    for (tool, arguments) in [
+        ("read_board", json!({})),
+        ("read_board", json!({"board":"logical"})),
+        (
+            "read_board",
+            json!({"board":"logical","if_revision":"current"}),
+        ),
+        ("create_board", json!({"board":"logical"})),
+        ("list_boards", json!({})),
+        ("list_archived_boards", json!({})),
+        ("inspect_board", json!({"board":"logical"})),
+        (
+            "archive_board",
+            json!({"board":"logical","expected_revision":"current"}),
+        ),
+        (
+            "restore_board",
+            json!({"board":"logical","expected_revision":"current"}),
+        ),
+        (
+            "update_board",
+            json!({"expected_revision":"current","edits":[],"verbose":false}),
+        ),
+        (
+            "update_board",
+            json!({"board":"logical","expected_revision":"current","edits":[],"verbose":true}),
+        ),
+        (
+            "update_board",
+            json!({"board":"logical","expected_revision":"stale","edits":[],"verbose":false}),
+        ),
+        (
+            "update_board",
+            json!({"board":"logical","expected_revision":"stale","edits":[],"verbose":true}),
+        ),
+        (
+            "add_board_message_input",
+            json!({"agent":"owner","board":"logical","expected_revision":"current","id":"compose","label":"Message owner"}),
+        ),
+        (
+            "add_board_message_input",
+            json!({"agent":"owner","board":"logical","expected_revision":"stale","id":"compose","label":"Message owner"}),
+        ),
+    ] {
+        let conflict = arguments["expected_revision"] == "stale";
+        let name = arguments["board"].as_str().unwrap_or("main");
+        let response = mcp.call(tool, arguments.clone()).await;
+        assert_logical_board_response(&response, root.path());
+        assert!(response.get("error").is_none(), "{tool}: {response}");
+        assert_eq!(
+            failed(&response),
+            tool == "update_board" && conflict,
+            "{tool}: {response}"
+        );
+        let structured = &response["result"]["structuredContent"];
+        let text: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            &text, structured,
+            "MCP text and structured output must agree for {tool}"
+        );
+        let result = &structured["result"];
+        let assert_snapshot = |snapshot: &Value, expected_name: &str| {
+            assert_eq!(snapshot["name"], expected_name, "{tool}: {response}");
+            assert_eq!(snapshot["revision"], "current", "{tool}: {response}");
+            assert_eq!(snapshot["markdown"], authored, "{tool}: {response}");
+            assert_eq!(snapshot["exists"], true, "{tool}: {response}");
+        };
+        match tool {
+            "list_boards" | "list_archived_boards" => {
+                let rows = result
+                    .as_array()
+                    .expect("Legacy catalog must remain an array");
+                assert_eq!(rows.len(), 1);
+                assert_snapshot(&rows[0], "main");
+            }
+            "read_board" if arguments["if_revision"] == "current" => {
+                assert_eq!(result["name"], name);
+                assert_eq!(result["revision"], "current");
+                assert_eq!(result["unchanged"], true);
+                assert!(result.get("markdown").is_none());
+            }
+            "update_board" if !conflict && arguments["verbose"] != true => {
+                assert_eq!(result["board"], name);
+                assert_eq!(result["revision"], "current");
+                assert!(result.get("markdown").is_none());
+            }
+            "update_board" | "add_board_message_input" => {
+                assert_eq!(result["applied"], !conflict);
+                assert_eq!(result["conflict"] == true, conflict);
+                assert_snapshot(&result["board"], name);
+            }
+            _ => assert_snapshot(result, name),
+        }
+    }
+    mcp.close().await;
+    for revision in ["current", "stale"] {
+        let output = logical_board_cli(
+            root.path(),
+            &[
+                "add-board-message-input",
+                "owner",
+                "--board",
+                "logical",
+                "--expected-revision",
+                revision,
+                "--id",
+                "compose",
+                "--label",
+                "Message owner",
+            ],
+        )
+        .await;
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_logical_board_response(&value, root.path());
+        assert_eq!(value["board"]["markdown"], authored);
+        assert_eq!(value["applied"], revision == "current");
+        assert_eq!(value["conflict"] == true, revision == "stale");
+        assert_eq!(value["board"]["name"], "logical");
+        assert_eq!(value["board"]["revision"], "current");
+        assert_eq!(value["board"]["exists"], true);
+    }
+    let unrelated = broker::rpc(root.path(), &Request::Status).await.unwrap();
+    assert_eq!(unrelated["state_dir"], "/unrelated/service/configuration");
+    legacy.abort();
+    assert!(legacy.await.unwrap_err().is_cancelled());
 }

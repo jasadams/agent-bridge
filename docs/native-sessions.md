@@ -5,6 +5,16 @@ client MCP connection and native delivery adapter have separate responsibilities
 MCP provides agent tools, while native adapters deliver incoming messages to the
 selected running session.
 
+## Shared-board changes
+
+For every native client, board mutations must use broker tools: `create_board`,
+`read_board`, `update_board` and lifecycle operations. Use logical board names and
+current revisions, never shell/editor writes to backing files. On conflict, review
+the returned latest snapshot and retry only the intended change while preserving
+other writers. If the tools are unavailable, report the blocker rather than bypassing
+the broker with filesystem edits. Normal responses omit internal backing-file paths;
+user-authored Markdown and unrelated connection configuration remain unchanged.
+
 ## Codex
 
 The service discovers loaded sessions from the existing native Codex daemon and

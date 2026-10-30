@@ -90,6 +90,15 @@ a server shared by several conversations must not guess which session owns a cal
 Local registration names are available through `list_agents` or native registration
 context. Pairing alone still shares no sessions.
 
+Agents must mutate boards only through `create_board`, `read_board`, `update_board`
+and the lifecycle tools. Normal, verbose, conditional and conflict results identify
+boards by name/revision and never expose their backing-file path. User-authored
+Markdown paths are preserved. Never edit board files through a shell or editor.
+On a revision conflict, review the returned latest snapshot and retry only the
+intended edit while preserving other writers. If tools are unavailable, report the
+blocker and restore the broker/MCP connection; do not fall back to direct file writes.
+
+
 Codex peer deliveries contain a trust marker and JSON message data, without
 repeated tool instructions or shell commands. The MCP tool descriptions explain
 how to acknowledge and reply: use the incoming `to` as your local `agent` or

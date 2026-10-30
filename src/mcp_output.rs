@@ -167,7 +167,7 @@ mod tests {
     fn board_receipt_is_constant_size_and_verbose_keeps_the_snapshot() {
         for length in [100, 50_000] {
             let value = json!({"applied":true,"board":{
-                "name":"main","revision":"revision-id","markdown":"x".repeat(length),"path":"/board.md"
+                "name":"main","revision":"revision-id","markdown":"x".repeat(length)
             }});
             let compact = write_result("update_board", value.clone(), false);
             assert_eq!(compact, json!({"board":"main","revision":"revision-id"}));

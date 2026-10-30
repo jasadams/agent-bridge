@@ -171,6 +171,8 @@ pub struct Snapshot {
     pub name: String,
     pub markdown: String,
     pub revision: String,
+    /// Internal storage location; logical snapshots never expose or accept it.
+    #[serde(skip)]
     pub path: PathBuf,
     pub exists: bool,
     #[serde(default)]
@@ -1126,5 +1128,20 @@ mod tests {
         assert!(read(state.path()).is_err());
         fs::write(&before.path, vec![b'x'; MAX_BOARD_BYTES + 1]).unwrap();
         assert!(read(state.path()).is_err());
+    }
+    #[test]
+    fn snapshot_projection_keeps_internal_path_private_and_ignores_legacy_paths() {
+        let state = private_state();
+        let snapshot = set(state.path(), "Authored /work/user/report.md stays exact");
+        assert!(!snapshot.path.as_os_str().is_empty());
+        let mut external = serde_json::to_value(&snapshot).unwrap();
+        assert!(external.get("path").is_none());
+        external["path"] = serde_json::json!("/untrusted/legacy/boards/main.md");
+        let parsed: Snapshot = serde_json::from_value(external).unwrap();
+        assert!(parsed.path.as_os_str().is_empty());
+        assert_eq!(parsed.name, snapshot.name);
+        assert_eq!(parsed.markdown, snapshot.markdown);
+        assert_eq!(parsed.revision, snapshot.revision);
+        assert!(serde_json::to_value(parsed).unwrap().get("path").is_none());
     }
 }
