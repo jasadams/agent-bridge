@@ -196,6 +196,18 @@ pub enum Request {
         label: String,
     },
     BoardList,
+    BoardArchivedList,
+    BoardInspect {
+        board: crate::board::Name,
+    },
+    BoardArchive {
+        board: crate::board::Name,
+        expected_revision: String,
+    },
+    BoardRestore {
+        board: crate::board::Name,
+        expected_revision: String,
+    },
     BoardCreate {
         board: crate::board::Name,
     },
@@ -212,11 +224,15 @@ pub enum Request {
     Subscribe {
         agent: String,
         events: Vec<EventSelector>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        board_revisions: std::collections::BTreeMap<crate::board::Name, String>,
     },
     Unsubscribe {
         agent: String,
         #[serde(default)]
         events: Option<Vec<EventSelector>>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        board_revisions: std::collections::BTreeMap<crate::board::Name, String>,
     },
     BoardRead,
     BoardUpdate {
@@ -358,6 +374,16 @@ pub enum Request {
     },
 }
 impl Request {
+    /// Main has no archive lifecycle and keeps its frozen legacy read wire.
+    /// Named inspection never falls back to main on an older broker.
+    pub fn board_inspect(board: crate::board::Name) -> Self {
+        if board.is_main() {
+            Self::BoardRead
+        } else {
+            Self::BoardInspect { board }
+        }
+    }
+
     pub fn board_read(board: crate::board::Name) -> Self {
         if board.is_main() {
             Self::BoardRead

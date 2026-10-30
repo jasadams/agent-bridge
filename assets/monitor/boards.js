@@ -13,11 +13,50 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   const text = (element, value) => { if (element.textContent !== value) element.textContent = value; };
   const status = value => { text($("board-status"), value); };
   const error = value => { text($("board-error"), value || ""); $("board-error").hidden = !value; };
-  const capture = () => ({ auth: authEpoch, epoch: boardEpoch, name: board });
+  const capture = () => ({ auth: authEpoch, epoch: boardEpoch, name: board, authority: authorityEpoch });
   const current = c => authenticated() && c.auth === authEpoch && c.epoch === boardEpoch && c.name === board;
   const validName = name => typeof name === "string" && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(name);
   const validView = (view, name) => view && view.name === name && typeof view.markdown === "string" && typeof view.revision === "string" && Array.isArray(view.nodes) && Array.isArray(view.controls);
   const dirty = () => !!draft && (draft.kind === "checkbox" || draft.value !== draft.original || draft.state !== "editing");
+  // The authoritative lifecycle advances independently of the frozen document.
+  let authority = null, authorityEpoch = 0, lifecycleOperation = null, archiveIntent = null;
+  let archivedEpoch = 0, archivedAbort = null, archivedActionFeedback = "";
+  const scope = view => JSON.stringify([view?.incarnation || null, view?.lifecycle_generation || null]);
+  const phase = view => view?.state || "active";
+  const writable = view => !!authority && !lifecycleOperation && phase(authority) === "active" && !authority.read_only && scope(view) === scope(authority);
+  const authorityCurrent = c => current(c) && c.authority === authorityEpoch;
+  function lifecycleUI() {
+    const state = authority ? phase(authority) : "unavailable";
+    let message = state === "active" ? "" : state === "archived" ? "Archived · read only. Restore before permanent deletion." : state === "purging" ? "Expired · permanent cleanup is pending. Restore is unavailable." : state === "restoring" ? "Restoring · read only until recovery completes." : "Board unavailable · its displayed content and local drafts are kept.";
+    if (lifecycleOperation) message = lifecycleOperation.pending ? `${lifecycleOperation.action === "archive" ? "Archiving" : "Restoring"} ${lifecycleOperation.name}… Wait for the outcome.` : lifecycleOperation.feedback;
+    text($("board-lifecycle-status"), message);
+    if ($("archived-dialog").open && lifecycleOperation) text($("archived-feedback"), message + (lifecycleOperation.pending ? "" : " Close this dialog, then Inspect current board state."));
+    $("board-lifecycle-review").hidden = !lifecycleOperation && state === "active";
+    $("board-lifecycle-review").disabled = !!lifecycleOperation?.pending;
+    $("board-archive").disabled = board === "main" || !shown || !writable(shown) || saving || messagePending();
+    $("board-archive").title = board === "main" ? "Main cannot be archived." : "Archive for 30 days, then permanently delete managed content.";
+    $("board-selector").disabled = !!lifecycleOperation?.pending;
+    $("archive-confirm-submit").disabled = !!lifecycleOperation;
+    $("archived-close").disabled = !!lifecycleOperation?.pending;
+    $("archived-refresh").disabled = !!lifecycleOperation?.pending;
+    for (const button of $("archived-list").querySelectorAll("button")) button.disabled = !!lifecycleOperation || button.dataset.unavailable === "true";
+  }
+  function observeAuthority(view) {
+    if (!view || view.name !== board) return;
+    const changed = authority && (scope(authority) !== scope(view) || phase(authority) !== phase(view) || !!authority.read_only !== !!view.read_only);
+    if (changed) {
+      authorityEpoch++;
+      if (draft) { draft.interrupted = true; draft.reviewed = false; if (draft.state === "editing") draft.state = "conflict"; }
+    }
+    authority = { name: view.name, revision: view.revision, incarnation: view.incarnation,
+      lifecycle_generation: view.lifecycle_generation, state: phase(view), read_only: !!view.read_only,
+      archived_at: view.archived_at, expires_at: view.expires_at };
+    if (shown) controls(shown); else lifecycleUI();
+  }
+  function unavailable() {
+    observeAuthority({ name: board, revision: authority?.revision, incarnation: authority?.incarnation,
+      lifecycle_generation: authority?.lifecycle_generation, state: "unavailable", read_only: true });
+  }
   function renderTimestamp(view) {
     const footer = $("board-last-updated"), value = view?.last_updated;
     let formatted = "Unknown";
@@ -113,6 +152,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       const names = validateCatalog(data);
       reconcileCatalog(names); catalogNames = names; catalogDelay = 2000;
       catalogFeedback(names.includes(board) ? "" : "The selected board is no longer listed. Its identity is kept; refresh it to check availability.");
+      if (!names.includes(board) && !lifecycleOperation?.pending) void readSnapshot();
       delay = Math.max(0, 4000 - (Date.now() - started));
     } catch (e) {
       if (!catalogCurrent(epoch) || catalogFlight !== controller) return;
@@ -181,10 +221,12 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
           if (metadata && (typeof data.exists !== "boolean" ||
               !(data.last_updated === null || Number.isSafeInteger(data.last_updated) && Math.abs(data.last_updated) <= 8640000000000000) ||
               !["file_mtime", "unknown"].includes(data.last_updated_source))) throw new Error("Invalid board metadata event");
+          observeAuthority(data);
           backoff = 1000;
           const currentView = latest || shown;
           if (data.revision !== currentView?.revision || metadata &&
-              (data.exists !== currentView?.exists || data.last_updated !== currentView?.last_updated || data.last_updated_source !== currentView?.last_updated_source)) {
+              (data.exists !== currentView?.exists || data.last_updated !== currentView?.last_updated || data.last_updated_source !== currentView?.last_updated_source) ||
+              phase(data) !== phase(currentView) || scope(data) !== scope(currentView) || !!data.read_only !== !!currentView?.read_only) {
             refreshRequested = true;
             flushRefresh();
           }
@@ -288,10 +330,10 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   function renderMessage(m) {
     m.row.hidden = m.name !== board;
     m.input.readOnly = m.pending || m.state === "uncertain";
-    m.send.disabled = m.pending || (!m.submission && (!m.value.trim() || m.stale || !m.present));
+    m.send.disabled = m.pending || !!lifecycleOperation || (!m.submission && (!writable(m) || (!m.value.trim() || m.stale || !m.present)));
     text(m.send, m.submission ? "Retry same message" : "Send");
     m.review.hidden = !m.stale || m.state === "uncertain";
-    m.review.disabled = m.pending;
+    m.review.disabled = m.pending || !writable(m);
     m.discard.disabled = m.pending;
     m.discard.hidden = !m.value && !m.submission;
     const target = m.owner;
@@ -309,9 +351,9 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     renderMessage(m);
   }
   async function reviewMessage(m) {
-    if (m.pending || m.state === "uncertain") return;
+    if (m.pending || m.state === "uncertain" || !writable(m)) return;
     const c = capture(), view = await readSnapshot(true);
-    if (!current(c) || !active || !view || messageDrafts.get(m.key) !== m) return;
+    if (!authorityCurrent(c) || !writable(m) || !active || !view || messageDrafts.get(m.key) !== m) return;
     const found = view.controls.filter(control => control.kind === "message" && messageIdentity(control) === m.key);
     if (found.length !== 1) { m.feedbackText = "This exact input is unavailable or changed. Your draft is kept; discard it only after inspecting the current target."; renderMessage(m); return; }
     m.submission = null; m.state = "editing"; m.revision = view.revision; m.controlId = found[0].id; m.control = found[0]; m.present = true; m.stale = false;
@@ -319,7 +361,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   }
   async function sendMessage(m) {
     if (m.pending || !active || !authenticated() || m.name !== board || messageDrafts.get(m.key) !== m) return;
-    if (!m.submission && (!m.value.trim() || m.stale || !m.present)) return;
+    if (lifecycleOperation || (!m.submission && (!writable(m) || !m.value.trim() || m.stale || !m.present))) return;
     if (!m.submission) m.submission = Object.freeze({ board: m.name, expected_revision: m.revision, control_id: m.controlId, id: crypto.randomUUID(), text: m.value });
     const submission = m.submission, c = capture(), version = m.version;
     const focusedHere = m.row.contains(document.activeElement);
@@ -332,7 +374,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       m.submission = null; m.state = "editing";
       if (m.version === version) { m.value = ""; m.input.value = ""; }
       m.feedbackText = `Broker accepted message (${result.state}). This does not mean the agent has read or completed it.`;
-      if (m.present && m.control) { m.revision = m.currentRevision; m.controlId = m.control.id; m.stale = false; }
+      if (m.present && m.control && writable(m)) { m.revision = m.currentRevision; m.controlId = m.control.id; m.stale = false; }
     } catch (e) {
       if (!current(c) || !active || messageDrafts.get(m.key) !== m || m.submission !== submission) return;
       if (e.data?.accepted === false && e.data?.code !== "uncertain") {
@@ -340,6 +382,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
         if (e.status === 409) m.submission = null;
         m.feedbackText = e.data.error || "The broker rejected this message. Your draft is kept.";
         if (e.status === 409) m.stale = true;
+        if (authorityCurrent(c) && validView(e.data?.board, board)) observeAuthority(e.data.board);
       } else {
         m.state = "uncertain";
         m.feedbackText = "Acceptance is uncertain. Your exact draft and message ID are kept. Retry the same message explicitly, or inspect history before discarding.";
@@ -363,7 +406,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
         feedback.id = input.id + "-feedback"; feedback.setAttribute("role", "status"); feedback.setAttribute("aria-live", "polite"); input.setAttribute("aria-describedby", feedback.id);
         for (const button of [send, review, discard]) button.type = "button";
         actions.append(send, review, discard); row.append(label, target, input, feedback, actions); row.dataset.fieldId = control.field_id;
-        m = { key, name: board, owner: control.owner, value: "", version: 0, revision: view.revision, controlId: control.id, row, input, target, feedback, send, review, discard, state: "editing", pending: false, submission: null, composing: false };
+        m = { key, name: board, incarnation: view.incarnation, lifecycle_generation: view.lifecycle_generation, owner: control.owner, value: "", version: 0, revision: view.revision, controlId: control.id, row, input, target, feedback, send, review, discard, state: "editing", pending: false, submission: null, composing: false };
         const state = m;
         input.addEventListener("compositionstart", () => { state.composing = true; });
         input.addEventListener("compositionend", () => { state.composing = false; });
@@ -388,6 +431,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
         if (!m.value && !m.submission && !m.pending) { m.row.remove(); messageDrafts.delete(key); continue; }
         m.stale = true;
       }
+      if (!writable(m)) m.stale = true;
       renderMessage(m);
     }
     $("board-messages").hidden = !Array.from(messageDrafts.values()).some(m => m.name === board);
@@ -399,7 +443,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     row.control = control; row.dataset.controlId = id;
     if (control.field_id) row.dataset.fieldId = control.field_id;
     const pinned = capture(), revision = shown.revision;
-    const live = () => current(pinned) && active && row.isConnected && shown?.revision === revision && shown.controls.includes(control);
+    const live = () => current(pinned) && writable(shown) && active && row.isConnected && shown?.revision === revision && shown.controls.includes(control);
     const input = node(control.kind === "checkbox" ? "input" : "textarea");
     input.setAttribute("aria-label", `${control.label || "Response"} (line ${control.line})`);
     if (control.kind === "checkbox") {
@@ -441,18 +485,18 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     for (const row of controlRows.values()) {
       const input = row.querySelector("input, textarea.board-inline-text");
       if (!input) continue;
-      input.disabled = saving || (!!draft && draft.id !== row.control.id);
-      for (const button of row.querySelectorAll(".passive-actions button")) button.disabled = saving || !!draft;
+      input.disabled = !writable(shown) || saving || (!!draft && draft.id !== row.control.id);
+      for (const button of row.querySelectorAll(".passive-actions button")) button.disabled = !writable(shown) || saving || !!draft;
       if (row.control.kind === "checkbox") input.checked = draft?.id === row.control.id ? draft.value : row.control.checked;
     }
-    renderEditor();
+    renderEditor(); lifecycleUI();
   }
   function show(view) { shown = view; $("board-controls").append($("response-editor")); controlRows.clear(); renderDocument(view); controls(view); $("board-newer").hidden = !latest; }
   function makeDraft(control, value) {
-    return { name: board, id: control.id, kind: control.kind, fieldId: control.field_id, key: control.rebase_key, revision: shown.revision, original: control.kind === "text" ? control.value : control.checked, value, state: "editing", reviewed: false, label: control.label };
+    return { name: board, incarnation: shown.incarnation, lifecycle_generation: shown.lifecycle_generation, id: control.id, kind: control.kind, fieldId: control.field_id, key: control.rebase_key, revision: shown.revision, original: control.kind === "text" ? control.value : control.checked, value, state: "editing", reviewed: false, label: control.label };
   }
   function rebaseCandidate() {
-    if (!draft || draft.kind !== "text" || !latest || draft.reviewed !== latest.revision || shown?.revision !== latest.revision) return null;
+    if (!draft || draft.interrupted || !writable(draft) || draft.kind !== "text" || !latest || draft.reviewed !== latest.revision || shown?.revision !== latest.revision) return null;
     const found = latest.controls.filter(c => c.kind === "text" && c.field_id === draft.fieldId && c.rebase_key === draft.key);
     return found.length === 1 ? found[0] : null;
   }
@@ -476,7 +520,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     if (draft.kind === "text" && $("response-text").value !== draft.value) $("response-text").value = draft.value;
     $("response-text").disabled = saving;
     $("response-intent").hidden = draft.kind !== "checkbox"; $("response-intent").textContent = draft.value ? "Requested state: checked" : "Requested state: unchecked";
-    $("response-save").disabled = saving || draft.state !== "editing";
+    $("response-save").disabled = !writable(draft) || draft.interrupted || saving || draft.state !== "editing";
     $("response-cancel").disabled = saving;
     $("response-review").hidden = draft.state === "editing"; $("response-review").disabled = saving;
     $("response-rebase").hidden = !rebaseCandidate(); $("response-rebase").disabled = saving;
@@ -486,15 +530,16 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     $("response-feedback").textContent = draft.error || feedback;
   }
   async function readSnapshot(force = false) {
-    if (!active || !authenticated() || saving) return null;
+    if (!active || !authenticated() || lifecycleOperation?.pending) return null;
     if (reading) { if (!force) { refreshRequested = true; return null; } stopRead(); }
     const c = capture(), id = ++sequence; readAbort = new AbortController(); reading = true;
     const revision = latest?.revision || shown?.revision;
     const conditional = !force && revision ? `?if_revision=${encodeURIComponent(revision)}` : "";
     try {
       const result = await request(`/api/boards/${encodeURIComponent(c.name)}${conditional}`, { signal: readAbort.signal });
-      if (!current(c) || id !== sequence || !active) return null;
+      if (!authorityCurrent(c) || id !== sequence || !active) return null;
       if (result.name !== c.name) throw new Error("Mismatched board snapshot");
+      observeAuthority(result);
       backoff = 1000; error("");
       if (result.unchanged) { receiveTimestamp(result); status(latest && latest.revision !== shown?.revision ? "Live · newer content is available" : draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return latest || shown; }
       if (!validView(result, c.name)) throw new Error("Invalid board snapshot");
@@ -509,7 +554,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
         status(draft || selectionHeld() ? "Live · keeping your response or text selection" : "Live · up to date"); return shown;
       }
       if (result.revision === latest?.revision) { receiveTimestamp(result); status("Live · newer content is available"); return latest; }
-      if (shown && (draft || selectionHeld())) {
+      if (shown && (draft || saving || selectionHeld())) {
         latest = result;
         if (draft && draft.reviewed !== result.revision) { draft.reviewed = false; renderEditor(); }
         $("board-newer").hidden = false; status("Live · newer content is available");
@@ -517,13 +562,13 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       else { latest = null; show(result); status("Live · up to date"); }
       return result;
     } catch (e) {
-      if (current(c) && id === sequence && e.name !== "AbortError") { error("The board could not be refreshed. Your last content is kept; reconnecting."); status("Stale · reconnecting"); reconnect(); }
+      if (authorityCurrent(c) && id === sequence && e.name !== "AbortError") { if (e.status === 404) unavailable(); error("The board could not be refreshed. Your last content is kept; reconnecting."); status("Stale · reconnecting"); reconnect(); }
       return null;
     } finally { if (current(c) && id === sequence) { reading = false; readAbort = null; flushRefresh(); } }
   }
   async function refresh() {
     if (!active || !authenticated()) return;
-    if (saving) { refreshRequested = true; return; }
+    if (lifecycleOperation?.pending) return;
     if (latest && !draft && !selectionHeld()) { const next = latest; latest = null; show(next); }
     await readSnapshot();
   }
@@ -536,16 +581,18 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     else { latest = null; show(view); status("Live · latest content shown"); }
   }
   async function saveDraft() {
-    if (!draft || saving || draft.state !== "editing" || !shown || !active) return false;
+    if (!draft || !writable(draft) || draft.interrupted || saving || draft.state !== "editing" || !shown || !active) return false;
     const d = draft, c = capture(); d.error = ""; stopRead(); saving = true; controls(shown); renderEditor(); error("");
     try {
       const result = await request(`/api/boards/${encodeURIComponent(d.name)}/responses`, { method: "POST", body: JSON.stringify({ board: d.name, expected_revision: d.revision, control_id: d.id, value: d.kind === "text" ? { type: "text", text: d.value } : { type: "checkbox", checked: d.value } }) });
       if (!current(c) || draft !== d || !active) return false;
       if (!result.applied || !validView(result.board, d.name)) throw new Error("Unconfirmed save result");
+      if (!authorityCurrent(c) || d.interrupted) { d.state = "conflict"; d.interrupted = true; d.error = "The save was accepted before the lifecycle changed. Your interrupted draft is kept for review; it cannot write to the new generation."; return false; }
+      observeAuthority(result.board);
       savedControl = result.saved_control_id; draft = null; latest = null; show(result.board); renderEditor(); status("Saved response"); return true;
     } catch (e) {
       if (!current(c) || draft !== d || !active) return false;
-      if (e.status === 409 && validView(e.data?.board, d.name)) { latest = e.data.board; d.state = "conflict"; }
+      if (e.status === 409 && validView(e.data?.board, d.name)) { if (authorityCurrent(c)) { observeAuthority(e.data.board); latest = e.data.board; } d.state = "conflict"; }
       else if (e.status && e.status < 500 && e.status !== 429 && !e.data?.uncertain) { d.error = e.data?.error || "This response could not be saved. Review it before trying again."; error(d.error); }
       else { d.state = "uncertain"; latest = null; }
       d.reviewed = false; renderEditor(); return false;
@@ -553,6 +600,16 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   }
   function discard() { draft = null; saving = false; renderEditor(); if (latest) { const view = latest; latest = null; show(view); } else if (shown) controls(shown); }
   async function allowLeave(clearsPrivate = false) {
+    if (lifecycleOperation?.pending) { status("Wait for the board lifecycle operation to finish."); return false; }
+    if (lifecycleOperation && !clearsPrivate) { status("Inspect the originating board to resolve the lifecycle outcome before leaving."); return false; }
+    if (lifecycleOperation && clearsPrivate && !dirty() && !messageDirty()) {
+      if (leaveChoice) return false;
+      $("unsaved-save").disabled = true; text($("unsaved-save"), "Save and continue");
+      text($("unsaved-title"), "Discard unresolved board action?");
+      text($("unsaved-description"), "The action may already have applied. Locking forgets its local status and cannot undo it. Discard and continue, or cancel and inspect the board.");
+      $("unsaved-dialog").showModal(); $("unsaved-cancel").focus();
+      return new Promise(resolve => { leaveChoice = resolve; });
+    }
     if (messagePending()) { status("Sending message. Wait for its outcome before leaving."); return false; }
     if (saving) { status("Saving response. Wait for its outcome before leaving."); return false; }
     if (!dirty() && !messageDirty()) { discard(); return true; }
@@ -570,7 +627,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     if (!validName(name) || name === board) return;
     const c = capture();
     if (!await allowLeave() || !current(c)) return;
-    stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; board = name; shown = null; latest = null; draft = null; backoff = 1000;
+    stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; authorityEpoch++; authority = null; board = name; shown = null; latest = null; draft = null; backoff = 1000;
     for (const m of messageDrafts.values()) m.row.hidden = true;
     $("board-messages").hidden = true;
     $("selected-board-name").textContent = board; $("board-selector").value = board;
@@ -592,11 +649,154 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   function clear() {
     active = false; authEpoch++; boardEpoch++; stopCatalog(); catalogNames = null; catalogDelay = 2000; catalogFeedback(""); stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); finishChoice(false);
     messageDrafts.clear(); $("message-controls").replaceChildren(); $("board-messages").hidden = true;
+    authorityEpoch++; authority = null; lifecycleOperation?.controller?.abort(); lifecycleOperation = null; archiveIntent = null; closeArchives();
+    if ($("archive-confirm-dialog").open) $("archive-confirm-dialog").close();
+    $("archive-confirm-description").textContent = ""; text($("board-lifecycle-status"), "");
     board = "main"; shown = null; latest = null; draft = null; saving = false; raw = false; backoff = 1000;
     $("board-controls").append($("response-editor")); $("board-document").replaceChildren(); $("board-raw").textContent = ""; controlRows.clear(); $("board-selector").replaceChildren();
     $("selected-board-name").textContent = "main"; $("response-heading").textContent = "Edit response"; $("response-intent").textContent = "";
-    $("board-newer").hidden = true; $("board-raw-toggle").setAttribute("aria-pressed", "false"); renderEditor(); error(""); status("Choose Boards to load main.");
+    $("board-newer").hidden = true; $("board-raw-toggle").setAttribute("aria-pressed", "false"); renderEditor(); lifecycleUI(); text($("board-lifecycle-status"), ""); error(""); status("Choose Boards to load main.");
   }
+  function closeArchives() {
+    archivedEpoch++; archivedAbort?.abort(); archivedAbort = null;
+    if ($("archived-dialog").open) $("archived-dialog").close();
+    $("archived-list").replaceChildren(); archivedActionFeedback = ""; text($("archived-feedback"), "");
+  }
+  function archiveDate(value, field) {
+    const time = node("time"); time.dataset.archiveDate = field;
+    if (Number.isSafeInteger(value) && Math.abs(value) <= 8640000000000000) {
+      time.dateTime = new Date(value).toISOString();
+      time.textContent = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "long" }).format(new Date(value));
+    } else time.textContent = "Unknown";
+    return time;
+  }
+  async function loadArchives() {
+    if (!active || !authenticated() || !$("archived-dialog").open || lifecycleOperation?.pending) return;
+    archivedAbort?.abort(); const controller = new AbortController(), epoch = ++archivedEpoch, auth = authEpoch;
+    archivedAbort = controller; text($("archived-feedback"), "Loading archived boards…");
+    const live = () => active && authenticated() && authEpoch === auth && epoch === archivedEpoch && $("archived-dialog").open;
+    let deadline;
+    try {
+      const timeout = new Promise((_, reject) => { deadline = setTimeout(() => { controller.abort(); reject(new Error("Archive list timed out")); }, 5000); });
+      const data = await Promise.race([request("/api/archived-boards", { signal: controller.signal }), timeout]);
+      if (!live()) return;
+      if (!data || !Array.isArray(data.boards) || data.boards.length > 256) throw new Error("Invalid archived board list");
+      const names = new Set(), rows = [];
+      for (const entry of data.boards) {
+        if (!entry || !validName(entry.name) || entry.name === "main" || names.has(entry.name) || !/^[a-f0-9]{64}$/.test(entry.revision) || !["archived", "restoring", "purging"].includes(entry.state)) throw new Error("Invalid archived record");
+        names.add(entry.name);
+        const row = node("section", undefined, "archived-row"); row.dataset.boardName = entry.name;
+        row.append(node("h3", entry.name));
+        const archived = node("p", "Archived: "), expires = node("p", "Permanent deletion: ");
+        archived.append(archiveDate(entry.archived_at, "archived_at")); expires.append(archiveDate(entry.expires_at, "expires_at"));
+        const feedback = node("p", entry.state === "purging" ? "Expired. Cleanup is pending; Restore is unavailable." : entry.state === "restoring" ? "Restore recovery is pending; inspect its current state." : "Read only until explicitly restored.", "help");
+        const actions = node("div", undefined, "response-actions"), restore = node("button", "Restore"), view = node("button", "View archived board");
+        restore.type = view.type = "button"; restore.dataset.archiveAction = "restore";
+        restore.dataset.unavailable = String(entry.state !== "archived");
+        const rowEpoch = epoch;
+        restore.addEventListener("click", () => { if (rowEpoch === archivedEpoch && row.isConnected && entry.state === "archived") void lifecycleAction("restore", entry); });
+        view.addEventListener("click", async () => { if (rowEpoch !== archivedEpoch || !row.isConnected || lifecycleOperation) return; closeArchives(); await choose(entry.name); });
+        actions.append(restore, view); row.append(archived, expires, feedback, actions); rows.push(row);
+      }
+      $("archived-list").replaceChildren(...rows);
+      text($("archived-feedback"), archivedActionFeedback || (rows.length ? "" : "No archived boards.")); lifecycleUI();
+    } catch (e) { if (live() && e.name !== "AbortError") text($("archived-feedback"), "Archived boards unavailable. Refresh to try again; no operation was retried."); }
+    finally { clearTimeout(deadline); if (live()) archivedAbort = null; }
+  }
+  async function prepareArchive() {
+    if (board === "main" || !shown || !writable(shown) || lifecycleOperation || archiveIntent) return;
+    const c = capture();
+    if (!await allowLeave() || !current(c) || !shown || !writable(shown)) return;
+    archiveIntent = { name: board, revision: shown.revision, incarnation: shown.incarnation, lifecycle_generation: shown.lifecycle_generation };
+    text($("archive-confirm-description"), `Archive ${board}? It will disappear from active lists. You can restore it for 30 days; after that the broker permanently deletes its managed content and metadata. External backups are unaffected.`);
+    $("archive-confirm-dialog").showModal(); $("archive-confirm-cancel").focus();
+  }
+  async function lifecycleAction(action, target) {
+    if (lifecycleOperation || !active || !authenticated() || saving || messagePending() || !validName(target.name)) return;
+    if (action === "archive" && (target.name !== board || board === "main" || !writable(target) || target.revision !== shown?.revision)) return;
+    // Fence pre-action selected snapshots AND buffered SSE before admitting an
+    // action. Catalog polling has its independent epoch and remains untouched.
+    stop(); authorityEpoch++; archivedEpoch++; archivedAbort?.abort(); archivedAbort = null;
+    const operation = { action, name: target.name, revision: target.revision, scope: scope(target), pending: true, code: "pending" };
+    lifecycleOperation = operation; archivedActionFeedback = ""; const c = capture(), controller = new AbortController(); operation.controller = controller;
+    let deadline;
+    if (shown) controls(shown); else lifecycleUI();
+    try {
+      const timeout = new Promise((_, reject) => { deadline = setTimeout(() => { controller.abort(); reject(new Error("Lifecycle outcome timed out")); }, 15000); });
+      const result = await Promise.race([request(`/api/boards/${encodeURIComponent(target.name)}/${action}`, { signal: controller.signal, method: "POST", body: JSON.stringify({ board: target.name, expected_revision: target.revision }) }), timeout]);
+      if (!current(c) || lifecycleOperation !== operation || !active) return;
+      // A decoded success must describe this exact board and a new lifecycle
+      // generation. Otherwise preserve the operation for explicit inspection.
+      if (!result.applied || !validView(result.board, target.name)
+          || typeof target.incarnation !== "string" || result.board.incarnation !== target.incarnation
+          || typeof target.lifecycle_generation !== "string" || typeof result.board.lifecycle_generation !== "string"
+          || !result.board.lifecycle_generation || result.board.lifecycle_generation === target.lifecycle_generation
+          || phase(result.board) !== (action === "archive" ? "archived" : "active")) throw new Error("Unconfirmed lifecycle result");
+      lifecycleOperation = null;
+      if (target.name === board) {
+        observeAuthority(result.board);
+        if (draft || saving || selectionHeld()) { latest = result.board; $("board-newer").hidden = false; }
+        else { latest = null; show(result.board); }
+      }
+      archivedActionFeedback = `${target.name}: ${action === "archive" ? "archived for 30 days" : "restored"}.`;
+      status(action === "archive" ? "Board archived for 30 days." : "Board restored. Old drafts remain bound to their prior generation.");
+    } catch (e) {
+      if (!current(c) || lifecycleOperation !== operation || !active) return;
+      if (validView(e.data?.board, target.name) && target.name === board) {
+        observeAuthority(e.data.board); latest = e.data.board;
+      }
+      if (e.status && e.status < 500 && e.status !== 429) {
+        lifecycleOperation = null;
+        archivedActionFeedback = e.data?.error || "The lifecycle action was rejected. Inspect the current board before trying again.";
+        error(archivedActionFeedback);
+      } else {
+        operation.pending = false; operation.code = e.data?.code || "uncertain";
+        operation.feedback = e.data?.code === "pending" ? "Restore recovery is pending. Inspect current state; do not repeat the operation." : "The lifecycle outcome is uncertain. Inspect the originating board before any further operation; nothing is retried automatically.";
+      }
+    } finally {
+      clearTimeout(deadline);
+      if (current(c) && active) {
+        if (lifecycleOperation === operation) operation.pending = false;
+        if (shown) controls(shown); else lifecycleUI();
+        catchUpCatalog();
+        if ($("archived-dialog").open) void loadArchives();
+        void startLive();
+      }
+    }
+  }
+  async function inspectLifecycle() {
+    if (!active || !authenticated() || lifecycleOperation?.pending) return;
+    const operation = lifecycleOperation, name = operation?.name || board, c = capture();
+    try {
+      const result = await request(`/api/boards/${encodeURIComponent(name)}`);
+      if (!authorityCurrent(c) || lifecycleOperation !== operation || !validView(result, name)) return;
+      if (phase(result) !== "restoring") lifecycleOperation = null;
+      if (name === board) {
+        observeAuthority(result);
+        if (draft || selectionHeld()) { latest = result; $("board-newer").hidden = false; }
+        else { latest = null; show(result); }
+      }
+      status(`Inspected ${name}: ${phase(result)}. No mutation was repeated.`);
+      if (shown) controls(shown); else lifecycleUI();
+      catchUpCatalog(); if ($("archived-dialog").open) void loadArchives();
+    } catch (e) {
+      if (!authorityCurrent(c) || lifecycleOperation !== operation) return;
+      if (e.status === 404) { lifecycleOperation = null; if (name === board) unavailable(); }
+      error("The originating board could not be inspected. Its prior content and drafts are kept."); lifecycleUI();
+    }
+  }
+  $("board-archive").addEventListener("click", () => { void prepareArchive(); });
+  $("archive-confirm-cancel").addEventListener("click", () => { archiveIntent = null; $("archive-confirm-dialog").close(); text($("archive-confirm-description"), ""); });
+  $("archive-confirm-dialog").addEventListener("cancel", () => { archiveIntent = null; text($("archive-confirm-description"), ""); });
+  $("archive-confirm-submit").addEventListener("click", () => {
+    const intent = archiveIntent; if (!intent || lifecycleOperation) return;
+    archiveIntent = null; $("archive-confirm-dialog").close(); text($("archive-confirm-description"), ""); void lifecycleAction("archive", intent);
+  });
+  $("board-archived-open").addEventListener("click", () => { if (!active || lifecycleOperation?.pending) return; if (!$("archived-dialog").open) $("archived-dialog").showModal(); void loadArchives(); });
+  $("archived-refresh").addEventListener("click", () => { void loadArchives(); });
+  $("archived-close").addEventListener("click", () => { if (!lifecycleOperation?.pending) closeArchives(); });
+  $("archived-dialog").addEventListener("cancel", event => { if (lifecycleOperation?.pending) event.preventDefault(); else closeArchives(); });
+  $("board-lifecycle-review").addEventListener("click", () => { void inspectLifecycle(); });
   // Keep an existing manual selection (and its frozen snapshot) during a
   // pointer copy; keyboard users can still Tab to and activate each button.
   $("board-document").addEventListener("mousedown", event => {
@@ -645,6 +845,6 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") catchUpCatalog(); });
   window.addEventListener("online", catchUpCatalog);
   window.addEventListener("focus", catchUpCatalog);
-  window.addEventListener("beforeunload", e => { if (dirty() || saving || messageDirty() || messagePending()) { e.preventDefault(); e.returnValue = ""; } });
-  return { open, leave, clear, hasDraft: () => dirty() || messageDirty() };
+  window.addEventListener("beforeunload", e => { if (dirty() || saving || messageDirty() || messagePending() || lifecycleOperation) { e.preventDefault(); e.returnValue = ""; } });
+  return { open, leave, clear, hasDraft: () => dirty() || messageDirty() || !!lifecycleOperation };
 };

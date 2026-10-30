@@ -220,6 +220,10 @@ impl Broker {
             .open(&dbpath)?;
         std::fs::set_permissions(&dbpath, std::fs::Permissions::from_mode(0o600))?;
         let db = Db::open(&dbpath)?;
+        crate::board_lifecycle::initialize(&db)?;
+        for error in crate::board_lifecycle::cleanup(&db, &state_dir, crate::db::now())? {
+            eprintln!("Board archive recovery: {error}");
+        }
         let mut event_state = crate::board_notifications::State::default();
         event_state.reconcile(
             crate::board_notifications::available(&db)?,
@@ -566,11 +570,45 @@ impl Broker {
                     }
                 }
                 Request::BoardList => json!(self.list_boards_locked(&db)?),
-                Request::BoardCreate { board } => {
-                    json!(crate::board_metadata::enrich(
+                Request::BoardArchivedList => json!(crate::board_lifecycle::archived(
+                    &db,
+                    &self.state_dir,
+                    crate::db::now()
+                )?),
+                Request::BoardInspect { board } => json!(crate::board_lifecycle::inspect(
+                    &db,
+                    &self.state_dir,
+                    &board,
+                    crate::db::now()
+                )?),
+                Request::BoardArchive {
+                    board,
+                    expected_revision,
+                } => {
+                    json!(self.archive_board_locked(
+                        &db,
+                        &board,
+                        &expected_revision,
+                        crate::db::now()
+                    )?)
+                }
+                Request::BoardRestore {
+                    board,
+                    expected_revision,
+                } => {
+                    json!(crate::board_lifecycle::restore(
                         &db,
                         &self.state_dir,
-                        crate::board::create(&self.state_dir, &board)?
+                        &board,
+                        &expected_revision,
+                        crate::db::now()
+                    )?)
+                }
+                Request::BoardCreate { board } => {
+                    json!(crate::board_lifecycle::create(
+                        &db,
+                        &self.state_dir,
+                        &board
                     )?)
                 }
                 Request::NamedBoardRead { board } => {
@@ -609,7 +647,12 @@ impl Broker {
                         }
                     }
                 }
-                Request::Subscribe { agent, events } => {
+                Request::Subscribe {
+                    agent,
+                    events,
+                    board_revisions,
+                } => {
+                    self.validate_board_fences_locked(&db, &events, &board_revisions)?;
                     let agent = db.agent(&agent)?;
                     let mut boards = std::collections::BTreeMap::new();
                     ensure!(
@@ -644,7 +687,16 @@ impl Broker {
                     });
                     json!({"agent":agent.name,"events":effective,"agents":if lifecycle {agents} else {Vec::new()},"persistent":false,"recovery":recovery})
                 }
-                Request::Unsubscribe { agent, events } => {
+                Request::Unsubscribe {
+                    agent,
+                    events,
+                    board_revisions,
+                } => {
+                    self.validate_board_fences_locked(
+                        &db,
+                        events.as_deref().unwrap_or_default(),
+                        &board_revisions,
+                    )?;
                     if let Some(events) = &events {
                         ensure!(
                             !events.is_empty() && events.len() <= 64,
@@ -936,7 +988,7 @@ impl Broker {
                         Ok(status) => json!(status),
                         Err(error) => json!({"error": format!("{error:#}")}),
                     };
-                    json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.monitor_control.lock().unwrap().status(),"machine":self.local_machine(&db)?,"updates":updates})
+                    json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.monitor_control.lock().unwrap().status(),"machine":self.local_machine(&db)?,"updates":updates,"board_archives":crate::board_lifecycle::diagnostics(&db)?})
                 }
                 Request::RemoteList | Request::RemoteListPeer { .. } => {
                     let mut agents = match &req {
@@ -1651,7 +1703,21 @@ impl Broker {
         }
         let snapshot = match self.read_board_locked(db, &request.board) {
             Ok(snapshot) => snapshot,
-            Err(error) => return Reply::error(503, "unavailable", error),
+            Err(error) => {
+                if let Ok(board) = crate::board_lifecycle::inspect(
+                    db,
+                    &self.state_dir,
+                    &request.board,
+                    crate::db::now(),
+                ) && !board.writable()
+                {
+                    return Reply {
+                        status: 409,
+                        body: json!({"code":"archived","error":"This board is not active; no message was sent","board":board}),
+                    };
+                }
+                return Reply::error(503, "unavailable", error);
+            }
         };
         let conflict = |error: &str| {
             let mut reply = Reply::error(409, "conflict", error);
@@ -1728,19 +1794,79 @@ impl Broker {
         db: &Db,
         name: &crate::board::Name,
     ) -> Result<crate::board::Snapshot> {
-        crate::board_metadata::enrich(
-            db,
-            &self.state_dir,
-            crate::board::read_named(&self.state_dir, name)?,
-        )
+        crate::board_lifecycle::read_active(db, &self.state_dir, name)
     }
 
     /// Enrich the exact snapshots read by the bounded board listing.
     pub(crate) fn list_boards_locked(&self, db: &Db) -> Result<Vec<crate::board::Summary>> {
-        crate::board::list(&self.state_dir)?
-            .into_iter()
-            .map(|summary| crate::board_metadata::enrich_summary(db, &self.state_dir, summary))
-            .collect()
+        crate::board_lifecycle::list_active(db, &self.state_dir)
+    }
+
+    fn validate_board_fences_locked(
+        &self,
+        db: &Db,
+        events: &[crate::protocol::EventSelector],
+        revisions: &std::collections::BTreeMap<crate::board::Name, String>,
+    ) -> Result<()> {
+        let names = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::protocol::EventSelector::BoardChanged { board } => Some(board.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(
+            revisions.len() <= 64 && revisions.keys().all(|name| names.contains(name)),
+            "Board revision fences must match the requested event selectors"
+        );
+        for name in names {
+            if !name.is_main() || revisions.contains_key(&name) {
+                let current = self.read_board_locked(db, &name)?;
+                ensure!(
+                    revisions.get(&name) == Some(&current.revision),
+                    "Named-board subscription revision is missing or stale; read the board and provide board_revisions before retrying"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn archive_board_locked(
+        &self,
+        db: &Db,
+        name: &crate::board::Name,
+        expected: &str,
+        now: i64,
+    ) -> Result<crate::board::Snapshot> {
+        let board = crate::board_lifecycle::archive(db, &self.state_dir, name, expected, now)?;
+        self.board_notifications
+            .lock()
+            .unwrap()
+            .invalidate_board(name);
+        self.revoke_event_controls_locked(db)?;
+        Ok(board)
+    }
+
+    pub(crate) async fn board_cleanup_loop(&self, period: std::time::Duration) {
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let result = {
+                let db = self.db.lock().unwrap();
+                crate::board_lifecycle::cleanup(&db, &self.state_dir, crate::db::now())
+            };
+            match result {
+                Ok(errors) => {
+                    for error in errors {
+                        eprintln!("Board archive cleanup: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Board archive cleanup failed; retrying on the next pass: {error:#}")
+                }
+            }
+        }
     }
 
     /// Caller holds the local DB administration mutex. HTTP additionally retains
@@ -1754,18 +1880,28 @@ impl Broker {
         actor: Option<&crate::protocol::Agent>,
     ) -> Result<crate::board::Snapshot> {
         let before = self.read_board_locked(db, name)?;
+        if before.revision != expected {
+            return Err(crate::board::Conflict { current: before }.into());
+        }
+        let raw_expected = crate::board::snapshot(
+            &self.state_dir,
+            name,
+            before.markdown.clone(),
+            before.exists,
+        )
+        .revision;
         self.board_notifications.lock().unwrap().observe_named(
             name,
             &before.revision,
             None,
             std::time::Instant::now(),
         );
-        let board = match crate::board::update_named(&self.state_dir, name, expected, edits) {
-            Ok(board) => crate::board_metadata::enrich(db, &self.state_dir, board)?,
+        let board = match crate::board::update_named(&self.state_dir, name, &raw_expected, edits) {
+            Ok(board) => crate::board_lifecycle::enrich_written(db, &self.state_dir, board)?,
             Err(error) => {
                 if let Some(conflict) = error.downcast_ref::<crate::board::Conflict>() {
                     return Err(crate::board::Conflict {
-                        current: crate::board_metadata::enrich(
+                        current: crate::board_lifecycle::enrich_written(
                             db,
                             &self.state_dir,
                             conflict.current.clone(),
@@ -2072,6 +2208,8 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     tokio::pin!(pairing_notifications);
     let board_notifications = crate::board_notifications::run(broker.clone());
     tokio::pin!(board_notifications);
+    let board_cleanup = broker.board_cleanup_loop(std::time::Duration::from_secs(300));
+    tokio::pin!(board_cleanup);
     let networking = crate::network::worker::run(broker.clone());
     tokio::pin!(networking);
     let observer = crate::clients::observe(bound.broker.clone(), codex_home);
@@ -2099,6 +2237,7 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
             _=&mut monitoring=>unreachable!("Monitor worker runs until shutdown"),
             res=&mut pairing_notifications=>break res,
             res=&mut board_notifications=>break res,
+            _=&mut board_cleanup=>unreachable!("Board archive cleanup runs until shutdown"),
             _=&mut networking=>unreachable!("Network worker runs until shutdown"),
             _=&mut observer=>unreachable!("Discovery observer runs until shutdown"),
             _=&mut update_checks=>unreachable!("Update checker runs until shutdown"),
@@ -2305,6 +2444,7 @@ mod opencode_admission_tests {
         assert!(
             broker
                 .request(Request::Subscribe {
+                    board_revisions: Default::default(),
                     agent: agent.name.clone(),
                     events: vec![crate::protocol::EventSelector::BoardChanged {
                         board: Default::default()
@@ -2330,6 +2470,7 @@ mod opencode_admission_tests {
         );
         broker
             .request(Request::Unsubscribe {
+                board_revisions: Default::default(),
                 agent: agent.name,
                 events: None,
             })
@@ -2575,6 +2716,7 @@ mod board_timestamp_integration_tests {
             .unwrap();
         broker
             .request(Request::Subscribe {
+                board_revisions: Default::default(),
                 agent: agent.name.clone(),
                 events: vec![
                     crate::protocol::EventSelector::AgentOpened {},

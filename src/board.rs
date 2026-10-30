@@ -21,6 +21,8 @@ use std::{
 pub const MAX_BOARD_BYTES: usize = 64 * 1024;
 pub const MAX_EDITS: usize = 32;
 
+pub(crate) mod lifecycle_files;
+
 const DIRECTORY: &CStr = c"boards";
 pub const MAX_BOARDS: usize = 256;
 const MAX_DIRECTORY_ENTRIES: usize = 1024;
@@ -96,6 +98,61 @@ pub enum LastUpdatedSource {
     Unknown,
 }
 
+/// Broker-owned identity and lifecycle; absent identities are legacy/main views.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Lifecycle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_generation: Option<String>,
+    #[serde(default)]
+    pub state: LifecycleState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    #[default]
+    Active,
+    Archived,
+    Restoring,
+    Purging,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub created_seconds: u64,
+    pub created_nanoseconds: u32,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self> {
+        Self::from_created(metadata.dev(), metadata.ino(), metadata.created())
+    }
+
+    fn from_created(
+        device: u64,
+        inode: u64,
+        created: std::io::Result<std::time::SystemTime>,
+    ) -> Result<Self> {
+        let birth = created.context("Board lifecycle requires filesystem birth-time identity; refusing unsafe inode-only fallback")?
+            .duration_since(std::time::UNIX_EPOCH).context("Invalid filesystem birth-time identity")?;
+        Ok(Self {
+            device,
+            inode,
+            created_seconds: birth.as_secs(),
+            created_nanoseconds: birth.subsec_nanos(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Summary {
     pub name: Name,
@@ -105,6 +162,8 @@ pub struct Summary {
     pub last_updated: Option<i64>,
     #[serde(default)]
     pub last_updated_source: LastUpdatedSource,
+    #[serde(default, flatten)]
+    pub lifecycle: Lifecycle,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,6 +177,31 @@ pub struct Snapshot {
     pub last_updated: Option<i64>,
     #[serde(default)]
     pub last_updated_source: LastUpdatedSource,
+    #[serde(default, flatten)]
+    pub lifecycle: Lifecycle,
+    #[serde(skip)]
+    pub(crate) file_identity: Option<FileIdentity>,
+}
+
+impl Snapshot {
+    /// Rebase/composer keys must survive ordinary edits but never an archive,
+    /// restoration, or same-name recreation. Main/legacy keys stay compatible.
+    pub fn control_scope(&self) -> String {
+        match (
+            &self.lifecycle.incarnation,
+            &self.lifecycle.lifecycle_generation,
+        ) {
+            (Some(incarnation), Some(generation)) => {
+                format!("{}\0{incarnation}\0{generation}", self.name)
+            }
+            (None, None) => self.name.clone(),
+            _ => format!("invalid-board-identity\0{}\0{}", self.name, self.revision),
+        }
+    }
+
+    pub fn writable(&self) -> bool {
+        self.lifecycle.state == LifecycleState::Active
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -153,7 +237,7 @@ impl std::fmt::Display for Conflict {
 }
 impl std::error::Error for Conflict {}
 
-fn snapshot(state_dir: &Path, name: &Name, markdown: String, exists: bool) -> Snapshot {
+pub(crate) fn snapshot(state_dir: &Path, name: &Name, markdown: String, exists: bool) -> Snapshot {
     Snapshot {
         name: name.to_string(),
         revision: revision_digest(name, &markdown)
@@ -165,6 +249,8 @@ fn snapshot(state_dir: &Path, name: &Name, markdown: String, exists: bool) -> Sn
         exists,
         last_updated: None,
         last_updated_source: LastUpdatedSource::Unknown,
+        lifecycle: Lifecycle::default(),
+        file_identity: None,
     }
 }
 
@@ -182,6 +268,7 @@ fn stable_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> boo
 }
 
 fn assign_file_time(board: &mut Snapshot, metadata: &std::fs::Metadata) {
+    board.file_identity = FileIdentity::from_metadata(metadata).ok();
     use std::time::{SystemTime, UNIX_EPOCH};
     board.last_updated = metadata
         .modified()
@@ -332,15 +419,13 @@ pub fn read_named(state_dir: &Path, name: &Name) -> Result<Snapshot> {
 
 /// Create without replacing any existing entry. Broker serialization protects transactions.
 pub fn create(state_dir: &Path, name: &Name) -> Result<Snapshot> {
-    let entries = list(state_dir)?;
+    let entries = names(state_dir)?;
     ensure!(
-        entries
-            .iter()
-            .all(|entry| &entry.name != name || !entry.exists),
+        lifecycle_files::target(state_dir, name)?.is_none(),
         "Board {name} already exists"
     );
     ensure!(
-        entries.iter().any(|entry| &entry.name == name) || entries.len() < MAX_BOARDS,
+        entries.contains(name) || entries.len() < MAX_BOARDS,
         "At most 256 boards may exist"
     );
     let state = root(state_dir)?;
@@ -370,7 +455,7 @@ unsafe fn directory_errno() -> *mut libc::c_int {
 }
 
 /// Enumerate from the validated directory descriptor, with explicit work/output limits.
-pub fn list(state_dir: &Path) -> Result<Vec<Summary>> {
+pub(crate) fn names(state_dir: &Path) -> Result<std::collections::BTreeSet<Name>> {
     let state = root(state_dir)?;
     let mut names = std::collections::BTreeSet::from([Name::default()]);
     if let Some(directory) = board_directory(&state, false)? {
@@ -428,7 +513,11 @@ pub fn list(state_dir: &Path) -> Result<Vec<Summary>> {
         }
         result?;
     }
-    names
+    Ok(names)
+}
+
+pub fn list(state_dir: &Path) -> Result<Vec<Summary>> {
+    names(state_dir)?
         .into_iter()
         .map(|name| {
             let board = read_named(state_dir, &name)?;
@@ -438,6 +527,7 @@ pub fn list(state_dir: &Path) -> Result<Vec<Summary>> {
                 revision: board.revision,
                 last_updated: board.last_updated,
                 last_updated_source: board.last_updated_source,
+                lifecycle: board.lifecycle,
             })
         })
         .collect()

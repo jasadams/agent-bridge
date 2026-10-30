@@ -17,6 +17,7 @@ fn inbox(name: &str) -> Agent {
 }
 fn subscribe(agent: &str, events: Vec<EventSelector>) -> Request {
     Request::Subscribe {
+        board_revisions: Default::default(),
         agent: agent.into(),
         events,
     }
@@ -147,6 +148,7 @@ async fn actual_broker_claude_control_preserves_quick_close_reopen_and_history()
     );
     broker
         .request(Request::Unsubscribe {
+            board_revisions: Default::default(),
             agent: "coordinator".into(),
             events: None,
         })
@@ -218,6 +220,7 @@ async fn selectors_are_strict_and_failed_changes_are_atomic() {
     );
     let reply = broker
         .request(Request::Unsubscribe {
+            board_revisions: Default::default(),
             agent: "coordinator".into(),
             events: None,
         })
@@ -246,6 +249,7 @@ async fn selectors_are_strict_and_failed_changes_are_atomic() {
     assert!(
         broker
             .request(Request::Unsubscribe {
+                board_revisions: Default::default(),
                 agent: "coordinator".into(),
                 events: Some(vec![
                     EventSelector::AgentOpened {},
@@ -258,6 +262,7 @@ async fn selectors_are_strict_and_failed_changes_are_atomic() {
     );
     let reply = broker
         .request(Request::Unsubscribe {
+            board_revisions: Default::default(),
             agent: "coordinator".into(),
             events: Some(vec![EventSelector::AgentOpened {}]),
         })
@@ -302,6 +307,7 @@ async fn oversized_lifecycle_snapshot_rejects_the_entire_selector_change() {
     assert_eq!(
         broker
             .request(Request::Unsubscribe {
+                board_revisions: Default::default(),
                 agent: "coordinator".into(),
                 events: None
             })
@@ -600,6 +606,7 @@ async fn snapshot_byte_bound_is_atomic_and_native_titles_are_bounded_for_events(
     assert_eq!(
         broker
             .request(Request::Unsubscribe {
+                board_revisions: Default::default(),
                 agent: "coordinator".into(),
                 events: None
             })

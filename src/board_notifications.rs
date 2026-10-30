@@ -254,6 +254,12 @@ pub(crate) fn available(db: &crate::db::Db) -> Result<Vec<serde_json::Value>> {
 }
 
 impl State {
+    /// Archive retires this board's watches and all collected authorization
+    /// tokens. A later restore requires a new explicit subscription.
+    pub(crate) fn invalidate_board(&mut self, name: &Name) {
+        self.boards.remove(name);
+    }
+
     fn token(&self, notice: &Notice) -> String {
         serde_json::to_string(&Authorization {
             epoch: self.epoch.clone(),
@@ -967,6 +973,7 @@ mod tests {
                 }
                 broker
                     .request(Request::Subscribe {
+                        board_revisions: Default::default(),
                         agent: native.name.clone(),
                         events: vec![EventSelector::AgentOpened {}],
                     })
@@ -1025,6 +1032,7 @@ mod tests {
                 };
                 broker
                     .request(Request::Unsubscribe {
+                        board_revisions: Default::default(),
                         agent: native.name.clone(),
                         events: None,
                     })
@@ -1075,6 +1083,7 @@ mod tests {
                 .unwrap();
             broker
                 .request(Request::Subscribe {
+                    board_revisions: Default::default(),
                     agent: native.name.clone(),
                     events: vec![EventSelector::AgentOpened {}],
                 })
@@ -1123,6 +1132,7 @@ mod tests {
             }
             broker
                 .request(Request::Subscribe {
+                    board_revisions: Default::default(),
                     agent: native.name.clone(),
                     events: vec![EventSelector::AgentOpened {}],
                 })
@@ -1506,5 +1516,120 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn archive_revokes_collected_and_queued_controls_without_reviving_them_on_restore() {
+        use crate::protocol::Request;
+        let root = tempfile::Builder::new()
+            .prefix("ab-archive-notice-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let name: Name = "project".parse().unwrap();
+        let created = broker
+            .request(Request::BoardCreate {
+                board: name.clone(),
+            })
+            .unwrap();
+        let mut native = agent("watcher");
+        native.session = uuid::Uuid::new_v4().to_string();
+        broker
+            .request(Request::Register {
+                agent: native.clone(),
+                replace: false,
+            })
+            .unwrap();
+        let subscribe = |revision: &str| Request::Subscribe {
+            agent: native.name.clone(),
+            events: vec![EventSelector::BoardChanged {
+                board: name.clone(),
+            }],
+            board_revisions: BTreeMap::from([(name.clone(), revision.to_owned())]),
+        };
+        broker
+            .request(subscribe(created["revision"].as_str().unwrap()))
+            .unwrap();
+        let updated = broker
+            .request(Request::board_update(
+                name.clone(),
+                created["revision"].as_str().unwrap().into(),
+                vec![crate::board::Edit::Append {
+                    text: "changed".into(),
+                }],
+                None,
+            ))
+            .unwrap();
+        let (notice, token) = {
+            let mut state = broker.board_notifications.lock().unwrap();
+            let notice = state.due(Instant::now() + DEBOUNCE, 1).pop().unwrap();
+            let token = state.token(&notice);
+            (notice, token)
+        };
+        let guard = broker.event_guard(&native, &token);
+        assert!(guard().is_ok());
+        broker.db.lock().unwrap().pause(true).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        broker
+            .request(Request::CodexNotice {
+                id: id.clone(),
+                recipient: native.name.clone(),
+                session: native.session.clone(),
+                content: notice.text(),
+                event_token: Some(token.clone()),
+            })
+            .unwrap();
+        assert_eq!(broker.db.lock().unwrap().get(&id).unwrap().state, "queued");
+        let now = crate::db::now();
+        let archived = {
+            let db = broker.db.lock().unwrap();
+            broker
+                .archive_board_locked(
+                    &db,
+                    &name,
+                    updated["board"]["revision"].as_str().unwrap(),
+                    now,
+                )
+                .unwrap()
+        };
+        {
+            let mut db = broker.db.lock().unwrap();
+            assert_eq!(db.get(&id).unwrap().state, "failed");
+            db.pause(false).unwrap();
+            assert!(db.claim().unwrap().is_none());
+        }
+        assert!(guard().is_err());
+        let restored = {
+            let db = broker.db.lock().unwrap();
+            crate::board_lifecycle::restore(
+                &db,
+                &broker.state_dir,
+                &name,
+                &archived.revision,
+                now + 1,
+            )
+            .unwrap()
+        };
+        assert!(
+            broker
+                .board_notifications
+                .lock()
+                .unwrap()
+                .events(&native.name)
+                .is_empty()
+        );
+        broker.request(subscribe(&restored.revision)).unwrap();
+        assert!(
+            guard().is_err(),
+            "A new watch cannot authorize a collected old control"
+        );
+        assert!(
+            !broker
+                .board_notifications
+                .lock()
+                .unwrap()
+                .authorizes(&token, &native)
+        );
+        assert_eq!(broker.db.lock().unwrap().get(&id).unwrap().state, "failed");
     }
 }

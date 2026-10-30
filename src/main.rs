@@ -23,6 +23,29 @@ struct Cli {
     command: Commands,
 }
 
+async fn subscription_revisions(
+    state: &std::path::Path,
+    events: &[EventSelector],
+) -> Result<std::collections::BTreeMap<Name, String>> {
+    let mut revisions = std::collections::BTreeMap::new();
+    for event in events {
+        if let EventSelector::BoardChanged { board } = event
+            && !board.is_main()
+            && !revisions.contains_key(board)
+        {
+            let current = broker::rpc(state, &Request::board_read(board.clone())).await?;
+            revisions.insert(
+                board.clone(),
+                current["revision"]
+                    .as_str()
+                    .context("Missing current board revision")?
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(revisions)
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Expose structured agent tools over a persistent local MCP stdio connection.
@@ -30,19 +53,31 @@ enum Commands {
     /// View and answer local shared Markdown board controls, or print its current Markdown.
     Board {
         /// Board name (defaults to main); named boards require explicit creation.
-        #[arg(conflicts_with_all = ["list", "create"])]
+        #[arg(conflicts_with_all = ["list", "create", "archive", "restore"])]
         name: Option<Name>,
         /// List local boards without opening the terminal UI.
-        #[arg(long, conflicts_with_all = ["raw", "create"])]
+        #[arg(long, conflicts_with_all = ["raw", "create", "archive", "restore"])]
         list: bool,
         /// Explicitly create an empty board without opening the terminal UI.
-        #[arg(long, value_name = "NAME", conflicts_with = "raw")]
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["raw", "archive", "restore", "archived"])]
         create: Option<Name>,
+        /// Archive NAME for 30 days, after which managed archive data is permanently deleted.
+        #[arg(long, value_name = "NAME", requires = "expected_revision", conflicts_with_all = ["name", "list", "create", "restore", "raw", "metadata", "archived"])]
+        archive: Option<Name>,
+        /// Restore an archived NAME before its retention deadline.
+        #[arg(long, value_name = "NAME", requires = "expected_revision", conflicts_with_all = ["name", "list", "create", "archive", "raw", "metadata", "archived"])]
+        restore: Option<Name>,
+        /// Exact revision for --archive or --restore, obtained by reading or inspecting the board.
+        #[arg(long)]
+        expected_revision: Option<String>,
+        /// List archived metadata, or explicitly inspect NAME with --raw/--metadata.
+        #[arg(long, conflicts_with_all = ["create", "archive", "restore"])]
+        archived: bool,
         /// Print Markdown once without opening the terminal UI.
         #[arg(long)]
         raw: bool,
         /// Print revision and UTC timestamp metadata as JSON, without Markdown.
-        #[arg(long, conflicts_with_all = ["raw", "list", "create"])]
+        #[arg(long, conflicts_with_all = ["raw", "list", "create", "archive", "restore"])]
         metadata: bool,
     },
     /// Add explicit local event selectors; returns effective events and lifecycle snapshot.
@@ -579,9 +614,48 @@ async fn main() -> Result<()> {
             list,
             create,
             metadata,
+            archive,
+            restore,
+            expected_revision,
+            archived,
         } => {
-            if list {
-                let value = broker::rpc(&state_dir, &Request::BoardList).await?;
+            anyhow::ensure!(
+                expected_revision.is_none() || archive.is_some() || restore.is_some(),
+                "--expected-revision requires --archive or --restore"
+            );
+            if archive.is_some() || restore.is_some() {
+                let expected_revision =
+                    expected_revision.context("An exact --expected-revision is required")?;
+                let request = if let Some(board) = archive {
+                    Request::BoardArchive {
+                        board,
+                        expected_revision,
+                    }
+                } else {
+                    Request::BoardRestore {
+                        board: restore.context("Missing restore board")?,
+                        expected_revision,
+                    }
+                };
+                let mut value = broker::rpc(&state_dir, &request).await?;
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("markdown");
+                    object.remove("path");
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            if list || (archived && name.is_none() && !raw && !metadata) {
+                let request = if archived {
+                    Request::BoardArchivedList
+                } else {
+                    Request::BoardList
+                };
+                let value = broker::rpc(&state_dir, &request).await?;
+                if archived {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    return Ok(());
+                }
                 let boards: Vec<agent_bridge::board::Summary> = serde_json::from_value(value)?;
                 for board in boards {
                     println!(
@@ -606,18 +680,28 @@ async fn main() -> Result<()> {
             }
             let name = name.unwrap_or_default();
             if metadata {
-                let board = broker::rpc(&state_dir, &Request::board_read(name)).await?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "name":board["name"], "revision":board["revision"], "exists":board["exists"],
-                        "last_updated":board["last_updated"], "last_updated_source":board["last_updated_source"]
-                    }))?
-                );
+                let request = if archived {
+                    Request::BoardInspect { board: name }
+                } else {
+                    Request::board_read(name)
+                };
+                let mut board = broker::rpc(&state_dir, &request).await?;
+                if let Some(object) = board.as_object_mut() {
+                    object.remove("markdown");
+                    object.remove("path");
+                }
+                println!("{}", serde_json::to_string_pretty(&board)?);
                 return Ok(());
             }
             if raw {
-                let value = broker::rpc(&state_dir, &Request::board_read(name.clone())).await?;
+                let request = if archived {
+                    Request::BoardInspect {
+                        board: name.clone(),
+                    }
+                } else {
+                    Request::board_read(name.clone())
+                };
+                let value = broker::rpc(&state_dir, &request).await?;
                 let board: agent_bridge::board::Snapshot = serde_json::from_value(value)?;
                 use std::io::Write;
                 std::io::stdout().write_all(board.markdown.as_bytes())?;
@@ -673,18 +757,29 @@ async fn main() -> Result<()> {
                 Request::List { all }
             }
         }
-        Commands::Subscribe { agent, events } => Request::Subscribe {
-            agent,
-            events: serde_json::from_str::<Vec<EventSelector>>(&events)
-                .context("Invalid event selector JSON")?,
-        },
-        Commands::Unsubscribe { agent, events } => Request::Unsubscribe {
-            agent,
-            events: events
+        Commands::Subscribe { agent, events } => {
+            let events = serde_json::from_str::<Vec<EventSelector>>(&events)
+                .context("Invalid event selector JSON")?;
+            let board_revisions = subscription_revisions(&state_dir, &events).await?;
+            Request::Subscribe {
+                agent,
+                events,
+                board_revisions,
+            }
+        }
+        Commands::Unsubscribe { agent, events } => {
+            let events = events
                 .map(|value| serde_json::from_str::<Vec<EventSelector>>(&value))
                 .transpose()
-                .context("Invalid event selector JSON")?,
-        },
+                .context("Invalid event selector JSON")?;
+            let board_revisions =
+                subscription_revisions(&state_dir, events.as_deref().unwrap_or_default()).await?;
+            Request::Unsubscribe {
+                agent,
+                events,
+                board_revisions,
+            }
+        }
         Commands::Status => Request::Status,
         Commands::Monitor { action } => match action {
             MonitorAction::Enable { port } => Request::MonitorEnable { port },

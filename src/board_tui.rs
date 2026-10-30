@@ -1,6 +1,6 @@
 //! A live Markdown view with revision-checked checkbox and text-field editing.
 use crate::{
-    board::{Edit, MAX_BOARD_BYTES, Name, Snapshot, Summary},
+    board::{Edit, LifecycleState, MAX_BOARD_BYTES, Name, Snapshot, Summary},
     board_interaction::{self, Control, Kind},
     board_messages::Submission,
     board_selection::{Selection, Viewport},
@@ -493,11 +493,29 @@ impl Editor {
     }
 }
 
+#[derive(Clone)]
+struct LifecycleAction {
+    base: Snapshot,
+    generation: u64,
+    restore: bool,
+}
+impl LifecycleAction {
+    fn verb(&self) -> &'static str {
+        if self.restore { "Restore" } else { "Archive" }
+    }
+}
+
 struct View {
     board: Name,
     generation: u64,
     picker: Option<(Vec<Summary>, usize)>,
     pick_requested: bool,
+    picker_archived: bool,
+    picker_epoch: u64,
+    lifecycle_confirm: Option<LifecycleAction>,
+    pending_lifecycle: Option<LifecycleAction>,
+    lifecycle_flight: Option<LifecycleAction>,
+    lifecycle_uncertain: Option<LifecycleAction>,
     snapshot: Option<Snapshot>,
     error: Option<String>,
     rendered: Text<'static>,
@@ -520,6 +538,7 @@ struct View {
     editor: Option<Editor>,
     pending: Option<Save>,
     saving: bool,
+    uncertain_save: Option<Save>,
     message_drafts: BTreeMap<String, Editor>,
     pending_message: Option<Submission>,
     owner_details: bool,
@@ -539,6 +558,12 @@ impl Default for View {
             generation: 0,
             picker: None,
             pick_requested: false,
+            picker_archived: false,
+            picker_epoch: 0,
+            lifecycle_confirm: None,
+            pending_lifecycle: None,
+            lifecycle_flight: None,
+            lifecycle_uncertain: None,
             snapshot: None,
             error: None,
             rendered: Text::default(),
@@ -561,6 +586,7 @@ impl Default for View {
             editor: None,
             pending: None,
             saving: false,
+            uncertain_save: None,
             message_drafts: BTreeMap::new(),
             pending_message: None,
             owner_details: false,
@@ -576,6 +602,111 @@ impl Default for View {
     }
 }
 impl View {
+    fn writable(&self) -> bool {
+        !self.lifecycle_busy()
+            && self.uncertain_save.is_none()
+            && self.error.is_none()
+            && self.snapshot.as_ref().is_some_and(Snapshot::writable)
+    }
+    fn lifecycle_busy(&self) -> bool {
+        self.pending_lifecycle.is_some()
+            || self.lifecycle_flight.is_some()
+            || self.lifecycle_uncertain.is_some()
+    }
+    fn confirm_lifecycle(&mut self, restore: bool) {
+        if self.editor.is_some()
+            || self.saving
+            || self.pending.is_some()
+            || self.pending_message.is_some()
+            || self.uncertain_save.is_some()
+            || self.has_message_drafts()
+            || self.lifecycle_busy()
+        {
+            self.notice = Some("Save successfully or explicitly discard retained drafts/uncertain tracking before archive, restore or navigation. Cancel keeps the board and draft.".into());
+            return;
+        }
+        let Some(base) = self.snapshot.clone().filter(|_| self.error.is_none()) else {
+            return;
+        };
+        if base.name == "main" {
+            self.notice = Some("Main is protected and cannot be archived.".into());
+            return;
+        }
+        if (restore && base.lifecycle.state != LifecycleState::Archived)
+            || (!restore && !base.writable())
+        {
+            self.notice = Some("Board lifecycle does not allow this action. Expired/purging boards cannot be restored.".into());
+            return;
+        }
+        self.selection = None;
+        self.viewport = None;
+        self.code_cells.clear();
+        self.clear_copy_focus();
+        self.lifecycle_confirm = Some(LifecycleAction {
+            base,
+            generation: self.generation,
+            restore,
+        });
+    }
+    fn action_current(&self, action: &LifecycleAction) -> bool {
+        self.error.is_none()
+            && self.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.revision == action.base.revision
+                    && snapshot.control_scope() == action.base.control_scope()
+                    && snapshot.lifecycle.state == action.base.lifecycle.state
+                    && if action.restore {
+                        snapshot.lifecycle.state == LifecycleState::Archived
+                    } else {
+                        snapshot.writable()
+                    }
+            })
+    }
+    fn lifecycle_result(&mut self, action: LifecycleAction, result: Result<Snapshot>) {
+        if action.generation != self.generation || action.base.name != self.board.as_str() {
+            return;
+        }
+        self.lifecycle_flight = None;
+        let result = result.and_then(|snapshot| {
+            ensure!(
+                snapshot.name == action.base.name
+                    && snapshot.lifecycle.incarnation == action.base.lifecycle.incarnation
+                    && snapshot.control_scope() != action.base.control_scope(),
+                "Unexpected lifecycle receipt identity"
+            );
+            ensure!(
+                if action.restore {
+                    snapshot.writable()
+                } else {
+                    snapshot.lifecycle.state == LifecycleState::Archived
+                },
+                "Lifecycle transition is not complete"
+            );
+            Ok(snapshot)
+        });
+        match result {
+            Ok(snapshot) => {
+                self.lifecycle_uncertain = None;
+                if self.snapshot.as_ref().is_none_or(|current| {
+                    current.control_scope() == action.base.control_scope()
+                        && current.revision == action.base.revision
+                }) {
+                    self.update(Ok(snapshot));
+                }
+                self.notice = Some(format!(
+                    "{} confirmed. Board content and Last Updated preserved.",
+                    action.verb()
+                ));
+            }
+            Err(error) => {
+                self.notice = Some(format!(
+                    "{} result uncertain or rejected: {}. Inspecting originating board; no automatic retry. Ctrl-D explicitly releases tracking after inspection.",
+                    action.verb(),
+                    safe_line(&format!("{error:#}"))
+                ));
+                self.lifecycle_uncertain = Some(action);
+            }
+        }
+    }
     fn has_message_drafts(&self) -> bool {
         self.editor.as_ref().is_some_and(|editor| {
             matches!(editor.control.kind, Kind::Message { .. })
@@ -588,7 +719,7 @@ impl View {
         let Kind::Message { id, instance, .. } = &editor.control.kind else {
             unreachable!()
         };
-        format!("{}:{id}:{instance}", editor.base.name)
+        format!("{}:{id}:{instance}", editor.base.control_scope())
     }
     fn retain_message(&mut self) {
         if let Some(editor) = self.editor.take() {
@@ -596,13 +727,19 @@ impl View {
         }
     }
     fn open_message(&mut self, control: Control) {
+        if !self.writable() {
+            self.notice = Some(
+                "Board is read-only; original message drafts remain available with Ctrl-E.".into(),
+            );
+            return;
+        }
         let Some(base) = self.snapshot.clone() else {
             return;
         };
         let Kind::Message { id, instance, .. } = &control.kind else {
             return;
         };
-        let key = format!("{}:{id}:{instance}", base.name);
+        let key = format!("{}:{id}:{instance}", base.control_scope());
         self.editor = Some(self.message_drafts.remove(&key).unwrap_or(Editor {
             base,
             control,
@@ -704,17 +841,21 @@ impl View {
         let (Some(editor), Some(snapshot)) = (&mut self.editor, &self.snapshot) else {
             return;
         };
+        if !snapshot.writable() || editor.base.control_scope() != snapshot.control_scope() {
+            self.notice = Some("Board lifecycle changed or is read-only; original draft retained. Cannot rebase across archive or restore.".into());
+            return;
+        }
         if editor.uncertain {
             self.notice = Some(
                 "Retry the exact pending message before changing its control or revision.".into(),
             );
             return;
         }
-        let key = editor.control.message_key(&editor.base.name);
+        let key = editor.control.message_key(&editor.base.control_scope());
         if let Some(current) = self
             .controls
             .iter()
-            .find(|control| control.message_key(&snapshot.name) == key)
+            .find(|control| control.message_key(&snapshot.control_scope()) == key)
         {
             editor.control = current.clone();
             editor.base = snapshot.clone();
@@ -737,6 +878,12 @@ impl View {
         // An ambiguous retry retains its original request. A definite rejection
         // also reuses its UUID while the exact payload/control remains unchanged.
         if !editor.uncertain {
+            if self.snapshot.as_ref().is_none_or(|current| {
+                !current.writable() || current.control_scope() != editor.base.control_scope()
+            }) {
+                self.notice = Some("Board is read-only or its lifecycle changed; original draft retained. No new message sent.".into());
+                return;
+            }
             if self
                 .snapshot
                 .as_ref()
@@ -836,15 +983,21 @@ impl View {
         }
     }
     fn switch(&mut self, board: Name) -> bool {
-        if self.editor.is_some()
+        if self.lifecycle_busy()
+            || self.lifecycle_confirm.is_some()
+            || self.editor.is_some()
             || self.saving
             || self.pending.is_some()
+            || self.pending_message.is_some()
+            || self.uncertain_save.is_some()
             || self.has_message_drafts()
         {
             return false;
         }
         if self.board == board {
             self.picker = None;
+            self.pick_requested = false;
+            self.picker_epoch = self.picker_epoch.wrapping_add(1);
             return false;
         }
         let generation = self.generation.wrapping_add(1);
@@ -890,21 +1043,31 @@ impl View {
                             || old.path != snapshot.path
                             || old.exists != snapshot.exists
                             || old.last_updated != snapshot.last_updated
+                            || old.lifecycle != snapshot.lifecycle
                     });
-                if self.snapshot.as_ref().map(|old| &old.revision) != Some(&snapshot.revision) {
+                if self.snapshot.as_ref().is_none_or(|old| {
+                    old.revision != snapshot.revision || old.lifecycle != snapshot.lifecycle
+                }) {
                     self.width = 0;
                     self.clear_copy_focus();
                     self.code_cells.clear();
-                    let composer_key = self
-                        .editor
-                        .as_ref()
-                        .and_then(|editor| editor.control.message_key(&editor.base.name));
+                    let composer_key = self.editor.as_ref().and_then(|editor| {
+                        editor.control.message_key(&editor.base.control_scope())
+                    });
                     self.controls = board_interaction::controls(&snapshot.markdown);
+                    if self.lifecycle_confirm.as_ref().is_some_and(|action| {
+                        action.base.revision != snapshot.revision
+                            || action.base.control_scope() != snapshot.control_scope()
+                            || action.base.lifecycle.state != snapshot.lifecycle.state
+                    }) {
+                        self.lifecycle_confirm = None;
+                        self.notice = Some("Board changed; archive/restore confirmation cancelled. Inspect the current board before trying again.".into());
+                    }
                     // Keep focus only for the exact unchanged composer. Source
                     // positions still reset for ordinary editable responses.
                     self.selected = composer_key.and_then(|key| {
                         self.controls.iter().position(|control| {
-                            control.message_key(&snapshot.name).as_ref() == Some(&key)
+                            control.message_key(&snapshot.control_scope()).as_ref() == Some(&key)
                         })
                     });
                     if self
@@ -915,11 +1078,31 @@ impl View {
                         self.notice = Some("Board changed; draft retained. Review latest board; Ctrl-R rebases unchanged field before saving.".into());
                     }
                 }
+                if let Some(action) = &self.lifecycle_uncertain {
+                    let reached = snapshot.lifecycle.incarnation
+                        == action.base.lifecycle.incarnation
+                        && snapshot.control_scope() != action.base.control_scope()
+                        && if action.restore {
+                            snapshot.writable()
+                        } else {
+                            snapshot.lifecycle.state == LifecycleState::Archived
+                        };
+                    if reached {
+                        self.notice = Some(format!(
+                            "{} state confirmed by inspection; no mutation retried.",
+                            action.verb()
+                        ));
+                        self.lifecycle_uncertain = None;
+                    }
+                }
                 self.snapshot = Some(snapshot);
                 self.error = None;
                 changed
             }
             Err(error) => {
+                if self.lifecycle_confirm.take().is_some() {
+                    self.notice = Some("Archive/restore confirmation cancelled while offline. Inspect the board before trying again.".into());
+                }
                 let error = safe_line(&format!("{error:#}"));
                 let changed = self.error.as_ref() != Some(&error);
                 self.error = Some(error);
@@ -980,14 +1163,42 @@ impl View {
                 )
             })
             .unwrap_or_else(|| (self.board.to_string(), "connecting".into()));
+        let lifecycle_label = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| !snapshot.writable())
+            .map(|snapshot| format!(" · READ-ONLY {:?}", snapshot.lifecycle.state))
+            .unwrap_or_default();
         frame.render_widget(
             Paragraph::new(format!(
-                "Local shared board · {name} · {}",
+                "Local shared board · {name} · {}{lifecycle_label}",
                 safe_line(&revision)
             ))
             .style(Style::default().fg(Color::Cyan)),
             header,
         );
+        if let Some(action) = &self.lifecycle_confirm {
+            let text = if action.restore {
+                format!(
+                    "Restore {}?\nArchived: {}\nScheduled permanent deletion: {}\nRestore before that deadline to return this exact board to the active list.\nEnter confirms Restore · Esc cancels",
+                    action.base.name,
+                    crate::board_time::archive_date(action.base.lifecycle.archived_at),
+                    crate::board_time::archive_date(action.base.lifecycle.expires_at)
+                )
+            } else {
+                format!(
+                    "Archive {}?\nThe board becomes read-only and leaves the active list.\nAutomatic PERMANENT DELETION after 30 days (30 × 24 hours).\nRestore it before the deadline to keep it. No agent message is sent.\nEnter confirms Archive · Esc cancels",
+                    action.base.name
+                )
+            };
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().title("Confirm board lifecycle action")),
+                body,
+            );
+            return;
+        }
         if let Some((boards, selected)) = &self.picker {
             let rows: Vec<Line> = boards
                 .iter()
@@ -997,7 +1208,18 @@ impl View {
                         "{} {}{}",
                         if i == *selected { ">" } else { " " },
                         board.name,
-                        if board.exists { "" } else { " (absent)" }
+                        if self.picker_archived {
+                            format!(
+                                " · {:?} · archived {} · deletes {}",
+                                board.lifecycle.state,
+                                crate::board_time::archive_date(board.lifecycle.archived_at),
+                                crate::board_time::archive_date(board.lifecycle.expires_at)
+                            )
+                        } else if board.exists {
+                            String::new()
+                        } else {
+                            " (absent)".into()
+                        }
                     ))
                 })
                 .collect();
@@ -1007,9 +1229,11 @@ impl View {
                         selected.saturating_sub(usize::from(body.height.saturating_sub(3))) as u16,
                         0,
                     ))
-                    .block(
-                        Block::bordered().title("Boards · j/k select · Enter open · Esc cancel"),
-                    ),
+                    .block(Block::bordered().title(if self.picker_archived {
+                        "Archived Boards · Tab active · Enter inspect · Esc cancel"
+                    } else {
+                        "Boards · Tab archived · j/k select · Enter open · Esc cancel"
+                    })),
                 body,
             );
             frame.render_widget(
@@ -1033,8 +1257,21 @@ impl View {
             },
             body.width.saturating_sub(4),
         );
+        let lifecycle_title = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| !snapshot.writable())
+            .map(|snapshot| {
+                format!(
+                    "READ-ONLY {:?} · Archived {} · Deletes {}",
+                    snapshot.lifecycle.state,
+                    crate::board_time::archive_date(snapshot.lifecycle.archived_at),
+                    crate::board_time::archive_date(snapshot.lifecycle.expires_at)
+                )
+            })
+            .unwrap_or(path);
         let block = Block::bordered()
-            .title(path)
+            .title(lifecycle_title)
             .title_bottom(Line::from(updated).centered());
         let inner = block.inner(body);
         if self.width != inner.width {
@@ -1212,7 +1449,8 @@ impl View {
             );
         } else if !self.controls.is_empty() {
             let title = format!(
-                "Responses · Tab/Shift-Tab select · Space checkbox · Enter text · {} controls",
+                "Responses{} · Tab/Shift-Tab select · Space checkbox · Enter text · {} controls",
+                if self.writable() { "" } else { " (read-only)" },
                 self.controls.len()
             );
             let block = Block::bordered().title(title);
@@ -1261,6 +1499,11 @@ impl View {
                 "{} · view frozen · Esc clears selection",
                 self.notice.as_deref().unwrap_or("Text selected")
             )
+        } else if let Some(action) = &self.lifecycle_flight {
+            format!(
+                "{} pending… waiting for the exact receipt; board actions paused.",
+                action.verb()
+            )
         } else if self.saving {
             "Saving response…".into()
         } else if let Some(error) = &self.error {
@@ -1291,7 +1534,7 @@ impl View {
         };
         frame.render_widget(Paragraph::new(vec![
             Line::from(safe_line(&status)),
-            Line::from(if self.editor.as_ref().is_some_and(|editor| matches!(editor.control.kind, Kind::Message { .. })) { "Enter send · Shift-Enter/Ctrl-J newline · Tab/Shift-Tab next · Esc retain · Ctrl-X discard · Ctrl-R review · Ctrl-O owner" } else if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · c code copies · m native mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "c code copies · m copy-on-select mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
+            Line::from(if self.editor.as_ref().is_some_and(|editor| matches!(editor.control.kind, Kind::Message { .. })) { "Enter send · Shift-Enter/Ctrl-J newline · Tab/Shift-Tab next · Esc retain · Ctrl-X discard · Ctrl-R review · Ctrl-O owner" } else if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "a archive · r restore/refresh · b boards · c code copies · m mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "a archive · r restore/refresh · b boards · c code copies · m mouse · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
             Line::from(safe_line(self.update_notice.as_deref().unwrap_or("")))
                 .style(Style::default().fg(Color::Yellow)),
         ]), footer);
@@ -1299,6 +1542,55 @@ impl View {
     fn key(&mut self, key: KeyEvent, page: u16) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
+        }
+        if self.lifecycle_confirm.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.lifecycle_confirm = None;
+                    self.notice = Some("Archive/restore cancelled; board unchanged.".into());
+                }
+                KeyCode::Enter if key.kind != KeyEventKind::Repeat => {
+                    let action = self.lifecycle_confirm.take().unwrap();
+                    if self.action_current(&action) {
+                        self.pending_lifecycle = Some(action);
+                    } else {
+                        self.notice = Some(
+                            "Board changed; confirmation cancelled. Inspect and confirm again."
+                                .into(),
+                        );
+                    }
+                }
+                _ => (),
+            }
+            return false;
+        }
+        if self.lifecycle_busy() {
+            if key.code == KeyCode::Char('d')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && self.lifecycle_uncertain.is_some()
+            {
+                self.lifecycle_uncertain = None;
+                self.notice = Some("Uncertain lifecycle tracking explicitly released; prior action may have committed. Inspect board before a new action.".into());
+                return false;
+            }
+            // Inspect/scroll/copy remain available; no new navigation or writes.
+            if matches!(
+                key.code,
+                KeyCode::Char('a' | 'b' | 'q')
+                    | KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Char(' ')
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+            ) && !(self.copy_focus
+                && matches!(
+                    key.code,
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter | KeyCode::Char(' ')
+                ))
+            {
+                self.notice = Some("Archive/restore pending or uncertain. Inspect originating board; Ctrl-D releases uncertain tracking explicitly.".into());
+                return false;
+            }
         }
         let frozen_copy_key = self.editor.is_none()
             && self.picker.is_none()
@@ -1348,10 +1640,12 @@ impl View {
                 self.retained_cursor = Some(key.clone());
                 self.editor = self.message_drafts.remove(&key);
                 self.selected = self.editor.as_ref().and_then(|editor| {
-                    let key = editor.control.message_key(&editor.base.name);
-                    self.controls
-                        .iter()
-                        .position(|control| control.message_key(self.board.as_str()) == key)
+                    let key = editor.control.message_key(&editor.base.control_scope());
+                    self.controls.iter().position(|control| {
+                        self.snapshot.as_ref().is_some_and(|snapshot| {
+                            control.message_key(&snapshot.control_scope()) == key
+                        })
+                    })
                 });
                 self.notice = Some("Retained draft reopened for its original target. Ctrl-R reviews current input; Ctrl-X explicitly discards.".into());
             }
@@ -1364,15 +1658,22 @@ impl View {
             if !self.message_drafts.values().any(|editor| editor.in_flight) {
                 let uncertain = self.message_drafts.values().any(|editor| editor.uncertain);
                 self.message_drafts.clear();
+                let save_uncertain = self.uncertain_save.take().is_some();
                 self.retained_cursor = None;
-                self.notice = Some(if uncertain {
+                self.notice = Some(if uncertain || save_uncertain {
                     "Drafts and retry tracking discarded. Previous submissions may have been accepted; inspect message history before resending."
                 } else { "All retained message drafts discarded; board unchanged." }.into());
             }
             return false;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.has_message_drafts() {
+            if self.lifecycle_busy()
+                || self.editor.is_some()
+                || self.saving
+                || self.pending.is_some()
+                || self.uncertain_save.is_some()
+                || self.has_message_drafts()
+            {
                 self.notice = Some(
                     "Unsent message drafts retained. Send them or Ctrl-D discards all; then quit."
                         .into(),
@@ -1389,8 +1690,10 @@ impl View {
                 KeyCode::PageUp => self.scroll.0 = self.scroll.0.saturating_sub(page.max(1)),
                 KeyCode::PageDown => self.scroll.0 = self.scroll.0.saturating_add(page.max(1)),
                 KeyCode::Esc => {
+                    let uncertain = self.editor.as_ref().is_some_and(|editor| editor.uncertain);
                     self.editor = None;
-                    self.notice = Some("Draft cancelled; board unchanged.".into());
+                    self.uncertain_save = None;
+                    self.notice = Some(if uncertain { "Draft explicitly discarded. Previous save may have committed; inspect board before editing." } else { "Draft cancelled; board unchanged." }.into());
                 }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.prepare_save()
@@ -1398,14 +1701,26 @@ impl View {
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.rebase_editor()
                 }
+                _ if self.editor.as_ref().is_some_and(|editor| editor.uncertain) => self.notice = Some("Save outcome uncertain; draft retained. Inspect the board before explicitly discarding with Esc.".into()),
                 _ => self.editor.as_mut().unwrap().key(key),
             }
             return false;
         }
         if self.picker.is_some() {
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                self.picker_archived = !self.picker_archived;
+                self.picker_epoch = self.picker_epoch.wrapping_add(1);
+                self.picker = Some((Vec::new(), 0));
+                self.pick_requested = true;
+                return false;
+            }
             let (boards, selected) = self.picker.as_mut().unwrap();
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.picker = None;
+                    self.pick_requested = false;
+                    self.picker_epoch = self.picker_epoch.wrapping_add(1);
+                }
                 KeyCode::Down | KeyCode::Char('j') if !boards.is_empty() => {
                     *selected = (*selected + 1) % boards.len()
                 }
@@ -1467,9 +1782,9 @@ impl View {
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
-            if self.has_message_drafts() {
+            if self.uncertain_save.is_some() || self.has_message_drafts() {
                 self.notice = Some(
-                    "Unsent message drafts retained. Send them or Ctrl-D discards all; then quit."
+                    "Uncertain saves or unsent drafts retained. Inspect, then Ctrl-D explicitly discards tracking before quitting."
                         .into(),
                 );
                 return false;
@@ -1477,10 +1792,27 @@ impl View {
             return true;
         }
         match key.code {
-            KeyCode::Char('b') if !self.saving => {
+            KeyCode::Char('a') => self.confirm_lifecycle(false),
+            KeyCode::Char('r')
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.writable()) =>
+            {
+                self.confirm_lifecycle(true)
+            }
+            KeyCode::Char('b')
+                if !self.saving
+                    && self.pending.is_none()
+                    && self.pending_message.is_none()
+                    && self.uncertain_save.is_none()
+                    && !self.lifecycle_busy() =>
+            {
                 if self.has_message_drafts() {
                     self.notice = Some("Send or discard message drafts before switching boards. Ctrl-D discards all; continue editing to cancel navigation.".into());
                 } else {
+                    self.picker_archived = false;
+                    self.picker_epoch = self.picker_epoch.wrapping_add(1);
                     self.pick_requested = true;
                 }
             }
@@ -1505,6 +1837,13 @@ impl View {
             }
             KeyCode::Char(' ') if !self.saving => self.toggle(),
             KeyCode::Enter if !self.saving => {
+                if !self.writable() {
+                    self.notice = Some(
+                        "Board is read-only; retained drafts remain recoverable with Ctrl-E."
+                            .into(),
+                    );
+                    return false;
+                }
                 if let (Some(index), Some(base)) = (self.selected, self.snapshot.as_ref()) {
                     let control = self.controls[index].clone();
                     if matches!(control.kind, Kind::Message { .. }) {
@@ -1594,7 +1933,11 @@ impl View {
         });
     }
     fn mouse(&mut self, event: MouseEvent) -> (bool, Option<String>) {
-        if !self.mouse_enabled || self.picker.is_some() || self.owner_details {
+        if !self.mouse_enabled
+            || self.picker.is_some()
+            || self.lifecycle_confirm.is_some()
+            || self.owner_details
+        {
             return (false, None);
         }
         let point = Position::new(event.column, event.row);
@@ -1687,6 +2030,10 @@ impl View {
         }
     }
     fn toggle(&mut self) {
+        if !self.writable() {
+            self.notice = Some("Board is read-only; checkbox unchanged.".into());
+            return;
+        }
         if let (Some(index), Some(base)) = (self.selected, self.snapshot.as_ref())
             && matches!(self.controls[index].kind, Kind::Checkbox { .. })
         {
@@ -1704,14 +2051,18 @@ impl View {
         }
     }
     fn prepare_save(&mut self) {
+        if self.editor.as_ref().is_some_and(|editor| editor.uncertain) {
+            self.notice = Some("Previous save outcome uncertain; inspect board, then explicitly discard the draft before a new save.".into());
+            return;
+        }
         let Some(editor) = &self.editor else {
             return;
         };
-        if self
-            .snapshot
-            .as_ref()
-            .is_none_or(|snapshot| snapshot.revision != editor.base.revision)
-        {
+        if self.snapshot.as_ref().is_none_or(|snapshot| {
+            !snapshot.writable()
+                || snapshot.control_scope() != editor.base.control_scope()
+                || snapshot.revision != editor.base.revision
+        }) {
             self.notice = Some("Board changed; draft retained. Review latest board; Ctrl-R rebases an unchanged field.".into());
             return;
         }
@@ -1734,10 +2085,17 @@ impl View {
         let (Some(editor), Some(snapshot)) = (&mut self.editor, &self.snapshot) else {
             return;
         };
-        let Kind::Text { id, value, .. } = &editor.control.kind else {
+        if editor.uncertain
+            || !snapshot.writable()
+            || snapshot.control_scope() != editor.base.control_scope()
+        {
+            self.notice = Some("Board lifecycle changed or is read-only; original response draft retained. Cannot rebase across archive or restore.".into());
             return;
-        };
-        let current = self.controls.iter().find(|control| matches!(&control.kind, Kind::Text { id: other, value: latest, .. } if other == id && latest == value));
+        }
+        let key = editor.control.text_rebase_key(&editor.base.control_scope());
+        let current = self.controls.iter().find(|control| {
+            key.is_some() && control.text_rebase_key(&snapshot.control_scope()) == key
+        });
         if let Some(control) = current {
             editor.base = snapshot.clone();
             editor.control = control.clone();
@@ -1762,17 +2120,34 @@ impl View {
         self.saving = false;
         match result {
             Ok((snapshot, applied)) => {
-                self.update(Ok(snapshot));
+                let lifecycle_changed = self.snapshot.as_ref().is_some_and(|current| {
+                    !current.writable() || current.control_scope() != save.base.control_scope()
+                });
+                // A late save receipt must not roll back a newer lifecycle/read.
+                if self.snapshot.as_ref().is_none_or(|current| {
+                    current.revision == save.base.revision
+                        && current.control_scope() == save.base.control_scope()
+                }) {
+                    self.update(Ok(snapshot));
+                }
                 if applied {
-                    if save.text {
-                        self.editor = None;
+                    if save.text && lifecycle_changed {
+                        self.notice = Some("Earlier response save accepted, but board lifecycle changed. Original draft retained; cannot rebase or save it into the current lifecycle. Esc explicitly discards.".into());
+                    } else {
+                        if save.text {
+                            self.editor = None;
+                        }
+                        self.notice = Some(if lifecycle_changed { "Earlier checkbox save accepted before the board lifecycle changed. Current board retained; no new write sent." } else { "Response saved to Markdown." }.into());
                     }
-                    self.notice = Some("Response saved to Markdown.".into());
                 } else {
                     self.notice = Some(if save.text { "Save conflict; draft retained. Review board; Ctrl-R rebases an unchanged field." } else { "Board changed; checkbox was not toggled. Review and select it again." }.into());
                 }
             }
             Err(error) => {
+                self.uncertain_save = Some(save);
+                if let Some(editor) = &mut self.editor {
+                    editor.uncertain = true;
+                }
                 self.notice = Some(format!(
                     "Save result uncertain: {error:#}. Refresh and inspect the board before retrying; draft retained."
                 ));
@@ -1835,9 +2210,10 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "The board viewer needs an interactive terminal; use board --raw to print Markdown"
     );
-    let initial: Snapshot =
-        serde_json::from_value(broker::rpc(&state_dir, &Request::board_read(board.clone())).await?)
-            .context("Invalid board snapshot from broker")?;
+    let initial: Snapshot = serde_json::from_value(
+        broker::rpc(&state_dir, &Request::board_inspect(board.clone())).await?,
+    )
+    .context("Invalid board snapshot from broker")?;
     ensure!(
         initial.name == board.as_str(),
         "Broker returned a different board"
@@ -1853,9 +2229,11 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
     let (writes, mut write_requests) = mpsc::channel::<Save>(1);
     let (messages, mut message_requests) = mpsc::channel::<Submission>(1);
     let (selection, current_selection) = tokio::sync::watch::channel((board.clone(), 0u64));
-    let (lists, mut list_requests) = mpsc::channel::<()>(1);
+    let (lists, mut list_requests) = mpsc::channel::<(bool, u64)>(1);
+    let (lifecycle, mut lifecycle_requests) = mpsc::channel::<LifecycleAction>(1);
     enum Update {
-        List(Name, u64, Result<Vec<Summary>>),
+        List(Name, u64, bool, u64, Result<Vec<Summary>>),
+        Lifecycle(LifecycleAction, Result<Snapshot>),
         Read(Name, u64, Result<Snapshot>, Option<String>),
         Saved(Save, Result<(Snapshot, bool)>),
         Message(Submission, Result<serde_json::Value>),
@@ -1866,6 +2244,16 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
         loop {
             let update = tokio::select! {
                 biased;
+                action = lifecycle_requests.recv() => {
+                    let Some(action) = action else { break; };
+                    let result = async {
+                        let board: Name = action.base.name.parse()?;
+                        let expected_revision = action.base.revision.clone();
+                        let request = if action.restore { Request::BoardRestore { board, expected_revision } } else { Request::BoardArchive { board, expected_revision } };
+                        serde_json::from_value::<Snapshot>(broker::rpc(&state, &request).await?).context("Invalid archive/restore receipt")
+                    }.await;
+                    Update::Lifecycle(action, result)
+                }
                 message = message_requests.recv() => {
                     let Some(request) = message else { break; };
                     let result = broker::rpc(&state, &Request::BoardMessageSend { request: request.clone() }).await;
@@ -1883,10 +2271,11 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     Update::Saved(save, result)
                 }
                 request = list_requests.recv() => {
-                    if request.is_none() { break; }
+                    let Some((archived, epoch)) = request else { break; };
                     let (board, generation) = current_selection.borrow().clone();
-                    Update::List(board, generation, async {
-                        let value = broker::rpc(&state, &Request::BoardList).await?;
+                    Update::List(board, generation, archived, epoch, async {
+                        let request = if archived { Request::BoardArchivedList } else { Request::BoardList };
+                        let value = broker::rpc(&state, &request).await?;
                         serde_json::from_value(value).context("Invalid board list from broker")
                     }.await)
                 }
@@ -1894,7 +2283,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     if request.is_none() { break; }
                     let (board, generation) = current_selection.borrow().clone();
                     let result = async {
-                        let value = broker::rpc(&state, &Request::board_read(board.clone())).await?;
+                        let value = broker::rpc(&state, &Request::board_inspect(board.clone())).await?;
                         serde_json::from_value::<Snapshot>(value).context("Invalid board snapshot from broker")
                     }.await;
                     // Availability is broker-owned cached metadata. Reading it
@@ -1936,7 +2325,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     if let Some(text) = view.pending_copy.take() { view.send_copy(&text); }
                     if view.pick_requested {
                         view.pick_requested = false;
-                        let _ = lists.try_send(());
+                        if lists.try_send((view.picker_archived, view.picker_epoch)).is_err() { view.pick_requested = true; view.notice = Some("Board catalog request pending…".into()); }
                     }
                     if previous_generation != view.generation {
                         selection.send_replace((view.board.clone(), view.generation));
@@ -1951,6 +2340,10 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                         }
                     }
                     if key.code == KeyCode::Char('r') && view.editor.is_none() { let _ = refresh.try_send(()); }
+                    if let Some(action) = view.pending_lifecycle.take() {
+                        view.lifecycle_flight = Some(action.clone());
+                        if lifecycle.try_send(action.clone()).is_err() { view.lifecycle_result(action, Err(anyhow::anyhow!("Lifecycle worker unavailable"))); }
+                    }
                     if let Some(request) = view.pending_message.take()
                         && messages.try_send(request.clone()).is_err() {
                         view.message_result(request, Err(anyhow::anyhow!("Submission worker unavailable")));
@@ -1971,14 +2364,18 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                 Some(Err(error)) => return Err(error).context("Cannot read terminal input"),
                 None => break,
             },
-            _ = fallback.tick() => { let _ = refresh.try_send(()); },
+            _ = fallback.tick() => {
+                let _ = refresh.try_send(());
+                if view.pick_requested && lists.try_send((view.picker_archived, view.picker_epoch)).is_ok() { view.pick_requested = false; }
+            },
             update = results.recv() => {
                 let Some(update) = update else { anyhow::bail!("Board refresh worker stopped"); };
                 let relevant = match &update {
                     Update::Read(board, generation, ..) => board == &view.board && *generation == view.generation,
                     Update::Message(..) => true,
                     Update::Saved(save, _) => save.generation == view.generation && save.base.name == view.board.as_str(),
-                    Update::List(board, generation, _) => board == &view.board && *generation == view.generation && view.editor.is_none() && !view.saving,
+                    Update::List(board, generation, archived, epoch, _) => board == &view.board && *generation == view.generation && *archived == view.picker_archived && *epoch == view.picker_epoch && view.editor.is_none() && !view.saving,
+                    Update::Lifecycle(action, _) => action.generation == view.generation && action.base.name == view.board.as_str(),
                 };
                 if !relevant { continue; }
                 let snapshot = match &update { Update::Read(_, _, Ok(snapshot), _) | Update::Saved(_, Ok((snapshot, _))) => Some(snapshot), _ => None };
@@ -1991,7 +2388,8 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     }
                 }
                 match update {
-                    Update::List(_, _, result) => {
+                    Update::Lifecycle(action, result) => { view.lifecycle_result(action, result); let _ = refresh.try_send(()); dirty = true; },
+                    Update::List(_, _, _, _, result) => {
                         match result {
                             Ok(mut boards) => {
                                 boards.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2029,8 +2427,305 @@ mod tests {
             exists: true,
             last_updated: None,
             last_updated_source: Default::default(),
+            lifecycle: Default::default(),
+            file_identity: None,
         }
     }
+    fn lifecycle_snapshot(
+        markdown: &str,
+        revision: &str,
+        generation: &str,
+        state: LifecycleState,
+    ) -> Snapshot {
+        let mut value = snapshot(markdown, revision);
+        value.name = "project".into();
+        value.lifecycle.incarnation = Some("00000000-0000-4000-8000-000000000002".into());
+        value.lifecycle.lifecycle_generation = Some(generation.into());
+        value.lifecycle.state = state;
+        if !value.writable() {
+            value.lifecycle.archived_at = Some(1_768_435_200_000);
+            value.lifecycle.expires_at = Some(1_771_027_200_000);
+        }
+        value
+    }
+    #[test]
+    fn lifecycle_confirmation_is_explicit_pinned_and_main_is_protected() {
+        let mut main = View::default();
+        main.update(Ok(snapshot("# Main", "one")));
+        press(&mut main, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(main.lifecycle_confirm.is_none());
+        assert!(main.notice.as_deref().unwrap().contains("protected"));
+        let mut view = View {
+            board: "project".parse().unwrap(),
+            ..View::default()
+        };
+        view.update(Ok(lifecycle_snapshot(
+            "same bytes",
+            "one",
+            "first",
+            LifecycleState::Active,
+        )));
+        press(&mut view, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(
+            view.lifecycle_confirm.as_ref().unwrap().base.revision,
+            "one"
+        );
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(view.pending_lifecycle.is_none());
+        press(&mut view, KeyCode::Char('a'), KeyModifiers::NONE);
+        view.update(Ok(lifecycle_snapshot(
+            "same bytes",
+            "two",
+            "second",
+            LifecycleState::Active,
+        )));
+        assert!(view.lifecycle_confirm.is_none());
+        assert!(view.pending_lifecycle.is_none());
+        press(&mut view, KeyCode::Char('a'), KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let action = view.pending_lifecycle.take().unwrap();
+        assert_eq!(action.base.revision, "two");
+        assert!(!action.restore);
+        assert!(view.pending_message.is_none());
+    }
+    #[test]
+    fn external_archive_retains_response_and_same_bytes_restore_cannot_rebase() {
+        let markdown = field("answer");
+        let mut view = View {
+            board: "project".parse().unwrap(),
+            ..View::default()
+        };
+        view.update(Ok(lifecycle_snapshot(
+            &markdown,
+            "one",
+            "first",
+            LifecycleState::Active,
+        )));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view.paste(" retained");
+        let old_scope = view.editor.as_ref().unwrap().base.control_scope();
+        view.update(Ok(lifecycle_snapshot(
+            &markdown,
+            "two",
+            "archived",
+            LifecycleState::Archived,
+        )));
+        press(&mut view, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(view.pending.is_none());
+        assert_eq!(view.editor.as_ref().unwrap().draft, "answer retained");
+        view.update(Ok(lifecycle_snapshot(
+            &markdown,
+            "three",
+            "restored",
+            LifecycleState::Active,
+        )));
+        press(&mut view, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut view, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(view.pending.is_none());
+        assert_eq!(
+            view.editor.as_ref().unwrap().base.control_scope(),
+            old_scope
+        );
+        assert!(!view.switch(Name::default()));
+    }
+    #[test]
+    fn archived_message_only_recovers_exact_uncertain_request_and_keeps_old_draft_scope() {
+        let markdown = message_field("coordinator", "alpha");
+        let mut view = View {
+            board: "project".parse().unwrap(),
+            ..View::default()
+        };
+        view.update(Ok(lifecycle_snapshot(
+            &markdown,
+            "one",
+            "first",
+            LifecycleState::Active,
+        )));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view.paste("exact message");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let original = view.pending_message.take().unwrap();
+        view.message_result(original.clone(), Err(anyhow::anyhow!("timeout")));
+        let draft_key = View::draft_key(view.editor.as_ref().unwrap());
+        view.update(Ok(lifecycle_snapshot(
+            &markdown,
+            "two",
+            "archived",
+            LifecycleState::Archived,
+        )));
+        press(&mut view, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let retried = view.pending_message.take().unwrap();
+        assert_eq!(
+            serde_json::to_value(&retried).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        view.message_result(retried, Err(anyhow::anyhow!("still uncertain")));
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(view.message_drafts.contains_key(&draft_key));
+        view.update(Ok(lifecycle_snapshot(
+            &markdown,
+            "three",
+            "restored",
+            LifecycleState::Active,
+        )));
+        view.open_message(view.controls[0].clone());
+        assert!(view.editor.as_ref().unwrap().draft.is_empty());
+        assert!(view.message_drafts.contains_key(&draft_key));
+    }
+    #[test]
+    fn lifecycle_phase_refreshes_and_late_save_cannot_replace_archived_snapshot() {
+        let markdown = field("answer");
+        let mut view = View {
+            board: "project".parse().unwrap(),
+            ..View::default()
+        };
+        let active = lifecycle_snapshot(&markdown, "one", "first", LifecycleState::Active);
+        view.update(Ok(active.clone()));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view.paste(" saved");
+        view.prepare_save();
+        let save = view.pending.take().unwrap();
+        let accepted =
+            lifecycle_snapshot(&save.markdown, "accepted", "first", LifecycleState::Active);
+        let archived =
+            lifecycle_snapshot(&save.markdown, "two", "archived", LifecycleState::Archived);
+        view.update(Ok(archived.clone()));
+        view.saved(save, Ok((accepted, true)));
+        assert_eq!(view.editor.as_ref().unwrap().draft, "answer saved");
+        assert_eq!(
+            view.editor.as_ref().unwrap().base.control_scope(),
+            active.control_scope()
+        );
+        assert!(
+            view.notice
+                .as_deref()
+                .unwrap()
+                .contains("Original draft retained")
+        );
+        assert_eq!(
+            view.snapshot.as_ref().unwrap().control_scope(),
+            archived.control_scope()
+        );
+        assert!(!view.writable());
+        let mut purging = archived;
+        purging.lifecycle.state = LifecycleState::Purging;
+        assert!(view.update(Ok(purging)));
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE); // Explicitly discard retained draft.
+        press(&mut view, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(view.lifecycle_confirm.is_none());
+    }
+
+    #[test]
+    fn accepted_late_save_retains_draft_after_same_bytes_restore_or_recreation() {
+        for recreated in [false, true] {
+            let mut view = View {
+                board: "project".parse().unwrap(),
+                ..View::default()
+            };
+            let active =
+                lifecycle_snapshot(&field("answer"), "one", "first", LifecycleState::Active);
+            view.update(Ok(active.clone()));
+            press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+            press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+            view.paste(" saved");
+            view.prepare_save();
+            let save = view.pending.take().unwrap();
+            let receipt =
+                lifecycle_snapshot(&save.markdown, "accepted", "first", LifecycleState::Active);
+            let mut current =
+                lifecycle_snapshot(&save.markdown, "restored", "next", LifecycleState::Active);
+            if recreated {
+                current.lifecycle.incarnation = Some("00000000-0000-4000-8000-000000000003".into());
+            }
+            view.update(Ok(current.clone()));
+            view.saved(save, Ok((receipt, true)));
+            let editor = view
+                .editor
+                .as_ref()
+                .expect("late old receipt must retain original draft");
+            assert_eq!(editor.draft, "answer saved");
+            assert_eq!(editor.base.control_scope(), active.control_scope());
+            assert_eq!(
+                view.snapshot.as_ref().unwrap().control_scope(),
+                current.control_scope()
+            );
+            assert!(view.pending.is_none());
+            press(&mut view, KeyCode::Char('r'), KeyModifiers::CONTROL);
+            press(&mut view, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(view.pending.is_none());
+            assert_eq!(view.editor.as_ref().unwrap().draft, "answer saved");
+            assert_eq!(
+                view.editor.as_ref().unwrap().base.control_scope(),
+                active.control_scope()
+            );
+            assert!(!view.switch(Name::default()));
+            press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(view.editor.is_none());
+        }
+    }
+
+    #[test]
+    fn uncertain_checkbox_blocks_archive_navigation_until_explicit_tracking_discard() {
+        let mut view = View {
+            board: "project".parse().unwrap(),
+            ..View::default()
+        };
+        view.update(Ok(lifecycle_snapshot(
+            "- [ ] check",
+            "one",
+            "first",
+            LifecycleState::Active,
+        )));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        view.toggle();
+        let save = view.pending.take().unwrap();
+        view.saved(save, Err(anyhow::anyhow!("receipt lost")));
+        assert!(view.uncertain_save.is_some());
+        assert!(!view.switch(Name::default()));
+        view.confirm_lifecycle(false);
+        assert!(view.lifecycle_confirm.is_none());
+        assert!(!view.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 10));
+        press(&mut view, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(view.uncertain_save.is_none());
+        view.confirm_lifecycle(false);
+        assert!(view.lifecycle_confirm.is_some());
+    }
+    #[test]
+    fn restore_confirmation_expires_on_phase_refresh_and_picker_cancel_invalidates_epoch() {
+        let mut view = View {
+            board: "project".parse().unwrap(),
+            ..View::default()
+        };
+        let mut archived = lifecycle_snapshot("same", "one", "archived", LifecycleState::Archived);
+        view.update(Ok(archived.clone()));
+        view.confirm_lifecycle(true);
+        assert!(view.lifecycle_confirm.is_some());
+        archived.lifecycle.state = LifecycleState::Purging;
+        view.update(Ok(archived));
+        assert!(view.lifecycle_confirm.is_none());
+        view.confirm_lifecycle(true);
+        assert!(view.lifecycle_confirm.is_none());
+        view.picker = Some((Vec::new(), 0));
+        view.pick_requested = true; // A full catalog channel scheduled a fallback retry.
+        let epoch = view.picker_epoch;
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(view.picker.is_none());
+        assert_ne!(view.picker_epoch, epoch);
+        assert!(
+            !view.pick_requested,
+            "cancel must not enqueue a new-epoch fallback request"
+        );
+        view.picker = Some((Vec::new(), 0));
+        view.pick_requested = true;
+        assert!(!view.switch(view.board.clone()));
+        assert!(view.picker.is_none());
+        assert!(!view.pick_requested, "same-board close cancels retry too");
+    }
+
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -3432,6 +4127,7 @@ mod tests {
                 revision: "two".into(),
                 last_updated: None,
                 last_updated_source: Default::default(),
+                lifecycle: Default::default(),
             }],
             0,
         ));
@@ -3449,6 +4145,7 @@ mod tests {
                 revision: "two".into(),
                 last_updated: None,
                 last_updated_source: Default::default(),
+                lifecycle: Default::default(),
             }],
             0,
         ));
@@ -3520,7 +4217,9 @@ mod tests {
                 board: board.clone(),
             })
             .unwrap();
-        let initial = crate::board::read_named(root.path(), &board).unwrap();
+        let initial: Snapshot =
+            serde_json::from_value(broker.request(Request::board_read(board.clone())).unwrap())
+                .unwrap();
         let seeded = broker
             .request(Request::board_update(
                 board.clone(),
@@ -3531,6 +4230,7 @@ mod tests {
                 None,
             ))
             .unwrap();
+        assert_eq!(seeded["applied"], true);
         let socket_path = root.path().join("native.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -3559,6 +4259,10 @@ mod tests {
         });
         broker
             .request(Request::Subscribe {
+                board_revisions: std::collections::BTreeMap::from([(
+                    board.clone(),
+                    seeded["board"]["revision"].as_str().unwrap().to_owned(),
+                )]),
                 agent: "terminal-watcher".into(),
                 events: vec![EventSelector::BoardChanged {
                     board: board.clone(),

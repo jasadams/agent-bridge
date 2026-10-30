@@ -69,7 +69,9 @@ unchanged. See [OpenCode support and limits](opencode.md).
 | Tool | Purpose |
 | --- | --- |
 | `read_board`, `update_board` | Read and atomically edit a local Markdown board with revision checks; optional `board` defaults to `main`. |
-| `list_boards`, `create_board` | List compact board metadata in name order, or explicitly create an empty board using required `board`. |
+| `list_boards`, `create_board` | List active board metadata in name order, or explicitly create an empty board using required `board`. |
+| `list_archived_boards`, `inspect_board` | List archive metadata/deadlines, or explicitly inspect an active or read-only archived board. |
+| `archive_board`, `restore_board` | Archive or restore an exact named board using its current revision; archives permanently expire after 30 days. |
 | `subscribe`, `unsubscribe` | Add/remove explicit local board-change and agent-lifecycle event selectors for an exact registered route. |
 | `connection_status` | Inspect the local broker and peer connections. |
 | `list_agents` | List local sessions by default, or one explicitly selected peer's permitted sessions. |
@@ -101,7 +103,53 @@ Acknowledgement confirms receipt, not task completion or permission.
 Board names are lowercase ASCII slugs matching `[a-z0-9][a-z0-9_-]{0,63}`.
 Call `create_board({"board":"streamr"})` before using a non-main board; duplicates
 never overwrite content and unknown names never fall back to main. `list_boards({})`
-includes lazy, absent `main`, and returns name/existence/revision without Markdown.
+includes lazy, absent `main`, and returns active-board metadata without Markdown.
+Archived names remain reserved; `create_board` fails clearly rather than replacing
+an archive. Normal `read_board` and `update_board` are active-only.
+
+### Archive and restore
+
+Use `list_archived_boards({})` for archive metadata, including `state`, `archived_at`
+and `expires_at`. These dates are UTC Unix milliseconds. Use
+`inspect_board({"board":"streamr"})` to inspect the exact current or read-only
+archived snapshot and obtain its revision. Both lifecycle mutations require
+explicit `board` and `expected_revision`:
+
+```json
+{"board":"streamr","expected_revision":"CURRENT_ACTIVE_REVISION_FOR_ARCHIVE"}
+```
+
+Pass that shape to `archive_board` after reading the active board. For
+`restore_board`, use the current archived revision returned by `inspect_board`.
+`main` cannot be archived. Revision conflicts, archived-name collisions and
+expired restores return clear errors; no operation silently selects `main`,
+overwrites an archive or recreates a missing board.
+
+Archive hides the board from active listings and freezes writes for a fixed
+**30-day (30 × 24 hour)** window. Inspection, reads, restarts and repeated Archive
+do not extend the persisted deadline. Restore before expiry preserves exact
+Markdown and original Last Updated metadata. A new Restore at or after expiry is
+refused even before physical cleanup. The broker performs startup and five-minute
+cleanup, including offline catch-up, and retries failed cleanup while retaining
+the archive record and name reservation. Check `status.board_archives` from
+`connection_status`, or `board_archives` in `agent-bridge status`, for state,
+deadline and `last_error`.
+User-managed external backups are never scanned or deleted by this retention job.
+
+If a lifecycle operation has an ambiguous result, inspect the originating board
+before taking another action. A committed `restoring` operation may need recovery;
+it is read-only until complete. `purging` is irrevocably expired and cannot be
+restored. Do not treat a failed or uncertain operation as successful deletion.
+
+Named snapshots and summaries expose `incarnation`, `lifecycle_generation` and
+`state`, with archive dates when applicable. Revisions and control/rebase keys bind
+that lifecycle identity, so old requests and drafts cannot target an identical
+restored document or a new board reusing the name after purge. Archive invalidates
+watches and pending board notices; Restore does not revive them. Read the current
+board and explicitly subscribe again. Archive/Restore send no agent messages or
+approval and do not cancel messages already accepted. Accepted-message receipt
+readback remains idempotent; new sends from archived controls are refused.
+See [board retention and recovery](board.md#archive-and-restore).
 
 ### Event subscriptions
 
@@ -120,6 +168,20 @@ mode. No compatibility aliases for the removed board-specific tools remain.
 Board selectors require explicit existing local names; unknown events, mixed or
 unknown fields, empty explicit lists, invalid boards and excessive selectors fail.
 There is no wildcard or automatic opt-in.
+
+For each named `board.changed` selector, read the active board and supply its
+current revision in `board_revisions` on both `subscribe` and selector-specific
+`unsubscribe`:
+
+```json
+{"agent":"coordinator-route","events":[{"event":"board.changed","board":"streamr"}],"board_revisions":{"streamr":"CURRENT_REVISION_FROM_READ_BOARD"}}
+```
+
+Missing or stale named-board fences fail without changing the subscription.
+`main` selectors retain compatibility and may omit this map. Unsubscribe-all
+(`events` omitted) may also omit it. Archive removes the board's watches; restoring
+it requires a fresh read and subscription with its new revision. CLI subscription
+commands obtain the current named-board fence automatically.
 
 Equivalent CLI commands accept a JSON selector array:
 

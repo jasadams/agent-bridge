@@ -308,6 +308,7 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
                       if (mode==='oversized') return {boards:Array(257).fill(value.boards[0])};
                       if (mode==='hang') await new Promise((resolve,reject) => {
                         options.signal.addEventListener('abort',()=>{s.aborted++;reject(new DOMException('Aborted','AbortError'));},{once:true});
+                        window.__catHangReady = true;
                       });
                       return value;
                     } finally { s.flight--; s.completed++; }
@@ -358,8 +359,10 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
             completed += 1
             twait("n=>window.__catStats.completed===n", arg=completed)
             expect(p.locator("#board-catalog-feedback")).to_be_hidden()
-            p.evaluate("window.__catMode='hang';window.dispatchEvent(new Event('online'))")
-            twait("window.__catStats.flight===1")
+            p.evaluate("window.__catHangReady=false;window.__catMode='hang';window.dispatchEvent(new Event('online'))")
+            # HTTP/decode readiness is independent of the paused browser clock.
+            # Advance the timeout only after the injected hang can observe abort.
+            twait("window.__catHangReady===true && window.__catStats.flight===1")
             count = p.evaluate("window.__catStats.starts.length")
             p.evaluate("for(let i=0;i<20;i++)window.dispatchEvent(new Event('online'))")
             p.clock.run_for(3999)
