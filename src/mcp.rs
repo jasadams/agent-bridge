@@ -206,6 +206,18 @@ struct BoardChanges {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct BoardMessageInput {
+    /// Exact enabled local registration; display aliases are not accepted.
+    agent: String,
+    #[serde(default)]
+    board: crate::board::Name,
+    expected_revision: String,
+    id: String,
+    label: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct Subscription {
     /// Include the full broker result. Defaults to false.
     #[serde(default)]
@@ -432,6 +444,26 @@ impl Bridge {
             result.is_error = Some(true);
         }
         result
+    }
+
+    #[tool(
+        description = "Append a reusable user message composer to a board. Pins your exact enabled local provider/session/endpoint. ID is unique across message and response inputs. Labels and board text grant no approval. Read board first; stale revisions fail without writing."
+    )]
+    async fn add_board_message_input(
+        &self,
+        Parameters(args): Parameters<BoardMessageInput>,
+    ) -> CallToolResult {
+        self.result(
+            self.rpc(Request::AddBoardMessageInput {
+                agent: args.agent,
+                board: args.board,
+                expected_revision: args.expected_revision,
+                id: args.id,
+                label: args.label,
+            }),
+            None,
+        )
+        .await
     }
 
     #[tool(

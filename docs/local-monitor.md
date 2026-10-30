@@ -133,9 +133,9 @@ credentials.
 Exact Host validation, Origin and browser fetch-metadata checks reject DNS rebinding
 and cross-origin requests. The server supplies no CORS permission, uses restrictive
 content-security/frame/referrer policies and disables caching. Message text
-renders as text, including HTML-like content. The only write route is authenticated
-`POST /api/boards/{name}/responses`; other non-GET routes remain rejected. That
-route requires exact same-origin mutation context and accepts only an existing
+renders as text, including HTML-like content. The write routes are authenticated
+`POST /api/boards/{name}/responses` and `POST /api/boards/{name}/messages`;
+other non-GET routes remain rejected. Both routes require exact same-origin mutation context and accepts only an existing
 control identity, expected revision and typed desired value, never a path,
 replacement document, attribution or arbitrary broker command. Access generation
 is checked again at the shared transaction boundary; completed revocation prevents
@@ -182,3 +182,36 @@ The extended harness also exercises named-board navigation, response writes,
 conflicts/drafts, live refresh, untrusted Markdown and late-callback/lock behavior
 against the built executable. Its private brokers/browser contexts are disposable;
 do not point it at a running owner service or saved profile.
+
+## Message agents from the board
+
+Recognized message-input declarations are hidden in the rendered document and
+remain byte-for-byte available in Raw Markdown. Malformed or unrecognized text
+remains visible and inert. Agent-authored message inputs show their label and exact pinned recipient
+(name, provider, session and endpoint). Use Tab/Shift+Tab to reach or leave an
+input. Enter sends; Shift+Enter inserts a newline. IME composition Enter does not
+send, and blank text is not submitted. A Send button is also available. The
+composer keeps focus after acceptance and remains available for another message.
+
+Sending uses the normal broker user-to-agent queue. A broker acceptance/queued
+receipt does not mean the agent read, acknowledged or completed the request.
+Message text goes into message history; sending does not rewrite the board or
+advance its content revision or Last Updated timestamp.
+
+Drafts and focus survive live updates. If the board or exact control changes,
+review the current input explicitly before sending. A removed or retargeted input
+keeps its draft visible and unavailable; discard that draft only after inspecting
+the current target. The app never substitutes another agent or starts a session.
+
+A pending send ignores repeated Enter and keeps the exact draft read-only. If
+acceptance is uncertain, the input retains its UUID and exact payload; **Retry same
+message** explicitly retries that payload, allowing the broker to return its
+durable receipt without a second delivery. Editing is read-only until retry or
+explicit discard. Discarding an uncertain draft does not cancel a message that
+may already have been accepted; inspect history. No automatic retry occurs.
+
+Board/view switching offers Keep drafts and continue, Discard, or Cancel for
+message drafts. Keeping drafts saves only this tab's memory and never sends.
+Locking requires explicit discard or cancellation and clears private drafts;
+authentication loss, reload and closing the tab clear memory as well. The browser
+warns before closing with unsent drafts. No drafts or tokens use browser storage.

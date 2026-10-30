@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -184,6 +184,10 @@ UPDATE messages SET state='uncertain',detail='Legacy OpenCode queue has no durab
         tx.execute_batch("CREATE TABLE codex_notices(id TEXT PRIMARY KEY REFERENCES messages(id));
 UPDATE messages SET state='blocked',detail='Original native provider is unknown; no automatic Codex submission is safe. Inspect and resolve native and broker history before considering any new message; the old native attempt may still execute' WHERE state='queued' AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=messages.id) AND EXISTS(SELECT 1 FROM agents a JOIN message_context c ON c.id=messages.id WHERE a.name=messages.recipient AND a.provider='codex' AND a.session=messages.recipient_session AND json_extract(c.destination,'$.provider') IS NULL);")?;
         tx.pragma_update(None, "user_version", 14)?;
+    }
+    if version < 15 {
+        tx.execute_batch("CREATE TABLE board_message_receipts(id TEXT PRIMARY KEY REFERENCES messages(id),submission TEXT NOT NULL,owner TEXT NOT NULL,receipt TEXT NOT NULL);")?;
+        tx.pragma_update(None, "user_version", 15)?;
     }
     tx.commit()?;
     Ok(())

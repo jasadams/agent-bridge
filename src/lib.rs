@@ -3,6 +3,7 @@ mod board_clipboard;
 mod board_code_copy;
 pub mod board_interaction;
 mod board_links;
+pub mod board_messages;
 mod board_notifications;
 mod board_selection;
 pub mod board_tui;

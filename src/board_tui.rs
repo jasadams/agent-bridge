@@ -2,6 +2,7 @@
 use crate::{
     board::{Edit, MAX_BOARD_BYTES, Name, Snapshot, Summary},
     board_interaction::{self, Control, Kind},
+    board_messages::Submission,
     board_selection::{Selection, Viewport},
     broker,
     protocol::Request,
@@ -21,10 +22,10 @@ use ratatui::{
     layout::{Constraint, Layout, Position},
     style::{Color, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::IsTerminal,
     path::{Path, PathBuf},
     time::Duration,
@@ -262,8 +263,9 @@ fn rendered_board(
     Text<'static>,
     Vec<String>,
 ) {
-    let prepared = crate::board_code_copy::Prepared::new(markdown);
-    let safe = safe_markdown(markdown);
+    let display = board_interaction::display_markdown(markdown);
+    let prepared = crate::board_code_copy::Prepared::new(display.as_ref());
+    let safe = safe_markdown(display.as_ref());
     let lines = safe.lines().count();
     let columns = safe
         .lines()
@@ -392,11 +394,15 @@ struct Save {
     markdown: String,
     text: bool,
 }
+#[derive(Clone)]
 struct Editor {
     base: Snapshot,
     control: Control,
     draft: String,
     cursor: usize,
+    submission: Option<Submission>,
+    in_flight: bool,
+    uncertain: bool,
 }
 impl Editor {
     fn key(&mut self, key: KeyEvent) {
@@ -514,6 +520,11 @@ struct View {
     editor: Option<Editor>,
     pending: Option<Save>,
     saving: bool,
+    message_drafts: BTreeMap<String, Editor>,
+    pending_message: Option<Submission>,
+    owner_details: bool,
+    owner_scroll: u16,
+    retained_cursor: Option<String>,
     notice: Option<String>,
     update_notice: Option<String>,
     viewport: Option<Viewport>,
@@ -549,6 +560,11 @@ impl Default for View {
             editor: None,
             pending: None,
             saving: false,
+            message_drafts: BTreeMap::new(),
+            pending_message: None,
+            owner_details: false,
+            owner_scroll: 0,
+            retained_cursor: None,
             notice: None,
             update_notice: None,
             viewport: None,
@@ -558,8 +574,271 @@ impl Default for View {
     }
 }
 impl View {
+    fn has_message_drafts(&self) -> bool {
+        self.editor.as_ref().is_some_and(|editor| {
+            matches!(editor.control.kind, Kind::Message { .. })
+                && (!editor.draft.is_empty() || editor.in_flight || editor.submission.is_some())
+        }) || self.message_drafts.values().any(|editor| {
+            !editor.draft.is_empty() || editor.in_flight || editor.submission.is_some()
+        })
+    }
+    fn draft_key(editor: &Editor) -> String {
+        let Kind::Message { id, instance, .. } = &editor.control.kind else {
+            unreachable!()
+        };
+        format!("{}:{id}:{instance}", editor.base.name)
+    }
+    fn retain_message(&mut self) {
+        if let Some(editor) = self.editor.take() {
+            self.message_drafts.insert(Self::draft_key(&editor), editor);
+        }
+    }
+    fn open_message(&mut self, control: Control) {
+        let Some(base) = self.snapshot.clone() else {
+            return;
+        };
+        let Kind::Message { id, instance, .. } = &control.kind else {
+            return;
+        };
+        let key = format!("{}:{id}:{instance}", base.name);
+        self.editor = Some(self.message_drafts.remove(&key).unwrap_or(Editor {
+            base,
+            control,
+            draft: String::new(),
+            cursor: 0,
+            submission: None,
+            in_flight: false,
+            uncertain: false,
+        }));
+        self.notice = Some(
+            "Enter sends · Shift-Enter or Ctrl-J newline · Esc retains draft · Ctrl-X discards."
+                .into(),
+        );
+    }
+    fn message_key(&mut self, key: KeyEvent, page: u16) -> bool {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Char('o') && control {
+            self.owner_details = !self.owner_details;
+            self.owner_scroll = 0;
+            return false;
+        }
+        if self.owner_details {
+            match key.code {
+                KeyCode::Esc => self.owner_details = false,
+                KeyCode::Up | KeyCode::PageUp => {
+                    self.owner_scroll = self.owner_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::PageDown => {
+                    self.owner_scroll = self.owner_scroll.saturating_add(1)
+                }
+                KeyCode::Home => self.owner_scroll = 0,
+                _ => (),
+            }
+            return false;
+        }
+        if self.editor.as_ref().unwrap().in_flight {
+            if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                self.scroll.0 = if key.code == KeyCode::PageUp {
+                    self.scroll.0.saturating_sub(page.max(1))
+                } else {
+                    self.scroll.0.saturating_add(page.max(1))
+                };
+            }
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.retain_message();
+                self.notice = Some("Message draft retained. Tab/Enter reopens existing inputs; Ctrl-E reopens any retained draft, including removed inputs. Ctrl-D discards all.".into());
+            }
+            KeyCode::Char('x') if control => {
+                let uncertain = self.editor.as_ref().unwrap().uncertain;
+                self.editor = None;
+                self.notice = Some(if uncertain {
+                    "Draft and retry tracking discarded. Previous submission may have been accepted; inspect message history before resending."
+                } else { "Message draft discarded; no accepted submission was confirmed." }.into());
+            }
+            KeyCode::Char('c') if control => {
+                if self.has_message_drafts() {
+                    self.notice = Some("Message draft retained. Ctrl-X discards this draft; Esc then Ctrl-D discards all before quitting.".into());
+                } else {
+                    return true;
+                }
+            }
+            KeyCode::Char('r') if control => self.review_message(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.retain_message();
+                if !self.controls.is_empty() {
+                    let backwards =
+                        key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+                    let index = match (self.selected, backwards) {
+                        (Some(0), true) | (None, true) => self.controls.len() - 1,
+                        (Some(index), true) => (index - 1).min(self.controls.len() - 1),
+                        (Some(index), false) => (index + 1) % self.controls.len(),
+                        (None, false) => 0,
+                    };
+                    self.selected = Some(index);
+                    if matches!(self.controls[index].kind, Kind::Message { .. }) {
+                        self.open_message(self.controls[index].clone());
+                    }
+                }
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if key.kind != KeyEventKind::Repeat {
+                    self.prepare_message();
+                }
+            }
+            KeyCode::PageUp => self.scroll.0 = self.scroll.0.saturating_sub(page.max(1)),
+            KeyCode::PageDown => self.scroll.0 = self.scroll.0.saturating_add(page.max(1)),
+            _ if self.editor.as_ref().unwrap().uncertain => {
+                self.notice = Some("Outcome uncertain: Enter retries the exact message ID/text; Ctrl-X explicitly discards. Editing is locked.".into());
+            }
+            KeyCode::Char('j') if control => self.editor.as_mut().unwrap().insert("\n"),
+            _ => self.editor.as_mut().unwrap().key(key),
+        }
+        false
+    }
+    fn review_message(&mut self) {
+        let (Some(editor), Some(snapshot)) = (&mut self.editor, &self.snapshot) else {
+            return;
+        };
+        if editor.uncertain {
+            self.notice = Some(
+                "Retry the exact pending message before changing its control or revision.".into(),
+            );
+            return;
+        }
+        let key = editor.control.message_key(&editor.base.name);
+        if let Some(current) = self
+            .controls
+            .iter()
+            .find(|control| control.message_key(&snapshot.name) == key)
+        {
+            editor.control = current.clone();
+            editor.base = snapshot.clone();
+            self.notice = Some("Current unchanged message target reviewed. Review the board and draft; Enter explicitly sends.".into());
+        } else {
+            self.notice = Some("Input changed, was retargeted or removed. Draft retained; cannot send it. Ctrl-X discards before selecting a new input.".into());
+        }
+    }
+    fn prepare_message(&mut self) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        if editor.in_flight || self.pending_message.is_some() {
+            return;
+        }
+        if editor.draft.trim().is_empty() {
+            self.notice = Some("Blank messages are not sent; draft retained.".into());
+            return;
+        }
+        // An ambiguous retry retains its original request. A definite rejection
+        // also reuses its UUID while the exact payload/control remains unchanged.
+        if !editor.uncertain {
+            if self
+                .snapshot
+                .as_ref()
+                .is_none_or(|current| current.revision != editor.base.revision)
+            {
+                self.notice = Some("Board changed; draft retained. Ctrl-R explicitly reviews an unchanged input before sending.".into());
+                return;
+            }
+            let control_id = board_interaction::control_id(&editor.base, &editor.control);
+            let same = editor.submission.as_ref().is_some_and(|old| {
+                old.board == self.board
+                    && old.expected_revision == editor.base.revision
+                    && old.control_id == control_id
+                    && old.text == editor.draft
+            });
+            if !same {
+                editor.submission = Some(Submission {
+                    board: self.board.clone(),
+                    expected_revision: editor.base.revision.clone(),
+                    control_id,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    text: editor.draft.clone(),
+                });
+            }
+        }
+        self.pending_message = editor.submission.clone();
+        editor.in_flight = true;
+        self.notice =
+            Some("Submitting user message… draft retained until exact acceptance.".into());
+    }
+    fn accepted_message(editor: &Editor, request: &Submission, value: &serde_json::Value) -> bool {
+        let Kind::Message { owner, .. } = &editor.control.kind else {
+            return false;
+        };
+        value["accepted"] == true
+            && value["id"] == request.id
+            && value["message"]["id"] == request.id
+            && value["message"]["sender"] == "user"
+            && value["message"]["recipient"] == owner.name
+            && value["message"]["recipient_session"] == owner.session
+            && value["message"]["body"] == request.text
+            && editor.draft == request.text
+    }
+    fn message_result(&mut self, request: Submission, result: Result<serde_json::Value>) {
+        let editor = if self.editor.as_ref().is_some_and(|editor| {
+            editor
+                .submission
+                .as_ref()
+                .is_some_and(|old| old.id == request.id)
+        }) {
+            self.editor.as_mut()
+        } else {
+            self.message_drafts.values_mut().find(|editor| {
+                editor
+                    .submission
+                    .as_ref()
+                    .is_some_and(|old| old.id == request.id)
+            })
+        };
+        let Some(editor) = editor else {
+            return;
+        };
+        editor.in_flight = false;
+        match result {
+            Ok(value) if Self::accepted_message(editor, &request, &value) => {
+                editor.draft.clear();
+                editor.cursor = 0;
+                editor.submission = None;
+                editor.uncertain = false;
+                let state = value["state"].as_str().unwrap_or("accepted");
+                self.notice = Some(format!(
+                    "Accepted message {} · {} · not proof of agent acknowledgement or completion.",
+                    request.id,
+                    safe_line(state)
+                ));
+            }
+            Ok(value)
+                if value["accepted"] == false
+                    && matches!(
+                        value["code"].as_str(),
+                        Some("invalid" | "conflict" | "unavailable" | "rejected")
+                    ) =>
+            {
+                editor.uncertain = false;
+                self.notice = Some(format!(
+                    "Message not accepted: {}. Draft retained; review before sending again.",
+                    safe_line(value["error"].as_str().unwrap_or("Rejected"))
+                ));
+            }
+            _ => {
+                editor.uncertain = true;
+                self.notice = Some(format!(
+                    "Submission outcome uncertain. Draft retained; Enter retries exact ID {} without duplicating. Ctrl-X explicitly discards.",
+                    request.id
+                ));
+            }
+        }
+    }
     fn switch(&mut self, board: Name) -> bool {
-        if self.editor.is_some() || self.saving || self.pending.is_some() {
+        if self.editor.is_some()
+            || self.saving
+            || self.pending.is_some()
+            || self.has_message_drafts()
+        {
             return false;
         }
         if self.board == board {
@@ -613,10 +892,18 @@ impl View {
                     self.width = 0;
                     self.clear_copy_focus();
                     self.code_cells.clear();
+                    let composer_key = self
+                        .editor
+                        .as_ref()
+                        .and_then(|editor| editor.control.message_key(&editor.base.name));
                     self.controls = board_interaction::controls(&snapshot.markdown);
-                    // Source positions are only valid for the snapshot selected.
-                    // Insertion/reordering must never silently retarget a response.
-                    self.selected = None;
+                    // Keep focus only for the exact unchanged composer. Source
+                    // positions still reset for ordinary editable responses.
+                    self.selected = composer_key.and_then(|key| {
+                        self.controls.iter().position(|control| {
+                            control.message_key(&snapshot.name).as_ref() == Some(&key)
+                        })
+                    });
                     if self
                         .editor
                         .as_ref()
@@ -824,17 +1111,64 @@ impl View {
                 links_limited = !links.paint(frame.buffer_mut());
             }
         }
-        if let Some(editor) = &self.editor {
-            let title = format!(
-                "Text response: {} · Ctrl-S save · Esc discard · save/discard before b switches · Ctrl-R rebase",
-                safe_line(&editor.control.label)
+        if self.owner_details
+            && let Some(Editor {
+                control:
+                    Control {
+                        kind: Kind::Message { owner, .. },
+                        ..
+                    },
+                ..
+            }) = &self.editor
+        {
+            let details = format!(
+                "Exact pinned owner\nName: {}\nProvider: {}\nSession: {}\nEndpoint: {}\n",
+                safe_line(&owner.name),
+                owner.provider.label(),
+                safe_line(&owner.session),
+                safe_line(&owner.endpoint)
             );
+            let block =
+                Block::bordered().title("Owner · arrows/PgUp/PgDn inspect · Esc/Ctrl-O return");
+            let inner = block.inner(body);
+            let paragraph = Paragraph::new(details).wrap(Wrap { trim: false });
+            let limit = paragraph
+                .line_count(inner.width)
+                .saturating_sub(usize::from(inner.height));
+            self.owner_scroll = self.owner_scroll.min(limit.min(u16::MAX as usize) as u16);
+            frame.render_widget(Clear, body);
+            frame.render_widget(block, body);
+            frame.render_widget(paragraph.scroll((self.owner_scroll, 0)), inner);
+        }
+        if let Some(editor) = &self.editor {
+            let title = if let Kind::Message { owner, .. } = &editor.control.kind {
+                format!(
+                    "Message: {} → {} · Enter send · Shift-Enter/Ctrl-J newline · Ctrl-R review · Ctrl-X discard",
+                    safe_line(&editor.control.label),
+                    safe_line(&owner.name)
+                )
+            } else {
+                format!(
+                    "Text response: {} · Ctrl-S save · Esc discard · Ctrl-R rebase",
+                    safe_line(&editor.control.label)
+                )
+            };
             let block = Block::bordered().title(title);
             let inner = block.inner(responses);
             let before = safe_markdown(&editor.draft[..editor.cursor]);
             let after = safe_markdown(&editor.draft[editor.cursor..]);
-            let content = format!("{before}▏{after}");
-            let cursor_line = Paragraph::new(format!("{before}▏"))
+            let owner = if let Kind::Message { owner, .. } = &editor.control.kind {
+                format!(
+                    "To {}:{} ({})\n",
+                    owner.provider.label(),
+                    safe_line(&owner.session),
+                    safe_line(&owner.endpoint)
+                )
+            } else {
+                String::new()
+            };
+            let content = format!("{owner}{before}▏{after}");
+            let cursor_line = Paragraph::new(format!("{owner}{before}▏"))
                 .wrap(Wrap { trim: false })
                 .line_count(inner.width);
             let scroll = cursor_line
@@ -872,6 +1206,7 @@ impl View {
                             }
                         }
                         Kind::Text { .. } => "[text]",
+                        Kind::Message { .. } => "[message]",
                     };
                     let focused = self.selected == Some(index);
                     let line = Line::from(format!(
@@ -927,7 +1262,7 @@ impl View {
         };
         frame.render_widget(Paragraph::new(vec![
             Line::from(safe_line(&status)),
-            Line::from(if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · c code copies · m native mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "c code copies · m copy-on-select mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
+            Line::from(if self.editor.as_ref().is_some_and(|editor| matches!(editor.control.kind, Kind::Message { .. })) { "Enter send · Shift-Enter/Ctrl-J newline · Tab/Shift-Tab next · Esc retain · Ctrl-X discard · Ctrl-R review · Ctrl-O owner" } else if self.editor.is_some() { "Enter newline · arrows edit · PgUp/PgDn board · Ctrl-S save · Esc discard draft · then b boards · Ctrl-C quit" } else if self.mouse_enabled { "Drag text to copy · c code copies · m native mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit" } else { "c code copies · m copy-on-select mouse · b boards · q quit · j/k scroll · Tab responses · Space toggle · Enter edit · r refresh" }),
             Line::from(safe_line(self.update_notice.as_deref().unwrap_or("")))
                 .style(Style::default().fg(Color::Yellow)),
         ]), footer);
@@ -956,7 +1291,65 @@ impl View {
             self.notice = Some("Text selection cancelled.".into());
             return false;
         }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| matches!(editor.control.kind, Kind::Message { .. }))
+        {
+            return self.message_key(key, page);
+        }
+        if self.editor.is_none()
+            && key.code == KeyCode::Char('e')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let eligible =
+                |editor: &&Editor| !editor.draft.is_empty() || editor.submission.is_some();
+            let retained = self
+                .message_drafts
+                .iter()
+                .filter(|(_, editor)| eligible(editor))
+                .find(|(key, _)| self.retained_cursor.as_ref().is_none_or(|last| *key > last))
+                .or_else(|| {
+                    self.message_drafts
+                        .iter()
+                        .find(|(_, editor)| eligible(editor))
+                })
+                .map(|(key, _)| key.clone());
+            if let Some(key) = retained {
+                self.retained_cursor = Some(key.clone());
+                self.editor = self.message_drafts.remove(&key);
+                self.selected = self.editor.as_ref().and_then(|editor| {
+                    let key = editor.control.message_key(&editor.base.name);
+                    self.controls
+                        .iter()
+                        .position(|control| control.message_key(self.board.as_str()) == key)
+                });
+                self.notice = Some("Retained draft reopened for its original target. Ctrl-R reviews current input; Ctrl-X explicitly discards.".into());
+            }
+            return false;
+        }
+        if self.editor.is_none()
+            && key.code == KeyCode::Char('d')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if !self.message_drafts.values().any(|editor| editor.in_flight) {
+                let uncertain = self.message_drafts.values().any(|editor| editor.uncertain);
+                self.message_drafts.clear();
+                self.retained_cursor = None;
+                self.notice = Some(if uncertain {
+                    "Drafts and retry tracking discarded. Previous submissions may have been accepted; inspect message history before resending."
+                } else { "All retained message drafts discarded; board unchanged." }.into());
+            }
+            return false;
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.has_message_drafts() {
+                self.notice = Some(
+                    "Unsent message drafts retained. Send them or Ctrl-D discards all; then quit."
+                        .into(),
+                );
+                return false;
+            }
             return true;
         }
         if self.editor.is_some() {
@@ -1045,10 +1438,23 @@ impl View {
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
+            if self.has_message_drafts() {
+                self.notice = Some(
+                    "Unsent message drafts retained. Send them or Ctrl-D discards all; then quit."
+                        .into(),
+                );
+                return false;
+            }
             return true;
         }
         match key.code {
-            KeyCode::Char('b') if !self.saving => self.pick_requested = true,
+            KeyCode::Char('b') if !self.saving => {
+                if self.has_message_drafts() {
+                    self.notice = Some("Send or discard message drafts before switching boards. Ctrl-D discards all; continue editing to cancel navigation.".into());
+                } else {
+                    self.pick_requested = true;
+                }
+            }
             KeyCode::Char('m') => {
                 self.mouse_enabled = !self.mouse_enabled;
                 self.notice = Some(if self.mouse_enabled {
@@ -1072,12 +1478,17 @@ impl View {
             KeyCode::Enter if !self.saving => {
                 if let (Some(index), Some(base)) = (self.selected, self.snapshot.as_ref()) {
                     let control = self.controls[index].clone();
-                    if let Kind::Text { value, .. } = &control.kind {
+                    if matches!(control.kind, Kind::Message { .. }) {
+                        self.open_message(control);
+                    } else if let Kind::Text { value, .. } = &control.kind {
                         self.editor = Some(Editor {
                             base: base.clone(),
                             draft: value.clone(),
                             cursor: value.len(),
                             control,
+                            submission: None,
+                            in_flight: false,
+                            uncertain: false,
                         });
                         self.notice = None;
                     }
@@ -1154,7 +1565,7 @@ impl View {
         });
     }
     fn mouse(&mut self, event: MouseEvent) -> (bool, Option<String>) {
-        if !self.mouse_enabled || self.picker.is_some() {
+        if !self.mouse_enabled || self.picker.is_some() || self.owner_details {
             return (false, None);
         }
         let point = Position::new(event.column, event.row);
@@ -1231,6 +1642,10 @@ impl View {
         let Some(editor) = &mut self.editor else {
             return;
         };
+        if editor.in_flight || editor.uncertain {
+            self.notice = Some("Message outcome pending/uncertain; retry the exact message or explicitly discard before editing.".into());
+            return;
+        }
         let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
         let text = normalized
             .chars()
@@ -1407,12 +1822,14 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
     let mut events = EventStream::new();
     let (refresh, mut requests) = mpsc::channel(1);
     let (writes, mut write_requests) = mpsc::channel::<Save>(1);
+    let (messages, mut message_requests) = mpsc::channel::<Submission>(1);
     let (selection, current_selection) = tokio::sync::watch::channel((board.clone(), 0u64));
     let (lists, mut list_requests) = mpsc::channel::<()>(1);
     enum Update {
         List(Name, u64, Result<Vec<Summary>>),
         Read(Name, u64, Result<Snapshot>, Option<String>),
         Saved(Save, Result<(Snapshot, bool)>),
+        Message(Submission, Result<serde_json::Value>),
     }
     let (updates, mut results) = mpsc::channel(1);
     let state = state_dir.clone();
@@ -1420,6 +1837,11 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
         loop {
             let update = tokio::select! {
                 biased;
+                message = message_requests.recv() => {
+                    let Some(request) = message else { break; };
+                    let result = broker::rpc(&state, &Request::BoardMessageSend { request: request.clone() }).await;
+                    Update::Message(request, result)
+                }
                 save = write_requests.recv() => {
                     let Some(save) = save else { break; };
                     let result = async {
@@ -1500,6 +1922,10 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                         }
                     }
                     if key.code == KeyCode::Char('r') && view.editor.is_none() { let _ = refresh.try_send(()); }
+                    if let Some(request) = view.pending_message.take()
+                        && messages.try_send(request.clone()).is_err() {
+                        view.message_result(request, Err(anyhow::anyhow!("Submission worker unavailable")));
+                    }
                     if let Some(save) = view.pending.take() {
                         if writes.try_send(save).is_ok() { view.saving = true; } else { view.notice = Some("Another save is pending; draft retained.".into()); }
                     }
@@ -1521,6 +1947,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                 let Some(update) = update else { anyhow::bail!("Board refresh worker stopped"); };
                 let relevant = match &update {
                     Update::Read(board, generation, ..) => board == &view.board && *generation == view.generation,
+                    Update::Message(..) => true,
                     Update::Saved(save, _) => save.generation == view.generation && save.base.name == view.board.as_str(),
                     Update::List(board, generation, _) => board == &view.board && *generation == view.generation && view.editor.is_none() && !view.saving,
                 };
@@ -1551,6 +1978,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                         dirty |= view.read_result(&board, generation, result);
                     },
                     Update::Saved(save, result) => { view.saved(save, result); dirty = true; },
+                    Update::Message(request, result) => { view.message_result(request, result); dirty = true; },
                 }
             }
         }
@@ -1618,6 +2046,346 @@ mod tests {
         terminal.draw(|frame| view.draw(frame)).unwrap();
         assert!(!buffer_text(&terminal).contains("Update available"));
         assert_eq!(view.selection.as_ref().unwrap().area(), area);
+    }
+
+    fn message_field(id: &str, route: &str) -> String {
+        let marker = crate::board_messages::Marker {
+            instance: "00000000-0000-4000-8000-000000000001".into(),
+            id: id.into(),
+            label: format!("Message {route}"),
+            owner: crate::board_messages::Owner {
+                name: route.into(),
+                provider: crate::protocol::Provider::Inbox,
+                session: route.into(),
+                endpoint: String::new(),
+            },
+        };
+        format!(
+            "<!-- board-message: {} -->\n",
+            serde_json::to_string(&marker).unwrap()
+        )
+    }
+    fn accepted_receipt(request: &Submission, recipient: &str, session: &str) -> serde_json::Value {
+        serde_json::json!({"accepted":true,"id":request.id,"state":"queued","message":{"id":request.id,"sender":"user","recipient":recipient,"recipient_session":session,"body":request.text}})
+    }
+    #[test]
+    fn rendered_composer_declaration_is_hidden_but_raw_and_control_remain_exact() {
+        let marker = message_field("coordinator", "alpha");
+        let raw = format!("# Context\n{marker}\nAfter input\n");
+        let original = raw.clone();
+        let (rendered, _, _, _) = rendered_markdown(&raw, 40);
+        let visible = rendered.to_string();
+        assert!(visible.contains("Context") && visible.contains("After input"));
+        assert!(!visible.contains("board-message") && !visible.contains("endpoint"));
+        assert_eq!(raw, original);
+        assert_eq!(board_interaction::controls(&raw).len(), 1);
+    }
+    fn message_view() -> View {
+        let mut view = View::default();
+        view.update(Ok(snapshot(
+            &message_field("coordinator", "alpha"),
+            &"a".repeat(64),
+        )));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view
+    }
+    #[test]
+    fn message_enter_submits_exact_multiline_and_pending_enter_cannot_duplicate() {
+        let mut view = message_view();
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(view.pending_message.is_none(), "blank Enter cannot submit");
+        view.paste("first");
+        press(&mut view, KeyCode::Enter, KeyModifiers::SHIFT);
+        view.paste("第二行");
+        press(&mut view, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        view.paste("third");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let request = view.pending_message.take().unwrap();
+        assert_eq!(request.text, "first\n第二行\nthird");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view.paste("must not change pending text");
+        assert!(view.pending_message.is_none());
+        assert_eq!(view.editor.as_ref().unwrap().draft, request.text);
+        assert_eq!(
+            view.snapshot.as_ref().unwrap().markdown,
+            message_field("coordinator", "alpha")
+        );
+        view.message_result(
+            request.clone(),
+            Ok(accepted_receipt(&request, "alpha", "alpha")),
+        );
+        assert!(
+            view.editor.is_some(),
+            "successful send retains composer focus"
+        );
+        assert!(view.editor.as_ref().unwrap().draft.is_empty());
+        assert!(view.notice.as_ref().unwrap().contains("not proof"));
+        view.paste("next");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert_ne!(view.pending_message.as_ref().unwrap().id, request.id);
+    }
+    #[test]
+    fn uncertain_message_retries_same_id_and_body_and_rejects_unmatched_acceptance() {
+        let mut view = message_view();
+        view.paste("exact original");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let first = view.pending_message.take().unwrap();
+        view.message_result(first.clone(), Err(anyhow::anyhow!("timeout")));
+        view.paste("not allowed");
+        assert_eq!(view.editor.as_ref().unwrap().draft, first.text);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let retry = view.pending_message.take().unwrap();
+        assert_eq!(retry.id, first.id);
+        assert_eq!(retry.text, first.text);
+        view.message_result(
+            retry.clone(),
+            Ok(serde_json::json!({"accepted":true,"id":"wrong-id"})),
+        );
+        assert_eq!(view.editor.as_ref().unwrap().draft, first.text);
+        assert!(view.editor.as_ref().unwrap().submission.is_some());
+        press(&mut view, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(view.editor.is_none());
+        assert!(
+            view.notice
+                .as_ref()
+                .unwrap()
+                .contains("may have been accepted")
+        );
+    }
+    #[test]
+    fn uncertain_retained_draft_discard_keeps_outcome_warning() {
+        let mut view = message_view();
+        view.paste("possibly sent");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let request = view.pending_message.take().unwrap();
+        view.message_result(request, Err(anyhow::anyhow!("timeout")));
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(view.message_drafts.is_empty());
+        assert!(
+            view.notice
+                .as_ref()
+                .unwrap()
+                .contains("may have been accepted")
+        );
+    }
+    #[test]
+    fn message_drafts_are_independent_and_require_explicit_discard_before_switch_or_quit() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(
+            &(message_field("first", "alpha") + &message_field("second", "beta")),
+            &"a".repeat(64),
+        )));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view.paste("draft alpha");
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        view.paste("draft beta");
+        press(&mut view, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(view.editor.as_ref().unwrap().draft, "draft alpha");
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!view.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 10));
+        press(&mut view, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(!view.pick_requested);
+        assert!(!view.switch("other".parse().unwrap()));
+        press(&mut view, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(view.switch("other".parse().unwrap()));
+        assert!(view.message_drafts.is_empty());
+    }
+    #[test]
+    fn refreshed_or_retargeted_message_controls_cannot_send_stale_drafts() {
+        let mut view = message_view();
+        view.paste("keep this");
+        view.update(Ok(snapshot(
+            &format!("new prose\n{}", message_field("coordinator", "alpha")),
+            &"b".repeat(64),
+        )));
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(view.pending_message.is_none());
+        press(&mut view, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(view.editor.as_ref().unwrap().draft, "keep this");
+        assert_eq!(view.editor.as_ref().unwrap().base.revision, "b".repeat(64));
+        view.update(Ok(snapshot(
+            &message_field("coordinator", "beta"),
+            &"c".repeat(64),
+        )));
+        press(&mut view, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(view.pending_message.is_none());
+        assert_eq!(view.editor.as_ref().unwrap().draft, "keep this");
+        assert!(
+            matches!(&view.editor.as_ref().unwrap().control.kind, Kind::Message {owner,..} if owner.name=="alpha")
+        );
+    }
+    #[test]
+    fn message_focus_survives_refresh_and_tab_leaves_for_existing_response_controls() {
+        let markdown = message_field("first", "alpha")
+            + &message_field("second", "beta")
+            + "\n- [ ] Existing checkbox\n\n<!-- board-input: answer -->\n> old answer\n<!-- /board-input -->\n";
+        let mut view = View::default();
+        view.update(Ok(snapshot(&markdown, &"a".repeat(64))));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view.paste("first draft");
+        view.update(Ok(snapshot(
+            &format!("new context\n{markdown}"),
+            &"b".repeat(64),
+        )));
+        assert_eq!(view.selected, Some(0));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(
+            matches!(&view.editor.as_ref().unwrap().control.kind, Kind::Message {owner,..} if owner.name=="beta")
+        );
+        view.paste("second draft");
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(view.editor.is_none());
+        assert!(matches!(
+            view.controls[view.selected.unwrap()].kind,
+            Kind::Checkbox { .. }
+        ));
+        press(&mut view, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(
+            view.pending
+                .as_ref()
+                .unwrap()
+                .markdown
+                .contains("[x] Existing checkbox")
+        );
+        view.pending = None;
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            view.editor.as_ref().unwrap().control.kind,
+            Kind::Text { .. }
+        ));
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(view.editor.as_ref().unwrap().draft.ends_with('\n'));
+        assert!(view.pending_message.is_none());
+        assert_eq!(view.message_drafts.len(), 2);
+    }
+    #[test]
+    fn exact_owner_inspection_is_keyboard_only_and_does_not_send_or_change_draft() {
+        let mut view = message_view();
+        view.paste("retain draft");
+        press(&mut view, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(view.owner_details);
+        let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(buffer_text(&terminal).contains("Session: alpha"));
+        press(&mut view, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!view.owner_details);
+        assert_eq!(view.editor.as_ref().unwrap().draft, "retain draft");
+        assert!(view.pending_message.is_none());
+    }
+    #[test]
+    fn removed_message_input_draft_remains_keyboard_accessible_without_rerouting() {
+        let mut view = message_view();
+        view.paste("original instruction");
+        view.update(Ok(snapshot("Input removed by author", &"b".repeat(64))));
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(view.editor.as_ref().unwrap().draft, "original instruction");
+        assert!(
+            matches!(&view.editor.as_ref().unwrap().control.kind, Kind::Message {owner,..} if owner.name=="alpha")
+        );
+        press(&mut view, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(view.pending_message.is_none());
+        press(&mut view, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(!view.has_message_drafts());
+    }
+    #[test]
+    fn retained_orphans_cycle_without_discarding_any_draft_or_retry_identity() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(
+            &(message_field("first", "alpha") + &message_field("second", "beta")),
+            &"a".repeat(64),
+        )));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        view.paste("uncertain alpha");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let request = view.pending_message.take().unwrap();
+        view.message_result(request.clone(), Err(anyhow::anyhow!("timeout")));
+        press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
+        view.paste("unsent beta");
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        view.update(Ok(snapshot("Both inputs removed", &"b".repeat(64))));
+        press(&mut view, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(view.editor.as_ref().unwrap().draft, "uncertain alpha");
+        assert_eq!(
+            view.editor
+                .as_ref()
+                .unwrap()
+                .submission
+                .as_ref()
+                .unwrap()
+                .id,
+            request.id
+        );
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(view.editor.as_ref().unwrap().draft, "unsent beta");
+        press(&mut view, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut view, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(view.editor.as_ref().unwrap().draft, "uncertain alpha");
+        assert!(view.editor.as_ref().unwrap().uncertain);
+        assert_eq!(view.message_drafts.len(), 1);
+    }
+    #[test]
+    fn mismatched_receipt_session_does_not_clear_a_draft() {
+        let mut view = message_view();
+        view.paste("exact request");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let request = view.pending_message.take().unwrap();
+        view.message_result(
+            request.clone(),
+            Ok(accepted_receipt(&request, "alpha", "replacement-session")),
+        );
+        assert_eq!(view.editor.as_ref().unwrap().draft, "exact request");
+        assert!(view.editor.as_ref().unwrap().uncertain);
+    }
+    #[test]
+    fn recreated_message_instance_requires_new_composer_even_with_same_id_and_owner() {
+        let mut view = message_view();
+        view.paste("old unsent draft");
+        let recreated = message_field("coordinator", "alpha").replace(
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+        );
+        view.update(Ok(snapshot(&recreated, &"b".repeat(64))));
+        press(&mut view, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(view.pending_message.is_none());
+        assert_eq!(view.editor.as_ref().unwrap().draft, "old unsent draft");
+        assert_eq!(view.editor.as_ref().unwrap().base.revision, "a".repeat(64));
+    }
+    #[test]
+    fn rejected_message_keeps_editable_draft_and_narrow_render_preserves_target() {
+        let mut view = message_view();
+        view.paste("retain");
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let request = view.pending_message.take().unwrap();
+        view.message_result(
+            request.clone(),
+            Ok(serde_json::json!({"accepted":false,"code":"rejected","error":"Queue is full"})),
+        );
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+        let retry = view.pending_message.take().unwrap();
+        assert_eq!(retry.id, request.id);
+        view.message_result(
+            retry,
+            Ok(serde_json::json!({"accepted":false,"code":"rejected","error":"Queue is full"})),
+        );
+        view.paste(" edited");
+        assert_eq!(view.editor.as_ref().unwrap().draft, "retain edited");
+        for width in [18, 40, 100] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            assert!(buffer_text(&terminal).contains("inbox:alpha"));
+        }
     }
 
     #[test]

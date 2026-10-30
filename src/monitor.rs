@@ -259,14 +259,14 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
     }
     if request.method() == hyper::Method::POST
         && path.starts_with("/api/boards/")
-        && path.ends_with("/responses")
+        && (path.ends_with("/responses") || path.ends_with("/messages"))
     {
         return Ok(board_response(request, app).await);
     }
     if request.method() != hyper::Method::GET {
         return Ok(error(
             StatusCode::METHOD_NOT_ALLOWED,
-            "Only reads and existing board responses are supported",
+            "Only reads and existing board control submissions are supported",
         ));
     }
     if request.headers().contains_key(TRANSFER_ENCODING)
@@ -424,6 +424,7 @@ fn board_reply(reply: crate::monitor_board::Reply) -> Response<Body> {
 }
 async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> {
     const MAX_BODY: usize = 512 * 1024;
+    let message = request.uri().path().ends_with("/messages");
     if request.uri().query().is_some() {
         return error(StatusCode::BAD_REQUEST, "Unexpected query");
     }
@@ -431,7 +432,7 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         .uri()
         .path()
         .strip_prefix("/api/boards/")
-        .and_then(|s| s.strip_suffix("/responses"))
+        .and_then(|s| s.strip_suffix(if message { "/messages" } else { "/responses" }))
         .and_then(|s| s.parse::<crate::board::Name>().ok())
     else {
         return error(StatusCode::BAD_REQUEST, "Invalid board name");
@@ -503,34 +504,54 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         Ok(Err(status)) => return error(status, "Invalid or oversized board response body"),
         Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Board response body timed out"),
     };
-    let request = match serde_json::from_slice::<crate::monitor_board::ResponseRequest>(&bytes) {
-        Ok(value) => value,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid board response JSON"),
+    enum Write {
+        Response(crate::monitor_board::ResponseRequest),
+        Message(crate::board_messages::Submission),
+    }
+    let request = if message {
+        let request = match serde_json::from_slice::<crate::board_messages::Submission>(&bytes) {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid board message JSON"),
+        };
+        if request.board != name || !request.valid() {
+            return error(StatusCode::BAD_REQUEST, "Invalid board message submission");
+        }
+        Write::Message(request)
+    } else {
+        let request = match serde_json::from_slice::<crate::monitor_board::ResponseRequest>(&bytes)
+        {
+            Ok(value) => value,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid board response JSON"),
+        };
+        if matches!(&request.value, crate::monitor_board::Desired::Text { text } if text.len() > crate::board::MAX_BOARD_BYTES)
+        {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Decoded text response exceeds 64 KiB",
+            );
+        }
+        if !request.valid(&name) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Invalid board response or decoded text exceeds 64 KiB",
+            );
+        }
+        Write::Response(request)
     };
-    if matches!(&request.value, crate::monitor_board::Desired::Text { text } if text.len() > crate::board::MAX_BOARD_BYTES)
-    {
-        return error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Decoded text response exceeds 64 KiB",
-        );
-    }
-    if !request.valid(&name) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "Invalid board response or decoded text exceeds 64 KiB",
-        );
-    }
     let broker = app.broker.clone();
     let generation = app.generation;
     match tokio::task::spawn_blocking(move || {
         // HTTP cancellation cannot release capacity while queued/running work
         // continues. The commit guard checks revocation after the DB queue.
         let _permit = permit;
-        broker.monitor_board_response(generation, &name, request)
+        match request {
+            Write::Response(request) => broker.monitor_board_response(generation, &name, request),
+            Write::Message(request) => broker.monitor_board_message(generation, &name, request),
+        }
     }).await {
         Ok(reply) if app.current()=>board_reply(reply),
         Ok(_)=>error(StatusCode::UNAUTHORIZED, "Monitor access expired"),
-        Err(_)=>response(StatusCode::INTERNAL_SERVER_ERROR,"application/json; charset=utf-8",json!({"code":"uncertain","uncertain":true,"error":"Save outcome is uncertain; read back before retrying"}).to_string()),
+        Err(_)=>response(StatusCode::INTERNAL_SERVER_ERROR,"application/json; charset=utf-8",json!({"code":"uncertain","uncertain":true,"error":"Submission outcome is uncertain; retain the exact message ID and payload for retry"}).to_string()),
     }
 }
 fn json_response(value: Value) -> Response<Body> {

@@ -1,13 +1,12 @@
 //! Board-specific monitor DTOs and safe, bounded Markdown structure.
 use crate::{
     board::{self, Name, Snapshot},
-    board_interaction::{self, Control, Kind},
+    board_interaction::{self, Kind},
     broker::Broker,
 };
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,27 +38,7 @@ impl ResponseRequest {
 pub(crate) fn hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
-fn control_id(snapshot: &Snapshot, control: &Control) -> String {
-    let mut digest = Sha256::new();
-    for part in [
-        snapshot.name.as_str(),
-        snapshot.revision.as_str(),
-        match &control.kind {
-            Kind::Checkbox { .. } => "checkbox",
-            Kind::Text { .. } => "text",
-        },
-    ] {
-        digest.update((part.len() as u64).to_be_bytes());
-        digest.update(part.as_bytes());
-    }
-    digest.update((control.range.start as u64).to_be_bytes());
-    digest.update((control.range.end as u64).to_be_bytes());
-    digest
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
+use board_interaction::control_id;
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Node {
@@ -226,25 +205,27 @@ pub(crate) fn view(snapshot: &Snapshot) -> Value {
         let id=control_id(snapshot,&control);
         match &control.kind {
             Kind::Checkbox{checked}=>json!({"id":id,"kind":"checkbox","line":control.line,"label":control.label,"checked":checked}),
+            Kind::Message{id:field_id,owner,..}=>json!({"id":id,"kind":"message","line":control.line,"label":control.label,"field_id":field_id,"owner":owner,"rebase_key":control.message_key(&snapshot.name)}),
             Kind::Text{id:field_id,value,..}=>json!({"id":id,"kind":"text","line":control.line,"label":control.label,"field_id":field_id,"value":value,"rebase_key":control.text_rebase_key(&snapshot.name)}),
         }
     }).collect::<Vec<_>>();
-    let rendered = structure(&snapshot.markdown);
+    let display = board_interaction::display_markdown(&snapshot.markdown);
+    let rendered = structure(display.as_ref());
     let notice = rendered.is_none();
     let nodes = rendered.unwrap_or_else(|| {
         vec![Node::Element {
             tag: "pre",
             children: vec![Node::Text {
-                text: snapshot.markdown.clone(),
+                text: display.to_string(),
             }],
             href: None,
             start: None,
         }]
     });
-    let mut result = json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"markdown":snapshot.markdown,"nodes":nodes,"controls":controls});
+    let mut result = json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"markdown":snapshot.markdown,"display_markdown":display.as_ref(),"nodes":nodes,"controls":controls});
     if notice {
         result["render_notice"] =
-            json!("This document is complex; showing its exact Markdown as plain text.");
+            json!("This document is complex; showing plain text. Raw Markdown remains available.");
     }
     result
 }
@@ -324,6 +305,32 @@ impl Broker {
                 "not_found",
                 "Board unavailable; select an existing board",
             ),
+        }
+    }
+    pub(crate) fn monitor_board_message(
+        &self,
+        generation: u64,
+        name: &Name,
+        request: crate::board_messages::Submission,
+    ) -> Reply {
+        let db = self.db.lock().unwrap();
+        let access = self.monitor_control.lock().unwrap();
+        if !access.current(generation) {
+            return reply(401, "unauthorized", "Monitor access expired");
+        }
+        if &request.board != name || !request.valid() {
+            return reply(400, "invalid", "Invalid board message submission");
+        }
+        let result = self.board_message_submit_locked(&db, &request);
+        let mut body = result.body;
+        if body["code"] == "conflict"
+            && let Ok(snapshot) = board::read_named(&self.state_dir, name)
+        {
+            body["board"] = view(&snapshot);
+        }
+        Reply {
+            status: result.status,
+            body,
         }
     }
     pub(crate) fn monitor_board_response(
@@ -430,6 +437,68 @@ mod tests {
                 &board_interaction::controls(&snapshot.markdown)[index],
             ),
             value,
+        }
+    }
+    #[tokio::test]
+    async fn message_metadata_is_hidden_only_in_rendered_view() {
+        let (root, _bound, old) = setup();
+        let marker = crate::board_messages::Marker {
+            id: "coordinator".into(),
+            instance: uuid::Uuid::new_v4().to_string(),
+            label: "Message coordinator".into(),
+            owner: crate::board_messages::Owner {
+                name: "coordinator".into(),
+                provider: crate::protocol::Provider::Inbox,
+                session: uuid::Uuid::new_v4().to_string(),
+                endpoint: String::new(),
+            },
+        };
+        let declaration = format!(
+            "<!-- board-message: {} -->",
+            serde_json::to_string(&marker).unwrap()
+        );
+        let source =
+            format!("# Friendly board\n{declaration}\nVisible text\n<!-- literal comment -->\n");
+        let snapshot = board::update_named(
+            root.path(),
+            &Name::default(),
+            &old.revision,
+            &[board::Edit::Set {
+                markdown: source.clone(),
+            }],
+        )
+        .unwrap();
+        let result = view(&snapshot);
+        assert_eq!(result["markdown"], source);
+        assert_eq!(result["controls"][0]["kind"], "message");
+        let rendered = result["nodes"].to_string();
+        assert!(!rendered.contains("board-message:"));
+        assert!(
+            !result["display_markdown"]
+                .as_str()
+                .unwrap()
+                .contains("board-message:")
+        );
+        assert!(rendered.contains("Visible text") && rendered.contains("literal comment"));
+
+        let mut complex = snapshot.clone();
+        complex.markdown = format!("{declaration}\n{}", "- item\n".repeat(4000));
+        let fallback = view(&complex);
+        assert!(fallback.get("render_notice").is_some());
+        assert_eq!(fallback["markdown"], complex.markdown);
+        assert!(!fallback["nodes"].to_string().contains("board-message:"));
+
+        // Non-controls stay visible, including malformed declarations and code
+        // examples; only successfully parsed interactive metadata is hidden.
+        for source in [
+            "<!-- board-message: malformed -->\n".to_owned(),
+            format!("```markdown\n{declaration}\n```\n"),
+        ] {
+            let mut snapshot = snapshot.clone();
+            snapshot.markdown = source.clone();
+            let result = view(&snapshot);
+            assert_eq!(result["markdown"], source);
+            assert!(result["nodes"].to_string().contains("board-message:"));
         }
     }
     #[tokio::test]

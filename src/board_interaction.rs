@@ -7,6 +7,11 @@ use std::{collections::BTreeMap, ops::Range};
 
 #[derive(Clone, Debug)]
 pub enum Kind {
+    Message {
+        id: String,
+        instance: String,
+        owner: crate::board_messages::Owner,
+    },
     Checkbox {
         checked: bool,
     },
@@ -70,8 +75,31 @@ impl Control {
         )
     }
 
+    /// Stable across unrelated board edits, but binds the label and exact owner.
+    pub fn message_key(&self, board: &str) -> Option<String> {
+        let Kind::Message {
+            id,
+            instance,
+            owner,
+        } = &self.kind
+        else {
+            return None;
+        };
+        Some(digest_parts(&[
+            board,
+            id,
+            instance,
+            &self.label,
+            &owner.name,
+            owner.provider.label(),
+            &owner.session,
+            &owner.endpoint,
+        ]))
+    }
+
     pub fn replacement(&self, markdown: &str, value: Option<&str>) -> Result<String> {
         let replacement = match &self.kind {
+            Kind::Message { .. } => anyhow::bail!("Message composers do not edit board Markdown"),
             Kind::Checkbox { checked } => if *checked { " " } else { "x" }.to_owned(),
             Kind::Text { newline, .. } => {
                 let value = value.unwrap_or_default();
@@ -104,6 +132,44 @@ impl Control {
     }
 }
 
+fn digest_parts(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+pub fn control_id(snapshot: &crate::board::Snapshot, control: &Control) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in [
+        snapshot.name.as_str(),
+        snapshot.revision.as_str(),
+        match &control.kind {
+            Kind::Checkbox { .. } => "checkbox",
+            Kind::Text { .. } => "text",
+            Kind::Message { .. } => "message",
+        },
+    ] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    digest.update((control.range.start as u64).to_be_bytes());
+    digest.update((control.range.end as u64).to_be_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn marker(line: &str) -> Option<Option<&str>> {
     let line = line.trim();
     if line == "<!-- /board-input -->" {
@@ -114,7 +180,7 @@ fn marker(line: &str) -> Option<Option<&str>> {
             .map(|id| Some(id.trim()))
     }
 }
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 80
         && id
@@ -137,6 +203,7 @@ pub fn controls(markdown: &str) -> Vec<Control> {
     let mut controls = Vec::new();
     let mut markers = BTreeMap::new();
     let mut html_first = None;
+    let mut message_markers = Vec::new();
     for (event, range) in Parser::new_ext(markdown, Options::ENABLE_TASKLISTS).into_offset_iter() {
         match event {
             Event::Start(Tag::HtmlBlock) => html_first = Some(true),
@@ -164,13 +231,36 @@ pub fn controls(markdown: &str) -> Vec<Control> {
                 // pulldown emits separate HTML events for lines inside a single
                 // comment/block. Only its first line may declare a field marker.
                 let first = html_first.unwrap_or(true);
-                html_first = html_first.map(|_| false);
+                let source = &markdown[range.clone()];
+                // Adjacent complete standalone comments may share one HTML
+                // block. Continue parsing those, while keeping every line of
+                // an outer/multiline comment opaque.
+                html_first = html_first.map(|_| {
+                    first
+                        && source.trim().starts_with("<!--")
+                        && source.trim().ends_with("-->")
+                        && source.matches("<!--").count() == 1
+                        && source.matches("-->").count() == 1
+                });
                 if !first {
                     continue;
                 }
-                let source = &markdown[range.clone()];
                 // A marker must occupy its entire source line and its entire HTML
                 // event. This excludes marker-looking text nested inside comments.
+                let line_start = markdown[..range.start].rfind('\n').map_or(0, |n| n + 1);
+                let line_end = markdown[range.start..]
+                    .find('\n')
+                    .map_or(markdown.len(), |n| range.start + n + 1);
+                if range.end <= line_end
+                    && markdown[line_start..range.start].trim().is_empty()
+                    && markdown[range.end..line_end].trim().is_empty()
+                    && let Some(raw) = source
+                        .trim()
+                        .strip_prefix("<!-- board-message:")
+                        .and_then(|s| s.strip_suffix("-->"))
+                {
+                    message_markers.push((line_start, range.clone(), raw.to_owned()));
+                }
                 if let Some(value) = marker(source)
                     && !source.trim().contains('\n')
                 {
@@ -250,6 +340,41 @@ pub fn controls(markdown: &str) -> Vec<Control> {
     for id in markers.values().flatten() {
         *counts.entry(id.clone()).or_insert(0) += 1;
     }
+    let mut messages = Vec::new();
+    let mut malformed_message = false;
+    for (start, range, raw) in message_markers {
+        if protected.iter().any(|region| region.contains(&start)) {
+            continue;
+        }
+        // Even a malformed declaration poisons another occurrence of its ID.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(id) = value.get("id").and_then(|id| id.as_str())
+        {
+            *counts.entry(id.to_owned()).or_insert(0) += 1;
+        }
+        let parsed = serde_json::from_str::<crate::board_messages::Marker>(&raw);
+        if parsed.as_ref().is_err() || parsed.as_ref().is_ok_and(|marker| !marker.valid()) {
+            malformed_message = true;
+        }
+        if let Ok(marker) = parsed
+            && marker.valid()
+        {
+            messages.push(Control {
+                line: line_starts.partition_point(|offset| *offset <= start),
+                label: marker.label,
+                range,
+                kind: Kind::Message {
+                    id: marker.id,
+                    instance: marker.instance,
+                    owner: marker.owner,
+                },
+            });
+        }
+    }
+    controls.extend(messages.into_iter().filter(|control| match &control.kind {
+        Kind::Message { id, .. } => !malformed_message && counts.get(id) == Some(&1),
+        _ => false,
+    }));
     controls.retain(|control| {
         !protected
             .iter()
@@ -261,6 +386,28 @@ pub fn controls(markdown: &str) -> Vec<Control> {
     }));
     controls.sort_by_key(|control| control.range.start);
     controls
+}
+
+/// Presentation-only source: keep composer metadata out of rendered Markdown.
+/// The original document remains the authority for parsing and submission.
+pub fn display_markdown(markdown: &str) -> std::borrow::Cow<'_, str> {
+    let hidden = controls(markdown)
+        .into_iter()
+        .filter(|control| matches!(control.kind, Kind::Message { .. }))
+        .map(|control| control.range)
+        .collect::<Vec<_>>();
+    if hidden.is_empty() {
+        return std::borrow::Cow::Borrowed(markdown);
+    }
+    let mut displayed = String::with_capacity(markdown.len());
+    let mut offset = 0;
+    for range in hidden {
+        displayed.push_str(&markdown[offset..range.start]);
+        displayed.push('\n');
+        offset = range.end;
+    }
+    displayed.push_str(&markdown[offset..]);
+    std::borrow::Cow::Owned(displayed)
 }
 
 #[cfg(test)]
@@ -318,5 +465,47 @@ mod tests {
             .unwrap();
         let again = controls(&updated);
         assert_eq!(again.len(), 1);
+    }
+    fn message_marker(id: &str) -> String {
+        format!(
+            r#"<!-- board-message: {{"id":"{id}","instance":"123e4567-e89b-42d3-a456-426614174001","label":"Message coordinator","owner":{{"name":"coordinator","provider":"inbox","session":"session","endpoint":""}}}} -->"#
+        )
+    }
+
+    #[test]
+    fn display_hides_only_active_composer_metadata_without_changing_source() {
+        let marker = message_marker("compose");
+        let source = format!("Before\n{marker}\nAfter\n");
+        let original = source.clone();
+        let display = display_markdown(&source);
+        assert!(matches!(display, std::borrow::Cow::Owned(_)));
+        assert_eq!(display, "Before\n\nAfter\n");
+        assert_eq!(source, original);
+        assert_eq!(controls(&source).len(), 1);
+    }
+
+    #[test]
+    fn display_preserves_examples_unrecognized_comments_and_invalid_controls() {
+        let marker = message_marker("compose");
+        for source in [
+            format!("```md\n{marker}\n```\n"),
+            format!("<!-- outer\n{marker}\n-->\n"),
+            format!("<!-- board-input: response -->\n> {marker}\n<!-- /board-input -->\n"),
+            "<!-- ordinary comment -->\n".to_owned(),
+            "<!-- board-message: {broken} -->\n".to_owned(),
+            format!("{marker}\n{marker}\n"),
+        ] {
+            assert!(
+                matches!(display_markdown(&source), std::borrow::Cow::Borrowed(_)),
+                "{source}"
+            );
+            assert_eq!(display_markdown(&source), source);
+        }
+        let example = message_marker("example");
+        let source = format!("```md\n{example}\n```\n\n<!-- ordinary comment -->\n\n{marker}\n");
+        let displayed = display_markdown(&source);
+        assert!(displayed.contains(&example));
+        assert!(displayed.contains("<!-- ordinary comment -->"));
+        assert!(!displayed.contains(&marker));
     }
 }

@@ -468,6 +468,9 @@ def main():
                 board_browser_checks(page=page, browser=browser, context=context,
                                      rpc=rpc, state=a, second_state=b, url=url,
                                      token=token, record=record, output=output)
+                from monitor_message_qa import message_browser_checks
+                message_browser_checks(page=page, context=context, rpc=rpc, state=a,
+                                       url=url, token=token, record=record, output=output)
                 board_readback(a, "alpha")
                 page.locator("#lock-button").click()
                 page.locator("#access-token").wait_for(state="visible")
