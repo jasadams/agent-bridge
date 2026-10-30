@@ -566,7 +566,13 @@ send uses a new UUID. Queue rejection and errors retain the draft.
 
 Both interfaces keep compact message boxes stacked at the bottom, below the
 independently scrollable board. Each box shows the pinned agent's friendly name,
-an editable input and Send. Click an input or Tab/Shift-Tab into it to type directly;
+an editable input and Send. Explicit registration aliases remain names; canonical
+session registrations use their native session display title. Without a title, a
+meaningful authored composer label is shown, then a concise provider fallback.
+Generated session IDs are kept out of the compact label. Titles refresh as
+presentation metadata without changing board text, revision, timestamp or draft
+identity; a replacement session cannot supply its title to an old pinned target.
+Click an input or Tab/Shift-Tab into it to type directly;
 there is no activation step. A bounded stack scrolls when many inputs are present,
 and keyboard focus brings the selected input into view. Errors and pending or stale
 targets appear only when relevant; ordinary inputs reserve no feedback rows.
@@ -593,7 +599,9 @@ only when its ID, label and pinned owner are unchanged; Enter remains an explici
 send action. A changed or removed input cannot receive the stale draft.
 
 Successful acceptance clears only that exact draft and keeps the composer focused
-for another message. Pending submissions ignore repeated Enter and lock editing.
+for another message, without adding a success message or feedback row. Pending
+submissions keep the Send button and layout unchanged, lock editing and ignore
+repeated Enter without adding routine status text.
 An uncertain result keeps both text and UUID locked: Enter retries the exact same
 submission; Ctrl-X discards explicitly. Definite errors retain an editable draft.
 Text responses keep their existing Enter-newline/Ctrl-S-save behavior. Normal

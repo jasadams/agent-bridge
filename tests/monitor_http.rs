@@ -54,6 +54,7 @@ fn board_metadata(running: &Running, name: &agent_bridge::board::Name) -> Value 
     value["last_updated"] = serde_json::json!(board.last_updated);
     value["last_updated_source"] = serde_json::json!(board.last_updated_source);
     value["read_only"] = serde_json::json!(!board.writable());
+    value["message_labels"] = serde_json::json!({});
     value
 }
 

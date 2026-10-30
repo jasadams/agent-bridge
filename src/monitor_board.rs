@@ -346,6 +346,7 @@ fn conflict(snapshot: &Snapshot) -> Reply {
 /// Content identity plus authoritative metadata observed by the live board feed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct BoardIdentity {
+    pub message_labels: crate::board_messages::DisplayLabels,
     pub revision: String,
     pub exists: bool,
     pub last_updated: Option<i64>,
@@ -367,13 +368,16 @@ impl Broker {
             return Err(reply(401, "unauthorized", "Monitor access expired"));
         }
         crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now())
-            .map(|snapshot| BoardIdentity {
-                revision: snapshot.revision,
-                exists: snapshot.exists,
-                last_updated: snapshot.last_updated,
-                last_updated_source: snapshot.last_updated_source,
-                read_only: snapshot.lifecycle.state != board::LifecycleState::Active,
-                lifecycle: snapshot.lifecycle,
+            .and_then(|snapshot| {
+                Ok(BoardIdentity {
+                    message_labels: crate::board_messages::display_labels(&db, &snapshot)?,
+                    revision: snapshot.revision,
+                    exists: snapshot.exists,
+                    last_updated: snapshot.last_updated,
+                    last_updated_source: snapshot.last_updated_source,
+                    read_only: snapshot.lifecycle.state != board::LifecycleState::Active,
+                    lifecycle: snapshot.lifecycle,
+                })
             })
             .map_err(|_| {
                 reply(
@@ -509,16 +513,21 @@ impl Broker {
             return reply(401, "unauthorized", "Monitor access expired");
         }
         match crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now()) {
-            Ok(snapshot) => Reply {
-                status: 200,
-                body: if conditional == Some(snapshot.revision.as_str()) {
+            Ok(snapshot) => {
+                let labels = match crate::board_messages::display_labels(&db, &snapshot) {
+                    Ok(labels) => labels,
+                    Err(_) => return reply(500, "unavailable", "Agent labels could not be read"),
+                };
+                let mut body = if conditional == Some(snapshot.revision.as_str()) {
                     let mut value = json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"last_updated":snapshot.last_updated,"last_updated_source":snapshot.last_updated_source,"unchanged":true});
                     lifecycle_metadata(&mut value, &snapshot);
                     value
                 } else {
                     view(&snapshot)
-                },
-            },
+                };
+                body["message_labels"] = json!(labels);
+                Reply { status: 200, body }
+            }
             Err(_) => reply(
                 404,
                 "not_found",
@@ -689,6 +698,99 @@ mod tests {
             value,
         }
     }
+    #[tokio::test]
+    async fn main_label_metadata_refreshes_without_changing_board_identity() {
+        let (root, bound, old) = setup();
+        let broker = &bound.broker;
+        let session = "885b5a56-af8d-4a72-9b43-8ad930e945b6";
+        let name = format!("claude-{session}");
+        let owner = crate::board_messages::Owner {
+            name: name.clone(),
+            provider: crate::protocol::Provider::Claude,
+            session: session.into(),
+            endpoint: "/tmp/display-fixture.sock".into(),
+        };
+        let marker = crate::board_messages::Marker {
+            id: "main-title".into(),
+            instance: uuid::Uuid::new_v4().to_string(),
+            label: format!("Message {name}"),
+            owner: owner.clone(),
+        };
+        let before = board::update_named(
+            root.path(),
+            &Name::default(),
+            &old.revision,
+            &[board::Edit::Append {
+                text: format!(
+                    "\n<!-- board-message: {} -->\n",
+                    serde_json::to_string(&marker).unwrap()
+                ),
+            }],
+        )
+        .unwrap();
+        broker
+            .db
+            .lock()
+            .unwrap()
+            .register(
+                &crate::protocol::Agent {
+                    name,
+                    provider: owner.provider,
+                    session: session.into(),
+                    endpoint: owner.endpoint,
+                    enabled: true,
+                },
+                false,
+            )
+            .unwrap();
+        broker
+            .observe_claude_name(session, "Main coordinator")
+            .unwrap();
+        broker.monitor_control.lock().unwrap().enable(0);
+        let first = broker.monitor_board(1, &Name::default(), None);
+        assert_eq!(first.status, 200);
+        assert!(
+            first.body["message_labels"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|value| value == "Main coordinator")
+        );
+        let identity = broker
+            .monitor_board_revision(1, &Name::default())
+            .unwrap_or_else(|reply| {
+                panic!(
+                    "Main label identity read failed: HTTP {}: {}",
+                    reply.status, reply.body
+                )
+            });
+        broker.observe_claude_name(session, "Main planner").unwrap();
+        let renamed = broker.monitor_board(1, &Name::default(), Some(&before.revision));
+        assert_eq!(renamed.body["unchanged"], true);
+        assert!(
+            renamed.body["message_labels"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|value| value == "Main planner")
+        );
+        let updated = broker
+            .monitor_board_revision(1, &Name::default())
+            .unwrap_or_else(|reply| {
+                panic!(
+                    "Main label identity read failed: HTTP {}: {}",
+                    reply.status, reply.body
+                )
+            });
+        assert_ne!(identity.message_labels, updated.message_labels);
+        assert_eq!(identity.revision, updated.revision);
+        let after = board::read(root.path()).unwrap();
+        assert_eq!(
+            (after.markdown, after.revision, after.last_updated),
+            (before.markdown, before.revision, before.last_updated)
+        );
+    }
+
     #[test]
     fn inline_controls_are_validated_and_source_associated() {
         let source = "# 世界\r\n- [ ] one\r\n  - [x] nested\r\n\r\n<!-- board-input: a -->\r\n> old\r\n<!-- /board-input -->\r\n<!-- board-input: b -->\r\n<!-- /board-input -->\r\n\r\n```md\r\n- [ ] inert\r\n<!-- board-input: example -->\r\n```\r\n";

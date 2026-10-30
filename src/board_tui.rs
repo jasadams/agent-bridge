@@ -539,6 +539,7 @@ struct View {
     pending: Option<Save>,
     saving: bool,
     uncertain_save: Option<Save>,
+    message_labels: crate::board_messages::DisplayLabels,
     message_drafts: BTreeMap<String, Editor>,
     message_regions: Vec<(Rect, usize, bool)>,
     message_area: Rect,
@@ -590,6 +591,7 @@ impl Default for View {
             pending: None,
             saving: false,
             uncertain_save: None,
+            message_labels: BTreeMap::new(),
             message_drafts: BTreeMap::new(),
             message_regions: Vec::new(),
             message_area: Rect::default(),
@@ -916,8 +918,7 @@ impl View {
         }
         self.pending_message = editor.submission.clone();
         editor.in_flight = true;
-        self.notice =
-            Some("Submitting user message… draft retained until exact acceptance.".into());
+        self.notice = None;
     }
     fn accepted_message(editor: &Editor, request: &Submission, value: &serde_json::Value) -> bool {
         let Kind::Message { owner, .. } = &editor.control.kind else {
@@ -959,11 +960,12 @@ impl View {
                 editor.submission = None;
                 editor.uncertain = false;
                 let state = value["state"].as_str().unwrap_or("accepted");
-                self.notice = Some(format!(
-                    "Accepted message {} · {} · not proof of agent acknowledgement or completion.",
-                    request.id,
-                    safe_line(state)
-                ));
+                self.notice = match state {
+                    "queued" | "sending" | "sent" | "delivered" | "acknowledged" | "accepted" => {
+                        None
+                    }
+                    _ => Some(format!("Message {}", safe_line(state))),
+                };
             }
             Ok(value)
                 if value["accepted"] == false
@@ -1189,20 +1191,30 @@ impl View {
                     .values()
                     .find(|editor| editor.control.message_key(&editor.base.control_scope()) == key)
             };
+            let label_key = if focused {
+                self.editor
+                    .as_ref()
+                    .and_then(|editor| editor.control.message_key(&editor.base.control_scope()))
+            } else {
+                key.clone()
+            };
+            let name = label_key
+                .as_ref()
+                .and_then(|key| self.message_labels.get(key))
+                .cloned()
+                .unwrap_or_else(|| crate::board_messages::fallback_label(owner, &control.label));
             let mut title = if rows.len() > visible {
                 format!(
                     "{} · {}/{}",
-                    safe_line(&owner.name),
+                    safe_line(&name),
                     self.message_scroll + slot + 1,
                     rows.len()
                 )
             } else {
-                safe_line(&owner.name)
+                safe_line(&name)
             };
             if let Some(editor) = editor {
-                if editor.in_flight {
-                    title.push_str(" · Sending…");
-                } else if editor.uncertain {
+                if editor.uncertain {
                     title.push_str(" · Uncertain");
                 } else if self.snapshot.as_ref().is_none_or(|snapshot| {
                     snapshot.revision != editor.base.revision
@@ -2447,15 +2459,42 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     run_named(state_dir, Name::default()).await
 }
 
+async fn read_composer_snapshot(
+    state: &Path,
+    board: &Name,
+) -> Result<(Snapshot, crate::board_messages::DisplayLabels)> {
+    // Keep the frozen legacy read contract intact. New brokers can inspect main
+    // with presentation metadata; older brokers retain the safe main fallback.
+    let value = match broker::rpc(
+        state,
+        &Request::BoardInspect {
+            board: board.clone(),
+        },
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) if board.is_main() => broker::rpc(state, &Request::BoardRead).await?,
+        Err(error) => return Err(error),
+    };
+    let labels = match value.get("message_labels") {
+        Some(value) => {
+            serde_json::from_value(value.clone()).context("Invalid composer labels from broker")?
+        }
+        None => BTreeMap::new(),
+    };
+    Ok((
+        serde_json::from_value(value).context("Invalid board snapshot from broker")?,
+        labels,
+    ))
+}
+
 pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
     ensure!(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "The board viewer needs an interactive terminal; use board --raw to print Markdown"
     );
-    let initial: Snapshot = serde_json::from_value(
-        broker::rpc(&state_dir, &Request::board_inspect(board.clone())).await?,
-    )
-    .context("Invalid board snapshot from broker")?;
+    let (initial, initial_labels) = read_composer_snapshot(&state_dir, &board).await?;
     ensure!(
         initial.name == board.as_str(),
         "Broker returned a different board"
@@ -2476,7 +2515,12 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
     enum Update {
         List(Name, u64, bool, u64, Result<Vec<Summary>>),
         Lifecycle(LifecycleAction, Result<Snapshot>),
-        Read(Name, u64, Result<Snapshot>, Option<String>),
+        Read(
+            Name,
+            u64,
+            Result<(Snapshot, crate::board_messages::DisplayLabels)>,
+            Option<String>,
+        ),
         Saved(Save, Result<(Snapshot, bool)>),
         Message(Submission, Result<serde_json::Value>),
     }
@@ -2524,10 +2568,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                 request = requests.recv() => {
                     if request.is_none() { break; }
                     let (board, generation) = current_selection.borrow().clone();
-                    let result = async {
-                        let value = broker::rpc(&state, &Request::board_inspect(board.clone())).await?;
-                        serde_json::from_value::<Snapshot>(value).context("Invalid board snapshot from broker")
-                    }.await;
+                    let result = read_composer_snapshot(&state, &board).await;
                     // Availability is broker-owned cached metadata. Reading it
                     // never fetches a release or changes the board document.
                     let notice = cached_release_notice(&state);
@@ -2548,6 +2589,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
         hyperlinks_enabled: crate::board_links::enabled(),
         ..View::default()
     };
+    view.message_labels = initial_labels;
     view.update(Ok(initial));
     let mut watch: Option<FileWatch> = None;
     let mut dirty = true;
@@ -2609,7 +2651,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     Update::Lifecycle(action, _) => action.generation == view.generation && action.base.name == view.board.as_str(),
                 };
                 if !relevant { continue; }
-                let snapshot = match &update { Update::Read(_, _, Ok(snapshot), _) | Update::Saved(_, Ok((snapshot, _))) => Some(snapshot), _ => None };
+                let snapshot = match &update { Update::Read(_, _, Ok((snapshot, _)), _) | Update::Saved(_, Ok((snapshot, _))) => Some(snapshot), _ => None };
                 if snapshot.is_some() {
                     // RPC snapshots carry logical identity only. The private file
                     // watcher is an internal optimization, never a display value.
@@ -2636,6 +2678,10 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     }
                     Update::Read(board, generation, result, notice) => {
                         dirty |= view.update_release_notice(notice);
+                        let result = result.map(|(snapshot, labels)| {
+                            if view.message_labels != labels { view.message_labels = labels; dirty = true; }
+                            snapshot
+                        });
                         dirty |= view.read_result(&board, generation, result);
                     },
                     Update::Saved(save, result) => { view.saved(save, result); dirty = true; },
@@ -3127,6 +3173,7 @@ mod tests {
         view.paste("third");
         press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
         let request = view.pending_message.take().unwrap();
+        assert!(view.notice.is_none(), "Pending send adds no routine status");
         assert_eq!(request.text, "first\n第二行\nthird");
         press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
         view.paste("must not change pending text");
@@ -3145,10 +3192,29 @@ mod tests {
             "successful send retains composer focus"
         );
         assert!(view.editor.as_ref().unwrap().draft.is_empty());
-        assert!(view.notice.as_ref().unwrap().contains("not proof"));
+        assert!(
+            view.notice.is_none(),
+            "Accepted send adds no success status"
+        );
         view.paste("next");
         press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
         assert_ne!(view.pending_message.as_ref().unwrap().id, request.id);
+    }
+    #[test]
+    fn historical_problem_states_remain_visible_after_confirmed_acceptance() {
+        for state in ["failed", "blocked", "cancelled", "uncertain"] {
+            let mut view = message_view();
+            view.paste("exact historical message");
+            press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+            let request = view.pending_message.take().unwrap();
+            let mut receipt = accepted_receipt(&request, "alpha", "alpha");
+            receipt["state"] = serde_json::json!(state);
+            view.message_result(request, Ok(receipt));
+            assert_eq!(
+                view.notice.as_deref(),
+                Some(format!("Message {state}").as_str())
+            );
+        }
     }
     #[test]
     fn uncertain_message_retries_same_id_and_body_and_rejects_unmatched_acceptance() {
