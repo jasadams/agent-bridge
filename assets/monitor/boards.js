@@ -371,12 +371,12 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     m.row.hidden = m.name !== board;
     m.input.readOnly = m.pending || m.state === "uncertain";
     m.send.disabled = m.pending || !!lifecycleOperation || (!m.submission && (!writable(m) || (!m.value.trim() || m.stale || !m.present)));
-    text(m.send, m.submission ? "Retry same message" : "Send");
+    if (!m.pending) text(m.send, m.submission ? "Retry same message" : "Send");
     m.review.hidden = !m.stale || m.state === "uncertain";
     m.review.disabled = m.pending || !writable(m);
     m.discard.disabled = m.pending;
     m.discard.hidden = (!m.value && !m.submission) || (!m.stale && m.state === "editing");
-    text(m.feedback, m.pending ? "Sending to broker…" : m.feedbackText || (m.stale ? "The board or input changed. Your draft is kept. Review before sending." : ""));
+    text(m.feedback, m.pending ? "" : m.feedbackText || (m.stale ? "The board or input changed. Your draft is kept. Review before sending." : ""));
     $("board-messages").hidden = !Array.from(messageDrafts.values()).some(d => d.name === board);
   }
   // Resizing can clip a box that was already focused: focus events do not fire
@@ -419,7 +419,8 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       if (result.accepted !== true || result.id !== submission.id || result.message?.id !== submission.id || result.message?.body !== submission.text || result.message?.sender !== "user" || result.message?.recipient !== m.owner.name || result.message?.recipient_session !== m.owner.session || typeof result.state !== "string") throw new Error("Unconfirmed message acceptance");
       m.submission = null; m.state = "editing";
       if (m.version === version) { m.value = ""; m.input.value = ""; }
-      m.feedbackText = `Broker accepted message (${result.state}). This does not mean the agent has read or completed it.`;
+      m.feedbackText = ["queued", "sending", "sent", "delivered", "acknowledged", "accepted"].includes(result.state)
+        ? "" : `Message ${result.state}`;
       if (m.present && m.control && writable(m)) { m.revision = m.currentRevision; m.controlId = m.control.id; m.stale = false; }
     } catch (e) {
       if (!current(c) || !active || messageDrafts.get(m.key) !== m || m.submission !== submission) return;

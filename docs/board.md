@@ -599,7 +599,9 @@ only when its ID, label and pinned owner are unchanged; Enter remains an explici
 send action. A changed or removed input cannot receive the stale draft.
 
 Successful acceptance clears only that exact draft and keeps the composer focused
-for another message. Pending submissions ignore repeated Enter and lock editing.
+for another message, without adding a success message or feedback row. Pending
+submissions keep the Send button and layout unchanged, lock editing and ignore
+repeated Enter without adding routine status text.
 An uncertain result keeps both text and UUID locked: Enter retries the exact same
 submission; Ctrl-X discards explicitly. Definite errors retain an editable draft.
 Text responses keep their existing Enter-newline/Ctrl-S-save behavior. Normal

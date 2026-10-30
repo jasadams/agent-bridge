@@ -31,6 +31,37 @@ def run(binary, output=None):
         if output is not None:
             (output / (name + ".txt")).write_text(viewer.screen.text() + "\n")
 
+    def discard_and_quit(viewer):
+        # Escape decoding is platform dependent. Observe each state transition
+        # before sending another key, so Ctrl-D cannot arrive inside the editor.
+        viewer.keys(b"\x1b")
+        viewer.wait(lambda: "Message draft retained." in viewer.screen.text())
+        viewer.keys(b"\x04")
+        viewer.wait(lambda: "All retained message drafts discarded" in viewer.screen.text())
+        os.write(viewer.master, b"q")
+        deadline = time.monotonic() + 5
+        while viewer.process.poll() is None:
+            assert time.monotonic() < deadline, "normal keyboard quit timed out: " + viewer.screen.text()
+            if select.select([viewer.master], [], [], .05)[0]:
+                try:
+                    viewer.output.extend(os.read(viewer.master, 65536))
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+        while select.select([viewer.master], [], [], 0)[0]:
+            try:
+                remaining = os.read(viewer.master, 65536)
+                if not remaining:
+                    break
+                viewer.output.extend(remaining)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                break
+        assert viewer.process.wait(timeout=1) == 0
+        assert b"\x1b[?1049l" in viewer.output, "normal quit restores alternate screen"
+        assert b"\x1b[?2004l" in viewer.output, "normal quit disables bracketed paste"
+
     with tempfile.TemporaryDirectory(prefix="ab-msg-", dir="/tmp") as directory:
         root = Path(directory)
         native = root / "native"
@@ -97,19 +128,6 @@ def run(binary, output=None):
                 added = rpc({"op": "add_board_message_input", "board": "alpha", "expected_revision": before["revision"], "agent": "coordinator", "id": "compose", "label": "Message coordinator"})
                 original = rpc({"op": "named_board_update", "board": "alpha", "expected_revision": added["board"]["revision"], "edits": [{"op": "append", "text": "\nRun `printf hello` before composing.\n\n```text\n<!-- board-message: literal example -->\n```\n"}]})["board"]
                 viewer = Viewer(binary, state, "alpha")
-                accepted_ids = set()
-                original_feed = viewer.screen.feed
-
-                def record_rendered_acceptance(data):
-                    # Sample the rendered status row within a read: several
-                    # redraws may be coalesced before the parent drains the PTY.
-                    for byte in data:
-                        original_feed(bytes([byte]))
-                        if byte in (32, ord("e")):
-                            status = "\n".join("".join(viewer.screen.cells.get((x, y), (" ", None))[0] for x in range(viewer.screen.columns)) for y in range(viewer.screen.rows - 3, viewer.screen.rows))
-                            accepted_ids.update(re.findall(r"Accepted message ([0-9a-f-]{36})", status))
-
-                viewer.screen.feed = record_rendered_acceptance
                 viewer.wait(lambda: "coordinator" in viewer.screen.text() and "[Send]" in viewer.screen.text())
                 viewer.wait(lambda: "Last Updated:" in viewer.screen.text())
                 assert isinstance(original["last_updated"], int)
@@ -146,7 +164,7 @@ def run(binary, output=None):
                 assert not frames, "typing and newline must not send"
                 viewer.keys(b"\r\r\r")
                 viewer.wait(lambda: len(frames) == 1)
-                viewer.wait(lambda: frames[0]["msg_id"] in accepted_ids)
+                viewer.wait(lambda: "Exact first" not in viewer.screen.text())
                 assert "Exact first" not in viewer.screen.text() and "▏" in viewer.screen.text(), "exact accepted draft clears while composer stays focused"
                 assert frames[0]["from"] == "user" and frames[0]["session_id"] == session
                 assert "Exact first 🦀\nsecond line" in frames[0]["message"]["content"]
@@ -159,13 +177,15 @@ def run(binary, output=None):
                 assert len(frames) == 1 and "retained draft" in viewer.screen.text()
                 viewer.keys(b"\x12\r")  # Explicit Ctrl-R review then Enter send.
                 viewer.wait(lambda: len(frames) == 2)
-                viewer.wait(lambda: frames[1]["msg_id"] in accepted_ids)
+                viewer.wait(lambda: "retained draft" not in viewer.screen.text())
                 assert frames[1]["session_id"] == session
                 assert "retained draft" in frames[1]["message"]["content"]
                 assert frames[0]["msg_id"] != frames[1]["msg_id"]
                 assert rpc({"op": "named_board_read", "board": "alpha"}) == changed["board"]
                 history = rpc({"op": "history", "agent": "coordinator", "limit": 100})
                 assert len(history) == 2 and len(frames) == 2, "rapid Enter must not create duplicate messages or native deliveries"
+                assert {message["id"] for message in history} == {frame["msg_id"] for frame in frames}
+                assert "Accepted message" not in viewer.screen.text() and "not proof" not in viewer.screen.text()
                 # Mouse Send must dispatch immediately, without a later keyboard event.
                 viewer.keys(b"mouse send without keyboard")
                 x, y = next((x, y) for (x, y) in viewer.screen.cells if all(
@@ -174,12 +194,12 @@ def run(binary, output=None):
                 viewer.keys(f"\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m".encode())
                 # Only drain PTY output and inspect RPCs from here until accepted.
                 viewer.wait(lambda: len(frames) == 3)
-                viewer.wait(lambda: frames[2]["msg_id"] in accepted_ids)
                 viewer.wait(lambda: "mouse send without keyboard" not in viewer.screen.text())
                 assert frames[2]["session_id"] == session
                 history = rpc({"op": "history", "agent": "coordinator", "limit": 100})
                 assert len(history) == 3 and any(message["body"] == "mouse send without keyboard" for message in history)
                 assert rpc({"op": "named_board_read", "board": "alpha"}) == changed["board"]
+                assert "Accepted message" not in viewer.screen.text() and "Queued" not in viewer.screen.text()
                 capture(viewer, "message-mouse-send-accepted-without-key")
                 # Real multi-owner layout, click focus, overflow reveal and independent scroll.
                 viewer.keys(b"\x1b")
@@ -226,31 +246,7 @@ def run(binary, output=None):
                 capture(viewer, "message-stacked-stale-target")
                 assert len(frames) == 3, "Layout/focus checks unexpectedly submitted a message"
                 # Explicitly discard the private test drafts, then quit normally.
-                viewer.keys(b"\x1b")
-                viewer.keys(b"\x04")
-                os.write(viewer.master, b"q")
-                deadline = time.monotonic() + 5
-                while viewer.process.poll() is None:
-                    assert time.monotonic() < deadline, "normal keyboard quit timed out"
-                    if select.select([viewer.master], [], [], .05)[0]:
-                        try:
-                            viewer.output.extend(os.read(viewer.master, 65536))
-                        except OSError as error:
-                            if error.errno != errno.EIO:
-                                raise
-                while select.select([viewer.master], [], [], 0)[0]:
-                    try:
-                        remaining = os.read(viewer.master, 65536)
-                        if not remaining:
-                            break
-                        viewer.output.extend(remaining)
-                    except OSError as error:
-                        if error.errno != errno.EIO:
-                            raise
-                        break
-                assert viewer.process.wait(timeout=1) == 0
-                assert b"\x1b[?1049l" in viewer.output, "normal quit restores alternate screen"
-                assert b"\x1b[?2004l" in viewer.output, "normal quit disables bracketed paste"
+                discard_and_quit(viewer)
                 # Real canonical registration IDs and separate native titles must
                 # render differently, without changing the pinned owner or board.
                 viewer.close()
@@ -299,10 +295,7 @@ def run(binary, output=None):
                 capture(viewer, "message-canonical-replaced-owner")
                 if output is not None:
                     (output / "friendly-label-fixture.json").write_text(json.dumps({"canonical": canonical, "session": canonical_session, "friendly_title": "Coordinator", "renamed_title": "Planner", "replacement_title": "Wrong replacement", "authored_fallback": "Support desk", "board_revision": baseline["revision"]}, indent=2))
-                viewer.keys(b"\x1b")
-                viewer.keys(b"\x04")
-                os.write(viewer.master, b"q")
-                viewer.process.wait(timeout=5)
+                discard_and_quit(viewer)
                 # Default main must use the metadata-capable inspection path too.
                 viewer.close()
                 rpc({"op": "register", "agent": {"name": canonical, "provider": "claude", "session": canonical_session, "endpoint": str(endpoint), "enabled": True}, "replace": True})
@@ -323,10 +316,7 @@ def run(binary, output=None):
                 capture(viewer, "message-main-canonical-renamed-title")
                 if output is not None:
                     (output / "friendly-main-fixture.json").write_text(json.dumps({"board": "main", "canonical": canonical, "session": canonical_session, "friendly_title": "Main coordinator", "renamed_title": "Main planner", "board_revision": main_before["revision"], "last_updated": main_before["last_updated"]}, indent=2))
-                viewer.keys(b"\x1b")
-                viewer.keys(b"\x04")
-                os.write(viewer.master, b"q")
-                viewer.process.wait(timeout=5)
+                discard_and_quit(viewer)
                 assert not failures, failures
                 print("PASS: real native delivery, Enter send/Ctrl-J newline, repeated Enter, focus, draft refresh/review, exact board, graceful quit/reset")
             finally:

@@ -186,12 +186,20 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             page.keyboard.press("Shift+Enter"); page.keyboard.type("second line  ")
             body = "  exact keyboard 🦀\nsecond line  "
             expect(textarea).to_have_value(body); assert not history(body)
+            geometry = page.evaluate("""() => ['.board-layout', '#board-messages'].map(selector => {
+              const {x,y,width,height}=document.querySelector(selector).getBoundingClientRect(); return {x,y,width,height};
+            })""")
             page.keyboard.press("Enter"); first = sent(body)
             wait("actual native frame", lambda: any(f.get("msg_id") == first["id"] for f in frames))
             frame = next(f for f in frames if f.get("msg_id") == first["id"])
             assert frame["from"] == "user" and frame["session_id"] == session and body in frame["message"]["content"]
             assert read() == before, "Sending edited board Markdown/revision/timestamp"
-            expect(row().locator(".message-feedback")).to_contain_text("does not mean")
+            expect(row().locator(".message-feedback")).to_have_text("")
+            expect(row().locator(".message-feedback")).to_be_hidden()
+            assert page.evaluate("""() => ['.board-layout', '#board-messages'].map(selector => {
+              const {x,y,width,height}=document.querySelector(selector).getBoundingClientRect(); return {x,y,width,height};
+            })""") == geometry, "Accepted send shifted the document or composer dock"
+            page.screenshot(path=str(output / "message-accepted-no-feedback.png"), full_page=False)
             textarea.fill("second deliberate message"); page.keyboard.press("Enter"); second = sent("second deliberate message")
             assert first["id"] != second["id"]
             record("keyboard Tab/backtab, Enter send, Shift+Enter exact multiline, repeated reuse/focus and actual pinned native delivery; board unchanged")
@@ -214,16 +222,29 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
         def case_pending_refresh():
             textarea = row().locator("textarea")
             textarea.fill("pending exact message"); arm_gate()
+            geometry = """row => {
+              const rect = e => { const {x,y,width,height}=e.getBoundingClientRect(); return {x,y,width,height}; };
+              return [document.querySelector('.board-layout'), document.querySelector('#board-messages'), row,
+                row.querySelector('textarea'), row.querySelector('.response-actions button')].map(rect);
+            }"""
+            before_geometry = row().evaluate(geometry)
             page.keyboard.press("Enter")
             wait("decoded real acceptance held", lambda: page.evaluate("window.__composerGate.decoded"))
             count = len(posts)
             page.keyboard.press("Enter"); page.keyboard.press("Enter")
             expect(textarea).to_have_attribute("readonly", "")
+            expect(row().get_by_role("button", name="Send", exact=True)).to_be_disabled()
+            expect(row().locator(".message-feedback")).to_have_text("")
+            expect(row().locator(".message-feedback")).to_be_hidden()
+            assert row().evaluate(geometry) == before_geometry, "Pending send shifted composer/document geometry"
+            page.screenshot(path=str(output / "message-pending-no-feedback.png"), full_page=False)
             assert len(posts) == count
             # Ordinary refresh must continue while this composer awaits its receipt.
             write(read()["markdown"] + "\nUpdated during pending send\n")
             expect(page.locator("#board-document")).to_contain_text("Updated during pending send", timeout=15000)
             release_gate(); sent("pending exact message")
+            expect(row().locator(".message-feedback")).to_be_hidden()
+            assert row().evaluate(geometry) == before_geometry, "Accepted send shifted composer/document geometry"
             assert len(posts) == count and read()["markdown"].endswith("Updated during pending send\n")
             record("pending Enter does not duplicate and actual live refresh continues independently while acceptance is delayed")
 

@@ -918,8 +918,7 @@ impl View {
         }
         self.pending_message = editor.submission.clone();
         editor.in_flight = true;
-        self.notice =
-            Some("Submitting user message… draft retained until exact acceptance.".into());
+        self.notice = None;
     }
     fn accepted_message(editor: &Editor, request: &Submission, value: &serde_json::Value) -> bool {
         let Kind::Message { owner, .. } = &editor.control.kind else {
@@ -961,11 +960,12 @@ impl View {
                 editor.submission = None;
                 editor.uncertain = false;
                 let state = value["state"].as_str().unwrap_or("accepted");
-                self.notice = Some(format!(
-                    "Accepted message {} · {} · not proof of agent acknowledgement or completion.",
-                    request.id,
-                    safe_line(state)
-                ));
+                self.notice = match state {
+                    "queued" | "sending" | "sent" | "delivered" | "acknowledged" | "accepted" => {
+                        None
+                    }
+                    _ => Some(format!("Message {}", safe_line(state))),
+                };
             }
             Ok(value)
                 if value["accepted"] == false
@@ -1214,9 +1214,7 @@ impl View {
                 safe_line(&name)
             };
             if let Some(editor) = editor {
-                if editor.in_flight {
-                    title.push_str(" · Sending…");
-                } else if editor.uncertain {
+                if editor.uncertain {
                     title.push_str(" · Uncertain");
                 } else if self.snapshot.as_ref().is_none_or(|snapshot| {
                     snapshot.revision != editor.base.revision
@@ -3175,6 +3173,7 @@ mod tests {
         view.paste("third");
         press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
         let request = view.pending_message.take().unwrap();
+        assert!(view.notice.is_none(), "Pending send adds no routine status");
         assert_eq!(request.text, "first\n第二行\nthird");
         press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
         view.paste("must not change pending text");
@@ -3193,10 +3192,29 @@ mod tests {
             "successful send retains composer focus"
         );
         assert!(view.editor.as_ref().unwrap().draft.is_empty());
-        assert!(view.notice.as_ref().unwrap().contains("not proof"));
+        assert!(
+            view.notice.is_none(),
+            "Accepted send adds no success status"
+        );
         view.paste("next");
         press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
         assert_ne!(view.pending_message.as_ref().unwrap().id, request.id);
+    }
+    #[test]
+    fn historical_problem_states_remain_visible_after_confirmed_acceptance() {
+        for state in ["failed", "blocked", "cancelled", "uncertain"] {
+            let mut view = message_view();
+            view.paste("exact historical message");
+            press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
+            let request = view.pending_message.take().unwrap();
+            let mut receipt = accepted_receipt(&request, "alpha", "alpha");
+            receipt["state"] = serde_json::json!(state);
+            view.message_result(request, Ok(receipt));
+            assert_eq!(
+                view.notice.as_deref(),
+                Some(format!("Message {state}").as_str())
+            );
+        }
     }
     #[test]
     fn uncertain_message_retries_same_id_and_body_and_rejects_unmatched_acceptance() {
