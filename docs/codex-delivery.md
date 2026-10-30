@@ -5,7 +5,8 @@ private socket and same-user peer, canonical `CODEX_HOME`, loaded-thread members
 and fresh thread metadata. It never starts/resumes a thread, interrupts work,
 answers a permission request or changes native permission rules.
 
-For the verified Codex 0.165.0 protocol, an active thread with
+Active delivery is selected by verified runtime capabilities and protocol facts,
+not a version allowlist. An active thread with
 `canAcceptDirectInput: true` receives one `turn/steer` using its latest exact
 `inProgress` turn ID as `expectedTurnId`. The lookup is bounded to one descending
 summary turn. Input retains the original bridge UUID and peer envelope; steer
@@ -14,13 +15,14 @@ or proof of model judgement. A running tool may finish before the next model
 request sees the input; the adapter does not cancel it to reduce latency.
 
 Idle threads and false/missing direct-input capabilities use the native queue.
-Unknown versions retain only this existing compatibility path, with exact queue
-UUID/input confirmation: they never use the new steer path or pinned capacity
-classification. This is compatibility behavior, not qualification of another
-native version. The version check uses the first `initialize.userAgent` token's
-exact `/0.165.0` version after a nonempty client prefix in the first token, not a
-version substring elsewhere in the response. The prefix can retain the daemon's
-first observer name, so it need not equal this adapter's client name.
+A newer or unrecognized runtime that reports the same valid contract uses the
+same active path. The `initialize.userAgent` version is diagnostic only: missing,
+unusual or changed version text neither enables nor blocks a native write. The
+private same-user peer, canonical home, loaded destination, status/capability,
+latest active turn and exact receipt remain mandatory. A version string alone
+never establishes compatibility; changed or unsupported protocol facts still
+fail safely. Exercised 0.165 and 0.166 fixtures are regression examples,
+not an allowlist.
 
 Contradictory/malformed metadata, unavailable threads, unsupported required lookup
 APIs and a stale active-turn selection fail before submission. If the active turn
@@ -53,11 +55,13 @@ admission. Idempotent sends return the existing record before new admission chec
 Captured provider/native identity is immutable across alias replacement; a rebound
 alias cannot redirect an old attempt to another provider, even if the UUID matches.
 
-The pinned native queue itself holds 100 entries and can include messages sent
-outside this broker. The exact known 0.165.0 capacity rejection produces a failed
+The exercised native queue holds 100 entries and can include messages sent
+outside this broker. The exact validated capacity rejection produces a failed
 message with a sanitized queue-full diagnostic, distinct from an uncertain write.
 Only that exact code/message and an unambiguous error-only response qualify;
-generic errors, unknown versions and contradictory receipts remain uncertain.
+generic errors, malformed error envelopes and contradictory receipts remain uncertain.
+Capacity classification uses the correlated error-only response and exact known
+code/message semantics, independently of runtime version.
 There is no automatic retry when native capacity becomes available. A result
 describes only the latest attempt: an earlier explicitly retried uncertain or
 submitted attempt may still execute. A definite latest rejection does not prove
@@ -88,7 +92,9 @@ is a separate action; isolated validation does not change the running installati
 The [AGB-11 diagnosis](codex-delivery-diagnosis.md) records the original queue-only
 boundary, historical uncertainty and disposable native feasibility evidence.
 The [production native regression report](codex-active-delivery-regression.md)
-records actual executable evidence. `tools/codex-native-delivery.py --production` exercises the built adapter through
+records historical executable evidence; the [capability-driven follow-up](codex-capability-delivery-regression.md)
+records the current 0.166 runtime and version-independent contract tests.
+`tools/codex-native-delivery.py --production` exercises the built adapter through
 actual broker sends and MCP acknowledgement/reply against a deterministic localhost
 Responses fixture. It also verifies held-tool success, same-turn continuation,
 observer disconnection and exact native capacity rejection. Synthetic model

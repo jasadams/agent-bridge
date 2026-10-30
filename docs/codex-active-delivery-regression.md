@@ -3,7 +3,10 @@
 The production regression mode of `tools/codex-native-delivery.py` sends through
 the built broker's normal public send API. It preserves the historical AGB-11
 artifact verifier and direct-API feasibility scenarios. Run with Python 3.11+,
-websockets 15.0.1, Codex CLI 0.165.0 and the current task binary:
+websockets 15.0.1, an installed Codex runtime and the current task binary. The
+historical measurements below used Codex 0.165.0; runtime versions/hashes are
+recorded rather than used as routing gates. See the
+[capability-driven follow-up](codex-capability-delivery-regression.md) for current evidence:
 
 ```sh
 python3 tools/codex-native-delivery.py --production --broker target/debug/agent-bridge

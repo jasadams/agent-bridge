@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Disposable Codex delivery diagnostic and production regression; isolated state only.
 
-Requires Python 3.11+, websockets, codex 0.165.0 and a current agent-bridge.
+Requires Linux, Python 3.11+, websockets 15.0.1 and a current agent-bridge.
+Codex runtime version is recorded; eligibility is verified from its protocol.
 All model traffic is served by a deterministic loopback Responses fixture.
 """
 import argparse
@@ -13,7 +14,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import signal
 import socket
 import stat
 import subprocess
@@ -21,6 +21,8 @@ import tempfile
 import threading
 import time
 import uuid
+
+from qualification_native import Processes
 
 
 def stamp():
@@ -50,16 +52,15 @@ class Probe:
                     "LANG": "C.UTF-8"}
         self.events = []
         self.cases = []
-        self.children = []
-        self.files = []
+        self.processes = Processes(self.root)
+        self.children = self.processes.children
         self.current = None
+        self.expected_commit = None
         self.lock = threading.Lock()
         parent = Path(f"/tmp/codex-daemon-{os.getuid()}")
-        meta = parent.lstat()
-        assert stat.S_ISDIR(meta.st_mode) and meta.st_uid == os.getuid()
-        assert stat.S_IMODE(meta.st_mode) & 0o077 == 0
         self.sock = parent / ("agb11-" + uuid.uuid4().hex + ".sock")
         self.native_sock = self.root / "native.sock"
+        self.socket_identity = None
         self.server = None
         self.worker = None
 
@@ -68,13 +69,7 @@ class Probe:
             self.events.append(dict(stamp(), kind=kind, **data))
 
     def spawn(self, label, command):
-        out = (self.root / (label + ".stdout")).open("w")
-        err = (self.root / (label + ".stderr")).open("w")
-        self.files += [out, err]
-        proc = subprocess.Popen(command, cwd=self.root, env=self.env,
-                                stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
-        self.children.append((label, proc))
-        return proc
+        return self.processes.start(label, command, self.env, self.root)
 
     def broker(self, value):
         self.event("broker_request", frame=value)
@@ -168,14 +163,28 @@ class Probe:
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
-        self.worker = threading.Thread(target=self.server.serve_forever)
-        self.worker.start()
+        try:
+            self.worker = threading.Thread(target=self.server.serve_forever)
+            self.worker.start()
+        except BaseException:
+            # shutdown() blocks when serve_forever never started. A failed
+            # thread startup owns only a bound server, which must be closed.
+            self.worker = None
+            try:
+                self.server.server_close()
+            finally:
+                self.server = None
+            raise
 
-    async def wait_path(self, path):
-        async with asyncio.timeout(15):
+    async def wait_path(self, path, seconds=15):
+        async def observe():
             while not path.exists():
-                assert all(proc.poll() is None for _, proc in self.children), "child exited"
+                # Observe exit without reaping: cleanup must reserve every owned
+                # process-group ID until its final group signal is complete.
+                assert all(os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None
+                           for _, proc in self.children), "child exited"
                 await asyncio.sleep(.05)
+        await asyncio.wait_for(observe(), timeout=seconds)
 
     async def proxy(self, ws):
         from websockets.asyncio.client import unix_connect
@@ -387,12 +396,19 @@ class Probe:
                 await ws.close()
 
     async def run(self):
+        meta = self.sock.parent.lstat()
+        assert stat.S_ISDIR(meta.st_mode) and meta.st_uid == os.getuid()
+        assert stat.S_IMODE(meta.st_mode) & 0o077 == 0
+        assert not self.sock.exists(), "unique proxy path already exists"
         self.fixture()
         config = '[mcp_servers.bridge]\nenabled_tools = ["acknowledge_message", "send_message"]\ncommand = ' + json.dumps(self.args.broker) + '\nargs = ["--state-dir", ' + json.dumps(str(self.root / "state")) + ', "mcp"]\n'
         config += '\n[mcp_servers.bridge.tools.acknowledge_message]\napproval_mode = "approve"\n[mcp_servers.bridge.tools.send_message]\napproval_mode = "approve"\n'
         (self.root / "codex" / "config.toml").write_text(config)
         self.spawn("broker", [self.args.broker, "--state-dir", str(self.root / "state"), "serve", "--no-discovery"])
         await self.wait_path(self.root / "state" / "bridge.sock")
+        if self.args.production:
+            status = self.broker({"op": "status"})
+            assert status.get("build_commit") == self.expected_commit, "rebuild broker with AGENT_BRIDGE_BUILD_COMMIT matching source HEAD"
         command = [self.args.codex, "app-server", "--listen", "unix://" + str(self.native_sock)]
         for setting in ['model_provider="fixture"', 'model="fixture"', 'model_providers.fixture.name="fixture"', f'model_providers.fixture.base_url="http://127.0.0.1:{self.server.server_port}/v1"', 'model_providers.fixture.wire_api="responses"', 'model_providers.fixture.requires_openai_auth=false', 'model_providers.fixture.supports_websockets=false']:
             command += ["-c", setting]
@@ -401,61 +417,63 @@ class Probe:
         from websockets.asyncio.server import unix_serve
         async with unix_serve(self.proxy, path=str(self.sock)):
             self.sock.chmod(0o600)
+            meta = self.sock.lstat()
+            self.socket_identity = (meta.st_dev, meta.st_ino)
             for name in self.args.cases.split(","):
                 await self.case(name)
 
     def cleanup(self):
         if self.current:
             self.current["release"].set()
-        results = {}
+        # Shared cleanup signals groups while their unreaped leaders still own
+        # the group IDs, attempts every child and then closes every log.
+        results = self.processes.close()
+        errors = list(self.processes.cleanup_errors)
         audits = {}
-        for label, proc in reversed(self.children):
-            # Each owned child has its own session; include its MCP descendants.
+        def cleanup(label, action):
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                results[label] = proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                results[label] = proc.wait(timeout=5)
-            # A parent can exit before its MCP descendants. Never signal our own group.
-            assert proc.pid != os.getpgrp()
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            deadline = time.monotonic() + 2
-            while True:
-                survivors = []
-                for entry in Path("/proc").iterdir():
-                    if not entry.name.isdigit():
-                        continue
-                    try:
-                        fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                        if int(fields[2]) == proc.pid and fields[0] != "Z":
-                            survivors.append(int(entry.name))
-                    except (FileNotFoundError, ProcessLookupError):
-                        pass
-                if not survivors or time.monotonic() >= deadline:
-                    break
-                time.sleep(.05)
-            audits[label] = {"process_group": proc.pid, "surviving_non_zombie_pids": survivors, **stamp()}
-            assert not survivors, (label, survivors)
+                action()
+            except Exception as error:
+                errors.append(f"{label}: {error}")
+        for label, proc in self.children:
+            def audit(label=label, proc=proc):
+                deadline = time.monotonic() + 2
+                while True:
+                    survivors = []
+                    for entry in Path("/proc").iterdir():
+                        if not entry.name.isdigit():
+                            continue
+                        try:
+                            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                            if int(fields[2]) == proc.pid and fields[0] != "Z":
+                                survivors.append(int(entry.name))
+                        except (FileNotFoundError, ProcessLookupError):
+                            pass
+                    if not survivors or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.05)
+                audits[label] = {"process_group": proc.pid, "surviving_non_zombie_pids": survivors, **stamp()}
+                assert not survivors, (label, survivors)
+            cleanup(label + " group audit", audit)
         if self.server:
-            self.server.shutdown()
-            self.server.server_close()
-            self.worker.join(timeout=5)
-            assert not self.worker.is_alive()
-        if self.sock.exists():
-            meta = self.sock.lstat()
-            assert stat.S_ISSOCK(meta.st_mode) and meta.st_uid == os.getuid()
-            self.sock.unlink()
-        for handle in self.files:
-            handle.close()
+            cleanup("provider shutdown", self.server.shutdown)
+            cleanup("provider close", self.server.server_close)
+        if self.worker:
+            cleanup("provider join", lambda: self.worker.join(timeout=5))
+            if self.worker.is_alive():
+                errors.append("Provider thread did not stop")
+        def remove_socket():
+            if self.socket_identity is not None and self.sock.exists():
+                meta = self.sock.lstat()
+                assert stat.S_ISSOCK(meta.st_mode) and meta.st_uid == os.getuid()
+                assert (meta.st_dev, meta.st_ino) == self.socket_identity
+                self.sock.unlink()
+        cleanup("proxy socket", remove_socket)
         (self.root / "events.json").write_text(json.dumps(self.events, indent=2))
-        (self.root / "results.json").write_text(json.dumps({"cases": self.cases, "cleanup": results, "cleanup_audit": audits}, indent=2))
+        (self.root / "results.json").write_text(json.dumps({"cases": self.cases, "cleanup": results,
+            "cleanup_audit": audits, "cleanup_errors": errors}, indent=2))
+        if errors:
+            raise RuntimeError("Native regression cleanup failed: " + "; ".join(errors))
 
 
 def verify_production_active(case, rows, wire, outgoing, models, timeline):
@@ -521,6 +539,7 @@ def verify_artifacts(root):
     events = json.loads((root / "events.json").read_text())
     results = json.loads((root / "results.json").read_text())
     wire = [event for event in events if event["kind"] == "wire_frame"]
+    assert not results.get("cleanup_errors", []), results.get("cleanup_errors")
     assert results["cleanup"] == {"native": 0, "broker": 0}, results["cleanup"]
     assert results["cases"], "no completed cases"
     if any(case.get("production") for case in results["cases"]):
@@ -765,23 +784,26 @@ def main():
         parser.error("--production requires broker-send cases; steer cases are historical direct-API feasibility only")
     assert 0 < args.hold_seconds <= 10
     assert set(args.cases.split(",")) <= {"idle", "generating", "held-tool", "long-turn", "disconnected", "saturation", "steer", "steer-held-tool"}
+    args.codex = str(Path(args.codex).resolve(strict=True))
     probe = Probe(args)
-    print("ARTIFACT_ROOT", probe.root, flush=True)
-    import websockets
-    assert platform.system() == "Linux" and tuple(map(int, platform.python_version_tuple()[:2])) >= (3, 11)
-    assert websockets.__version__ == "15.0.1", "native regression pins websockets 15.0.1"
-    versions = {"platform": platform.platform(), "python": platform.python_version(),
-                "websockets": websockets.__version__, "production": args.production,
-                "source_diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=Path(__file__).resolve().parent.parent)).hexdigest(), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent.parent, text=True).strip()}
-    repository = Path(__file__).resolve().parent.parent
-    paths = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=repository).decode().split("\0")
-    versions["source_files_sha256"] = {path: hashlib.sha256((repository / path).read_bytes()).hexdigest()
-                                       for path in sorted(set(paths)) if path and (repository / path).is_file()}
-    for name, binary in (("broker", args.broker), ("codex", args.codex)):
-        versions[name] = {"path": str(Path(binary).resolve()), "sha256": hashlib.sha256(Path(binary).resolve().read_bytes()).hexdigest(), "version": subprocess.check_output([binary, "--version"], text=True).strip()}
-    assert versions["codex"]["version"] == "codex-cli 0.165.0", versions["codex"]["version"]
-    (probe.root / "versions.json").write_text(json.dumps(versions, indent=2))
     try:
+        print("ARTIFACT_ROOT", probe.root, flush=True)
+        import websockets
+        assert platform.system() == "Linux" and tuple(map(int, platform.python_version_tuple()[:2])) >= (3, 11)
+        assert websockets.__version__ == "15.0.1", "native regression pins websockets 15.0.1"
+        versions = {"platform": platform.platform(), "python": platform.python_version(),
+                    "websockets": websockets.__version__, "production": args.production,
+                    "source_diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=Path(__file__).resolve().parent.parent)).hexdigest(), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent.parent, text=True).strip()}
+        repository = Path(__file__).resolve().parent.parent
+        probe.expected_commit = versions["source_commit"]
+        if args.production:
+            subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", "src", "Cargo.toml", "Cargo.lock", "build.rs"], cwd=repository, check=True, stdout=subprocess.DEVNULL)
+        paths = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=repository).decode().split("\0")
+        versions["source_files_sha256"] = {path: hashlib.sha256((repository / path).read_bytes()).hexdigest()
+                                           for path in sorted(set(paths)) if path and (repository / path).is_file()}
+        for name, binary in (("broker", args.broker), ("codex", args.codex)):
+            versions[name] = {"path": str(Path(binary).resolve()), "sha256": hashlib.sha256(Path(binary).resolve().read_bytes()).hexdigest(), "version": subprocess.check_output([binary, "--version"], text=True, env=probe.env, cwd=probe.root, timeout=10).strip()}
+        (probe.root / "versions.json").write_text(json.dumps(versions, indent=2))
         asyncio.run(probe.run())
     finally:
         probe.cleanup()
