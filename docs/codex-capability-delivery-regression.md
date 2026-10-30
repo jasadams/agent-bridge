@@ -117,3 +117,22 @@ and immediate-child-exit tests both assert no `poll()` or `wait()` reaping. The
 native fixture's other APIs still require Python 3.11+. No platform is skipped.
 The earlier native measurement above retains its exact source and harness hashes;
 refreshed measurements after this harness repair are attributed separately.
+
+## Refreshed proof after portability repair
+
+The repaired harness passed all six native production cases again against
+`105ef923dd444ecf8c680ef29b5b6407498a868f`. Its rebuilt broker SHA-256 is
+`f32bbbcc24730bc1c71f1fb2438116ba0a036caa3fc8abddaa6fb5ca621b5529`; the installed Codex artifact is unchanged.
+Offline replay again accepted all six cases, and all eight corruptions were rejected.
+Both owned processes exited 0, with no surviving non-zombie group members or cleanup
+errors. Thirteen Python safety tests passed; a separate process also passed all 13
+with `asyncio.timeout` removed, a missing-API simulation rather than a claim of a
+locally installed Python 3.10.
+
+The manifest's current fields bind this refreshed run at
+`/var/tmp/agb13-codex-famr90md`; `previous_measurement` preserves the original run
+above. It includes the full initial CI inventory and hashes of all four saved job
+logs. Rust source, dependencies and build script are unchanged from the original
+native proof; the rebuilt binary has the repaired commit in its diagnostic metadata.
+This refresh exercises the changed harness readiness path. Later report/evidence-only
+commits retain their own attribution and do not change the measured executable.
