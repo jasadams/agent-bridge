@@ -12,8 +12,9 @@ const LEASE_MS = 20000, HEARTBEAT_MS = 5000, RECEIPT_MS = 3000;
 type Delivery = Identity & { op: "deliver" | "reconcile"; generation: string; attempt: string };
 type Reply = { ok: boolean; instance: string; protocol: number; session: string; id?: string; namespace?: string; generation?: string; attempt?: string; native_message_id?: string; status?: "inserted" | "deferred" | "uncertain"; error?: string };
 type Frame = { op: "probe"; session: string } | Delivery;
-type Live = { generation: string; namespace: string; expires: number };
+type Live = { generation: string; namespace: string; expires: number; revision: number };
 type Data = { buffer: Buffer; handled: boolean; timer?: ReturnType<typeof setTimeout> };
+class InvalidNativeSession extends Error {}
 
 function parseFrame(input: unknown): Frame {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid frame");
@@ -55,7 +56,12 @@ const AgentBridge = Plugin.define({
     const active = new Set<Promise<unknown>>();
     const deliveries = new Map<string, { fingerprint: string; pending: ReturnType<typeof handle> }>();
     const registrations = new Set<{ dispose: () => void }>();
+    const heartbeats = new Set<Live>();
+    const observing = new Set<string>();
+    const recoverable = new Set<string>();
     let disposed = false, events = Promise.resolve();
+    const sessionEvents = new Map<string, Promise<void>>();
+    const lifecycle = new Map<string, number>();
     function guard(session: string, frame?: Delivery): Live {
       const entry = live.get(session);
       if (disposed || !entry || entry.expires <= Date.now() || frame && (entry.generation !== frame.generation || entry.namespace !== frame.namespace)) throw new Error("Stale session generation or lease");
@@ -63,40 +69,60 @@ const AgentBridge = Plugin.define({
     }
     async function verified(session: string): Promise<V2SessionInfo> {
       if (disposed || !SESSION.test(session)) throw new Error("Invalid or disposed session");
-      const info = await ctx.session.get({ sessionID: session }) as V2SessionInfo;
-      if (disposed || !info || info.id !== session || resolve(info.location.directory) !== resolve(locationDirectory) || info.time.archived) throw new Error("Native session is unavailable");
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let info: V2SessionInfo;
+      try {
+        info = await Promise.race([
+          ctx.session.get({ sessionID: session }) as Promise<V2SessionInfo>,
+          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Native session lookup timed out")), RECEIPT_MS); }),
+        ]);
+      } finally { if (timeout) clearTimeout(timeout); }
+      if (disposed || !info || info.id !== session || resolve(info.location.directory) !== resolve(locationDirectory) || info.time.archived) throw new InvalidNativeSession("Native session is unavailable");
       return info;
     }
-    async function close(session: string) {
+    async function close(session: string, forget = true) {
+      if (forget) recoverable.delete(session);
       const entry = live.get(session);
       live.delete(session);
       if (entry?.generation) await brokerRpc(state as string, { op: "opencode_close", session, endpoint, generation: entry.generation });
     }
     async function observe(session: string) {
+      observing.add(session);
+      try {
+      const epoch = lifecycle.get(session) ?? 0;
+      recoverable.add(session);
       const old = live.get(session);
+      if (old) old.revision++;
       let info: V2SessionInfo;
-      try { info = await verified(session); } catch (error) { if (old && live.get(session) === old) await close(session); throw error; }
-      if (disposed || live.get(session) !== old) throw new Error("Observation belongs to an ended lifecycle");
-      const entry = old && old.expires > Date.now() ? old : { generation: "", namespace: "", expires: Date.now() + LEASE_MS };
+      try { info = await verified(session); } catch (error) {
+        if (error instanceof InvalidNativeSession) recoverable.delete(session);
+        if (old && live.get(session) === old) await close(session, error instanceof InvalidNativeSession);
+        throw error;
+      }
+      if (disposed || live.get(session) !== old || (lifecycle.get(session) ?? 0) !== epoch) throw new Error("Observation belongs to an ended lifecycle");
+      recoverable.add(session);
+      const entry = old && old.expires > Date.now() ? old : { generation: "", namespace: "", expires: Date.now() + LEASE_MS, revision: 0 };
       live.set(session, entry); // Probe can validate provisional membership, never delivery.
+      const registrationRevision = entry.revision;
       try {
         const result = await brokerRpc(state as string, { op: "opencode_observe", session, endpoint, title: info.title, ready: true }) as { generation?: unknown; namespace?: unknown };
         if (typeof result.generation !== "string" || !UUID.test(result.generation) || typeof result.namespace !== "string" || !UUID.test(result.namespace)) throw new Error("Invalid registration generation");
-        if (disposed || live.get(session) !== entry) {
+        if (disposed || live.get(session) !== entry || (lifecycle.get(session) ?? 0) !== epoch) {
           await brokerRpc(state as string, { op: "opencode_close", session, endpoint, generation: result.generation });
           throw new Error("Registration completed after its lifecycle ended");
         }
-        entry.generation = result.generation; entry.namespace = result.namespace; entry.expires = Date.now() + LEASE_MS;
-      } catch (error) { if (live.get(session) === entry) live.delete(session); throw error; }
+        entry.generation = result.generation; entry.namespace = result.namespace; entry.expires = Date.now() + LEASE_MS; entry.revision++; recoverable.add(session);
+      } catch (error) { if (live.get(session) === entry && entry.revision === registrationRevision) live.delete(session); throw error; }
+      } finally { observing.delete(session); }
     }
     async function heartbeat(session: string, entry: Live) {
       if (guard(session) !== entry) throw new Error("Heartbeat belongs to an ended lifecycle");
-      const generation = entry.generation;
+      const generation = entry.generation, revision = ++entry.revision;
       try {
         await brokerRpc(state as string, { op: "opencode_heartbeat", session, endpoint, generation, ready: true });
         if (disposed || live.get(session) !== entry || entry.generation !== generation) throw new Error("Replaced heartbeat generation");
-        entry.expires = Date.now() + LEASE_MS;
-      } catch (error) { if (live.get(session) === entry) live.delete(session); throw error; }
+        entry.expires = Date.now() + LEASE_MS; entry.revision++;
+      } catch (error) { if (live.get(session) === entry && entry.revision === revision) live.delete(session); throw error; }
     }
     const contextMarker = "<agent-bridge-session-context>";
     const compactionMarker = "<agent-bridge-compaction-context>";
@@ -179,7 +205,7 @@ For ${identity}, preserve unresolved peer message IDs, exact sender/recipient ro
       const initial = guard(frame.session, frame.op === "probe" ? undefined : frame);
       try { await verified(frame.session); }
       catch (error) {
-        if (live.get(frame.session) === initial && (frame.op === "probe" || initial.generation === frame.generation)) await close(frame.session);
+        if (live.get(frame.session) === initial && (frame.op === "probe" || initial.generation === frame.generation)) await close(frame.session, error instanceof InvalidNativeSession);
         throw error;
       }
       const entry = guard(frame.session, frame.op === "probe" ? undefined : frame);
@@ -280,28 +306,64 @@ For ${identity}, preserve unresolved peer message IDs, exact sender/recipient ro
       events = events.catch(() => {}).then(work);
       return events.catch((error: unknown) => { console.error("Agent Bridge: native session registration is unavailable:", error instanceof Error ? error.message : error); });
     }
-    const timer = setInterval(() => {
-      void enqueue(async () => {
-        if (disposed) return;
-        for (const [session, entry] of live) {
-          if (entry.expires <= Date.now()) { live.delete(session); continue; }
-          await heartbeat(session, entry);
-        }
+    function enqueueSession(session: string, work: () => Promise<void>, requireCurrent = true) {
+      const previous = sessionEvents.get(session) ?? Promise.resolve();
+      const epoch = lifecycle.get(session) ?? 0;
+      const pending = previous.catch(() => {}).then(async () => {
+        if (!requireCurrent || (lifecycle.get(session) ?? 0) === epoch) await work();
       });
+      sessionEvents.set(session, pending);
+      void pending.catch(() => { console.error("Agent Bridge: native session registration is unavailable"); })
+        .finally(() => { if (sessionEvents.get(session) === pending) sessionEvents.delete(session); });
+    }
+    const timer = setInterval(() => {
+      if (disposed) return;
+      for (const [session, entry] of live) {
+        if (entry.expires <= Date.now()) { live.delete(session); continue; }
+        if (!entry.generation || heartbeats.has(entry) || observing.has(session)) continue;
+        heartbeats.add(entry);
+        void heartbeat(session, entry)
+          .catch(() => { console.error("Agent Bridge: native session heartbeat is unavailable"); })
+          .finally(() => heartbeats.delete(entry));
+      }
+      // A previously verified, still-open session can lose its lease after a
+      // transient broker failure. Re-verify before re-observing; deletion and
+      // archive explicitly remove the session from this recovery set.
+      for (const session of recoverable) {
+        if (!live.has(session) && !sessionEvents.has(session)) enqueueSession(session, () => observe(session));
+      }
     }, HEARTBEAT_MS);
     timer.unref();
     // The activation gate means plugin setup can run after the triggering
     // session exists, and events queued before subscribe() are already gone.
     // Register every live session of this location once, then rely on events.
-    void enqueue(async () => {
+    async function scanSessions() {
       if (disposed) return;
-      const result = await ctx.session.list({});
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let result: Awaited<ReturnType<typeof ctx.session.list>>;
+      try {
+        result = await Promise.race([
+          ctx.session.list({}),
+          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Native session list timed out")), RECEIPT_MS); }),
+        ]);
+      } finally { if (timeout) clearTimeout(timeout); }
       const sessions = (result as { data?: V2SessionInfo[] }).data ?? [];
       for (const info of sessions) {
         if (disposed) return;
-        if (isAbsolute(info.location.directory) && resolve(info.location.directory) === resolve(locationDirectory) && !info.time.archived) await observe(info.id).catch(() => {});
+        if (isAbsolute(info.location.directory) && resolve(info.location.directory) === resolve(locationDirectory) && !info.time.archived) enqueueSession(info.id, () => observe(info.id));
       }
-    });
+    }
+    let scanTimer: ReturnType<typeof setTimeout> | undefined;
+    async function initialScan() {
+      try { await scanSessions(); }
+      catch {
+        if (!disposed) {
+          scanTimer = setTimeout(() => { void enqueue(initialScan); }, HEARTBEAT_MS);
+          scanTimer.unref();
+        }
+      }
+    }
+    void enqueue(initialScan);
     // Event payloads moved from V1 `properties` to a `data` field with a flat
     // sessionID. V2 also dropped session.updated and the permission.* revision
     // stream: the selection pin they guarded has no V2 equivalent, so leases
@@ -315,16 +377,25 @@ For ${identity}, preserve unresolved peer message IDs, exact sender/recipient ro
           const value = event as unknown as { type: string; location?: { directory?: unknown } };
           const data = ((event as unknown as { data?: Record<string, unknown> }).data ?? {}) as { sessionID?: unknown };
           if (typeof data.sessionID !== "string" || typeof value.location?.directory === "string" && isAbsolute(value.location.directory) && resolve(value.location.directory) !== resolve(locationDirectory)) continue;
+          if (value.type === "session.deleted" || value.type === "session.archived") {
+            lifecycle.set(data.sessionID, (lifecycle.get(data.sessionID) ?? 0) + 1);
+            const closing = close(data.sessionID).catch(() => { console.error("Agent Bridge: native session close is unavailable"); });
+            // Start invalidation immediately, but make later registrations wait
+            // until the old generation's broker close has completed.
+            enqueueSession(data.sessionID, () => closing, false);
+            continue;
+          }
       const sourceEntry = live.get(data.sessionID);
-          await enqueue(async () => {
+          enqueueSession(data.sessionID, async () => {
             if (disposed) return;
             const sourceSession = data.sessionID as string;
-            if (live.get(sourceSession) !== sourceEntry) return;
             if (value.type === "session.deleted") {
               if (live.has(sourceSession)) await close(sourceSession);
+            } else if (live.get(sourceSession) !== sourceEntry && value.type !== "session.archived" && value.type !== "session.created" && value.type !== "tui.session.select" && value.type !== "session.status") {
+              return;
             } else if (value.type === "session.status" && sourceEntry) {
               await heartbeat(sourceSession, sourceEntry as Live);
-            } else if (value.type === "session.created" || value.type === "tui.session.select") {
+            } else if (value.type === "session.created" || value.type === "tui.session.select" || value.type === "session.status") {
               await observe(sourceSession);
             } else if ((value.type === "session.renamed" || value.type === "session.archived" || value.type === "session.status") && live.has(sourceSession)) {
               // Renames and archives carry metadata for existing sessions only;
@@ -356,15 +427,22 @@ For ${identity}, preserve unresolved peer message IDs, exact sender/recipient ro
     // deliveries, and observing an already-live session is idempotent.
     disposeHooks(await ctx.session.hook("prompt", (event) => {
       const sessionID = (event as unknown as { sessionID: string }).sessionID;
-      return void enqueue(() => observe(sessionID));
+      return void enqueueSession(sessionID, () => observe(sessionID));
     }));
     return async () => {
       if (disposed) return;
-      disposed = true; clearInterval(timer); abort.abort(); listener.stop(true);
+      disposed = true; clearInterval(timer); if (scanTimer) clearTimeout(scanTimer); abort.abort(); listener.stop(true);
       for (const socket of connections) socket.terminate();
-      await events.catch(() => {});
+      // Native calls may never resolve. Allow normal in-flight registrations to
+      // compensate, but do not let one stalled location prevent shutdown.
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([events, ...sessionEvents.values()]),
+        new Promise<void>(resolve => { drainTimer = setTimeout(resolve, 6500); }),
+      ]);
+      if (drainTimer) clearTimeout(drainTimer);
       for (const registration of registrations) registration.dispose();
-      const results = await Promise.allSettled([...live.keys()].map(close));
+      const results = await Promise.allSettled([...live.keys()].map(session => close(session)));
       // Native calls may remain unresolved; their guards prevent journal access
       // after disposal. Do not wait indefinitely or keep a model process alive.
       journal.close(); await rm(socketDirectory, { recursive: true, force: true });

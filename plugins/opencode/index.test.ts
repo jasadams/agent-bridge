@@ -242,7 +242,7 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
   // Events process through the plugin's serialized work queue. Wait until that
   // queue is quiescent before assertions: fake native calls settle in a few
   // microtasks, so a small event-loop drain is sufficient.
-  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise<void>(resolve => setImmediate(resolve)); await Bun.sleep(10); };
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise<void>(resolve => setImmediate(resolve)); await Bun.sleep(50); };
   const event = async (type: string, data: any) => {
     pushEvent({ type, data, location: { directory } });
     await settle();
@@ -333,6 +333,182 @@ describe("fixture cleanup deadline", () => {
 });
 
 describe("V2 plugin with real private Unix sockets", () => {
+  test("an idle session recovers after a transient native lookup failure", async () => {
+    const s = await setup(); await s.created(A);
+    const gate = s.blockNext("get", 0, true);
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered; gate.release(); await gate.settled();
+      await Bun.sleep(5600);
+      expect(s.registrations.has(A)).toBe(true);
+      expect((await frame(s.endpoint(), { op: "probe", session: A })).ok).toBe(true);
+    } finally { gate.release(); }
+  }, 9000);
+  test("an idle session re-registers after a transient heartbeat failure", async () => {
+    const s = await setup(); await s.created(A);
+    let failed = false;
+    s.brokerResponse(async request => {
+      if (!failed && request.op === "opencode_heartbeat" && request.session === A) { failed = true; return false; }
+    });
+    try {
+      await Bun.sleep(15500);
+      expect(failed).toBe(true);
+      expect(s.requests.filter(request => request.op === "opencode_observe" && request.session === A).length).toBeGreaterThanOrEqual(2);
+      expect((await frame(s.endpoint(), { op: "probe", session: A })).ok).toBe(true);
+    } finally { s.brokerResponse(undefined); }
+  }, 20000);
+  test("a status event re-registers a session after a transient observation failure", async () => {
+    const s = await setup(); await s.created(A);
+    const gate = s.blockNext("get", 0, true);
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      gate.release(); await gate.settled();
+      await Bun.sleep(50);
+      expect(s.registrations.has(A)).toBe(false);
+      await s.event("session.status", { sessionID: A, status: { type: "busy" } });
+      expect(s.registrations.has(A)).toBe(true);
+    } finally { gate.release(); }
+  });
+  test("selection queued behind a timed-out observation registers the session", async () => {
+    const s = await setup(); await s.created(A);
+    const gate = s.blockNext("get");
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
+      await Bun.sleep(3400);
+      expect(s.registrations.has(A)).toBe(true);
+    } finally { gate.release(); await gate.settled(); }
+  }, 8000);
+  test("queued prompts cannot resurrect a session after deletion", async () => {
+    const s = await setup(); await s.created(A);
+    const gate = s.blockNext("get");
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      await s.hooks.prompt?.({ sessionID: A, messageID: "msg_queued", delivery: "steer", prompt: { text: "hi" } });
+      await s.event("session.deleted", { sessionID: A });
+      gate.release(); await gate.settled();
+      await Bun.sleep(100);
+      expect(s.registrations.has(A)).toBe(false);
+    } finally { gate.release(); }
+  });
+  test("deletion invalidates a live session while its observation is stalled", async () => {
+    const s = await setup(); await s.created(A);
+    const endpoint = s.endpoint();
+    const gate = s.blockNext("get");
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      await s.event("session.deleted", { sessionID: A });
+      expect((await frame(endpoint, { op: "probe", session: A })).ok).toBe(false);
+      expect(s.registrations.has(A)).toBe(false);
+    } finally { gate.release(); await gate.settled(); }
+  });
+  test("a timed-out observation does not prevent a later prompt from registering the session", async () => {
+    const s = await setup(); await s.created(A);
+    const gate = s.blockNext("get");
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      await Bun.sleep(3300);
+      expect(s.registrations.has(A)).toBe(false);
+      await s.hooks.prompt?.({ sessionID: A, messageID: "msg_retry", delivery: "steer", prompt: { text: "hi" } });
+      await Bun.sleep(100);
+      expect(s.registrations.has(A)).toBe(true);
+    } finally { gate.release(); await gate.settled(); }
+  }, 8000);
+  test("deletion arriving during session creation closes the newly registered lease", async () => {
+    const s = await setup();
+    const gate = s.blockNext("get");
+    try {
+      s.pushEvent({ type: "session.created", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      s.pushEvent({ type: "session.deleted", data: { sessionID: A }, location: { directory: s.directory } });
+      gate.release(); await gate.settled();
+      await Bun.sleep(100);
+      expect(s.registrations.has(A)).toBe(false);
+    } finally { gate.release(); }
+  });
+  test("a stalled observation does not block another session's deletion", async () => {
+    const s = await setup(); await s.created(A); await s.created(B);
+    const gate = s.blockNext("get");
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      await s.event("session.deleted", { sessionID: B });
+      expect(s.registrations.has(B)).toBe(false);
+    } finally { gate.release(); await gate.settled(); }
+  });
+  test("a stalled observation times out and closes even with a heartbeat in flight", async () => {
+    const s = await setup(); await s.created(A);
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    s.brokerResponse(async request => {
+      if (request.op === "opencode_heartbeat" && request.session === A) { entered(); await blocked; return false; }
+    });
+    const gate = s.blockNext("get");
+    try {
+      await started;
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      await Bun.sleep(3300);
+      expect(s.registrations.has(A)).toBe(false);
+      gate.release(); await gate.settled();
+    } finally { gate.release(); release(); s.brokerResponse(undefined); await Bun.sleep(1900); }
+  }, 14000);
+  test("failed native verification closes the session", async () => {
+    const s = await setup(); await s.created(A);
+    const gate = s.blockNext("get", 0, true);
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      gate.release(); await gate.settled();
+      await Bun.sleep(50);
+      expect(s.registrations.has(A)).toBe(false);
+    } finally { gate.release(); }
+  }, 12000);
+  test("a delayed failed heartbeat cannot remove a newer observation", async () => {
+    const s = await setup();
+    await s.created(A);
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    s.brokerResponse(async request => {
+      if (request.op === "opencode_heartbeat" && request.session === A) {
+        entered();
+        await blocked;
+        return false;
+      }
+    });
+    try {
+      await started;
+      await s.event("session.renamed", { sessionID: A });
+      await Bun.sleep(5200);
+      expect((await frame(s.endpoint(), { op: "probe", session: A })).ok).toBe(true);
+    } finally {
+      release();
+      s.brokerResponse(undefined);
+    }
+  }, 14000);
+  test("a stalled session observation does not prevent heartbeats for other live sessions", async () => {
+    const s = await setup();
+    await s.created(A);
+    await s.created(B);
+    const gate = s.blockNext("get");
+    try {
+      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      await gate.entered;
+      await Bun.sleep(5600);
+      expect(s.requests.some(request => request.op === "opencode_heartbeat" && request.session === B)).toBe(true);
+      expect(s.requests.some(request => request.op === "opencode_heartbeat" && request.session === A)).toBe(false);
+    } finally {
+      gate.release();
+      await gate.settled();
+    }
+  }, 12000);
   test("missing and invalid connected descriptors fail peer authentication", () => {
     expect(sameUser({})).toBe(false); expect(sameUser({ fd: -1 })).toBe(false); expect(sameUser({ fd: 99999999 })).toBe(false);
   });
