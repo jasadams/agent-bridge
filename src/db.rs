@@ -108,6 +108,9 @@ impl Db {
         conn.execute("UPDATE opencode_deliveries SET namespace=(SELECT value FROM settings WHERE key='opencode_namespace') WHERE namespace='legacy'", [])?;
         conn.execute("UPDATE agents SET enabled=0 WHERE provider='opencode'", [])?;
         conn.execute("UPDATE messages SET state='uncertain', detail='Service stopped during delivery; inspect the native conversation before retrying.' WHERE state='sending' AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=messages.id)", [])?;
+        // A broker restart cannot have an in-flight native attempt; requalify
+        // those deliveries for the automatic read-only reconciliation sweep.
+        conn.execute("UPDATE opencode_deliveries SET phase='uncertain' WHERE phase='dispatched' AND id IN (SELECT id FROM messages WHERE state='uncertain')", [])?;
         conn.execute("UPDATE messages SET state='failed', detail='Event subscription expired on broker restart; resubscribe for a fresh snapshot' WHERE state='queued' AND id IN (SELECT id FROM message_context WHERE json_extract(destination,'$.event_control') IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')", [])?;
         Ok(Self { conn })
     }

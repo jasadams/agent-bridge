@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -174,9 +174,9 @@ CREATE TRIGGER opencode_retry_bound BEFORE UPDATE OF state ON messages WHEN NEW.
  SELECT CASE WHEN (SELECT count(*) FROM messages m JOIN opencode_deliveries d ON d.id=m.id WHERE d.session=NEW.recipient_session AND m.id<>NEW.id AND m.state IN ('queued','sending','uncertain'))>=64 THEN RAISE(ABORT,'OpenCode session queue is full (64 pending messages)') END;
 END;
 CREATE TRIGGER opencode_enqueue_binding AFTER INSERT ON messages WHEN (SELECT provider FROM agents WHERE name=NEW.recipient)='opencode' BEGIN
- INSERT INTO opencode_deliveries SELECT NEW.id,NEW.recipient_session,COALESCE((SELECT generation FROM opencode_leases WHERE session=NEW.recipient_session),'unleased'),(SELECT value FROM settings WHERE key='opencode_namespace'),'pending',NULL,NULL,'queued',NEW.created+120000;
+ INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,content,attempt,phase,deadline) SELECT NEW.id,NEW.recipient_session,COALESCE((SELECT generation FROM opencode_leases WHERE session=NEW.recipient_session),'unleased'),(SELECT value FROM settings WHERE key='opencode_namespace'),'pending',NULL,NULL,'queued',NEW.created+120000;
 END;
-INSERT INTO opencode_deliveries SELECT m.id,m.recipient_session,'legacy','legacy','msg_'||replace(lower(m.id),'-',''),NULL,NULL,'legacy',m.created+120000 FROM messages m JOIN message_context c ON c.id=m.id WHERE json_extract(c.destination,'$.provider')='opencode';
+INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,content,attempt,phase,deadline) SELECT m.id,m.recipient_session,'legacy','legacy','msg_'||replace(lower(m.id),'-',''),NULL,NULL,'legacy',m.created+120000 FROM messages m JOIN message_context c ON c.id=m.id WHERE json_extract(c.destination,'$.provider')='opencode';
 UPDATE messages SET state='uncertain',detail='Legacy OpenCode queue has no durable attempt provenance; only read-only reconciliation is safe' WHERE state IN('queued','sending') AND id IN(SELECT id FROM opencode_deliveries);")?;
         tx.pragma_update(None, "user_version", 13)?;
     }
@@ -201,6 +201,39 @@ UPDATE messages SET state='blocked',detail='Original native provider is unknown;
 );",
         )?;
         tx.pragma_update(None, "user_version", 16)?;
+    }
+    if version < 17 {
+        // Fixtures and interrupted upgrades may already carry these columns;
+        // add each only when absent so re-running the migration stays safe.
+        for (name, ddl) in [
+            (
+                "reconcile_attempts",
+                "ALTER TABLE opencode_deliveries ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0;",
+            ),
+            (
+                "reconcile_at",
+                "ALTER TABLE opencode_deliveries ADD COLUMN reconcile_at INTEGER;",
+            ),
+        ] {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('opencode_deliveries') WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            if !present {
+                tx.execute_batch(ddl)?;
+            }
+        }
+        // Existing databases keep the positional enqueue trigger created before
+        // these columns existed; recreate it with explicit columns or every new
+        // OpenCode message insert would fail after the upgrade.
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS opencode_enqueue_binding;
+CREATE TRIGGER opencode_enqueue_binding AFTER INSERT ON messages WHEN (SELECT provider FROM agents WHERE name=NEW.recipient)='opencode' BEGIN
+ INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,content,attempt,phase,deadline) SELECT NEW.id,NEW.recipient_session,COALESCE((SELECT generation FROM opencode_leases WHERE session=NEW.recipient_session),'unleased'),(SELECT value FROM settings WHERE key='opencode_namespace'),'pending',NULL,NULL,'queued',NEW.created+120000;
+END;",
+        )?;
+        tx.pragma_update(None, "user_version", 17)?;
     }
     tx.commit()?;
     Ok(())
