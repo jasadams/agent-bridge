@@ -99,6 +99,7 @@ impl Db {
              JOIN agents a ON a.name=m.recipient AND a.provider='opencode' AND a.session=d.session AND a.enabled=1
              JOIN opencode_leases l ON l.session=d.session AND l.endpoint=a.endpoint
              WHERE d.phase IN ('uncertain','dispatched') AND m.state='uncertain'
+               AND NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=d.id AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL))
                AND l.expires>?1 AND l.ready=1
                AND (d.reconcile_at IS NULL OR d.reconcile_at<=?1)
              ORDER BY m.rowid LIMIT 64",
