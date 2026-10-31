@@ -12,7 +12,7 @@ import tempfile
 from release_version import parse_version
 
 ASSETS = ('agent-bridge-linux-x86_64', 'agent-bridge-linux-aarch64',
-          'agent-bridge-macos-x86_64', 'agent-bridge-macos-aarch64')
+          'agent-bridge-macos-aarch64')
 
 
 def license_files(package):
@@ -75,7 +75,7 @@ def release_notes(version, commit, changes=''):
     if changes:
         overview += changes.strip() + '\n\n'
     return overview + (
-        'Linux: x86_64/aarch64, glibc 2.35 or newer. macOS: Intel/Apple Silicon, macOS 13 or newer.\n'
+        'Linux: x86_64/aarch64, glibc 2.35 or newer. macOS: Apple Silicon, macOS 13 or newer.\n'
         'macOS binaries are ad-hoc signed, not Apple notarized.\n\n'
         'SHA256SUMS protects download integrity; it is not an independent publisher signature.\n'
         'LICENSE and THIRD_PARTY_LICENSES.txt accompany the binaries. The source archive includes\n'
@@ -103,7 +103,7 @@ def main():
     dist = args.dist.resolve()
     unexpected = [path.name for path in dist.iterdir() if path.name not in ASSETS]
     if unexpected:
-        parser.error("Distribution directory must contain only the four platform binaries")
+        parser.error("Distribution directory must contain only the three platform binaries")
     for name in ASSETS:
         if not (dist / name).is_file():
             parser.error(f'Missing platform executable: {name}')

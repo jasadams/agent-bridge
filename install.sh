@@ -95,6 +95,9 @@ case "$(uname -m)" in
     aarch64|arm64) arch=aarch64 ;;
     *) fail 'supported architectures are x86_64 and arm64' ;;
 esac
+if [ "$platform" = macos ] && [ "$arch" = x86_64 ]; then
+    fail 'Intel macOS is not supported by current releases; use the installer from an older release tag or build from source'
+fi
 if command -v sha256sum >/dev/null 2>&1; then
     checksum_tool=sha256sum
 elif command -v shasum >/dev/null 2>&1; then

@@ -9,7 +9,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/jasadams
 
 The installer resolves the latest published semantic version once, then downloads
 all files from that immutable release tag. Supported platforms are Linux
-x86_64/arm64 with glibc 2.35 or newer, and macOS Intel/Apple
+x86_64/arm64 with glibc 2.35 or newer, and macOS Apple
 Silicon with macOS 13 or newer. Alpine/musl and older systems can build from source.
 macOS binaries are ad-hoc signed, not Apple notarized.
 
