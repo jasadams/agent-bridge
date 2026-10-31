@@ -235,7 +235,7 @@ enum Commands {
         #[arg(long, value_enum)]
         provider: Provider,
     },
-    /// Explicitly install or remove the OpenCode V1 plugin and MCP configuration.
+    /// Explicitly install or remove the OpenCode V2 plugin and MCP configuration.
     Opencode {
         #[command(subcommand)]
         action: OpenCodeAction,

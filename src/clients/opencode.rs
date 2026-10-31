@@ -1,4 +1,4 @@
-//! OpenCode V1 plugin transport. A receipt confirms native insertion, never model acknowledgement.
+//! OpenCode plugin transport. A receipt confirms native insertion, never model acknowledgement.
 use crate::{
     delivery::Outcome,
     protocol::{Agent, MAX_FRAME, Message},

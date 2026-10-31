@@ -86,6 +86,69 @@ impl Db {
         Ok(())
     }
 
+    /// Unresolved OpenCode receipts would otherwise block their session queue
+    /// forever. Promotion is a read-only reconciliation: it can only prove an
+    /// insertion that already happened, never submit again, so per-session order
+    /// and the dedup guarantee are preserved. Each promotion is atomic (savepoint)
+    /// and non-fatal; the delivery row is CAS-guarded and rebound to the live
+    /// lease generation exactly like an explicit retry.
+    pub(crate) fn opencode_sweep_uncertain(&self, time: i64) -> Result<usize> {
+        let mut rows = self.conn.prepare(
+            "SELECT d.id,d.reconcile_attempts FROM opencode_deliveries d
+             JOIN messages m ON m.id=d.id AND m.recipient_session=d.session
+             JOIN agents a ON a.name=m.recipient AND a.provider='opencode' AND a.session=d.session AND a.enabled=1
+             JOIN opencode_leases l ON l.session=d.session AND l.endpoint=a.endpoint
+             WHERE d.phase IN ('uncertain','dispatched') AND m.state='uncertain'
+               AND l.expires>?1 AND l.ready=1
+               AND (d.reconcile_at IS NULL OR d.reconcile_at<=?1)
+             ORDER BY m.rowid LIMIT 64",
+        )?;
+        let candidates = rows
+            .query_map([time], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(rows);
+        let mut promoted = 0;
+        for (id, attempts) in candidates {
+            // min(300s, 2^attempts); attempts reset only on a terminal outcome.
+            let seconds = 2i64
+                .checked_pow(u32::try_from(attempts.clamp(0, 8)).unwrap_or(8))
+                .unwrap_or(300)
+                .min(300);
+            self.conn.execute_batch("SAVEPOINT opencode_sweep")?;
+            let result = (|| -> Result<bool> {
+                let changed = self.conn.execute(
+                    "UPDATE opencode_deliveries SET phase='reconcile',generation=(SELECT generation FROM opencode_leases WHERE session=opencode_deliveries.session),reconcile_attempts=reconcile_attempts+1,reconcile_at=?1 WHERE id=?2 AND phase IN ('uncertain','dispatched')",
+                    params![time + seconds * 1000, id],
+                )?;
+                if changed == 0 {
+                    return Ok(false);
+                }
+                // Queue-capacity triggers may reject this; the savepoint keeps
+                // the delivery row committed with the message row.
+                self.conn.execute(
+                    "UPDATE messages SET state='queued',detail='OpenCode receipt unresolved; automatic read-only reconciliation',updated=?1 WHERE id=?2 AND state='uncertain'",
+                    params![time, id],
+                )?;
+                Ok(true)
+            })();
+            match result {
+                Ok(true) => {
+                    self.conn.execute_batch("RELEASE opencode_sweep")?;
+                    promoted += 1;
+                }
+                Ok(false) => self.conn.execute_batch("RELEASE opencode_sweep")?,
+                Err(error) => {
+                    self.conn
+                        .execute_batch("ROLLBACK TO opencode_sweep; RELEASE opencode_sweep")?;
+                    eprintln!("OpenCode reconciliation sweep skipped {id}: {error:#}");
+                }
+            }
+        }
+        Ok(promoted)
+    }
+
     #[cfg(test)]
     pub(crate) fn opencode_observe(&mut self, agent: &Agent, ready: bool) -> Result<Value> {
         self.opencode_observe_at(agent, ready, now())
@@ -197,6 +260,12 @@ impl Db {
             [id],
             |r| r.get(0),
         )?;
+        if phase != "queued" {
+            self.conn.execute(
+                "UPDATE opencode_deliveries SET phase='uncertain' WHERE id=?",
+                [id],
+            )?;
+        }
         self.finish(
             id,
             if phase == "queued" {
@@ -259,6 +328,7 @@ impl Db {
         let valid: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id JOIN opencode_leases l ON l.session=d.session WHERE m.state='sending' AND d.id=?1 AND d.generation=?2 AND d.attempt=?3 AND l.generation=d.generation AND l.endpoint=?4 AND l.expires>?5)",params![id,dispatch.generation,dispatch.attempt,dispatch.endpoint,now()],|r|r.get(0))?;
         if !valid {
             self.conn.execute("UPDATE messages SET state='uncertain',detail='OpenCode generation changed before receipt; read-only reconciliation required',updated=?1 WHERE id=?2 AND state='sending' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=?2 AND d.generation=?3 AND d.attempt=?4)",params![now(),id,dispatch.generation,dispatch.attempt])?;
+            self.conn.execute("UPDATE opencode_deliveries SET phase='uncertain' WHERE id=?1 AND generation=?2 AND attempt=?3",params![id,dispatch.generation,dispatch.attempt])?;
             return Ok(());
         }
         let deferred = state == "queued";
@@ -286,6 +356,14 @@ impl Db {
             "UPDATE opencode_deliveries SET phase=?1 WHERE id=?2 AND attempt=?3",
             params![phase, id, dispatch.attempt],
         )?;
+        // Backoff state is terminal-only: an unresolved receipt keeps its
+        // attempt count so retries continue to widen.
+        if phase == "inserted" || next_state == "failed" {
+            tx.execute(
+                "UPDATE opencode_deliveries SET reconcile_attempts=0,reconcile_at=NULL WHERE id=?",
+                [id],
+            )?;
+        }
         // A deferred head stays queued but sleeps until an idle heartbeat/event.
         if deferred {
             tx.execute(
@@ -1072,5 +1150,236 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn uncertain_receipts_sweep_to_read_only_reconcile_without_duplication_or_starvation() {
+        let (_root, mut db, agent, _generation) = setup();
+        let first = send(&db, &agent.name);
+        let second = send(&db, &agent.name);
+        let (msg, attempt) = dispatch(&mut db);
+        assert_eq!(msg.id, first.id);
+        let native = attempt.frame["native_message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
+            .unwrap();
+        assert!(db.claim().unwrap().is_none());
+        let now = crate::db::now();
+        assert_eq!(db.opencode_sweep_uncertain(now).unwrap(), 1);
+        let row = |db: &Db| -> (String, i64, Option<i64>) {
+            db.conn
+                .query_row(
+                    "SELECT phase,reconcile_attempts,reconcile_at FROM opencode_deliveries WHERE id=?",
+                    [&first.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        let (phase, attempts, at) = row(&db);
+        assert_eq!(phase, "reconcile");
+        assert_eq!(attempts, 1);
+        assert_eq!(at, Some(now + 1000));
+        // Backoff holds the next sweep until reconcile_at.
+        assert_eq!(db.opencode_sweep_uncertain(now + 500).unwrap(), 0);
+        let (msg, reconcile) = dispatch(&mut db);
+        assert_eq!(msg.id, first.id);
+        assert_eq!(reconcile.frame["op"], "reconcile");
+        assert_eq!(
+            reconcile.frame["native_message_id"].as_str(),
+            Some(native.as_str())
+        );
+        assert_eq!(reconcile.frame["content"], "stable rendered envelope");
+        db.opencode_finish(&first.id, &reconcile, "submitted", "verified readonly")
+            .unwrap();
+        let (phase, attempts, at) = row(&db);
+        assert_eq!(phase, "inserted");
+        assert_eq!(attempts, 0, "terminal insertion resets backoff");
+        assert_eq!(at, None);
+        // The follower queued behind the resolved head is no longer starved.
+        let (next, _) = dispatch(&mut db);
+        assert_eq!(next.id, second.id);
+    }
+
+    #[test]
+    fn uncertain_sweep_backs_off_and_only_terminal_outcomes_reset_it() {
+        let (_root, mut db, agent, _generation) = setup();
+        let first = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
+            .unwrap();
+        let now = crate::db::now();
+        assert_eq!(db.opencode_sweep_uncertain(now).unwrap(), 1);
+        let (msg, reconcile) = dispatch(&mut db);
+        assert_eq!(msg.id, first.id);
+        // An unresolved reconciliation keeps the attempt count and widens.
+        db.opencode_finish(&first.id, &reconcile, "uncertain", "still unresolved")
+            .unwrap();
+        let (attempts, at): (i64, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT reconcile_attempts,reconcile_at FROM opencode_deliveries WHERE id=?",
+                [&first.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+        assert_eq!(at, Some(now + 1000));
+        assert_eq!(db.opencode_sweep_uncertain(now).unwrap(), 0);
+        assert_eq!(db.opencode_sweep_uncertain(now + 1000).unwrap(), 1);
+        let (attempts, at): (i64, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT reconcile_attempts,reconcile_at FROM opencode_deliveries WHERE id=?",
+                [&first.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(at, Some(now + 1000 + 2000));
+    }
+
+    #[test]
+    fn sweep_never_overwrites_manual_or_in_flight_reconciliation() {
+        let (_root, mut db, agent, _generation) = setup();
+        let first = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
+            .unwrap();
+        db.retry(&first.id, false).unwrap();
+        let now = crate::db::now();
+        assert_eq!(db.opencode_sweep_uncertain(now).unwrap(), 0);
+        let (phase, attempts): (String, i64) = db
+            .conn
+            .query_row(
+                "SELECT phase,reconcile_attempts FROM opencode_deliveries WHERE id=?",
+                [&first.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "reconcile");
+        assert_eq!(attempts, 0, "manual retry is left untouched by the sweep");
+    }
+
+    #[test]
+    fn restart_requalifies_stale_attempts_and_sweeps_after_reobserve() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let agent = Agent {
+            name: format!("opencode-{SESSION}"),
+            provider: Provider::OpenCode,
+            session: SESSION.into(),
+            endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
+            enabled: true,
+        };
+        let first;
+        {
+            let mut db = Db::open(&path).unwrap();
+            db.opencode_observe(&agent, true).unwrap();
+            first = send(&db, &agent.name);
+            let (msg, attempt) = dispatch(&mut db);
+            assert_eq!(msg.id, first.id);
+            // Broker stops mid-attempt: the message stays 'sending'.
+            assert_eq!(db.get(&first.id).unwrap().state, "sending");
+            let _ = attempt;
+        }
+        let mut db = Db::open(&path).unwrap();
+        assert_eq!(db.get(&first.id).unwrap().state, "uncertain");
+        let phase: String = db
+            .conn
+            .query_row(
+                "SELECT phase FROM opencode_deliveries WHERE id=?",
+                [&first.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "uncertain");
+        // Plugins reconnect, then the ordinary tick sweeps the stale attempt.
+        db.opencode_observe(&agent, true).unwrap();
+        let now = crate::db::now();
+        db.opencode_sweep_uncertain(now).unwrap();
+        let phase: String = db
+            .conn
+            .query_row(
+                "SELECT phase FROM opencode_deliveries WHERE id=?",
+                [&first.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "reconcile");
+    }
+
+    #[test]
+    fn v16_upgrade_recreates_the_enqueue_trigger_with_explicit_columns() {
+        let root = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&root.path().join("db")).unwrap();
+        // Reconstruct the released v16 shape: the old positional trigger and no
+        // reconciliation columns. Db::open must upgrade it in place.
+        db.conn
+            .execute_batch(
+                "ALTER TABLE opencode_deliveries DROP COLUMN reconcile_at;
+ALTER TABLE opencode_deliveries DROP COLUMN reconcile_attempts;
+DROP TRIGGER opencode_enqueue_binding;
+CREATE TRIGGER opencode_enqueue_binding AFTER INSERT ON messages WHEN (SELECT provider FROM agents WHERE name=NEW.recipient)='opencode' BEGIN
+ INSERT INTO opencode_deliveries SELECT NEW.id,NEW.recipient_session,COALESCE((SELECT generation FROM opencode_leases WHERE session=NEW.recipient_session),'unleased'),(SELECT value FROM settings WHERE key='opencode_namespace'),'pending',NULL,NULL,'queued',NEW.created+120000;
+END;
+PRAGMA user_version=16;",
+            )
+            .unwrap();
+        crate::migrations::migrate(&mut db.conn).unwrap();
+        let trigger: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='opencode_enqueue_binding'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(trigger.contains("opencode_deliveries(id,session,generation,namespace,native_id,content,attempt,phase,deadline)"));
+        let agent = Agent {
+            name: format!("opencode-{SESSION}"),
+            provider: Provider::OpenCode,
+            session: SESSION.into(),
+            endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
+            enabled: true,
+        };
+        db.opencode_observe(&agent, true).unwrap();
+        // The live trigger still enqueues after the upgrade.
+        let message = send(&db, &agent.name);
+        assert_eq!(db.get(&message.id).unwrap().state, "queued");
+    }
+
+    #[test]
+    fn sweep_rebinds_a_plugin_restart_to_the_live_generation() {
+        let (_root, mut db, agent, _generation) = setup();
+        let first = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
+            .unwrap();
+        // A new plugin instance (new endpoint UUID) takes the session over.
+        db.conn
+            .execute(
+                "UPDATE opencode_leases SET expires=0 WHERE session=?",
+                [SESSION],
+            )
+            .unwrap();
+        let replacement = Agent {
+            endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
+            ..agent
+        };
+        let live = db.opencode_observe(&replacement, true).unwrap();
+        let generation = live["generation"].as_str().unwrap().to_owned();
+        assert_eq!(db.opencode_sweep_uncertain(crate::db::now()).unwrap(), 1);
+        let (phase, bound): (String, String) = db
+            .conn
+            .query_row(
+                "SELECT phase,generation FROM opencode_deliveries WHERE id=?",
+                [&first.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "reconcile");
+        assert_eq!(bound, generation);
     }
 }

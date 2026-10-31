@@ -2071,7 +2071,13 @@ impl Broker {
         loop {
             {
                 let db = self.db.lock().unwrap();
-                db.opencode_tick(crate::db::now())?;
+                let now = crate::db::now();
+                db.opencode_tick(now)?;
+                // Unresolved receipts block their session queue; reconcile them
+                // read-only with bounded backoff instead of waiting for a manual retry.
+                if let Err(error) = db.opencode_sweep_uncertain(now) {
+                    eprintln!("OpenCode reconciliation sweep failed: {error:#}");
+                }
                 let mut state = self.board_notifications.lock().unwrap();
                 state.reconcile(
                     crate::board_notifications::available(&db)?,

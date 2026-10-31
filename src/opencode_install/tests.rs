@@ -5,6 +5,12 @@ struct Fixture {
     env: Environment,
     state: PathBuf,
 }
+fn namespaces(env: &Environment) -> config::Namespaces {
+    config::Namespaces {
+        plain: format!("{}/", env.data.to_str().unwrap()),
+        legacy: url(&env.data),
+    }
+}
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -61,7 +67,10 @@ fn install_repeat_update_remove_preserve_unrelated_jsonc_and_state() {
     assert!(installed.contains("// header\r\n"));
     assert!(installed.contains("\"permission\" : {\"bash\":\"ask\",}"));
     assert!(installed.contains("bin with spaces"));
-    assert!(installed.contains("file:///"));
+    assert!(installed.contains("\"plugins\""));
+    assert!(installed.contains("stateDir"));
+    assert!(installed.contains("agent-bridge"));
+    assert!(!installed.contains("file://"));
     assert!(!installed.replace("\r\n", "").contains('\n'));
     let backups = snapshots(&f.target());
     assert_eq!(backups, vec![original.as_bytes()]);
@@ -81,7 +90,8 @@ fn install_repeat_update_remove_preserve_unrelated_jsonc_and_state() {
     assert!(removed.contains("unrelated@1"));
     assert!(removed.contains("\"other\""));
     assert!(removed.contains("// permissions comment\r\n"));
-    assert!(!removed.contains("file:///"));
+    assert!(removed.contains("\"plugins\"")); // The owner array survives removal.
+    assert!(!removed.contains("stateDir"));
     assert!(!removed.contains("\"agent-bridge\""));
     assert_eq!(
         fs::read(f.state.join("sentinel.sqlite")).unwrap(),
@@ -141,6 +151,7 @@ fn malformed_duplicate_extended_or_wrong_shape_config_never_modified() {
         "{",
         "{\"mcp\":[],}",
         "{\"plugin\":{},}",
+        "{\"plugins\":{},}",
         "{unquoted:1}",
         "{\"x\":1 \"y\":2}",
         "{\"x\":1,\"\\u0078\":2}",
@@ -158,10 +169,19 @@ fn malformed_duplicate_extended_or_wrong_shape_config_never_modified() {
 fn unowned_collisions_and_env_overrides_are_never_adopted() {
     for text in [
         "{\"mcp\":{\"agent-bridge\":{\"type\":\"local\"}}}",
-        "{\"plugin\":[\"@agent-bridge/opencode-plugin@1\"]}",
+        "{\"plugins\":[{\"package\":\"@agent-bridge/opencode-plugin@1\",\"options\":{},}]}",
     ] {
         let f = Fixture::new();
         fs::write(f.target(), text).unwrap();
+        assert!(f.run(true).is_err());
+        assert_eq!(read(&f.target()).unwrap().unwrap(), text);
+    }
+    {
+        let f = Fixture::new();
+        let text =
+            serde_json::json!({"plugins":[{"package": f.env.data.join("other"), "options": {}}]})
+                .to_string();
+        fs::write(f.target(), &text).unwrap();
         assert!(f.run(true).is_err());
         assert_eq!(read(&f.target()).unwrap().unwrap(), text);
     }
@@ -257,7 +277,7 @@ fn unsafe_symlink_target_ancestor_and_sidecars_are_rejected() {
 fn concurrent_writer_and_held_lock_are_rejected_without_config_loss() {
     let f = Fixture::new();
     fs::write(f.target(), "{}").unwrap();
-    let observed = preflight(&f.env, &f.target(), "file:///none").unwrap();
+    let observed = preflight(&f.env, &f.target(), &namespaces(&f.env)).unwrap();
     fs::write(f.target(), "{\"owner\":true}").unwrap();
     assert!(verify(&observed).is_err());
     let lock = OpenOptions::new()
@@ -283,7 +303,7 @@ fn interrupted_transaction_retries_only_old_or_desired_bytes() {
         after: "{\"installed\":true}".into(),
         manifest_before: None,
         manifest_after: Some("owned".into()),
-        observed: preflight(&f.env, &f.target(), "file:///none").unwrap(),
+        observed: preflight(&f.env, &f.target(), &namespaces(&f.env)).unwrap(),
     };
     replace(&journal, &serde_json::to_string(&pending).unwrap()).unwrap();
     // A new global source must prevent any interrupted transaction replay.
@@ -320,7 +340,7 @@ fn oversized_recovery_transaction_refuses_before_creating_journal_or_backup() {
     let f = Fixture::new();
     let before = format!("{{\"owner\":\"{}\"}}", "x".repeat(2 * 1024 * 1024));
     fs::write(f.target(), &before).unwrap();
-    let observed = preflight(&f.env, &f.target(), "file:///none").unwrap();
+    let observed = preflight(&f.env, &f.target(), &namespaces(&f.env)).unwrap();
     let journal = sidecar(&f.target(), "pending.json").unwrap();
     assert!(
         transaction(
@@ -347,6 +367,13 @@ fn plugin_residue_from_another_managed_configuration_is_a_conflict() {
         .data
         .join("different-target/different-version/index.ts"));
     fs::write(f.target(), serde_json::json!({"plugin":[[other_url,{"stateDir":f.state}]],"mcp":{"renamed":{"type":"local"}}}).to_string()).unwrap();
+    assert!(f.run(true).is_err());
+    let f = Fixture::new();
+    fs::write(
+        f.target(),
+        serde_json::json!({"plugins":[{"package": f.env.data.join("other/other"), "options": {"stateDir": f.state}}]}).to_string(),
+    )
+    .unwrap();
     assert!(f.run(true).is_err());
 }
 

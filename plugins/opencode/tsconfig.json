@@ -1,1 +1,1 @@
-{"compilerOptions":{"target":"ES2022","module":"Preserve","moduleResolution":"Bundler","strict":true,"noEmit":true,"types":["bun"],"skipLibCheck":true,"allowImportingTsExtensions":true},"include":["*.ts"]}
+{"compilerOptions":{"target":"ES2022","module":"Preserve","moduleResolution":"Bundler","strict":true,"noEmit":true,"types":["bun"],"skipLibCheck":true,"allowImportingTsExtensions":true},"include":["*.ts"],"exclude":["native.ts","setup-native.ts"]}

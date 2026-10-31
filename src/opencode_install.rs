@@ -1,4 +1,4 @@
-//! Explicit OpenCode V1 setup. It never starts a service, native client or model.
+//! Explicit OpenCode V2 setup. It never starts a service, native client or model.
 mod config;
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
@@ -306,7 +306,7 @@ fn select(env: &Environment, explicit: Option<&Path>) -> Result<PathBuf> {
                 .with_context(|| format!("Invalid OpenCode config {}", path.display()))?;
             config::validate_shape(&root)?;
             existing = Some(path.clone());
-            if config::value(&root, "plugin").is_some() {
+            if config::owns_array(&root) {
                 owner = Some(path);
             }
         }
@@ -318,9 +318,9 @@ fn select(env: &Environment, explicit: Option<&Path>) -> Result<PathBuf> {
 fn preflight(
     env: &Environment,
     target: &Path,
-    namespace: &str,
+    ns: &config::Namespaces,
 ) -> Result<Vec<(PathBuf, Option<String>)>> {
-    // V1 loads this extensionless TOML after the JSON globals and may migrate
+    // OpenCode loads this extensionless TOML after the JSON globals and may migrate
     // it by overwriting config.json. Do not freeze or shadow that configuration.
     let legacy = env.global.join("config");
     ensure!(
@@ -347,7 +347,7 @@ fn preflight(
         if let Some(text) = read(path)? {
             let root = config::parse(&text)?;
             config::validate_shape(&root)?;
-            if config::value(&root, "plugin").is_some() {
+            if config::owns_array(&root) {
                 active_global = Some(path);
             }
         }
@@ -369,7 +369,7 @@ fn preflight(
             let root = config::parse(text)
                 .with_context(|| format!("Invalid OpenCode config {}", path.display()))?;
             ensure!(
-                !config::conflict(&root, namespace)?,
+                !config::conflict(&root, ns)?,
                 "Agent Bridge configuration also exists in {}; resolve that conflict before changing {}",
                 path.display(),
                 target.display()
@@ -379,7 +379,7 @@ fn preflight(
     }
     if let Some(text) = &env.inline {
         ensure!(
-            !config::conflict(&config::parse(text)?, namespace)?,
+            !config::conflict(&config::parse(text)?, ns)?,
             "OPENCODE_CONFIG_CONTENT contains conflicting Agent Bridge settings; remove that override before installing"
         );
     }
@@ -397,7 +397,7 @@ fn verify(observed: &[(PathBuf, Option<String>)]) -> Result<()> {
 }
 fn validate_manifest(manifest: &Manifest, target: &Path, namespace: &Path) -> Result<()> {
     ensure!(
-        manifest.version == 1 && manifest.target == target,
+        matches!(manifest.version, 1 | 2) && manifest.target == target,
         "Installer ownership manifest does not match this configuration"
     );
     for path in &manifest.assets {
@@ -411,11 +411,13 @@ fn validate_manifest(manifest: &Manifest, target: &Path, namespace: &Path) -> Re
         );
     }
     ensure!(
-        manifest
-            .assets
-            .iter()
-            .any(|p| url(&p.join("index.ts")) == manifest.owned.url),
-        "Managed plugin URL does not match owned assets"
+        manifest.assets.iter().any(|p| if manifest.version == 1 {
+            // Legacy manifests record the file:// URL of the index.ts entry.
+            url(&p.join("index.ts")) == manifest.owned.path
+        } else {
+            p.to_str() == Some(manifest.owned.path.as_str())
+        }),
+        "Managed plugin package does not match owned assets"
     );
     Ok(())
 }
@@ -515,7 +517,7 @@ pub fn configure(state: &Path, explicit: Option<&Path>, install: bool) -> Result
     let explicit = explicit.map(system_path).transpose()?;
     let target = run(&env, &state, explicit.as_deref(), install)?;
     println!(
-        "{} OpenCode V1 integration in {}. Restart the OpenCode process to reload plugins and MCP configuration.",
+        "{} OpenCode V2 integration in {}. Restart the OpenCode process to reload plugins and MCP configuration.",
         if install { "Installed" } else { "Removed" },
         target.display()
     );
@@ -525,14 +527,18 @@ fn run(env: &Environment, state: &Path, explicit: Option<&Path>, install: bool) 
     absolute(state)?;
     absolute(&env.binary)?;
     ensure!(
-        state.to_str().is_some() && env.binary.to_str().is_some(),
-        "Native state and executable paths must be valid UTF-8"
+        state.to_str().is_some() && env.binary.to_str().is_some() && env.data.to_str().is_some(),
+        "Native state, data and executable paths must be valid UTF-8"
     );
+    let namespace = format!("{}/", env.data.to_str().context("Data path must be UTF-8")?);
+    let ns = config::Namespaces {
+        plain: namespace,
+        legacy: url(&env.data),
+    };
     let target = select(env, explicit)?;
-    let namespace = asset_namespace(env, &target);
-    let namespace_url = format!("{}/", url(&env.data));
+    let asset_namespace = asset_namespace(env, &target);
     // Preflight before creating directories or installer files.
-    preflight(env, &target, &namespace_url)?;
+    preflight(env, &target, &ns)?;
     directories(
         target.parent().context("Missing configuration parent")?,
         true,
@@ -562,24 +568,30 @@ fn run(env: &Environment, state: &Path, explicit: Option<&Path>, install: bool) 
     let manifest_path = sidecar(&target, "manifest.json")?;
     let journal = sidecar(&target, "pending.json")?;
     recover(&target, &manifest_path, &journal)?;
-    let observed = preflight(env, &target, &namespace_url)?;
+    let observed = preflight(env, &target, &ns)?;
     let before = read(&target)?;
     let old = read_private(&manifest_path)?
         .map(|text| serde_json::from_str::<Manifest>(&text))
         .transpose()?;
     if let Some(old) = &old {
-        validate_manifest(old, &target, &namespace)?;
+        validate_manifest(old, &target, &asset_namespace)?;
     }
     if !install && old.is_none() {
         return Ok(target);
     }
-    let directory = asset_version(&namespace);
-    let plugin_url = url(&directory.join("index.ts"));
+    let directory = asset_version(&asset_namespace);
+    // V2 plugin entries reference the asset directory itself; OpenCode resolves
+    // its index.ts entrypoint. The path must be plain so OpenCode treats it as
+    // a local directory rather than a package name.
+    let package = directory
+        .to_str()
+        .context("Owned asset directory must be UTF-8")?
+        .to_owned();
     let (after, owned) = config::edit(
         before.as_deref().unwrap_or("{}\n"),
         old.as_ref().map(|m| &m.owned),
-        install.then_some((plugin_url.as_str(), env.binary.as_path(), state)),
-        &namespace_url,
+        install.then_some((package.as_str(), env.binary.as_path(), state)),
+        &ns,
     )?;
     let manifest_after = if let Some(owned) = owned {
         let mut assets = old.as_ref().map(|m| m.assets.clone()).unwrap_or_default();
@@ -587,7 +599,7 @@ fn run(env: &Environment, state: &Path, explicit: Option<&Path>, install: bool) 
             assets.push(directory.clone());
         }
         let manifest = Manifest {
-            version: 1,
+            version: 2,
             target: target.clone(),
             owned,
             assets,
