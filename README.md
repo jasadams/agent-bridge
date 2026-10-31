@@ -57,7 +57,7 @@ macOS.
 | Platform | Architectures | Requirement |
 | --- | --- | --- |
 | Linux | x86_64, ARM64 | glibc 2.35 or newer; systemd user session for the managed service |
-| macOS | Intel, Apple Silicon | macOS 13 or newer |
+| macOS | Apple Silicon | macOS 13 or newer |
 
 See [installation options](docs/install.md) for custom state directories,
 binary-only installation, source builds, backups and removal.

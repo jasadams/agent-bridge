@@ -27,14 +27,14 @@ The original code is GPL-3.0-or-later; third-party notices are retained.
 
 ## Portable installation and releases
 
-A POSIX installer selects prebuilt Linux/macOS x86_64/arm64 binaries, verifies
+A POSIX installer selects prebuilt Linux x86_64/arm64 and macOS arm64 binaries, verifies
 checksums and retains source/license notices before delegating transactional
 per-user service setup. Linux systemd and macOS launchd upgrades stop before
 private backup and restore matching binary/state on failure. Existing state,
 identity, grants and service configuration are preserved. Binary-only installs
 are available without service managers.
 
-CI tests/builds all four platforms before publishing an immutable semantic-version
+CI tests/builds all three platforms before publishing an immutable semantic-version
 release. Version tags supply the executable's version, and the installer selects
 the latest published release or an explicitly pinned tag. Corresponding source
 includes locked dependency sources and offline build configuration. The source

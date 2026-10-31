@@ -49,8 +49,6 @@ jobs:
             asset: agent-bridge-linux-x86_64
           - runner: ubuntu-22.04-arm
             asset: agent-bridge-linux-aarch64
-          - runner: macos-15-intel
-            asset: agent-bridge-macos-x86_64
           - runner: macos-14
             asset: agent-bridge-macos-aarch64
     runs-on: ${{ matrix.runner }}

@@ -24,7 +24,7 @@ pipelines:
 workflow: .github/workflows/release.yml
 
 Only strict semantic version tags publish releases. The release pipeline validates
-the tag's commit on main, checks and builds all four platforms, packages complete
+the tag's commit on main, checks and builds all three platforms, packages complete
 corresponding source and notices, and publishes immutable versioned assets.
 Plain main pushes and pull requests run validation without publishing releases.
 
@@ -34,6 +34,6 @@ Verify the Release workflow succeeds, the GitHub release tag points to the inten
 commit, and SOURCE_VERSION/SOURCE_COMMIT/checksums agree. Check the published Linux
 binary's --version and exercise the installer in a disposable custom binary
 directory without changing the user's service or private state. Supported artifacts
-are Linux x86_64/ARM64 and macOS Intel/Apple Silicon.
+are Linux x86_64/ARM64 and macOS Apple Silicon.
 
 See docs/releasing.md for release commands and rerun/recovery behavior.

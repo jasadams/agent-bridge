@@ -177,7 +177,6 @@ exit "$FAKE_SERVICE_RESULT"
 
     def test_platform_selection_and_explicit_version(self):
         for system, machine, asset in [("Darwin", "arm64", "agent-bridge-macos-aarch64"),
-                                       ("Darwin", "x86_64", "agent-bridge-macos-x86_64"),
                                        ("Linux", "aarch64", "agent-bridge-linux-aarch64")]:
             with self.subTest(system=system, machine=machine):
                 self.env.update(FAKE_OS=system, FAKE_ARCH=machine)
@@ -187,6 +186,13 @@ exit "$FAKE_SERVICE_RESULT"
                 calls = [json.loads(line) for line in (self.root / "curl-args").read_text().splitlines()]
                 self.assertTrue(any(call[-1].endswith("/v0.2.0/" + asset) for call in calls))
                 self.assertFalse(any(call[-1].endswith('/releases/latest') for call in calls))
+
+    def test_intel_macos_is_rejected_before_download(self):
+        self.env.update(FAKE_OS="Darwin", FAKE_ARCH="x86_64")
+        result = self.run_installer("--no-service")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Intel macOS is not supported", result.stderr)
+        self.assertFalse((self.root / "curl-args").exists())
 
     def test_latest_resolves_once_and_all_downloads_use_the_immutable_version(self):
         result = self.run_installer("--no-service")
@@ -290,7 +296,7 @@ exit "$FAKE_SERVICE_RESULT"
                 manager=self.home / relative
                 manager.parent.mkdir(parents=True)
                 manager.write_text("existing manager configuration")
-                self.env.update(FAKE_OS=platform,FAKE_SERVICE_ACTIVE="0")
+                self.env.update(FAKE_OS=platform, FAKE_ARCH="arm64" if platform == "Darwin" else "x86_64", FAKE_SERVICE_ACTIVE="0")
                 result=self.run_installer("--no-service")
                 self.assertNotEqual(result.returncode,0)
                 self.assertIn("managed service is configured",result.stderr)
@@ -351,7 +357,8 @@ exit "$FAKE_SERVICE_RESULT"
         for system in ["Linux", "Darwin"]:
             with self.subTest(system=system):
                 self.env["FAKE_OS"] = system
-                self.publish("agent-bridge-macos-x86_64" if system == "Darwin" else self.asset)
+                self.env["FAKE_ARCH"] = "arm64" if system == "Darwin" else "x86_64"
+                self.publish("agent-bridge-macos-aarch64" if system == "Darwin" else self.asset)
                 paths = [self.home, self.home / ".local", self.home / ".local/bin",
                          self.home / ".local/state", self.home / ".config",
                          self.home / ".config/systemd", self.home / ".config/systemd/user",

@@ -12,7 +12,7 @@ import tempfile
 from release_version import parse_version, tag_version, version_key
 
 PLATFORMS = {'agent-bridge-linux-x86_64', 'agent-bridge-linux-aarch64',
-             'agent-bridge-macos-x86_64', 'agent-bridge-macos-aarch64'}
+             'agent-bridge-macos-aarch64'}
 
 
 def verify_assets(directory, commit, version):

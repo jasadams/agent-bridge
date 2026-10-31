@@ -171,7 +171,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(platforms, [
             ('ubuntu-22.04', 'agent-bridge-linux-x86_64'),
             ('ubuntu-22.04-arm', 'agent-bridge-linux-aarch64'),
-            ('macos-15-intel', 'agent-bridge-macos-x86_64'),
             ('macos-14', 'agent-bridge-macos-aarch64'),
         ])
         validation = self.step('build', 'Validate source and installer')

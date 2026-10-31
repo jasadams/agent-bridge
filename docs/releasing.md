@@ -24,15 +24,15 @@ builds use the manifest's fallback version.
 
 The `Release` workflow validates the strict `vMAJOR.MINOR.PATCH` tag and that its
 commit belongs to `main`. It runs tests and lint checks, builds Linux x86_64/ARM64
-and macOS Intel/Apple Silicon binaries, checks their reported versions, then
+and macOS Apple Silicon binaries, checks their reported versions, then
 publishes a GitHub release after all platforms succeed. Pull requests, ordinary
-main pushes and manual runs on branches run the same four-platform source,
+main pushes and manual runs on branches run the same three-platform source,
 test, lint, installer and packaging checks. They skip optimized executable builds,
 macOS signing, release-binary version checks and release artifact uploads.
 
 Release preparation therefore requires no optimized PR or main build to finish
 before tagging a reviewed, validated commit. The tag workflow runs all required
-validation again and builds the four executables once with the tag's version.
+validation again and builds the three executables once with the tag's version.
 Only a tag-push event in the canonical repository can publish; a manual run cannot
 publish. A manual run on a strict release tag can validate and build that tag.
 
@@ -40,7 +40,7 @@ The version is embedded in `agent-bridge --version`, broker status and MCP serve
 metadata. Every release includes the binaries, SHA256SUMS, SOURCE_VERSION,
 SOURCE_COMMIT, release notes, GPL license, dependency notices, and a versioned
 source archive containing locked dependencies and offline build instructions.
-On the next real release, verify all four platform assets and the corresponding
+On the next real release, verify all three platform assets and the corresponding
 source/version/checksum provenance below; do not create a release solely to test
 the workflow.
 
