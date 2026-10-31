@@ -203,13 +203,32 @@ UPDATE messages SET state='blocked',detail='Original native provider is unknown;
         tx.pragma_update(None, "user_version", 16)?;
     }
     if version < 17 {
+        // Fixtures and interrupted upgrades may already carry these columns;
+        // add each only when absent so re-running the migration stays safe.
+        for (name, ddl) in [
+            (
+                "reconcile_attempts",
+                "ALTER TABLE opencode_deliveries ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0;",
+            ),
+            (
+                "reconcile_at",
+                "ALTER TABLE opencode_deliveries ADD COLUMN reconcile_at INTEGER;",
+            ),
+        ] {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('opencode_deliveries') WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            if !present {
+                tx.execute_batch(ddl)?;
+            }
+        }
         // Existing databases keep the positional enqueue trigger created before
         // these columns existed; recreate it with explicit columns or every new
         // OpenCode message insert would fail after the upgrade.
         tx.execute_batch(
-            "ALTER TABLE opencode_deliveries ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE opencode_deliveries ADD COLUMN reconcile_at INTEGER;
-DROP TRIGGER IF EXISTS opencode_enqueue_binding;
+            "DROP TRIGGER IF EXISTS opencode_enqueue_binding;
 CREATE TRIGGER opencode_enqueue_binding AFTER INSERT ON messages WHEN (SELECT provider FROM agents WHERE name=NEW.recipient)='opencode' BEGIN
  INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,content,attempt,phase,deadline) SELECT NEW.id,NEW.recipient_session,COALESCE((SELECT generation FROM opencode_leases WHERE session=NEW.recipient_session),'unleased'),(SELECT value FROM settings WHERE key='opencode_namespace'),'pending',NULL,NULL,'queued',NEW.created+120000;
 END;",
