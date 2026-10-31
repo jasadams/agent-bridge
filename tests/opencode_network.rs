@@ -100,7 +100,24 @@ impl Native {
                         continue;
                     }
                 } else {
-                    assert_eq!(frame["op"], "probe");
+                    // The broker's automatic recovery may issue read-only
+                    // reconciliation frames; they must never re-submit.
+                    assert!(matches!(
+                        frame["op"].as_str(),
+                        Some("probe") | Some("reconcile")
+                    ));
+                    if frame["op"] == "reconcile" {
+                        for key in [
+                            "id",
+                            "native_message_id",
+                            "namespace",
+                            "generation",
+                            "attempt",
+                        ] {
+                            receipt[key] = frame[key].clone();
+                        }
+                        receipt["status"] = json!("uncertain");
+                    }
                 }
                 writeln!(stream, "{receipt}").unwrap();
             }
