@@ -22,6 +22,60 @@ probe_spec.loader.exec_module(codex_probe)
 
 
 class Isolation(unittest.TestCase):
+    def test_matrix_broker_keeps_discovery_scoped_to_private_codex_home(self):
+        harness = Qualification.__new__(Qualification)
+        harness.args = Mock(binary="/fixture/agent-bridge")
+        harness.root, harness.workroot = Path("/fixture"), Path("/fixture/work")
+        harness.envs = {"a": {"CODEX_HOME": "/fixture/a/codex", "HOME": "/fixture/a/home"}}
+        harness.states, harness.brokers = {"a": Path("/fixture/a/broker")}, {}
+        harness.evidence = {"source_commit": "fixture-commit"}
+        harness.processes = Mock()
+        with patch("qualification_native.rpc", return_value={"build_commit": "fixture-commit"}):
+            harness.broker("a")
+        argv = harness.processes.start.call_args.args[1]
+        self.assertNotIn("--no-discovery", argv)
+        self.assertEqual(harness.processes.start.call_args.args[2], harness.envs["a"])
+
+    def test_v2_requests_keep_private_auth_and_only_unwrap_data_when_requested(self):
+        harness = Qualification.__new__(Qualification)
+        harness.oc = {"a": {"base": "http://127.0.0.1:1234", "headers": {"Authorization": "Basic private-fixture"}}}
+        page = {"data": [{"id": "msg_one"}], "cursor": {"next": "next-page"}}
+        with patch("qualification_native.http_json", return_value=page) as request:
+            self.assertEqual(harness.oc_api("a", "/api/session"), page["data"])
+            self.assertEqual(harness.oc_api("a", "/api/session", unwrap=False), page)
+        self.assertEqual(request.call_count, 2)
+        for call in request.call_args_list:
+            self.assertEqual(call.kwargs["headers"], harness.oc["a"]["headers"])
+
+    def test_v2_prompt_checks_exact_admission_without_retry_or_consumption_claim(self):
+        harness = Qualification.__new__(Qualification)
+        harness.evidence = {}
+        accepted = {"id": "msg_fixture_fixed", "sessionID": "ses_private", "type": "user", "payload": {"text": "resume"}, "delivery": "steer"}
+        with patch("qualification_native.uid", return_value="fixed"), patch.object(harness, "oc_api", return_value=accepted) as request:
+            harness.oc_prompt("a", "ses_private", "resume")
+        request.assert_called_once_with("a", "/api/session/ses_private/prompt", {"id": "msg_fixture_fixed", "text": "resume"})
+        self.assertEqual(harness.evidence, {"explicit_prompt_receipts": [accepted]})
+        for field, wrong in [("id", "wrong"), ("sessionID", "other"), ("type", "synthetic"), ("payload", {"text": "other"}), ("delivery", "queue")]:
+            with self.subTest(field=field), patch("qualification_native.uid", return_value="fixed"), patch.object(harness, "oc_api", return_value={**accepted, field: wrong}) as request:
+                with self.assertRaisesRegex(RuntimeError, "receipt differs"):
+                    harness.oc_prompt("a", "ses_private", "resume")
+                self.assertEqual(request.call_count, 1)
+
+    def test_v2_history_reads_all_pages_and_rejects_duplicate_or_setup_text(self):
+        harness = Qualification.__new__(Qualification)
+        harness.fixture = Mock(routes={"opencode-ses_private": {"session": "ses_private", "state": Path("/a")}})
+        harness.states = {"a": Path("/a")}
+        row = {"id": "msg_peer", "type": "user", "text": "peer MARKER"}
+        first = {"data": [{"id": "assistant", "type": "assistant"}], "cursor": {"next": "opaque/+="}}
+        last = {"data": [row], "cursor": {"next": None}}
+        with patch.object(harness, "oc_api", side_effect=[first, last]) as request:
+            self.assertEqual(harness.oc_exact_message("opencode-ses_private", "MARKER"), "msg_peer")
+        self.assertEqual(request.call_args_list[1].args[1], "/api/session/ses_private/message?limit=200&cursor=opaque%2F%2B%3D")
+        for rows in ([row, row], [{**row, "text": "MARKER <agent-bridge-session-context>"}]):
+            with self.subTest(rows=rows), patch.object(harness, "oc_api", return_value={"data": rows, "cursor": {"next": None}}):
+                with self.assertRaises(RuntimeError):
+                    harness.oc_exact_message("opencode-ses_private", "MARKER")
+
     def test_codex_probe_exit_observation_does_not_reap_owned_leader(self):
         probe = codex_probe.Probe.__new__(codex_probe.Probe)
         child = Mock(pid=12345)
@@ -191,11 +245,11 @@ class Isolation(unittest.TestCase):
                                         ("/opencode/v1/chat/completions", "opencode-dest", "Your identity is opencode-dest")]:
                 body = {"messages": [{"role": "system", "content": systems},
                                      {"role": "user", "content": "MARKER from opencode-source"}],
-                        "tools": [{"name": "bridge_acknowledge_message"}]}
+                         "tools": [{"name": "bridge_send_message"}]}
                 record = {"body": "MARKER", "recipient": route, "sender": "opencode-source", "id": "incoming"}
                 with patch("qualification_native.rpc", return_value=[record]):
                     action = fixture.action(path, body)
-                self.assertEqual(action["arguments"], {"agent": route, "id": "incoming"})
+                self.assertEqual(action["arguments"], {"from": route, "to": "opencode-source", "body": "Reply MARKER", "id": "reply", "parent": "incoming"})
         finally:
             fixture.close()
 

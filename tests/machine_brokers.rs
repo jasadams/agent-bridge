@@ -232,16 +232,12 @@ async fn authenticated_machine_names_survive_renaming_with_pinned_queued_deliver
         let message = bob.request(Request::Get {
             id: local_id.clone(),
         });
-        (message["state"] == "submitted").then_some(message)
+        (message["state"] == "unknown").then_some(message)
     })
     .await;
-    bob.request(Request::Ack {
-        id: local_id.clone(),
-        agent: "reviewer".into(),
-    });
     wait(|| {
         let message = alice.request(Request::Get { id: id.clone() });
-        (message["state"] == "acknowledged").then_some(message)
+        (message["state"] == "unknown").then_some(message)
     })
     .await;
     let reply = uuid::Uuid::new_v4().to_string();

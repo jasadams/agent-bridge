@@ -255,13 +255,9 @@ async fn discovered_peers_pair_exchange_and_reconnect_without_manual_addresses()
     })
     .await;
     let local_id = received["id"].as_str().unwrap();
-    bob.state(local_id, "submitted").await;
-    bob.request(Request::Ack {
-        id: local_id.into(),
-        agent: "user".into(),
-    });
-    let acknowledged = alice.state(&id, "acknowledged").await;
-    assert_eq!(acknowledged["transfer"]["state"], "accepted");
+    bob.state(local_id, "delivered").await;
+    let delivered = alice.state(&id, "delivered").await;
+    assert_eq!(delivered["transfer"]["state"], "accepted");
     send(
         &bob,
         &format!("{alice_id}/user"),
@@ -349,9 +345,9 @@ async fn discovered_peers_pair_exchange_and_reconnect_without_manual_addresses()
             .find(|message| message["body"] == "Queued across LAN address change")
     })
     .await;
-    bob.state(recovered["id"].as_str().unwrap(), "submitted")
+    bob.state(recovered["id"].as_str().unwrap(), "delivered")
         .await;
-    alice.state(&offline_id, "submitted").await;
+    alice.state(&offline_id, "delivered").await;
     assert_eq!(
         bob.history()
             .iter()

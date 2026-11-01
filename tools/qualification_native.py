@@ -2,11 +2,12 @@
 """Opt-in, real native clients with scripted loopback models; never owner state.
 
 Requires Python 3.11+, websockets 15.0.1, Claude 2.1.300, standalone Codex
-0.165.0 (experimental native queue), and OpenCode 1.18.35. See
+0.166.0 (experimental native queue), and OpenCode V2.2.5. See
 docs/compatibility.md for the evidence boundary and build commands.
 """
 import argparse
 import asyncio
+import base64
 import errno
 import hashlib
 import http.server
@@ -26,6 +27,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import uuid
 
 
@@ -161,10 +163,10 @@ def private_env(root):
     }
 
 
-def http_json(base, path, body=None, method=None, timeout=60):
+def http_json(base, path, body=None, method=None, timeout=60, headers=None):
     request = urllib.request.Request(base + path, method=method,
                                     data=None if body is None else json.dumps(body).encode(),
-                                    headers={"Content-Type": "application/json"})
+                                    headers={"Content-Type": "application/json", **(headers or {})})
     # Cold native dependency/bootstrap work may exceed 20 seconds. Match the
     # existing SDK harness's bounded 60-second request timeout; never retry a
     # timed-out mutation, because the native session may already exist.
@@ -176,7 +178,7 @@ def http_json(base, path, body=None, method=None, timeout=60):
 class Fixture:
     """Only emits scripted calls through tools actually exposed by native MCP.
 
-    The provider never performs acknowledgement/send itself. Main-thread RPC
+    The provider never sends itself. Main-thread RPC
     observes those effects independently, after actual native tool execution.
     """
     def __init__(self):
@@ -235,13 +237,17 @@ class Fixture:
         message = next((m for m in records if m["body"] == wanted_body and m["recipient"] == route), None)
         require(message, "Model request had marker but no exact broker recipient record")
         step = self.stages.get((route, original), 0)
-        if step == 0:
-            suffix, args = "acknowledge_message", {"agent": route, "id": message["id"]}
-        elif step == 1 and not is_reply:
-            suffix, args = "send_message", {"from": route, "to": message["sender"],
-                "body": "Reply " + original, "id": row["reply_id"], "parent": message["id"]}
-        else:
+        if step != 0:
             return None
+        self.stages[(route, original)] = 1
+        # Record actual model input in each direction, without a receipt tool call.
+        self.receipts.append({"route": route, "marker": original, "message": message["id"],
+            "sender_label_visible": message["sender"] in text,
+            "correlation_visible": message["id"] in text, "tool": None if is_reply else "send_message"})
+        if is_reply:
+            return None
+        suffix, args = "send_message", {"from": route, "to": message["sender"],
+            "body": "Reply " + original, "id": row["reply_id"], "parent": message["id"]}
         if info["provider"] == "codex":
             namespace = next(t for t in tools if t.get("name") == "mcp__bridge")
             found = next(t for t in namespace["tools"] if t["name"].endswith(suffix))
@@ -249,11 +255,6 @@ class Fixture:
         else:
             name = next(t.get("name", t.get("function", {}).get("name", "")) for t in tools
                         if t.get("name", t.get("function", {}).get("name", "")).endswith(suffix))
-        self.stages[(route, original)] = step + 1
-        # No prompts, credentials or raw transcripts are retained in evidence.
-        self.receipts.append({"route": route, "marker": original, "message": message["id"],
-            "sender_label_visible": message["sender"] in text,
-            "correlation_visible": message["id"] in text, "tool": suffix})
         return {"name": name, "arguments": args, "id": "call_" + uid().replace("-", "")}
 
     def respond(self, path, body):
@@ -313,7 +314,7 @@ class Qualification:
         self.processes = Processes(root)
         # A disk-backed cache must not put the native workspace beneath an owner
         # home: OpenCode searches project ancestors for configuration.
-        self.workroot = Path(tempfile.mkdtemp(prefix="abqw-", dir="/tmp"))
+        self.workroot = Path(tempfile.mkdtemp(prefix="abqw-", dir="/tmp/opencode"))
         self.envs, self.states, self.brokers, self.oc = {}, {}, {}, {}
         self.codex_socket = None
         try:
@@ -336,34 +337,63 @@ class Qualification:
         child = self.processes.start("broker-" + side, [self.args.binary, "--state-dir", str(self.states[side]), "serve"], env, self.work(side))
         self.brokers[side] = child
         status = wait_for("broker startup", lambda: rpc(self.states[side], {"op": "status"}))
-        require(status["build_commit"] == self.evidence["source_commit"], "Binary build_commit differs from source HEAD; rebuild with AGENT_BRIDGE_BUILD_COMMIT")
+        self.evidence.setdefault("broker_build_commits", {}).setdefault(side, []).append(status["build_commit"])
+        require(status["build_commit"] == self.evidence["source_commit"], f"Binary build_commit {status['build_commit']!r} differs from source HEAD {self.evidence['source_commit']!r}; rebuild with AGENT_BRIDGE_BUILD_COMMIT")
 
     def opencode(self, side):
         root, env, state = self.root / side, self.envs[side], self.states[side]
         config_dir = Path(env["XDG_CONFIG_HOME"]) / "opencode"
         config_dir.mkdir(mode=0o700)
-        config = {"$schema": "https://opencode.ai/config.json", "enabled_providers": ["fixture"], "model": "fixture/fixture", "small_model": "fixture/fixture",
-            "provider": {"fixture": {"npm": "@ai-sdk/openai-compatible", "name": "Fixture", "options": {"baseURL": self.fixture.origin + "/opencode/v1", "apiKey": "local-fixture-only"},
-                "models": {"fixture": {"name": "Fixture", "limit": {"context": 32768, "output": 2048}, "tool_call": True}}}}}
-        (config_dir / "opencode.json").write_text(json.dumps(config))
+        config = {"$schema": "https://opencode.ai/config.json", "model": "fixture/fixture", "snapshots": False, "update": "disable",
+            "policies": [{"action": "provider.use", "resource": "*", "effect": "deny"}, {"action": "provider.use", "resource": "fixture", "effect": "allow"}],
+            "agents": {"title": {"model": "fixture/fixture"}},
+            "permissions": [{"action": "*", "resource": "*", "effect": "allow"}],
+            "providers": {"fixture": {"package": "@opencode/ai/providers/openai-compatible", "name": "Fixture", "settings": {"baseURL": self.fixture.origin + "/opencode/v1", "apiKey": "local-fixture-only"},
+                "models": {"fixture": {"name": "Fixture", "limit": {"context": 32768, "output": 2048}, "capabilities": {"tools": True}}}}}}
+        config_file = config_dir / "opencode.json"
+        config_file.write_text(json.dumps(config))
+        config_file.chmod(0o600)
         self.command([self.args.binary, "--state-dir", str(state), "opencode", "install"], env, self.work(side))
+        installed = json.loads(config_file.read_text())
+        generated = installed["mcp"]["agent-bridge"]
+        require(generated["command"] == [self.args.binary, "--state-dir", str(state), "mcp"], "Installed MCP command does not match isolated binary/state")
+        # Initial disposable fixture configuration only: preserve installed
+        # assets, use canonical V2 MCP config and documented direct-tool mode.
+        installed["mcp"] = {"servers": {"agent-bridge": {"type": "local", "command": generated["command"], "codemode": False}}}
+        (root / "installer-config.json").write_text(json.dumps({"generated_mcp": generated, "effective_config": installed}, indent=2))
+        config_file.write_text(json.dumps(installed))
+        env["OPENCODE_PASSWORD"] = uid()
         with socket.socket() as reserve:
             reserve.bind(("127.0.0.1", 0))
             port = reserve.getsockname()[1]
         argv = [self.args.opencode, "serve", "--hostname", "127.0.0.1", "--port", str(port)]
         native = self.processes.start("opencode-" + side, argv, env, self.work(side))
         base = f"http://127.0.0.1:{port}"
-        wait_for("OpenCode startup", lambda: http_json(base, "/global/health", timeout=2))
-        # Global health can precede lazy project/plugin dependency bootstrap.
-        # Exercise the same project API with a retriable read before the first
-        # mutation. A timed-out create must never be issued a second time.
-        wait_for("OpenCode project bootstrap", lambda: isinstance(http_json(base, "/session", timeout=2), list), 180)
-        self.oc[side] = {"base": base, "process": native, "argv": argv}
+        headers = {"Authorization": "Basic " + base64.b64encode(("opencode:" + env["OPENCODE_PASSWORD"]).encode()).decode()}
+        self.oc[side] = {"base": base, "process": native, "argv": argv, "headers": headers}
+        wait_for("OpenCode startup", lambda: self.oc_api(side, "/api/info", timeout=2))
+        wait_for("OpenCode project bootstrap", lambda: self.oc_api(side, "/api/config", timeout=2), 180)
+        wait_for("OpenCode MCP connected", lambda: '"connected"' in json.dumps(self.oc_api(side, "/api/mcp", timeout=2)), 180)
+        (root / "openapi.json").write_text(json.dumps(self.oc_api(side, "/openapi.json", unwrap=False), indent=2))
         return self.oc_session(side, "Qualification " + side)
 
+    def oc_api(self, side, path, body=None, method=None, timeout=60, unwrap=True):
+        native = self.oc[side]
+        value = http_json(native["base"], path, body, method, timeout, headers=native["headers"])
+        return value["data"] if unwrap and isinstance(value, dict) and "data" in value else value
+
     def oc_session(self, side, title):
-        session = http_json(self.oc[side]["base"], "/session", {"title": title})["id"]
+        session = self.oc_api(side, "/api/session", {"title": title, "location": {"directory": str(self.work(side))}})["id"]
         return self.route("opencode", session, self.states[side])
+
+    def oc_prompt(self, side, session, text):
+        ident = "msg_fixture_" + uid().replace("-", "")
+        accepted = self.oc_api(side, "/api/session/" + session + "/prompt", {"id": ident, "text": text})
+        require(accepted["id"] == ident and accepted["sessionID"] == session and accepted["type"] == "user"
+                and accepted["payload"]["text"] == text and accepted["delivery"] == "steer", "V2 prompt receipt differs from exact input")
+        # Durable native admission is not proof of later model consumption.
+        self.evidence.setdefault("explicit_prompt_receipts", []).append(accepted)
+        return ident
 
     def route(self, provider, session, state):
         name = provider + "-" + session
@@ -380,7 +410,7 @@ class Qualification:
         mcp = root / "claude-mcp.json"
         mcp.write_text(json.dumps({"mcpServers": {"bridge": {"command": self.args.binary, "args": ["--state-dir", str(state), "mcp"]}}}))
         argv = [self.args.claude, "--bare", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(mcp), "--tools", "",
-            "--allowedTools", "mcp__bridge__acknowledge_message,mcp__bridge__send_message", "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            "--allowedTools", "mcp__bridge__send_message", "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--replay-user-messages", "--model", "claude-fixture", "--session-id", session, "--messaging-socket-path", str(endpoint)]
         native = self.processes.start("claude", argv, env, self.work("a"), stdin=subprocess.PIPE)
         native.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": "Initialize disposable qualification session."}}) + "\n")
@@ -399,7 +429,7 @@ class Qualification:
         require(stat.S_ISDIR(meta.st_mode) and meta.st_uid == os.getuid() and stat.S_IMODE(meta.st_mode) & 0o077 == 0, "Codex socket directory is not private")
         self.codex_socket = shared / ("agb7-" + uid() + ".sock")
         config = Path(env["CODEX_HOME"]) / "config.toml"
-        config.write_text('[mcp_servers.bridge]\nenabled_tools = ["acknowledge_message", "send_message"]\ncommand = ' + json.dumps(self.args.binary) + '\nargs = ["--state-dir", ' + json.dumps(str(self.states['a'])) + ', "mcp"]\n[mcp_servers.bridge.tools.acknowledge_message]\napproval_mode = "approve"\n[mcp_servers.bridge.tools.send_message]\napproval_mode = "approve"\n')
+        config.write_text('[mcp_servers.bridge]\nenabled_tools = ["send_message"]\ncommand = ' + json.dumps(self.args.binary) + '\nargs = ["--state-dir", ' + json.dumps(str(self.states['a'])) + ', "mcp"]\n[mcp_servers.bridge.tools.send_message]\napproval_mode = "approve"\n')
         # A unique provider endpoint is filled after thread/start identifies the route.
         argv = [self.args.codex, "app-server", "--listen", "unix://" + str(self.codex_socket)]
         for setting in ['model_provider="fixture"', 'model="fixture"', 'model_providers.fixture.name="fixture"',
@@ -442,33 +472,46 @@ class Qualification:
             original = rpc(source["state"], {"op": "get", "id": row["id"]})
             replies = rpc(source["state"], {"op": "history", "agent": sender, "limit": 100})
             reply = next((m for m in replies if m["body"] == "Reply " + row["marker"] and m["recipient"] == sender), None)
-            return (original, reply) if original["state"] == "acknowledged" and reply and reply["state"] == "acknowledged" else None
-        original, reply = wait_for("native explicit ack/reply " + sender + " -> " + target, complete, 90)
+            observed = {r["route"] for r in self.fixture.receipts if r["marker"] == row["marker"]}
+            source_outcome = "unknown" if dest["provider"] == "claude" else "delivered"
+            reply_outcome = "unknown" if source["provider"] == "claude" else "delivered"
+            return (original, reply) if original["state"] == source_outcome and reply and reply["state"] == reply_outcome and observed == {sender, recipient} else None
+        original, reply = wait_for("native model input and correlated reply " + sender + " -> " + target, complete, 90)
         require(reply["parent"] == row["id"] and reply["hops"] == 1 and reply["recipient_session"] == source["session"], "Reply correlation/session mismatch")
         records = rpc(dest["state"], {"op": "history", "agent": recipient, "limit": 100})
         incoming = next(m for m in records if m["body"] == row["marker"] and m["recipient"] == recipient)
         require(incoming["recipient_session"] == dest["session"], "Destination native identity mismatch")
         receipts = [r for r in self.fixture.receipts if r["marker"] == row["marker"]]
-        require(len(receipts) == 3 and all(r["sender_label_visible"] and r["correlation_visible"] for r in receipts), "Missing actual model-visible sender/reference or tool execution")
+        require(len(receipts) == 2 and sum(r["tool"] == "send_message" for r in receipts) == 1 and all(r["sender_label_visible"] and r["correlation_visible"] for r in receipts), "Missing actual model-visible sender/reference or reply execution")
         for route, marker in [(recipient, row["marker"]), (sender, "Reply " + row["marker"])]:
             info = self.fixture.routes[route]
             if info["provider"] == "opencode":
                 self.oc_exact_message(route, marker)
         row.update(incoming_id=incoming["id"], reply_local_id=reply["id"], parent=reply["parent"], original_state=original["state"], reply_state=reply["state"],
-                   source_model_receipt=True, destination_model_receipt=True, scripted_mcp_calls=len(receipts),
-                   task_completion="not established by ack/reply; scripted tools only")
+                   source_model_receipt=True, destination_model_receipt=True, scripted_mcp_calls=1,
+                   task_completion="not established by native acceptance or reply; scripted tools only")
         self.evidence["pairs"].append(row)
         self.fixture.active = None
+
+    def oc_messages(self, side, session):
+        messages, cursor = [], None
+        while True:
+            query = "cursor=" + urllib.parse.quote(cursor, safe="") if cursor else "order=asc"
+            page = self.oc_api(side, "/api/session/" + session + "/message?limit=200&" + query, unwrap=False)
+            messages.extend(page["data"])
+            cursor = page["cursor"].get("next")
+            if not cursor:
+                break
+        return messages
 
     def oc_exact_message(self, route, marker):
         info = self.fixture.routes[route]
         side = "a" if info["state"] == self.states["a"] else "b"
-        messages = http_json(self.oc[side]["base"], "/session/" + info["session"] + "/message")
-        found = [m for m in messages if m["info"]["role"] == "user" and any(p.get("type") == "text" and marker in p["text"] for p in m["parts"])]
+        messages = self.oc_messages(side, info["session"])
+        found = [m for m in messages if m["type"] == "user" and marker in m["text"]]
         require(len(found) == 1, "Native history must contain exactly one matching user message")
-        parts = [p for p in found[0]["parts"] if p.get("type") == "text"]
-        require(len(parts) == 1 and "<agent-bridge-session-context>" not in parts[0]["text"], "Native message text duplicated or accumulated setup context")
-        return found[0]["info"]["id"]
+        require("<agent-bridge-session-context>" not in found[0]["text"], "Native message text accumulated setup context")
+        return found[0]["id"]
 
     @staticmethod
     def lease_ended(state, session):
@@ -479,8 +522,8 @@ class Qualification:
     def lifecycle(self, route):
         info, state, native = self.fixture.routes[route], self.states["a"], self.oc["a"]
         session = info["session"]
-        path = "/session/" + session
-        http_json(native["base"], path, {"title": "Qualification renamed"}, "PATCH")
+        path = "/api/session/" + session
+        self.oc_api("a", path, {"title": "Qualification renamed"}, "PATCH")
         wait_for("native rename discovery", lambda: any(a["name"] == route and a.get("display_name") == "Qualification renamed" for a in rpc(state, {"op": "list", "all": False})))
         with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
             old_generation = db.execute("SELECT generation FROM opencode_leases WHERE session=?", (session,)).fetchone()[0]
@@ -491,6 +534,7 @@ class Qualification:
             return [{key: row[key] for key in ("peer_id", "provider", "session", "permissions", "shared")}
                     for row in rpc(state, {"op": "shared_sessions"})]
         grants = durable_grants()
+        native_users_before = [m for m in self.oc_messages("a", session) if m["type"] == "user"]
         history_id = self.evidence["pairs"][0]["id"]
         rpc(state, {"op": "pause", "paused": True})
         self.processes.stop(self.brokers["a"])
@@ -498,7 +542,7 @@ class Qualification:
         require(rpc(state, {"op": "status"})["paused"], "Broker restart lost pause")
         require(rpc(state, {"op": "identity"}) == identity, "Broker restart changed identity")
         require(durable_grants() == grants, "Broker restart lost exact session grants")
-        require(rpc(state, {"op": "get", "id": history_id})["state"] == "acknowledged", "Broker restart lost retained history")
+        require(rpc(state, {"op": "get", "id": history_id})["state"] == self.evidence["pairs"][0]["original_state"], "Broker restart lost retained history")
         rpc(state, {"op": "pause", "paused": False})
         self.processes.stop(native["process"])
         wait_for("closed plugin expires native routes", lambda: not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})))
@@ -507,24 +551,64 @@ class Qualification:
         # disabled presentation flag as evidence that replacement is allowed.
         wait_for("closed plugin generation lease ends", lambda: self.lease_ended(state, session))
         native["process"] = self.processes.start("opencode-a-restarted", native["argv"], self.envs["a"], self.work("a"))
-        wait_for("native restart health", lambda: http_json(native["base"], "/global/health", timeout=2))
-        http_json(native["base"], path)  # history lookup does not activate a route
-        require(not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})), "Stored history lookup activated native route")
-        http_json(native["base"], path + "/prompt_async", {"parts": [{"type": "text", "text": "Explicit disposable resume after reload."}]})
+        wait_for("native restart health", lambda: self.oc_api("a", "/api/info", timeout=2))
+        # V2 exposes canonical unarchived server sessions without a TUI tab or
+        # explicit prompt. Recovery must own a fresh live lease, not infer
+        # liveness from saved files, and must not manufacture native input.
+        recovered_session = self.oc_api("a", path)
+        self.oc_api("a", "/api/config")
+        recovered = wait_for("V2 canonical session recovery", lambda: next((a for a in rpc(state, {"op": "list", "all": False}) if a["name"] == route), None))
+        with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
+            db.row_factory = sqlite3.Row
+            lease = dict(db.execute("SELECT * FROM opencode_leases WHERE session=?", (session,)).fetchone())
+        native_users_after = [m for m in self.oc_messages("a", session) if m["type"] == "user"]
+        observed_at = int(time.time() * 1000)
+        self.evidence["v2_recovery_observation"] = {"session": recovered_session, "registration": recovered, "lease": lease,
+            "native_users_before": native_users_before, "native_users_after": native_users_after,
+            "no_unintended_native_input": native_users_before == native_users_after, "observed_at_ms": observed_at}
+        require(recovered_session["id"] == session and recovered_session["location"]["directory"] == str(self.work("a"))
+                and not recovered_session["time"].get("archived"), "Recovery did not expose the exact unarchived canonical V2 session")
+        require(recovered["provider"] == "opencode" and recovered["session"] == session and recovered["enabled"]
+                and recovered["endpoint"] == lease["endpoint"] and lease["ready"] == 1 and lease["expires"] > observed_at
+                and lease["generation"] != old_generation, "Recovery lacks a fresh owning live plugin lease")
+        endpoint = Path(lease["endpoint"]).lstat()
+        require(stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid == os.getuid(), "Recovered plugin endpoint is not an owned live socket")
+        require(native_users_before == native_users_after, "Canonical recovery admitted unintended native input")
+        explicit_id = self.oc_prompt("a", session, "Explicit disposable resume after reload.")
         self.route("opencode", session, state)
         with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
             new_generation = db.execute("SELECT generation FROM opencode_leases WHERE session=?", (session,)).fetchone()[0]
         require(new_generation != old_generation, "Plugin replacement reused a stale generation")
+        require(new_generation == lease["generation"], "Explicit input replaced the recovered plugin generation")
+        def explicit_projection():
+            rows = [m for m in self.oc_messages("a", session) if m["type"] == "user"]
+            return rows if any(m["id"] == explicit_id for m in rows) else None
+        explicit_users = wait_for("explicit native input projected exactly once", explicit_projection)
+        explicit = [m for m in explicit_users if m["id"] == explicit_id]
+        require(len(explicit) == 1 and explicit[0]["text"] == "Explicit disposable resume after reload."
+                and explicit_users == native_users_before + explicit, "Explicit input duplicated or changed retained native user history")
+        self.evidence["v2_recovery_observation"]["explicit_native_input_id"] = explicit_id
+        self.evidence["v2_recovery_observation"]["explicit_native_input_once"] = True
         # All previously inserted native user records survive restart exactly once.
         for row in self.evidence["pairs"]:
             if row["recipient"] == route:
                 self.oc_exact_message(route, row["marker"])
             if row["sender"] == route:
                 self.oc_exact_message(route, "Reply " + row["marker"])
-        http_json(native["base"], path, method="DELETE")
+        before_archive = [m for m in self.oc_messages("a", session) if m["type"] == "user"]
+        self.oc_api("a", path, {"archived": True}, "PATCH")
+        wait_for("native archive removes live registration", lambda: not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})))
+        wait_for("archived plugin lease ends", lambda: self.lease_ended(state, session))
+        archived = self.oc_api("a", path)
+        require(archived["id"] == session and archived["time"].get("archived"), "Canonical API did not retain exact archived session")
+        require([m for m in self.oc_messages("a", session) if m["type"] == "user"] == before_archive, "Archive/history lookup admitted native input")
+        require(not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})), "Archived history lookup reactivated native route")
+        self.evidence["v2_archive_observation"] = {"session": archived, "lease_ended": True, "route_absent": True, "no_unintended_native_input": True}
+        self.oc_api("a", path, method="DELETE")
         wait_for("native delete removes registration", lambda: not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})))
         self.evidence["lifecycle"] = {"native_rename": True, "broker_restart_retained_identity_history_grants_pause": True,
-            "plugin_close": True, "history_lookup_inactive": True, "explicit_resume_same_native_id": True,
+            "plugin_close": True, "closed_plugin_lease_ended": True, "canonical_v2_recovery_with_live_lease_no_input": True,
+            "archived_history_inactive": True, "explicit_resume_same_native_id": True, "explicit_native_input_once": True,
             "replacement_new_generation": True, "native_history_no_duplicates_after_restart": True, "native_delete_unregister": True}
 
     def pair_brokers(self, first, second):
@@ -547,8 +631,7 @@ class Qualification:
                 info = self.fixture.routes[name]
                 wait_for("old sharing generation ends", lambda: self.lease_ended(state, info["session"]))
                 side = "a" if state == a else "b"
-                http_json(self.oc[side]["base"], "/session/" + info["session"] + "/prompt_async",
-                          {"parts": [{"type": "text", "text": "Explicitly resume this disposable conversation for sharing qualification."}]})
+                self.oc_prompt(side, info["session"], "Explicitly resume this disposable conversation for sharing qualification.")
                 self.route("opencode", info["session"], state)
             rpc(state, {"op": "peer_share", "peer": alias, "agent": name, "shared": True})
         wait_for("explicit destination directory", lambda: any(r["name"] == second for r in rpc(a, {"op": "remote_list"})))
@@ -612,6 +695,9 @@ def main():
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--scratch-parent", type=Path, default=Path(tempfile.gettempdir()),
                         help="Private run directory is created here; use disk storage if tmpfs quota is small")
+    parser.add_argument("--allow-dirty-source", action="store_true",
+                        help="Explicit candidate run: retain the source patch; requires --expected-binary-sha256 and does not attest binary/source equivalence")
+    parser.add_argument("--expected-binary-sha256", help="Reject any binary other than the explicitly selected candidate")
     args = parser.parse_args()
     import websockets
     require(websockets.__version__ == "15.0.1", "Native runner requires websockets 15.0.1")
@@ -623,16 +709,29 @@ def main():
         "model": "scripted localhost fixture, no external model judgment", "websockets": websockets.__version__,
         "python": platform.python_version(), "codex_matrix": "unheld-turn workflows; separate active-turn qualification in AGB-13",
         "pairs": [], "outstanding": ["native macOS", "physical cross-machine", "interactive rendering", "external model judgment"]}
+    require(not args.allow_dirty_source or args.expected_binary_sha256, "Dirty candidate qualification requires an explicit binary SHA-256")
+    if args.expected_binary_sha256:
+        require(evidence["binary_sha256"] == args.expected_binary_sha256, "Binary SHA-256 differs from selected candidate")
+    evidence["command"] = [sys.executable, *sys.argv]
     evidence["checkout_status"] = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True).splitlines()
     sources = [p for folder in ("src", "plugins/opencode") for p in (repo / folder).rglob("*")
                if p.is_file() and p.suffix in (".rs", ".ts") and "node_modules" not in p.parts]
     sources += [repo / p for p in ("Cargo.toml", "Cargo.lock", "build.rs", "plugins/opencode/bun.lock", "tools/qualification_native.py", "tools/test_qualification.py")]
     evidence["source_sha256"] = {str(p.relative_to(repo)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(sources)}
-    subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", "src", "Cargo.toml", "Cargo.lock", "build.rs", "plugins/opencode/index.ts", "plugins/opencode/journal.ts", "plugins/opencode/peer.ts", "plugins/opencode/rpc.ts"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
-    for name, expected in [("claude", "2.1.300"), ("codex", "0.165.0"), ("opencode", "1.18.35")]:
+    if args.allow_dirty_source:
+        source_patch = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=repo)
+        patch_path = args.evidence.with_suffix(".source.patch")
+        require(not patch_path.exists(), "Source patch artifact exists; choose a fresh evidence path")
+        patch_path.parent.mkdir(parents=True, exist_ok=True)
+        patch_path.write_bytes(source_patch)
+        evidence["candidate_source"] = {"patch": str(patch_path), "patch_sha256": hashlib.sha256(source_patch).hexdigest(),
+            "binary_source_equivalence": "not established by HEAD or patch; explicitly selected binary hash recorded separately"}
+    else:
+        subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", "src", "Cargo.toml", "Cargo.lock", "build.rs", "plugins/opencode/index.ts", "plugins/opencode/journal.ts", "plugins/opencode/peer.ts", "plugins/opencode/rpc.ts"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+    for name, expected in [("claude", "2.1.300"), ("codex", "0.166.0"), ("opencode", "opencode v2.2.5")]:
         executable = require(getattr(args, name), name + " executable unavailable")
         result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=15, check=True)
-        actual = result.stdout.strip().split()[1 if name == "codex" else 0]
+        actual = result.stdout.strip() if name == "opencode" else result.stdout.strip().split()[1 if name == "codex" else 0]
         require(expected == actual, f"Unsupported {name}: {result.stdout.strip()}")
         evidence[name] = {"version": result.stdout.strip(), "executable": str(Path(executable).resolve())}
     root = Path(tempfile.mkdtemp(prefix="abq-", dir=args.scratch_parent)).resolve()

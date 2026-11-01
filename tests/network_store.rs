@@ -87,10 +87,9 @@ fn lost_receipt_duplicate_and_restart_never_replay_native_submission() {
     p.b = Db::open(&p.bpath).unwrap();
     p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
     assert!(p.b.claim().unwrap().is_none());
-    p.b.ack(&message.id, "user").unwrap();
     let events = p.b.sync_events(&p.aid, 0).unwrap();
     p.a.apply_events(&p.bid, &events).unwrap();
-    assert_eq!(p.a.get(&env.id).unwrap().state, "acknowledged");
+    assert_eq!(p.a.get(&env.id).unwrap().state, "submitted");
     assert_eq!(
         p.a.transfer_info(&env.id).unwrap().unwrap()["state"],
         "accepted"
@@ -100,6 +99,126 @@ fn lost_receipt_duplicate_and_restart_never_replay_native_submission() {
     p.a.apply_events(&p.bid, &events).unwrap();
     assert_eq!(p.a.sync_cursor(&p.bid).unwrap(), cursor);
     assert!(p.a.retry(&env.id, true).is_err());
+}
+
+#[test]
+fn opencode_status_sync_preserves_legacy_unknown_without_local_phase_metadata() {
+    for (state, phase, expected) in [
+        ("queued", "queued", "queued"),
+        ("sending", "queued", "sending"),
+        ("sending", "dispatched", "sending"),
+        ("queued", "reconcile", "uncertain"),
+        ("sending", "reconcile", "uncertain"),
+        ("queued", "uncertain", "uncertain"),
+        ("sending", "uncertain", "uncertain"),
+        ("queued", "legacy", "uncertain"),
+        ("sending", "legacy", "uncertain"),
+        ("queued", "inserted", "uncertain"),
+        ("sending", "inserted", "uncertain"),
+    ] {
+        let mut p = Pair::new();
+        let agent = Agent {
+            name: "native".into(),
+            provider: Provider::OpenCode,
+            session: "ses_0123456789abcdefghijklmnop".into(),
+            endpoint: format!("/tmp/{}.sock", id()),
+            enabled: true,
+        };
+        p.b.register(&agent, false).unwrap();
+        // Native lease/phase APIs are crate-private. This isolated fixture sets
+        // only their durable metadata; envelope admission and status production,
+        // application, acceptance and restart use the real public store APIs.
+        let conn = rusqlite::Connection::open(&p.bpath).unwrap();
+        conn.execute(
+            "INSERT INTO opencode_leases(session,generation,instance,endpoint,expires,ready) VALUES(?1,?2,?3,?4,?5,1)",
+            rusqlite::params![agent.session, id(), id(), agent.endpoint, i64::MAX],
+        )
+        .unwrap();
+        p.b.share_peer_session(&p.aid, &agent.name, true).unwrap();
+        p.a.replace_remote_agents(
+            &p.bid,
+            &[RemoteAgent {
+                name: agent.name.clone(),
+                provider: agent.provider.clone(),
+                session: agent.session.clone(),
+            }],
+        )
+        .unwrap();
+        let remote_id = id();
+        p.a.send_remote(
+            &p.aid,
+            &remote_id,
+            "user",
+            "bob/native",
+            "native input",
+            &None,
+        )
+        .unwrap();
+        let envelope = p.a.pending_transfers(&p.bid, 1).unwrap().pop().unwrap();
+        p.a.mark_transfer_attempt(&remote_id).unwrap();
+        p.b.accept_remote(&p.bid, &p.aid, &envelope).unwrap();
+        let local_id = p.b.history(&None, 1).unwrap()[0].id.clone();
+        if phase == "inserted" {
+            // The current delivery phase can already be terminal when old
+            // reconciliation events are paged. Preserve their prior attempted
+            // provenance in the immutable event history, not only d.phase.
+            conn.execute(
+                "UPDATE messages SET state='uncertain' WHERE id=?",
+                [&local_id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE opencode_deliveries SET phase=?1 WHERE id=?2",
+            rusqlite::params![phase, local_id],
+        )
+        .unwrap();
+        // Queued fixtures reuse the real acceptance event; sending fixtures
+        // produce a transition event. Both must project the local phase when
+        // sync_events emits the legacy wire state.
+        conn.execute(
+            "UPDATE messages SET state=?1,updated=updated+1 WHERE id=?2",
+            rusqlite::params![state, local_id],
+        )
+        .unwrap();
+        let events = p.b.sync_events(&p.aid, 0).unwrap();
+        assert_eq!(events.last().unwrap().state, expected, "{state}/{phase}");
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event.state.as_str(), "queued" | "sending" | "uncertain"))
+        );
+        p.a.apply_events(&p.bid, &events).unwrap();
+        assert_eq!(p.a.get(&remote_id).unwrap().state, expected);
+        let public = if expected == "uncertain" {
+            "unknown"
+        } else {
+            "pending"
+        };
+        assert_eq!(p.a.counts().unwrap(), serde_json::json!({public: 1}));
+        assert_eq!(
+            p.a.transfer_info(&remote_id).unwrap().unwrap()["state"],
+            "accepted"
+        );
+        assert!(p.a.pending_transfers(&p.bid, 10).unwrap().is_empty());
+        let sender_conn = rusqlite::Connection::open(p._dir.path().join("a.sqlite")).unwrap();
+        assert_eq!(
+            sender_conn
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM opencode_deliveries WHERE id=?",
+                    [&remote_id],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0,
+            "sender must rely on the compatible wire state, not receiver-local metadata"
+        );
+        if expected == "uncertain" {
+            p.a = Db::open(&p._dir.path().join("a.sqlite")).unwrap();
+            assert_eq!(p.a.get(&remote_id).unwrap().state, "uncertain");
+            assert_eq!(p.a.counts().unwrap(), serde_json::json!({"unknown": 1}));
+        }
+    }
 }
 
 #[test]
@@ -700,13 +819,11 @@ fn codex_inbound_uses_canonical_alias_admission_and_duplicates_precede_pressure(
     let (claimed, _) = p.b.claim().unwrap().unwrap();
     p.b.finish(&claimed.id, "submitted", "native accepted")
         .unwrap();
-    for _ in 0..63 {
-        let local =
-            p.b.send(&id(), "user", &alias.name, "local", &None)
-                .unwrap();
-        let (claimed, _) = p.b.claim().unwrap().unwrap();
-        assert_eq!(claimed.id, local.id);
-        p.b.finish(&local.id, "submitted", "native accepted")
+    assert_eq!(p.b.get(&claimed.id).unwrap().state, "submitted");
+    // Delivered history does not consume admission capacity: all 64 genuinely
+    // pending alias messages must still fit beside the completed remote message.
+    for _ in 0..64 {
+        p.b.send(&id(), "user", &alias.name, "local", &None)
             .unwrap();
     }
     p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
@@ -721,8 +838,20 @@ fn codex_inbound_uses_canonical_alias_admission_and_duplicates_precede_pressure(
             .unwrap();
     let error = p.b.accept_remote(&p.bid, &p.aid, &next).unwrap_err();
     assert!(retryable(&error));
-    assert!(error.to_string().contains("64 unresolved"));
-    assert_eq!(p.b.history(&None, 100).unwrap().len(), 64);
+    assert!(error.to_string().contains("64 pending"));
+    let history = p.b.history(&None, 100).unwrap();
+    assert_eq!(history.len(), 65);
+    assert_eq!(
+        history.iter().filter(|row| row.state == "queued").count(),
+        64
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|row| row.state == "submitted")
+            .count(),
+        1
+    );
 }
 
 #[test]

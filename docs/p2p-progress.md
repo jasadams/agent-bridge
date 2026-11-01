@@ -86,10 +86,10 @@ version does not synchronize boards between machines. See [shared board](board.m
 
 ## OpenCode local sessions
 
-A pinned OpenCode 1.18.35 V1 plugin and built-in local adapter register observed
+A pinned OpenCode 2.2.5 V2 plugin and built-in local adapter register verified
 live sessions, retain shared native titles and submit peer messages to exact
 existing conversations with ordinary retry deduplication. Native insertion
-receipts remain distinct from model acknowledgements and correlated replies.
+receipts remain distinct from model read, task completion and correlated replies.
 Canonical FIFO, bounded busy/permission deferral, generation leases, durable
 receipt fences and read-only restart reconciliation are implemented. Real native
 fixtures cover busy tools, unanswered permissions, pause/cancel and the residual

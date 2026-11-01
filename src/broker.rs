@@ -25,8 +25,8 @@ use tokio::{
     time::timeout,
 };
 
-// Native receipt acknowledgement may change durable state before its worker
-// finishes. Keep the concurrency fence until the actual task is joined.
+// Keep the exact-session concurrency fence until the native worker is joined,
+// even when its durable outcome has already been stored.
 #[derive(Default)]
 struct CodexWorkers(std::collections::HashMap<tokio::task::Id, String>);
 impl CodexWorkers {
@@ -173,6 +173,13 @@ impl Broker {
 
     fn message_value(&self, db: &Db, message: &crate::protocol::Message) -> Result<Value> {
         let mut value = json!(message);
+        value["state"] = json!(db.delivery_state(message)?);
+        if message.state == "blocked" {
+            value["detail"] = json!(format!(
+                "{}; policy-blocked, restore exact-session permissions and explicitly retry this ID; it will not resume automatically",
+                message.detail.as_deref().unwrap_or("Delivery is blocked")
+            ));
+        }
         value["source_machine"] = self.message_machine(db, &message.sender)?;
         value["destination_machine"] = self.message_machine(db, &message.recipient)?;
         if let Some(transfer) = db.transfer_info(&message.id)? {
@@ -857,7 +864,7 @@ impl Broker {
                         db.event_control_record(&id, token)?;
                     }
                     transaction.commit()?;
-                    json!({"queued":true,"message":message,"acknowledged":false})
+                    json!({"queued":true,"message":self.message_value(&db, &message)?})
                 }
                 Request::CodexNotice {
                     id,
@@ -877,7 +884,7 @@ impl Broker {
                         &content,
                         event_token.as_deref(),
                     )?;
-                    json!({"queued":true,"message":message,"acknowledged":false})
+                    json!({"queued":true,"message":self.message_value(&db, &message)?})
                 }
                 Request::SessionClose {
                     name,
@@ -997,9 +1004,6 @@ impl Broker {
                         "cursor": page.cursor,
                         "has_more": page.has_more,
                     })
-                }
-                Request::Ack { id, agent } => {
-                    self.message_value(&db, &db.ack(&id, &db.resolve_agent(&agent)?.name)?)?
                 }
                 Request::Retry {
                     id,
@@ -1717,6 +1721,14 @@ impl Broker {
         match db.board_message_receipt(request) {
             Ok(Some(mut receipt)) => {
                 receipt["duplicate"] = json!(true);
+                // Old board receipts are immutable idempotency records. Normalize
+                // their presentation without rewriting them or enqueueing work.
+                if let Some(state) = receipt["state"].as_str().map(str::to_owned) {
+                    receipt["state"] = json!(crate::protocol::delivery_state(&state));
+                }
+                if let Some(state) = receipt["message"]["state"].as_str().map(str::to_owned) {
+                    receipt["message"]["state"] = json!(crate::protocol::delivery_state(&state));
+                }
                 return Reply {
                     status: 200,
                     body: receipt,
@@ -1789,7 +1801,7 @@ impl Broker {
         let result = (|| -> Result<Value> {
             let tx = db.conn.unchecked_transaction()?;
             let message = db.send(&request.id, "user", &owner.name, &request.text, &None)?;
-            let receipt = json!({"accepted":true,"id":request.id,"message":self.message_value(db, &message)?,"state":message.state,"duplicate":false});
+            let receipt = json!({"accepted":true,"id":request.id,"message":self.message_value(db, &message)?,"state":db.delivery_state(&message)?,"duplicate":false});
             tx.execute("INSERT INTO board_message_receipts(id,submission,owner,receipt) VALUES(?1,?2,?3,?4)", rusqlite::params![request.id, serde_json::to_string(request)?, serde_json::to_string(owner)?, serde_json::to_string(&receipt)?])?;
             tx.commit()?;
             Ok(receipt)
@@ -2171,13 +2183,17 @@ impl Broker {
                         .await
                     };
                     if raw_codex_notice && outcome.state == "submitted" {
-                        outcome.detail =
-                            "Native accepted typed control; no acknowledgement is required".into();
+                        outcome.detail = "Native accepted typed control".into();
                     }
-                    if outcome.state != "submitted"
+                    if outcome.state == "failed"
                         && let Some(token) = &event_token
                     {
                         this.board_notifications.lock().unwrap().lost(token, &agent);
+                    } else if outcome.state == "uncertain"
+                        && let Some(token) = &event_token
+                    {
+                        this.board_notifications.lock().unwrap().uncertain(token, &agent);
+                        eprintln!("Control {} has Unknown delivery after an ambiguous native attempt; lifecycle transitions require explicit snapshot recovery, without native resubmission: {}", msg.id, outcome.detail);
                     }
                     let finish_id = msg.id.clone();
                     let result = this
@@ -2818,7 +2834,8 @@ mod codex_worker_tests {
             held.await.unwrap();
         });
         busy.track(worker.id(), &one);
-        db.ack(&first.id, &one.name).unwrap();
+        db.finish(&first.id, "submitted", "native accepted")
+            .unwrap();
         assert!(
             db.claim_excluding_codex(&busy.sessions())
                 .unwrap()
@@ -2847,7 +2864,7 @@ mod codex_worker_tests {
             second.id
         );
         db.finish(&second.id, "submitted", "accepted").unwrap();
-        assert_eq!(db.get(&first.id).unwrap().state, "acknowledged");
+        assert_eq!(db.get(&first.id).unwrap().state, "submitted");
         for cancel in [false, true] {
             let queued = send(&db, &alias);
             let worker = workers.spawn(async move {

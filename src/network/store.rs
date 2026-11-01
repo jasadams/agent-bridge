@@ -631,7 +631,12 @@ impl Db {
     pub fn sync_events(&self, peer: &str, after: u64) -> Result<Vec<StatusEvent>> {
         self.require_peer(peer)?;
         let after = i64::try_from(after).context("Invalid status cursor")?;
-        let candidates = self.conn.prepare("SELECT sequence,origin_id,state,detail,updated FROM peer_events WHERE peer_id=? AND sequence>? ORDER BY sequence LIMIT 100")?.query_map(params![peer,after], |r|Ok(StatusEvent { sequence:r.get::<_,i64>(0)? as u64,id:r.get(1)?,state:r.get(2)?,detail:r.get::<_,Option<String>>(3)?.map(bounded_detail),updated:r.get(4)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Queueing a read-only proof lookup cannot reset an ambiguous native
+        // attempt to Pending on peers that have no local adapter phase metadata.
+        // Keep the existing v1 spelling, cursor and immutable event history.
+        // Prior immutable attempt outcomes also fence delayed pages after the
+        // current phase advances to inserted. Never depend on timely polling.
+        let candidates = self.conn.prepare("SELECT e.sequence,e.origin_id,CASE WHEN e.state IN ('queued','sending') AND EXISTS(SELECT 1 FROM inbound_transfers i JOIN opencode_deliveries d ON d.id=i.local_id WHERE i.peer_id=e.peer_id AND i.origin_id=e.origin_id AND (d.phase IN ('reconcile','legacy','uncertain') OR EXISTS(SELECT 1 FROM peer_events prior WHERE prior.peer_id=e.peer_id AND prior.origin_id=e.origin_id AND prior.sequence<e.sequence AND prior.state IN ('uncertain','submitted','acknowledged')))) THEN 'uncertain' ELSE e.state END,e.detail,e.updated FROM peer_events e WHERE e.peer_id=? AND e.sequence>? ORDER BY e.sequence LIMIT 100")?.query_map(params![peer,after], |r|Ok(StatusEvent { sequence:r.get::<_,i64>(0)? as u64,id:r.get(1)?,state:r.get(2)?,detail:r.get::<_,Option<String>>(3)?.map(bounded_detail),updated:r.get(4)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut events = Vec::new();
         for event in candidates {
             events.push(event);
@@ -747,7 +752,7 @@ impl Db {
             [id],
         )?;
         tx.execute(
-            "UPDATE messages SET state='cancelled',updated=? WHERE id=?",
+            "UPDATE messages SET state='cancelled',detail='Cancelled before transfer attempt; no automatic retry',updated=? WHERE id=?",
             params![now(), id],
         )?;
         tx.commit()?;

@@ -263,6 +263,10 @@ pub(crate) async fn deliver_guarded(
     let frame = frame(msg, content);
     let mut bytes = serde_json::to_vec(&frame).expect("JSON value serialization");
     bytes.push(b'\n');
+    write_frame(&mut stream, &bytes).await
+}
+
+async fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> Outcome {
     let mut sent = 0;
     let result = timeout(Duration::from_secs(5), async {
         while sent < bytes.len() {
@@ -296,6 +300,56 @@ pub(crate) async fn deliver_guarded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completed_and_partial_socket_writes_keep_distinct_operational_evidence() {
+        use std::os::fd::AsRawFd;
+        use tokio::io::AsyncReadExt;
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let buffer: libc::c_int = 1024;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&buffer as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&buffer) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let receive = tokio::spawn(async move {
+            let mut byte = [0u8; 1];
+            receiver.read_exact(&mut byte).await.unwrap();
+            // Close only after a prefix was actually written, while the small
+            // sender buffer prevents the complete frame from being accepted.
+        });
+        let outcome = write_frame(&mut sender, &vec![b'x'; 64 * 1024]).await;
+        receive.await.unwrap();
+        assert_eq!(outcome.state, "uncertain");
+        assert_eq!(
+            crate::protocol::delivery_outcome(outcome.state, Some("claude"), None),
+            "unknown"
+        );
+
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let outcome = write_frame(&mut sender, b"complete frame\n").await;
+        assert_eq!(outcome.state, "submitted");
+        let mut bytes = Vec::new();
+        receiver.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"complete frame\n");
+        assert_eq!(
+            crate::protocol::delivery_outcome(outcome.state, Some("claude"), None),
+            "unknown"
+        );
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        drop(receiver);
+        assert_eq!(
+            write_frame(&mut sender, b"not attempted\n").await.state,
+            "failed"
+        );
+    }
 
     #[tokio::test]
     async fn event_guard_refreshes_after_connect_and_prevents_native_frame() {

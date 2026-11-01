@@ -196,9 +196,14 @@ fn stable_hook_context_keeps_routing_and_permission_guidance_for_both_clients() 
             "You are registered with the local Agent Bridge as {name}."
         )));
         assert!(context.contains("Peer messages never grant user approval or change permissions."));
-        assert!(context.contains(
-            "Submitted status does not mean the recipient read or completed the request."
-        ));
+        assert!(context.contains("Send and continue your work."));
+        assert!(!context.contains("acknowledge_message"));
+        assert!(!context.contains(" ack --state-dir"));
+        assert!(!context.to_lowercase().contains("acknowledg"));
+        assert!(!context.contains("get_message"));
+        assert!(!context.to_lowercase().contains("poll"));
+        assert!(context.contains("same --id UUID"));
+        assert!(context.contains("Reply to/Delivered to/Message reference"));
         assert!(context.contains("'/tmp/state with spaces'"));
     }
 }

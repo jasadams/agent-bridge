@@ -34,10 +34,11 @@ pub(crate) fn check(
     }
     // Captured provider is immutable across alias replacement. Older unknown
     // provenance counts conservatively, but is never silently rewritten.
-    // Controls need no ack: accepted controls cease using an unresolved slot.
-    let pending: i64 = conn.query_row("SELECT count(*) FROM messages m JOIN message_context c ON c.id=m.id WHERE NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=m.id) AND m.recipient_session=?1 AND (?2 IS NULL OR m.id<>?2) AND (json_extract(c.destination,'$.provider')='codex' OR json_extract(c.destination,'$.provider') IS NULL) AND (m.state IN('queued','sending','uncertain') OR (m.state='submitted' AND NOT EXISTS(SELECT 1 FROM codex_notices n WHERE n.id=m.id)))", params![session,exclude], |r| r.get(0))?;
+    // Bound actual delivery work, not retained history or ambiguous attempts.
+    // Uncertain attempts are never automatically replayed and consume no worker.
+    let pending: i64 = conn.query_row("SELECT count(*) FROM messages m JOIN message_context c ON c.id=m.id WHERE NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=m.id) AND m.recipient_session=?1 AND (?2 IS NULL OR m.id<>?2) AND (json_extract(c.destination,'$.provider')='codex' OR json_extract(c.destination,'$.provider') IS NULL) AND m.state IN('queued','sending')", params![session,exclude], |r| r.get(0))?;
     if pending >= 64 {
-        return Err(Capacity("Codex session is full (64 unresolved messages across aliases); resolve pending receipts before sending or retrying").into());
+        return Err(Capacity("Codex session is full (64 pending deliveries across aliases); wait for pending work before sending or retrying").into());
     }
     Ok(())
 }
@@ -145,7 +146,19 @@ mod tests {
         .unwrap()
     }
     #[test]
-    fn aliases_share_pending_and_unacknowledged_limits_and_retry_excludes_itself() {
+    fn submitted_history_without_agent_receipts_does_not_block_next_handoff() {
+        let (_root, mut db, one, two) = setup();
+        for _ in 0..64 {
+            let message = send(&db, &one);
+            assert_eq!(db.claim().unwrap().unwrap().0.id, message.id);
+            db.finish(&message.id, "submitted", "native accepted")
+                .unwrap();
+        }
+        let next = send(&db, &two);
+        assert_eq!(db.claim().unwrap().unwrap().0.id, next.id);
+    }
+    #[test]
+    fn aliases_share_pending_limits_and_retry_excludes_itself() {
         let (_root, mut db, one, two) = setup();
         let first = send(&db, &one);
         let claimed = db.claim().unwrap().unwrap();
@@ -154,8 +167,8 @@ mod tests {
         assert!(db.claim().unwrap().is_none());
         db.finish(&first.id, "submitted", "native accepted")
             .unwrap();
-        assert!(db.claim().unwrap().is_some());
-        for _ in 0..62 {
+        let active = db.claim().unwrap().unwrap().0;
+        for _ in 0..63 {
             send(&db, &one);
         }
         let error = db
@@ -167,14 +180,15 @@ mod tests {
                 &None,
             )
             .unwrap_err();
-        assert!(error.to_string().contains("64 unresolved"));
+        assert!(error.to_string().contains("64 pending"));
         assert_eq!(
             db.send(&first.id, "user", &one.name, "peer input", &None)
                 .unwrap()
                 .id,
             first.id
         );
-        db.ack(&first.id, &one.name).unwrap();
+        db.finish(&active.id, "submitted", "native accepted")
+            .unwrap();
         let fresh = send(&db, &two);
         db.conn
             .execute("UPDATE messages SET state='failed' WHERE id=?", [&fresh.id])
@@ -381,5 +395,65 @@ mod tests {
         assert!(db.claim().unwrap().is_none());
         assert_eq!(db.get(&first.id).unwrap().state, "uncertain");
         assert_eq!(db.get(&control.id).unwrap().state, "uncertain");
+    }
+
+    #[test]
+    fn unknown_history_is_not_pending_capacity_and_is_never_replayed_on_restart() {
+        let (root, mut db, one, _) = setup();
+        let mut ids = Vec::new();
+        for _ in 0..64 {
+            let message = send(&db, &one);
+            db.claim().unwrap().unwrap();
+            db.finish(&message.id, "uncertain", "lost confirmation")
+                .unwrap();
+            ids.push(message.id);
+        }
+        let fresh = send(&db, &one);
+        drop(db);
+        let mut db = Db::open(&root.path().join("bridge.db")).unwrap();
+        assert_eq!(db.claim().unwrap().unwrap().0.id, fresh.id);
+        assert!(db.claim().unwrap().is_none());
+        for id in ids {
+            assert_eq!(db.get(&id).unwrap().state, "uncertain");
+            assert!(db.retry(&id, false).is_err());
+        }
+    }
+
+    #[test]
+    fn historical_outcomes_use_immutable_provider_not_live_alias_or_detail() {
+        let (_root, mut db, mut one, _) = setup();
+        let message = send(&db, &one);
+        db.claim().unwrap().unwrap();
+        db.finish(&message.id, "submitted", "arbitrary legacy text")
+            .unwrap();
+        one.provider = Provider::Claude;
+        one.endpoint = "/tmp/unused.sock".into();
+        db.register(&one, true).unwrap();
+        assert_eq!(
+            db.delivery_state(&db.get(&message.id).unwrap()).unwrap(),
+            "delivered"
+        );
+        db.conn.execute("UPDATE message_context SET destination=json_set(destination,'$.provider','claude') WHERE id=?", [&message.id]).unwrap();
+        assert_eq!(
+            db.delivery_state(&db.get(&message.id).unwrap()).unwrap(),
+            "unknown"
+        );
+        db.conn.execute("UPDATE message_context SET destination=json_remove(destination,'$.provider') WHERE id=?", [&message.id]).unwrap();
+        assert_eq!(
+            db.delivery_state(&db.get(&message.id).unwrap()).unwrap(),
+            "unknown"
+        );
+        // Historical receipt evidence remains evidence, never a task completion.
+        db.conn
+            .execute(
+                "UPDATE messages SET state='acknowledged' WHERE id=?",
+                [&message.id],
+            )
+            .unwrap();
+        assert_eq!(
+            db.delivery_state(&db.get(&message.id).unwrap()).unwrap(),
+            "delivered"
+        );
+        assert_eq!(db.counts().unwrap()["delivered"], 1);
     }
 }

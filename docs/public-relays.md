@@ -149,7 +149,7 @@ disables retained manual circuits through it. Automatic public routes accept onl
 through the currently configured operators with a final peer ID matching the
 signed registration. Rendezvous cannot inject arbitrary direct dial destinations.
 
-Message durability, deduplication, session pinning, acknowledgements and correlated
+Message durability, deduplication, session pinning, delivery status and correlated
 replies are unchanged. A relay only forwards live traffic and does not store
 messages for offline recipients. The sender retains pending messages. After
 remote revocation, an origin may only see a disconnected/offline peer and retain

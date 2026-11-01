@@ -6,8 +6,8 @@ message transport, lifecycle registration, and capabilities. Inbox has no native
 adapter: its history and message availability remain broker-owned.
 
 The Claude adapter owns private Unix socket validation and user-frame generation.
-The OpenCode adapter uses its pinned V1 plugin private socket, verifies exact live
-sessions and application insertion receipts, and shares native title metadata.
+The OpenCode adapter uses its pinned V2 plugin private socket, verifies exact live
+sessions and native client acceptance receipts, and shares native title metadata.
 Its durable canonical queue, generation leases and admission remain broker-owned;
 typed OpenCode controls enter that same queue with their raw control text.
 Direct adapter delivery without the broker's durable context fails closed. See
@@ -33,8 +33,8 @@ unchanged.
 
 Claude ordinary messages retain its native peer wrapper, sanitized sender display
 label, and compact stable references; Codex retains the shared peer envelope and
-acknowledgement guidance. OpenCode ordinary messages use a sender-labelled body
-with complete compact route/message references. Its V1 system context hook
+reply references. OpenCode ordinary messages use a sender-labelled body
+with complete compact route/message references. Its V2 system context hook
 supplies session-specific messaging guidance separately from peer message text.
 Locally generated `ControlNotice::BoardChanged` and `ControlNotice::Pairing` travel
 through a separate typed entry point and retain their existing text without a peer
@@ -43,12 +43,13 @@ selectors additionally require `PairingPrompts`, supported by Claude and Codex;
 OpenCode retains board controls but rejects native pairing prompt selection with
 an explicit CLI fallback. Both require an enabled exact registration and their
 existing local opt-in checks. Capabilities
-do not grant peer permissions, owner approval, or acknowledgement authority.
+do not grant peer permissions or owner approval.
 
 Durable queues, reply correlation, grants, network routing, retry decisions, board
 storage, and owner approval stay in shared broker/database/network modules. Native
-adapters report the existing failed/submitted/uncertain outcomes without turning
-submission into a claim of model execution or recipient acknowledgement.
+adapters supply proof for the shared Pending/Delivered/Failed/Unknown outcomes,
+without turning native acceptance into a claim of model read or task completion.
+See [provider proof and retained compatibility](delivery-outcomes.md).
 
 To integrate another built-in client, extend the explicit provider/adapter dispatch,
 its native validation and transport, lifecycle/discovery wiring, and capability
@@ -62,7 +63,7 @@ metadata alone never enables a destination. Exact registered aliases take
 precedence; otherwise display names resolve only to enabled automatic
 `provider-session` routes. Use `provider:title` to qualify a title; duplicate
 titles within that provider remain ambiguous. Renames update metadata without
-changing route identity, messages, acknowledgements, or session grants.
+changing route identity, messages, delivery history, or session grants.
 
 Schema version 11 transactionally copies Claude and Codex titles (including NULL
 and empty titles) into this shared table and removes their old tables. Reopening

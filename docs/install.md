@@ -48,7 +48,7 @@ configuration or change tool approval settings.
 
 ## Optional OpenCode integration
 
-OpenCode **1.18.35** V1 can use the bundled native plugin and
+OpenCode **2.2.5** V2 can use the bundled native plugin and
 existing Agent Bridge MCP tools. Installation is explicit and does not start a
 service, OpenCode, a model or a package manager:
 
@@ -62,26 +62,29 @@ agent-bridge opencode uninstall --config /absolute/opencode.jsonc
 The installer registers the current executable's absolute path for MCP and the
 same broker state directory for both MCP and the plugin. Keep that executable at
 its installed path. Repeat `opencode install` after upgrading the binary to update
-the extracted plugin; repeat installation without changes is a no-op. Fully restart
-the OpenCode process after installing, updating or removing the integration.
-Existing running instances keep their loaded code. No client permissions, tool
+the extracted plugin; repeat installation without changes is a no-op. V2 reloads
+changed configuration. No client permissions, tool
 approvals, peer grants or board subscriptions are enabled by installation.
 
 On Linux and macOS the default global directory is `$XDG_CONFIG_HOME/opencode`,
-otherwise `~/.config/opencode`. With multiple global files, the active `plugin`
+otherwise `~/.config/opencode`. With multiple global files, the active `plugins`
 array's file is selected to preserve inherited plugins. Otherwise the existing
 `opencode.jsonc`, `opencode.json`, then legacy `config.json` is preferred; a new
 installation uses `opencode.jsonc`. `OPENCODE_CONFIG` selects a custom file;
 additional directory/inline configuration is checked for conflicting integration
 entries. Project configuration is edited only through explicit `--config`.
-An extensionless global `config` file contains legacy TOML that V1 can migrate
-and merge after these JSON files. Setup refuses while that file exists: migrate
+An extensionless global `config` file can contain legacy TOML that another client
+may merge after these JSON files. Setup refuses while that file exists: migrate
 it with OpenCode, review the resulting JSON configuration, then retry. The installer
 never edits or migrates that legacy file. Its appearance during an interrupted
 setup also prevents automatic recovery from overwriting configuration.
 An explicit file that would hide an existing global plugin array is refused with
-the correct target path. The pinned V1 format uses singular `plugin` and a flat
-`mcp` map; V2 configuration is outside this integration's supported scope.
+the correct target path. The bundled V2 plugin uses a directory package under
+`plugins`. The installer currently retains the supported legacy flat MCP map;
+OpenCode's migration contract accepts this shape. Native V2 MCP configuration
+uses `mcp.servers`. The disposable setup harness explicitly records its initial
+normalization and preserved generated command; this is not a claim that the
+installer emits native V2 MCP shape itself.
 
 JSONC comments, unrelated plugins/MCP settings and permissions are preserved.
 Every changed existing file has an exact-byte backup beside it. Private ownership

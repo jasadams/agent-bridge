@@ -78,6 +78,32 @@ pub struct Message {
     pub updated: i64,
 }
 
+/// One durable lifecycle, exposed as four delivery outcomes. Legacy names stay
+/// on disk and peer protocol v1 so old peers can still synchronize history.
+pub fn delivery_state(state: &str) -> &'static str {
+    match state {
+        "queued" | "sending" | "blocked" | "pending" => "pending",
+        "submitted" | "acknowledged" | "delivered" => "delivered",
+        "failed" | "cancelled" => "failed",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn delivery_outcome(
+    state: &str,
+    provider: Option<&str>,
+    phase: Option<&str>,
+) -> &'static str {
+    if (state == "submitted" && !matches!(provider, Some("codex" | "opencode" | "inbox")))
+        || (state == "queued" && phase.is_some_and(|phase| phase != "queued"))
+        || (state == "sending" && matches!(phase, Some("reconcile" | "legacy" | "uncertain")))
+    {
+        "unknown"
+    } else {
+        delivery_state(state)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -170,10 +196,6 @@ pub enum Request {
     },
     Get {
         id: String,
-    },
-    Ack {
-        id: String,
-        agent: String,
     },
     Retry {
         id: String,

@@ -382,13 +382,13 @@ revision and can call `read_board` to inspect checkboxes and text responses.
 Notifications coalesce after **3 seconds without another change**, with a
 **10-second maximum coalescing delay** from the first pending change. Those are
 scheduling thresholds; a paused broker, queued work or native transport can delay
-receipt. The notice contains no Markdown and is not a normal message requiring
-acknowledgement. Failed or uncertain native submissions are not automatically
+receipt. The notice contains no Markdown and requires no peer reply or receipt
+bookkeeping. Failed or Unknown native submissions are not automatically
 retried; the board remains available through `read_board`.
 
 OpenCode notices use its durable native admission and receipt path: busy or
 permission-waiting work can delay insertion, pause holds delivery, and an
-uncertain native attempt is not resubmitted. Unsubscribe prevents pending notices
+Unknown native attempt is not resubmitted. Unsubscribe prevents pending notices
 for the removed selectors from starting native delivery; close, lease expiry or
 registration replacement removes the subscription. Broker restart invalidates
 pending notices too. Native I/O already admitted before cancellation may finish;
@@ -400,7 +400,7 @@ OpenCode subscribe/unsubscribe receipts can report attempted hidden controls in
 native delivery queue is unblocked. Inspect the bounded recovery IDs and, when
 appropriate, explicitly run `agent-bridge --state-dir "/same/private/state" retry
 CONTROL_ID` against the same broker. Attempted OpenCode controls reconcile
-read-only; they never insert a second prompt. Missing proof stays uncertain and
+read-only; they never insert a second prompt. Missing proof stays Unknown and
 may continue blocking later notices. See [event recovery diagnostics](mcp.md#event-subscriptions)
 for fields and limits. Reading diagnostics does not start native work.
 

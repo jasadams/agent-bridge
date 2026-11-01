@@ -4,7 +4,7 @@
 
 Add authenticated communication between bridges on different machines. Once networking is enabled, bridges discover nearby machines automatically, owners pair them once, and permitted agents can exchange durable messages. Internet connections support explicit addresses, NAT traversal and optional self-hosted relays. Identity and access decisions remain under each owner's control.
 
-The first release should deliver the full LAN flow before adding internet traversal. Preserve existing local commands, native delivery adapters and the distinction between transport submission, agent acknowledgement and task completion.
+The first release should deliver the full LAN flow before adding internet traversal. Preserve native delivery adapters and the distinction between remote durable transfer, native acceptance and task completion. AGB-33 supersedes the original acknowledgement requirement: see [delivery outcomes](delivery-outcomes.md).
 
 ## Scope and architectural decisions
 
@@ -68,22 +68,22 @@ Expose friendly remote destinations such as `workstation/reviewer`, while accept
 
 Return only exports permitted for the caller. Refresh directories on connection and local registration changes; invalidate cached entries on disconnect and show them as offline rather than live. Never include local adapter endpoints in exports. Render remote names and message content as untrusted data, with safe escaping for terminals and native envelopes.
 
-## Durable delivery and acknowledgements
+## Durable delivery and status synchronization
 
-Separate inter-bridge transport progress from native delivery state. A remote database receipt is not native submission, and native submission is not agent acknowledgement.
+Separate inter-bridge transport progress from native delivery state. A remote database receipt is not native acceptance, and native acceptance is not model read or task completion.
 
 | Record | Proposed states | Meaning |
 | --- | --- | --- |
 | Outbound transfer | pending, awaiting receipt, accepted, rejected, blocked | Whether the destination bridge has durably accepted the envelope. |
-| Destination delivery | queued, sending, submitted, acknowledged, failed, uncertain, cancelled | Existing native delivery semantics at the receiving bridge. |
+| Destination delivery | pending, delivered, failed, unknown | Shared public outcomes; operational phases and legacy wire labels remain compatibility details. |
 
 Commit outbound work before attempting network I/O. The receiver authenticates the origin and checks current peer authorization, then looks up the deduplication key and compares immutable fields. An already accepted identical transfer returns its durable receipt even if the queue is now full or the destination session has disappeared. Revoked peers receive no receipt or status access. For new transfers, validate grants, capacity and destination pinning, then commit the inbound record and native delivery queue entry in one transaction. Send acceptance only after that transaction commits. Retransmission never schedules a second native delivery.
 
 Retry ambiguous network transfers automatically with the same immutable identity and bounded exponential backoff with jitter. Resume after restart or reconnect. Keep retries bounded in concurrency and rate; offline peers must not cause a busy loop. Permanent rejection requires an explicit user action to retry. Local and per-peer capacity limits apply before durable acceptance.
 
-Retain the existing rule that an interrupted native submission becomes `uncertain` and is never automatically replayed. Network retries may repeat the transfer but must not repeat native execution. Exactly-once model execution is outside the guarantee.
+Retain the existing rule that an interrupted native submission becomes Unknown (legacy wire/storage `uncertain`) and is never automatically replayed. Network retries may repeat the transfer but must not repeat native execution. Exactly-once model execution is outside the guarantee.
 
-Persist destination status events with monotonically increasing sequence numbers. The origin acknowledges its last persisted sequence and resumes synchronization after reconnect. Display the timestamp of the latest remote observation so stale status is visible. Agent acknowledgement propagates as a status event without waking the sender; an explicit reply is a new message and can wake its destination.
+Persist destination status events with monotonically increasing sequence numbers. The origin confirms its last persisted sequence and resumes synchronization after reconnect. This transport cursor is not an agent acknowledgement. Display the timestamp of the latest remote observation so stale status is visible. Delivery status updates do not wake the sender; an explicit reply is a new message and can wake its destination.
 
 Keep the 100-hop reply limit and validate parent references against known conversation records where available. Hop counts alone cannot prevent fresh-message loops, so add per-peer and per-recipient rate limits. Replies remain subject to directional grants; pairing setup should show whether both directions are permitted. Peers running older versions may still reject replies beyond eight hops.
 
@@ -170,12 +170,12 @@ Add integration tests for:
 - Untrusted discovery, identity mismatch, forged origins, invitation replay and revoked active connections.
 - Directional grants, private sessions, peer name collisions and session replacement while offline.
 - Lost requests, lost receipts, concurrent duplicate sends, conflicting UUID reuse and receiver restart after commit but before response.
-- Sender restart, status synchronization after reconnect, fast agent acknowledgements and uncertain native submission without replay.
+- Sender restart, status synchronization after reconnect, native acceptance without recipient tool calls and Unknown native submission without replay.
 - Oversized or truncated frames, unsupported versions, slow connections, queue exhaustion and bounded resource use under malicious peers.
 - Existing database migration and schema refusal, key-file corruption, local-only startup and network disable during transfer.
 
 Use deterministic loopback tests for protocol and persistence. Keep multicast and router behaviour in a separate environment-sensitive suite. Test both origin and destination roles and assert that remote requests cannot invoke local administration.
 
-Live acceptance requires two physical machines on a LAN and two separate internet networks. Demonstrate discovery and pairing, an allowed message and correlated reply, blocked access to a private agent, revocation, offline recovery and a real native acknowledgement. Record direct and relayed outcomes separately. Submitted status alone does not pass the native round-trip check.
+Live acceptance requires two physical machines on a LAN and two separate internet networks. Demonstrate discovery and pairing, an allowed message and correlated reply, blocked access to a private agent, revocation, offline recovery and real native input evidence. Record direct and relayed outcomes separately. Delivered status alone does not pass a model-visible native round-trip check.
 
 The release must preserve local messaging when networking is disabled, require no central service for LAN or explicit-address connections, and document precisely which NAT scenarios require a relay or manual configuration.

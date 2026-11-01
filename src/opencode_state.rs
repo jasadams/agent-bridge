@@ -54,9 +54,13 @@ impl Db {
             [&agent.session],
             |row| row.get(0),
         )?;
-        let mut query=self.conn.prepare(&format!("SELECT m.id,m.state,(d.phase='reconcile' AND m.state IN('queued','sending')),EXISTS(SELECT 1 FROM agents a WHERE a.name=m.recipient AND a.provider='opencode' AND a.session=d.session),EXISTS(SELECT 1 FROM agents a JOIN opencode_leases l ON l.session=a.session WHERE a.name=m.recipient AND a.provider='opencode' AND a.session=d.session AND a.enabled=1 AND a.endpoint=l.endpoint AND l.expires>?2) {predicate} ORDER BY m.rowid LIMIT ?3"))?;
+        let mut query=self.conn.prepare(&format!("SELECT m.id,m.state,(d.phase='reconcile' AND m.state IN('queued','sending')),EXISTS(SELECT 1 FROM agents a WHERE a.name=m.recipient AND a.provider='opencode' AND a.session=d.session),EXISTS(SELECT 1 FROM agents a JOIN opencode_leases l ON l.session=a.session WHERE a.name=m.recipient AND a.provider='opencode' AND a.session=d.session AND a.enabled=1 AND a.endpoint=l.endpoint AND l.expires>?2),d.phase {predicate} ORDER BY m.rowid LIMIT ?3"))?;
         let items=query.query_map(params![agent.session,now(),LIMIT as i64],|row| {
-            Ok(json!({"id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?,"reconciliation_pending":row.get::<_,bool>(2)?,"route_matches":row.get::<_,bool>(3)?,"lease_available":row.get::<_,bool>(4)?}))
+            let state = row.get::<_,String>(1)?;
+            let reconcile = row.get::<_,bool>(2)?;
+            let phase = row.get::<_,String>(5)?;
+            let outcome = crate::protocol::delivery_outcome(&state, Some("opencode"), Some(&phase));
+            Ok(json!({"id":row.get::<_,String>(0)?,"state":outcome,"reconciliation_pending":reconcile,"route_matches":row.get::<_,bool>(3)?,"lease_available":row.get::<_,bool>(4)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut recovery = json!({"total":total,"truncated":total>LIMIT as i64,"items":items});
         if total > 0 {
@@ -466,6 +470,324 @@ mod tests {
             .unwrap();
         (msg, dispatch)
     }
+
+    #[test]
+    fn readonly_reconciliation_stays_unknown_through_claim_and_dispatch_until_exact_proof() {
+        for hidden_control in [false, true] {
+            for automatic in [false, true] {
+                let (_root, mut db, agent, _) = setup();
+                let first = send(&db, &agent.name);
+                if hidden_control {
+                    db.opencode_notice_content(&first.id, "typed control")
+                        .unwrap();
+                }
+                let assert_outcome = |db: &Db, expected: &str| {
+                    let message = db.get(&first.id).unwrap();
+                    assert_eq!(db.delivery_state(&message).unwrap(), expected);
+                    assert_eq!(db.counts().unwrap(), json!({expected: 1}));
+                };
+                let assert_recovery = |db: &Db| {
+                    let recovery = db.event_recovery(Some(&agent)).unwrap();
+                    if hidden_control {
+                        assert_eq!(recovery["total"], 1);
+                        assert_eq!(recovery["items"][0]["id"], first.id);
+                        assert_eq!(recovery["items"][0]["state"], "unknown");
+                        assert_eq!(recovery["items"][0]["reconciliation_pending"], true);
+                    } else {
+                        assert_eq!(recovery["total"], 0);
+                    }
+                };
+
+                // A genuine first attempt is still Pending both before and after
+                // dispatch; sending alone must not imply prior uncertainty.
+                assert_outcome(&db, "pending");
+                let (claimed, target) = db.claim().unwrap().unwrap();
+                assert_outcome(&db, "pending");
+                let attempt = db
+                    .opencode_dispatch(&claimed, &target, "stable rendered envelope")
+                    .unwrap();
+                assert_eq!(attempt.frame["op"], "deliver");
+                assert_outcome(&db, "pending");
+                db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
+                    .unwrap();
+                assert_outcome(&db, "unknown");
+
+                // Hidden controls deliberately require explicit recovery; the
+                // ordinary peer-message path also exercises automatic promotion.
+                if automatic && !hidden_control {
+                    assert_eq!(db.opencode_sweep_uncertain(now()).unwrap(), 1);
+                } else {
+                    if automatic {
+                        assert_eq!(db.opencode_sweep_uncertain(now()).unwrap(), 0);
+                    }
+                    db.retry(&first.id, false).unwrap();
+                }
+                db.pause(true).unwrap();
+                assert!(db.claim().unwrap().is_none());
+                assert_outcome(&db, "unknown");
+                assert_recovery(&db);
+                db.pause(false).unwrap();
+
+                // Hold the real read-only operation at both sides of dispatch.
+                // Neither queue scheduling nor an in-flight read proves absence
+                // of the original insertion or resets its public outcome.
+                let (claimed, target) = db.claim().unwrap().unwrap();
+                assert_eq!(claimed.id, first.id);
+                assert_eq!(claimed.state, "sending");
+                assert_outcome(&db, "unknown");
+                assert_recovery(&db);
+                let proof = db
+                    .opencode_dispatch(&claimed, &target, "ignored replacement content")
+                    .unwrap();
+                assert_eq!(proof.frame["op"], "reconcile");
+                assert_eq!(
+                    proof.frame["native_message_id"],
+                    attempt.frame["native_message_id"]
+                );
+                assert_eq!(proof.frame["content"], attempt.frame["content"]);
+                assert_outcome(&db, "unknown");
+                assert_recovery(&db);
+
+                db.opencode_finish(&first.id, &proof, "submitted", "exact native readback")
+                    .unwrap();
+                assert_outcome(&db, "delivered");
+                assert_eq!(db.event_recovery(Some(&agent)).unwrap()["total"], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_readonly_reconciliation_syncs_unknown_while_paused_running_and_restarted() {
+        use crate::network::wire::{RemoteAgent, WireResponse};
+
+        let (root, mut receiver, agent, generation) = setup();
+        let sender_path = root.path().join("sender");
+        let mut sender = Db::open(&sender_path).unwrap();
+        let origin = libp2p_identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        let destination = libp2p_identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        sender
+            .pair_peer(&destination, &destination, Some("remote"))
+            .unwrap();
+        sender
+            .grant_peer(
+                &destination,
+                "user",
+                crate::network::trust::Permission::Send,
+                true,
+            )
+            .unwrap();
+        receiver
+            .pair_peer(&origin, &origin, Some("origin"))
+            .unwrap();
+        receiver
+            .share_peer_session(&origin, &agent.name, true)
+            .unwrap();
+        sender
+            .replace_remote_agents(
+                &destination,
+                &[RemoteAgent {
+                    name: agent.name.clone(),
+                    provider: Provider::OpenCode,
+                    session: agent.session.clone(),
+                }],
+            )
+            .unwrap();
+        let remote_id = uuid::Uuid::new_v4().to_string();
+        sender
+            .send_remote(
+                &origin,
+                &remote_id,
+                "user",
+                &format!("remote/{}", agent.name),
+                "remote input",
+                &None,
+            )
+            .unwrap();
+        let envelope = sender
+            .pending_transfers(&destination, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        sender.mark_transfer_attempt(&remote_id).unwrap();
+        receiver
+            .accept_remote(&destination, &origin, &envelope)
+            .unwrap();
+        sender
+            .transfer_result(
+                &destination,
+                &remote_id,
+                &WireResponse::Accepted {
+                    id: remote_id.clone(),
+                },
+            )
+            .unwrap();
+
+        let sync = |sender: &Db, receiver: &Db, expected_wire: &str, expected_public: &str| {
+            let events = receiver
+                .sync_events(&origin, sender.sync_cursor(&destination).unwrap())
+                .unwrap();
+            assert!(!events.is_empty());
+            assert_eq!(events.last().unwrap().state, expected_wire);
+            sender.apply_events(&destination, &events).unwrap();
+            assert_eq!(
+                sender
+                    .delivery_state(&sender.get(&remote_id).unwrap())
+                    .unwrap(),
+                expected_public
+            );
+            assert_eq!(sender.counts().unwrap(), json!({expected_public: 1}));
+            assert_eq!(
+                sender.transfer_info(&remote_id).unwrap().unwrap()["state"],
+                "accepted"
+            );
+            assert!(
+                sender
+                    .pending_transfers(&destination, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        };
+        let (message, attempt) = dispatch(&mut receiver);
+        sync(&sender, &receiver, "sending", "pending");
+        receiver
+            .opencode_finish(
+                &message.id,
+                &attempt,
+                "uncertain",
+                "lost native confirmation",
+            )
+            .unwrap();
+        sync(&sender, &receiver, "uncertain", "unknown");
+        receiver.pause(true).unwrap();
+        receiver.retry(&message.id, false).unwrap();
+        assert!(receiver.claim().unwrap().is_none());
+        sync(&sender, &receiver, "uncertain", "unknown");
+        receiver.pause(false).unwrap();
+        let (claimed, target) = receiver.claim().unwrap().unwrap();
+        assert_eq!(claimed.id, message.id);
+        sync(&sender, &receiver, "uncertain", "unknown");
+        let proof = receiver
+            .opencode_dispatch(&claimed, &target, "ignored replacement")
+            .unwrap();
+        assert_eq!(proof.frame["op"], "reconcile");
+        assert_eq!(
+            proof.frame["native_message_id"],
+            attempt.frame["native_message_id"]
+        );
+        assert_eq!(proof.frame["content"], attempt.frame["content"]);
+        assert_eq!(
+            receiver
+                .delivery_state(&receiver.get(&message.id).unwrap())
+                .unwrap(),
+            "unknown"
+        );
+
+        drop(sender);
+        sender = Db::open(&sender_path).unwrap();
+        assert_eq!(
+            sender
+                .delivery_state(&sender.get(&remote_id).unwrap())
+                .unwrap(),
+            "unknown"
+        );
+        drop(receiver);
+        receiver = Db::open(&root.path().join("db")).unwrap();
+        assert_eq!(
+            receiver
+                .delivery_state(&receiver.get(&message.id).unwrap())
+                .unwrap(),
+            "unknown"
+        );
+        sync(&sender, &receiver, "uncertain", "unknown");
+        receiver
+            .opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
+            .unwrap();
+        receiver.retry(&message.id, false).unwrap();
+        let (claimed, proof) = dispatch(&mut receiver);
+        assert_eq!(claimed.id, message.id);
+        assert_eq!(proof.frame["op"], "reconcile");
+        let delayed_cursor = sender.sync_cursor(&destination).unwrap();
+        receiver
+            .opencode_finish(
+                &message.id,
+                &proof,
+                "submitted",
+                "exact existing native insertion verified",
+            )
+            .unwrap();
+        let phase: String = receiver
+            .conn
+            .query_row(
+                "SELECT phase FROM opencode_deliveries WHERE id=?",
+                [&message.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "inserted");
+        let stored = receiver
+            .conn
+            .prepare(
+                "SELECT state FROM peer_events WHERE peer_id=?1 AND sequence>?2 ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map(
+                params![origin, i64::try_from(delayed_cursor).unwrap()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(stored, ["queued", "sending", "submitted"]);
+
+        // The exact proof has committed before the sender asks for any of the
+        // queued/running recovery events. Apply one event per page to expose
+        // transient regressions that applying the final proof in the same batch
+        // would hide. Projection must use historical attempted provenance even
+        // though the mutable delivery phase is now inserted.
+        for (index, expected_wire, expected_public) in [
+            (0, "uncertain", "unknown"),
+            (1, "uncertain", "unknown"),
+            (2, "submitted", "delivered"),
+        ] {
+            let cursor = sender.sync_cursor(&destination).unwrap();
+            let page = receiver.sync_events(&origin, cursor).unwrap();
+            assert_eq!(page.len(), 3 - index);
+            assert_eq!(page[0].state, expected_wire);
+            assert!(page[0].sequence > cursor);
+            sender.apply_events(&destination, &page[..1]).unwrap();
+            assert_eq!(sender.sync_cursor(&destination).unwrap(), page[0].sequence);
+            assert_eq!(
+                sender
+                    .delivery_state(&sender.get(&remote_id).unwrap())
+                    .unwrap(),
+                expected_public
+            );
+            assert_eq!(sender.counts().unwrap(), json!({expected_public: 1}));
+            assert_eq!(
+                sender.transfer_info(&remote_id).unwrap().unwrap()["state"],
+                "accepted"
+            );
+            assert!(
+                sender
+                    .pending_transfers(&destination, 1)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            receiver
+                .sync_events(&origin, sender.sync_cursor(&destination).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn hidden_control_recovery_is_bounded_canonical_and_reports_original_route_mismatch() {
         let (_root, mut db, agent, _generation) = setup();

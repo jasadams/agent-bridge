@@ -268,7 +268,7 @@ async fn composer_uses_actual_native_claude_delivery_and_closed_owner_is_unavail
     let request = submission(&snapshot, "compose", "Exact multiline\ninstruction 🦀");
     let receipt = send(&broker, &request);
     assert_eq!(receipt["accepted"], true);
-    assert_eq!(receipt["state"], "queued");
+    assert_eq!(receipt["state"], "pending");
     let server = tokio::spawn(broker::serve(bound));
     let frame = timeout(Duration::from_secs(5), async {
         loop {

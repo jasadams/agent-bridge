@@ -31,6 +31,9 @@ pub(crate) fn envelope_with_machines(
 }
 
 pub struct Outcome {
+    /// Existing persisted/wire-v1 lifecycle spelling, not a second status field.
+    /// `submitted` records transport submission. Only provider-qualified proof
+    /// establishes public Delivered; a completed Claude socket write is Unknown.
     pub state: &'static str,
     pub detail: String,
 }
@@ -94,7 +97,7 @@ pub(crate) async fn deliver_control_notice(
         .await
         {
             Ok(_) => Outcome::submitted(
-                "Codex typed notice durably queued; native insertion is unconfirmed and no acknowledgement is required",
+                "Codex typed notice durably queued; native insertion is unconfirmed",
             ),
             Err(error) => Outcome::failed(error),
         };
@@ -112,7 +115,7 @@ pub(crate) async fn deliver_control_notice(
         .await
         {
             Ok(_) => Outcome::submitted(
-                "OpenCode typed notice durably queued; native insertion and acknowledgement are unconfirmed",
+                "OpenCode typed notice durably queued; native insertion is unconfirmed",
             ),
             Err(error) => Outcome::failed(error),
         };
@@ -153,9 +156,9 @@ pub(crate) async fn deliver_event_notice(
         Provider::Inbox => return Outcome::failed("Inbox does not support event control notices"),
     };
     match crate::broker::rpc(state_dir, &request).await {
-        Ok(_) => Outcome::submitted(
-            "Typed event notice durably queued; native insertion is unconfirmed and no acknowledgement is required",
-        ),
+        Ok(_) => {
+            Outcome::submitted("Typed event notice durably queued; native insertion is unconfirmed")
+        }
         Err(error) => Outcome::failed(error),
     }
 }

@@ -183,7 +183,7 @@ async fn directory(bridge: &Running, target: &str) {
 }
 
 #[tokio::test]
-async fn public_discovery_pairs_and_exchanges_private_acknowledged_replies_only_through_relay() {
+async fn public_discovery_pairs_and_exchanges_private_delivered_replies_only_through_relay() {
     let root = tempfile::Builder::new()
         .prefix("ab-relay-brokers-")
         .tempdir_in("/tmp")
@@ -245,20 +245,12 @@ async fn public_discovery_pairs_and_exchanges_private_acknowledged_replies_only_
     let original = a.send(&format!("{bid}/user"), "Relayed hello", None);
     let incoming = b.message("Relayed hello").await;
     let local = incoming["id"].as_str().unwrap().to_owned();
-    b.delivery(&local, "submitted").await;
-    b.request(Request::Ack {
-        id: local.clone(),
-        agent: "user".into(),
-    });
-    a.delivery(&original, "acknowledged").await;
+    b.delivery(&local, "delivered").await;
+    a.delivery(&original, "delivered").await;
     let replyid = b.send(&format!("{aid}/user"), "Relayed reply", Some(local));
     let reply = a.message("Relayed reply").await;
     assert_eq!(reply["parent"], original);
-    a.request(Request::Ack {
-        id: reply["id"].as_str().unwrap().into(),
-        agent: "user".into(),
-    });
-    b.delivery(&replyid, "acknowledged").await;
+    b.delivery(&replyid, "delivered").await;
     assert!(
         node.status.borrow()["circuits_opened"].as_u64().unwrap() > 0,
         "node must actually forward traffic"
@@ -283,10 +275,10 @@ async fn public_discovery_pairs_and_exchanges_private_acknowledged_replies_only_
     })
     .await;
     // A dropped connection cannot convey the remote owner's policy decision.
-    // The durable source intent may remain queued, but cannot be acknowledged.
+    // The durable source intent may remain pending, but cannot be delivered.
     assert_ne!(
         a.request(Request::Get { id: blocked })["state"],
-        "acknowledged"
+        "delivered"
     );
     assert!(
         b.history()
@@ -329,11 +321,8 @@ async fn configured_independent_nodes_provide_routes_when_an_operator_is_unavail
     directory(&a, &b.id()).await;
     let id = a.send(&format!("{}/user", b.id()), "Independent operator", None);
     let msg = b.message("Independent operator").await;
-    b.request(Request::Ack {
-        id: msg["id"].as_str().unwrap().into(),
-        agent: "user".into(),
-    });
-    a.delivery(&id, "acknowledged").await;
+    b.delivery(msg["id"].as_str().unwrap(), "delivered").await;
+    a.delivery(&id, "delivered").await;
     assert!(good.status.borrow()["circuits_opened"].as_u64().unwrap() > 0);
 }
 
@@ -402,11 +391,9 @@ async fn relay_restart_recovers_reservations_and_durable_messages_without_pairin
         listen: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
     });
     let incoming = b.message("Survives relay restart").await;
-    b.request(Request::Ack {
-        id: incoming["id"].as_str().unwrap().into(),
-        agent: "user".into(),
-    });
-    a.delivery(&original, "acknowledged").await;
+    b.delivery(incoming["id"].as_str().unwrap(), "delivered")
+        .await;
+    a.delivery(&original, "delivered").await;
     assert_eq!(
         b.history()
             .as_array()

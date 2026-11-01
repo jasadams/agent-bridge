@@ -39,7 +39,7 @@
   let query = new URLSearchParams();
   let listRequest = 0;
   let detailRequest = 0;
-  const states = new Set(["queued", "sending", "submitted", "delivered", "acknowledged", "failed", "uncertain", "cancelled", "blocked"]);
+  const states = new Set(["pending", "delivered", "failed", "unknown"]);
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -130,7 +130,8 @@
     return Number.isFinite(date.getTime()) ? date.toLocaleString() : "Unknown";
   }
   function badge(state) {
-    return element("span", `state-badge${states.has(state) ? ` ${state}` : ""}`, state || "unknown");
+    const outcome = states.has(state) ? state : "unknown";
+    return element("span", `state-badge ${outcome}`, outcome);
   }
   function patchNode(current, next) {
     const changedKey = current.nodeType === Node.ELEMENT_NODE && next.nodeType === Node.ELEMENT_NODE &&

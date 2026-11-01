@@ -39,7 +39,7 @@ pairing. Physical two-machine/no-SSH user acceptance is recorded separately.
 - Stop sharing, revoke and cancel independently. New sessions remain private;
   session replacement cannot inherit access. Reconnect preserves valid grants.
 
-Acceptance: allowed message, acknowledgement and correlated reply work; private
+Acceptance: allowed message, native acceptance evidence and correlated reply work; private
 sessions are excluded and revocation blocks further access immediately.
 
 ## 3. Public rendezvous and self-hosted relays

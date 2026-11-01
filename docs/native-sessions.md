@@ -40,7 +40,7 @@ for MCP client configuration.
 On Codex 0.165.0, verified active threads that support direct input receive peer
 handoffs through their current turn's native steer path. Idle or unsupported-capability
 threads retain native queuing, which may wait for the whole active turn to finish.
-Native acceptance is not acknowledgement. See [Codex delivery and backpressure](codex-delivery.md)
+Native acceptance is not model read or task completion. See [Codex delivery and backpressure](codex-delivery.md)
 for version limits, bounded admission and explicit recovery; the [original diagnosis](codex-delivery-diagnosis.md)
 retains queue-only evidence and historical uncertainty.
 
@@ -71,7 +71,7 @@ with the sender's native session name or explicit registration alias. Remote nam
 include their machine qualifier. The transport name is not part of the agent's name.
 The message contains its text and a short reference (message ID, reply address and
 recipient); repeated JSON envelopes and command instructions are omitted. Startup
-context explains how to acknowledge and reply through the messaging MCP tools or CLI.
+context explains how to send and reply through the messaging MCP tools or CLI.
 Use the stable addresses in that reference for routing, not a shortened display name
 or Claude's native `SendMessage` tool. Machine metadata remains available through
 `get_message` / `agent-bridge get MESSAGE_ID`.
@@ -83,14 +83,14 @@ when qualifying a new client version.
 
 ## OpenCode
 
-For supported OpenCode **1.18.35** V1, install the bundled native plugin and MCP
+For supported OpenCode **2.2.5** V2, install the bundled native plugin and MCP
 connection explicitly:
 
 ```sh
 agent-bridge opencode install
 ```
 
-Fully restart OpenCode after installation or updates. Send a prompt in the
+V2 reloads changed configuration. Send a prompt in the
 existing conversation you want to use, then check its live registration:
 
 ```sh
@@ -98,7 +98,7 @@ agent-bridge list
 ```
 
 Its exact route is `opencode-SESSION_ID`, where the native ID starts with `ses_`.
-Stored conversation history is not advertised automatically. The setup command
+Routes are verified against the current native server. The setup command
 does not start a native session or model, change permissions, or enable peer
 sharing. Repeat it after upgrading Agent Bridge to update the extracted plugin.
 
@@ -147,12 +147,14 @@ the specific access required through your client's normal approval controls;
 installation does not enable unrestricted shell access or bypass trust settings.
 
 For an end-to-end check, ask one registered agent to send a short message to a
-second session and request an acknowledgement and reply. Inspect the message with
-`agent-bridge get MESSAGE_ID`. A `submitted` state alone is not proof of receipt
-or task completion.
+second session and request a correlated reply. Inspect the message with
+`agent-bridge get MESSAGE_ID`. `delivered` confirms native client acceptance, not
+model read or task completion. Claude's
+socket-only interface remains `unknown` even when a fixture later observes input.
+See [delivery outcomes](delivery-outcomes.md).
 
 If a send times out, retain its UUID and retry with the same `--id` and exact
-message. For a message in `uncertain` state, inspect the native conversation before
+message. For a message in `unknown` state, inspect the native conversation before
 explicitly retrying: a partial submission may already have delivered it.
 
 ```sh
@@ -185,7 +187,7 @@ before subscription changes; they never silently truncate identities. Display
 labels are bounded to 4,096 UTF-8 bytes with safe truncation and `...`, without
 changing exact routes or ordinary listing metadata.
 
-Overflow or a failed or uncertain lifecycle delivery marks the stream incomplete.
+Overflow or a Failed or Unknown lifecycle delivery marks the stream incomplete.
 The broker attempts one `resync.required` notice and suppresses further lifecycle
 transitions until explicit lifecycle subscription obtains a fresh snapshot.
 Resync attempts are not automatically replayed. Unsubscribe, closure, replacement
@@ -200,6 +202,6 @@ availability. Other providers return the same empty recovery shape. A fresh
 snapshot can coexist with blocked native delivery. Inspect the ID, then use
 `agent-bridge --state-dir "/same/private/state" retry CONTROL_ID` for explicit
 read-only native reconciliation through that broker. This never reinserts an
-attempted prompt. Missing proof remains uncertain; neither unsubscribe nor cancel
+attempted prompt. Missing proof remains Unknown; neither unsubscribe nor cancel
 proves no insertion occurred. Diagnostics trigger no native work or automatic
 retry. See [event recovery](mcp.md#event-subscriptions) for the complete contract.

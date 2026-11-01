@@ -206,6 +206,10 @@ async fn typed_controls_use_native_frames_without_peer_envelopes() {
     }
     let outcome = crate::delivery::deliver(&agent, &msg, Path::new("/missing"), root.path()).await;
     assert_eq!(outcome.state, "submitted");
+    assert_eq!(
+        crate::protocol::delivery_outcome(outcome.state, Some("claude"), None),
+        "unknown"
+    );
     let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
         .await
         .unwrap()

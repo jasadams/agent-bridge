@@ -61,7 +61,7 @@ pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value
     }
 
     let names: &[&str] = match tool {
-        "send_message" | "acknowledge_message" => &["id", "state"],
+        "send_message" => &["id", "state"],
         "subscribe" | "unsubscribe" => &["agent", "events", "agents", "persistent", "recovery"],
         "open_pairing" => &["open", "valid_for_seconds", "notifications"],
         "create_invite" => &[
@@ -145,22 +145,20 @@ mod tests {
 
     #[test]
     fn compact_message_receipts_do_not_grow_with_the_body_or_machine_metadata() {
-        for tool in ["send_message", "acknowledge_message"] {
-            let mut sizes = Vec::new();
-            for length in [100, 50_000] {
-                let value = json!({
-                    "id":"message-id", "state":"acknowledged", "body":"x".repeat(length),
-                    "source_machine":{"details":"y".repeat(length)},
-                    "destination_machine":{"details":"z".repeat(length)}
-                });
-                let compact = write_result(tool, value.clone(), false);
-                assert_eq!(compact, json!({"id":"message-id","state":"acknowledged"}));
-                sizes.push(serde_json::to_vec(&compact).unwrap().len());
-                assert_eq!(write_result(tool, value.clone(), true), value);
-            }
-            assert_eq!(sizes[0], sizes[1]);
-            assert!(sizes[0] < 100);
+        let mut sizes = Vec::new();
+        for length in [100, 50_000] {
+            let value = json!({
+                "id":"message-id", "state":"delivered", "body":"x".repeat(length),
+                "source_machine":{"details":"y".repeat(length)},
+                "destination_machine":{"details":"z".repeat(length)}
+            });
+            let compact = write_result("send_message", value.clone(), false);
+            assert_eq!(compact, json!({"id":"message-id","state":"delivered"}));
+            sizes.push(serde_json::to_vec(&compact).unwrap().len());
+            assert_eq!(write_result("send_message", value.clone(), true), value);
         }
+        assert_eq!(sizes[0], sizes[1]);
+        assert!(sizes[0] < 100);
     }
 
     #[test]

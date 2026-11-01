@@ -97,6 +97,20 @@ pub(crate) fn pair_in_transaction(
 }
 
 impl Db {
+    /// Resolve historical proof using immutable destination provenance, never
+    /// a mutable registration or human-readable detail. No history is rewritten.
+    pub(crate) fn delivery_state(&self, message: &Message) -> Result<&'static str> {
+        let (provider, phase): (Option<String>, Option<String>) = self.conn.query_row(
+            "SELECT coalesce(json_extract(o.envelope,'$.destination.provider'),json_extract(c.destination,'$.provider')),d.phase FROM message_context c LEFT JOIN outbound_transfers o ON o.id=c.id LEFT JOIN opencode_deliveries d ON d.id=c.id WHERE c.id=?",
+            [&message.id], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(crate::protocol::delivery_outcome(
+            &message.state,
+            provider.as_deref(),
+            phase.as_deref(),
+        ))
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(3))?;
@@ -739,30 +753,12 @@ impl Db {
     }
 
     pub fn finish(&self, id: &str, state: &str, detail: &str) -> Result<()> {
-        // A very fast acknowledgement can arrive before the transport finishes.
+        // Only the worker that still owns an in-flight delivery can finish it.
         self.conn.execute(
             "UPDATE messages SET state=?,detail=?,updated=? WHERE id=? AND state='sending'",
             params![state, detail, now(), id],
         )?;
         Ok(())
-    }
-
-    pub fn ack(&self, id: &str, agent: &str) -> Result<Message> {
-        let m = self.get(id)?;
-        ensure!(
-            m.recipient == agent,
-            "Acknowledgement must come from the recipient"
-        );
-        ensure!(
-            self.agent(agent)?.session == m.recipient_session,
-            "Recipient session changed"
-        );
-        ensure!(
-            ["sending", "submitted", "uncertain", "acknowledged"].contains(&m.state.as_str()),
-            "Message has not been submitted"
-        );
-        self.conn.execute("UPDATE messages SET state='acknowledged',detail='Recipient acknowledged receipt',updated=? WHERE id=?",params![now(),id])?;
-        self.get(id)
     }
 
     pub fn retry(&self, id: &str, allow_duplicate: bool) -> Result<Message> {
@@ -800,7 +796,7 @@ impl Db {
             "Only queued messages can be cancelled"
         );
         self.conn.execute(
-            "UPDATE messages SET state='cancelled',updated=? WHERE id=?",
+            "UPDATE messages SET state='cancelled',detail='Cancelled before native delivery; no automatic retry',updated=? WHERE id=?",
             params![now(), id],
         )?;
         self.get(id)
@@ -824,14 +820,23 @@ impl Db {
     pub fn counts(&self) -> Result<serde_json::Value> {
         let mut s = self
             .conn
-            .prepare("SELECT state,count(*) FROM messages GROUP BY state")?;
+            .prepare("SELECT m.state,coalesce(json_extract(o.envelope,'$.destination.provider'),json_extract(c.destination,'$.provider')),d.phase,count(*) FROM messages m LEFT JOIN message_context c ON c.id=m.id LEFT JOIN outbound_transfers o ON o.id=m.id LEFT JOIN opencode_deliveries d ON d.id=m.id GROUP BY 1,2,3")?;
         let pairs = s
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(serde_json::to_value(
-            pairs
-                .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>(),
-        )?)
+        let mut counts = std::collections::BTreeMap::<&str, i64>::new();
+        for (state, provider, phase, count) in pairs {
+            let outcome =
+                crate::protocol::delivery_outcome(&state, provider.as_deref(), phase.as_deref());
+            *counts.entry(outcome).or_default() += count;
+        }
+        Ok(serde_json::to_value(counts)?)
     }
 }

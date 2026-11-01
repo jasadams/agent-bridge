@@ -177,7 +177,7 @@ fn temp() -> tempfile::TempDir {
 }
 
 #[tokio::test]
-async fn two_brokers_deliver_once_to_native_socket_and_sync_acknowledgement_and_reply() {
+async fn two_brokers_deliver_once_to_native_socket_and_sync_delivery_and_reply() {
     let root = temp();
     let alice = Running::start(&root.path().join("a"));
     let bob = Running::start(&root.path().join("b"));
@@ -233,16 +233,7 @@ async fn two_brokers_deliver_once_to_native_socket_and_sync_acknowledgement_and_
     assert_eq!(frame["from"], format!("{alice_id}/user"));
     assert!(content.contains(&format!("Reply to: {alice_id}/user")));
     assert!(!content.contains("Agent Bridge"));
-    broker::rpc(
-        &bob.state,
-        &Request::Ack {
-            id: local_id.clone(),
-            agent: "reviewer".into(),
-        },
-    )
-    .await
-    .unwrap();
-    let original = message_state(&alice, &id, "acknowledged").await;
+    let original = message_state(&alice, &id, "unknown").await;
     assert_eq!(original["transfer"]["state"], "accepted");
     let reply_id = uuid::Uuid::new_v4().to_string();
     broker::rpc(
@@ -266,7 +257,7 @@ async fn two_brokers_deliver_once_to_native_socket_and_sync_acknowledgement_and_
     .await;
     assert_eq!(reply["parent"], id);
     assert_eq!(reply["hops"], 1);
-    message_state(&alice, reply["id"].as_str().unwrap(), "submitted").await;
+    message_state(&alice, reply["id"].as_str().unwrap(), "delivered").await;
     assert!(
         timeout(Duration::from_millis(200), native.accept())
             .await
@@ -348,8 +339,10 @@ async fn queued_transfer_survives_origin_restart_and_destination_offline_period(
             .find(|message| message["body"] == "Persist while offline")
     })
     .await;
-    message_state(&bob, received["id"].as_str().unwrap(), "submitted").await;
-    message_state(&alice, &id, "submitted").await;
+    // This destination is the broker-owned Inbox, not a socket-only Claude
+    // adapter: durable inbox availability establishes recipient acceptance.
+    message_state(&bob, received["id"].as_str().unwrap(), "delivered").await;
+    message_state(&alice, &id, "delivered").await;
     assert_eq!(
         bob.history()
             .iter()
@@ -391,12 +384,28 @@ async fn revocation_blocks_a_durably_received_message_before_native_submission()
             .find(|message| message["body"] == "Block before native submission")
     })
     .await;
-    assert_eq!(received["state"], "queued");
+    assert_eq!(received["state"], "pending");
     bob.request(Request::PeerRevoke {
         peer: "alice".into(),
     });
     bob.request(Request::Pause { paused: false });
-    message_state(&bob, received["id"].as_str().unwrap(), "blocked").await;
+    let stored = rusqlite::Connection::open_with_flags(
+        root.path().join("b/messages.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    wait(|| {
+        let blocked: bool = stored
+            .query_row(
+                "SELECT state='blocked' FROM messages WHERE id=?",
+                [received["id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        blocked.then_some(Value::Null)
+    })
+    .await;
+    message_state(&bob, received["id"].as_str().unwrap(), "pending").await;
     assert!(
         bob.request(Request::RemoteList)
             .as_array()
