@@ -425,7 +425,19 @@ pub struct Response {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_persisted: Option<bool>,
 }
+
+#[derive(Debug)]
+pub(crate) struct SendNotPersisted(pub String);
+
+impl std::fmt::Display for SendNotPersisted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for SendNotPersisted {}
 
 impl Response {
     pub fn from_result(result: anyhow::Result<serde_json::Value>) -> Self {
@@ -434,13 +446,38 @@ impl Response {
                 ok: true,
                 result: Some(result),
                 error: None,
+                send_persisted: None,
             },
             Err(error) => Self {
                 ok: false,
                 result: None,
                 error: Some(format!("{error:#}")),
+                send_persisted: error.downcast_ref::<SendNotPersisted>().map(|_| false),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod send_response_tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct LegacyResponse {
+        ok: bool,
+        error: Option<String>,
+    }
+
+    #[test]
+    fn rejection_metadata_preserves_legacy_response_compatibility() {
+        let legacy: Response = serde_json::from_str(r#"{"ok":false,"error":"failed"}"#).unwrap();
+        assert_eq!(legacy.send_persisted, None);
+        let response = Response::from_result(Err(SendNotPersisted("failed".into()).into()));
+        let json = serde_json::to_string(&response).unwrap();
+        let old: LegacyResponse = serde_json::from_str(&json).unwrap();
+        assert!(!old.ok);
+        assert_eq!(old.error.as_deref(), Some("failed"));
+        assert_eq!(response.send_persisted, Some(false));
     }
 }
 

@@ -249,6 +249,163 @@ fn root() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn rejected_opencode_send_does_not_return_a_phantom_message_id() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    running.inbox("alice");
+    running.inbox("bob");
+    let conn = rusqlite::Connection::open(state.join("messages.sqlite3")).unwrap();
+    conn.execute(
+        "INSERT INTO agents(name,provider,session,endpoint,enabled) VALUES(?1,'opencode',?2,?3,1)",
+        rusqlite::params![
+            "opencode-ses_abcdefghijklmnopqrstuvwx12",
+            "ses_abcdefghijklmnopqrstuvwx12",
+            "/tmp/unused.sock"
+        ],
+    )
+    .unwrap();
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let rejected = mcp.call("send_message", json!({"from":"alice","to":"opencode-ses_abcdefghijklmnopqrstuvwx12","body":"rejected"})).await;
+    assert!(failed(&rejected), "{rejected}");
+    let error = &rejected["result"]["structuredContent"];
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("OpenCode live lease required"),
+        "{error}"
+    );
+    assert!(
+        error.get("id").is_none(),
+        "a rejected send must not claim a message id: {error}"
+    );
+    assert!(
+        error["request_id"].is_string(),
+        "retain a safe retry correlation id: {error}"
+    );
+    assert_eq!(error["persisted"], false);
+    let missing = mcp
+        .call("get_message", json!({"id":error["request_id"]}))
+        .await;
+    assert!(failed(&missing));
+    let retried = mcp.call("send_message", json!({"from":"alice","to":"opencode-ses_abcdefghijklmnopqrstuvwx12","body":"rejected","id":error["request_id"]})).await;
+    assert!(failed(&retried));
+    let retry_error = &retried["result"]["structuredContent"];
+    assert_eq!(retry_error["request_id"], error["request_id"]);
+    assert_eq!(retry_error["persisted"], false);
+    let mut second = Mcp::start(&state);
+    second.initialize().await;
+    let args =
+        json!({"from":"alice","to":"opencode-ses_abcdefghijklmnopqrstuvwx12","body":"concurrent"});
+    let (left, right) = tokio::join!(
+        mcp.call("send_message", args.clone()),
+        second.call("send_message", args)
+    );
+    for response in [&left, &right] {
+        assert!(failed(response));
+        let error = &response["result"]["structuredContent"];
+        assert_eq!(error["persisted"], false);
+        assert!(error.get("id").is_none());
+        assert!(error["request_id"].is_string());
+    }
+    assert_ne!(
+        left["result"]["structuredContent"]["request_id"],
+        right["result"]["structuredContent"]["request_id"]
+    );
+    second.close().await;
+    let accepted = mcp
+        .call(
+            "send_message",
+            json!({"from":"alice","to":"bob","body":"accepted"}),
+        )
+        .await;
+    let id = structured(&accepted)["id"].as_str().unwrap();
+    let readback = mcp.call("get_message", json!({"id":id})).await;
+    assert_eq!(structured(&readback)["result"]["body"], "accepted");
+    let conflict = mcp
+        .call(
+            "send_message",
+            json!({"from":"alice","to":"bob","body":"different","id":id}),
+        )
+        .await;
+    assert!(failed(&conflict));
+    let conflict_error = &conflict["result"]["structuredContent"];
+    assert_eq!(conflict_error["request_id"], id);
+    assert_eq!(conflict_error["persistence"], "unknown");
+    assert!(conflict_error.get("persisted").is_none());
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn lost_broker_response_keeps_send_persistence_unknown() {
+    let root = root();
+    let state = root.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let listener = UnixListener::bind(state.join("bridge.sock")).unwrap();
+    let broker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        assert!(request.contains("\"send\""));
+        // Simulate a response lost after the broker received the request.
+    });
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let result = mcp
+        .call(
+            "send_message",
+            json!({"from":"alice","to":"bob","body":"uncertain"}),
+        )
+        .await;
+    assert!(failed(&result));
+    let error = &result["result"]["structuredContent"];
+    assert!(error.get("id").is_none(), "{error}");
+    assert!(error["request_id"].is_string(), "{error}");
+    assert_eq!(error["persistence"], "unknown");
+    assert!(error.get("persisted").is_none(), "{error}");
+    broker.await.unwrap();
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn unclassified_broker_rejection_does_not_claim_no_persistence() {
+    let root = root();
+    let state = root.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let listener = UnixListener::bind(state.join("bridge.sock")).unwrap();
+    let broker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.unwrap();
+        reader
+            .get_mut()
+            .write_all(b"{\"ok\":false,\"error\":\"unknown failure\"}\n")
+            .await
+            .unwrap();
+    });
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let result = mcp
+        .call(
+            "send_message",
+            json!({"from":"alice","to":"bob","body":"uncertain"}),
+        )
+        .await;
+    assert!(failed(&result));
+    let error = &result["result"]["structuredContent"];
+    assert_eq!(error["persistence"], "unknown");
+    assert!(error.get("persisted").is_none());
+    assert!(error.get("id").is_none());
+    assert!(error["request_id"].is_string());
+    broker.await.unwrap();
+    mcp.close().await;
+}
+
+#[tokio::test]
 async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries() {
     let root = root();
     let state = root.path().join("state");
@@ -556,10 +713,14 @@ async fn failed_send_returns_a_stable_retry_id_without_leaking_message_in_errors
         )
         .await;
     assert!(failed(&result));
-    let id = result["result"]["structuredContent"]["id"]
+    let id = result["result"]["structuredContent"]["request_id"]
         .as_str()
         .unwrap();
     uuid::Uuid::parse_str(id).unwrap();
+    assert_eq!(
+        result["result"]["structuredContent"]["persistence"],
+        "unknown"
+    );
     assert!(!result.to_string().contains(body));
     let retry = mcp
         .call(
@@ -567,7 +728,7 @@ async fn failed_send_returns_a_stable_retry_id_without_leaking_message_in_errors
             json!({"from":"alice","to":"bob","body":body,"id":id}),
         )
         .await;
-    assert_eq!(retry["result"]["structuredContent"]["id"], id);
+    assert_eq!(retry["result"]["structuredContent"]["request_id"], id);
     assert!(failed(&retry));
     mcp.close().await;
 }
