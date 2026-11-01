@@ -1,3 +1,5 @@
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     protocol::Request,
@@ -167,7 +169,7 @@ async fn disable_and_restart_drop_incomplete_approval_without_creating_trust() {
     );
     b.task.abort();
     drop(b);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    support::wait_for_shutdown(&bpath).await;
     let b = Running::start(&bpath);
     assert!(b.pairing()["requests"].as_array().unwrap().is_empty());
     assert_eq!(a.peers(), serde_json::json!([]));

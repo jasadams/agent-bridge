@@ -1,5 +1,7 @@
 //! Black-box MCP stdio checks against the real broker. No native model, global
 //! client configuration or existing bridge state is touched.
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     db::Db,
@@ -1023,30 +1025,8 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
         .await;
     assert!(!failed(&subscribed), "{subscribed}");
     drop(running);
-    // Cancellation stops the async server, but started blocking jobs retain
-    // ownership until completion. Wait for that fence rather than assuming
-    // one scheduler turn is enough to make replacement safe.
-    let bound = timeout(Duration::from_secs(3), async {
-        loop {
-            match Broker::bind(state.clone(), "/missing/codex".into()) {
-                Ok(bound) => break bound,
-                Err(error)
-                    if error
-                        .to_string()
-                        .contains("Another agent-bridge service owns") =>
-                {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => panic!("Could not restart broker: {error:#}"),
-            }
-        }
-    })
-    .await
-    .expect("Old broker did not release ownership after blocking jobs finished");
-    let _restarted = Running {
-        broker: bound.broker.clone(),
-        task: tokio::spawn(broker::serve(bound)),
-    };
+    support::wait_for_shutdown(&state).await;
+    let _restarted = Running::start(&state);
     let current = mcp.call("read_board", json!({})).await;
     let revision = structured(&current)["result"]["revision"].clone();
     let after_restart = mcp.call("update_board", json!({"expected_revision":revision,"edits":[{"op":"append","text":"Private after restart\n"}]})).await;

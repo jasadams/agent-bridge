@@ -1,4 +1,6 @@
 //! Session sharing changes policy, not identity or durable delivery semantics.
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     protocol::{Agent, Provider, Request},
@@ -281,6 +283,7 @@ async fn shared_sessions_exchange_acknowledged_replies_and_enforce_unshare_acros
     });
     assert_eq!(b.connection(&a_id)["state"], "network_disabled");
     b.stop().await;
+    support::wait_for_shutdown(&b_path).await;
     let b = Running::start(&b_path);
     assert_eq!(b.request(Request::SharedSessions)[0]["shared"], true);
     connect(&a, &b).await;

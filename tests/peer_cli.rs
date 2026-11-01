@@ -1,3 +1,5 @@
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     network::identity::Identity,
@@ -179,6 +181,7 @@ async fn local_cli_manages_peer_trust_and_explicit_network_lifecycle() {
     .expect("CLI disable did not stop listener");
     server.abort();
     let _ = server.await;
+    support::wait_for_shutdown(&state).await;
     let rebound = Broker::bind(state, "/missing/codex".into()).unwrap();
     assert_eq!(
         rebound

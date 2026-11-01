@@ -1,3 +1,5 @@
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     network::trust::Permission,
@@ -322,6 +324,7 @@ async fn queued_transfer_survives_origin_restart_and_destination_offline_period(
         "pending"
     );
     alice.stop().await;
+    support::wait_for_shutdown(&alice_path).await;
     let alice = Running::start(&alice_path);
     assert_eq!(
         alice.request(Request::Get { id: id.clone() })["transfer"]["state"],
@@ -331,6 +334,7 @@ async fn queued_transfer_survives_origin_restart_and_destination_offline_period(
         enabled: true,
         listen: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
     });
+    support::wait_for_shutdown(&bob_path).await;
     let bob = Running::start(&bob_path);
     assert_eq!(bob.listening().await, bob_address);
     let alice_address = alice.listening().await;

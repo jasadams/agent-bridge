@@ -1,5 +1,7 @@
 //! Opt-in tests for real multicast discovery. They use two isolated brokers on
 //! one host and do not replace acceptance on two physical machines.
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     network::trust::Permission,
@@ -319,6 +321,7 @@ async fn discovered_peers_pair_exchange_and_reconnect_without_manual_addresses()
         })["transfer"]["state"],
         "pending"
     );
+    support::wait_for_shutdown(&bob_path).await;
     let bob = Running::start(&bob_path);
     assert_eq!(bob.identity(), bob_id);
     let new_address = bob.lan_address().await;
