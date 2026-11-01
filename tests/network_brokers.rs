@@ -339,8 +339,10 @@ async fn queued_transfer_survives_origin_restart_and_destination_offline_period(
             .find(|message| message["body"] == "Persist while offline")
     })
     .await;
-    message_state(&bob, received["id"].as_str().unwrap(), "unknown").await;
-    message_state(&alice, &id, "unknown").await;
+    // This destination is the broker-owned Inbox, not a socket-only Claude
+    // adapter: durable inbox availability establishes recipient acceptance.
+    message_state(&bob, received["id"].as_str().unwrap(), "delivered").await;
+    message_state(&alice, &id, "delivered").await;
     assert_eq!(
         bob.history()
             .iter()
