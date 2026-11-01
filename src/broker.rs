@@ -929,18 +929,28 @@ impl Broker {
                     body,
                     parent,
                 } => {
-                    if recipient.contains('/') {
+                    let sent = if recipient.contains('/') {
                         let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                        self.message_value(
-                            &db,
-                            &db.send_remote(&local, &id, &sender, &recipient, &body, &parent)?,
-                        )?
+                        db.send_remote(&local, &id, &sender, &recipient, &body, &parent)
                     } else {
-                        self.message_value(
-                            &db,
-                            &db.send(&id, &sender, &recipient, &body, &parent)?,
-                        )?
-                    }
+                        db.send(&id, &sender, &recipient, &body, &parent)
+                    };
+                    let message = match sent {
+                        Ok(message) => message,
+                        Err(error) => {
+                            // This runs under the broker's database lock. Only
+                            // claim a definite rejection when readback proves no
+                            // message was persisted; otherwise preserve ambiguity.
+                            if matches!(db.get_optional(&id), Ok(None)) {
+                                return Err(crate::protocol::SendNotPersisted(format!(
+                                    "{error:#}"
+                                ))
+                                .into());
+                            }
+                            return Err(error);
+                        }
+                    };
+                    self.message_value(&db, &message)?
                 }
                 Request::History { agent, limit } => {
                     let agent = agent
@@ -2324,7 +2334,11 @@ pub async fn rpc(state_dir: &Path, req: &Request) -> Result<Value> {
         );
         let response: Response = serde_json::from_slice(&frame)?;
         if !response.ok {
-            anyhow::bail!("{}", response.error.unwrap_or_default())
+            let error = response.error.unwrap_or_default();
+            if response.send_persisted == Some(false) {
+                return Err(crate::protocol::SendNotPersisted(error).into());
+            }
+            anyhow::bail!("{error}")
         }
         Ok(logical_board_rpc_result(
             req,

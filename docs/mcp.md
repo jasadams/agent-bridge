@@ -314,8 +314,15 @@ session for a two-way conversation. Use `unshare_session` with the same argument
 to remove this session's grants. An explicit local owner request authorizes the
 selected action; a request received from a remote agent does not.
 
-For a send, retain the returned message UUID. If the broker response is ambiguous,
-retry with that exact UUID and the same message rather than generating another.
+For a successful send, retain the returned message UUID. A failed send returns a
+`request_id`, not a message ID: `persisted: false` means the broker confirmed that
+no message existed for that ID at rejection time, while `persistence: "unknown"`
+means it may have been stored.
+For an unknown outcome, retry with `request_id` as the `id` and the exact same
+message rather than generating another UUID. Readback may report `Unknown message`
+when no record was persisted; it does not by itself settle an in-flight request.
+An older broker does not provide confirmed-rejection metadata, so its failures
+remain unknown to an updated MCP client.
 Submitted does not mean the other agent read the message or completed a task.
 
 ## Compact results and incremental reads
@@ -326,8 +333,9 @@ always returns its new full snapshot. This changes only MCP output;
 message persistence, delivery, CLI output and access checks are unchanged.
 
 - `update_board` returns `{"result":{"board":"main","revision":"…"}}` on success.
-- `send_message` returns `{"result":{"id":"…","state":"queued"},"id":"…"}`.
-  The top-level UUID is retained for retry compatibility, including failed sends.
+- `send_message` returns `{"result":{"id":"…","state":"queued"},"id":"…"}`
+  on success. On error it returns `request_id` for safe retry, plus either
+  `persisted: false` when confirmed or `persistence: "unknown"` otherwise.
 - `acknowledge_message` returns `{"result":{"id":"…","state":"acknowledged"}}`.
 - Subscriptions retain the effective `events` and complete `agents` snapshot, including in compact results.
   Pairing tools retain the exchange ID, verification state, invitation link and

@@ -355,6 +355,9 @@ fn outcome(result: Result<Value>, id: Option<String>) -> CallToolResult {
     let (mut value, error) = match result {
         Ok(value) => (json!({"result":value}), false),
         Err(error) => {
+            let not_persisted = error
+                .downcast_ref::<crate::protocol::SendNotPersisted>()
+                .is_some();
             let mut message = format!("{error:#}");
             if message.len() > 1024 {
                 let mut end = 1024;
@@ -364,18 +367,27 @@ fn outcome(result: Result<Value>, id: Option<String>) -> CallToolResult {
                 message.truncate(end);
                 message.push('…');
             }
-            (json!({"code":"operation_failed","error":message}), true)
+            let mut value = json!({"code":"operation_failed","error":message});
+            if id.is_some() {
+                if not_persisted {
+                    value["persisted"] = false.into();
+                } else {
+                    value["persistence"] = "unknown".into();
+                }
+            }
+            (value, true)
         }
     };
     if let Some(id) = id {
-        value["id"] = json!(id);
+        value[if error { "request_id" } else { "id" }] = json!(id);
     }
     // Broker history is bounded too, but MCP duplicates structured content into
     // its compatibility text block. Bound that output explicitly without truncating messages.
     if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > MAX_RESULT) {
         let mut limited = json!({"code":"result_too_large","error":"Tool result is too large; request fewer messages or inspect individual IDs"});
-        if let Some(id) = value.get("id") {
-            limited["id"] = id.clone();
+        if let Some(id) = value.get("id").or_else(|| value.get("request_id")) {
+            limited["request_id"] = id.clone();
+            limited["persistence"] = "unknown".into();
         }
         return CallToolResult::structured_error(limited);
     }
@@ -675,7 +687,7 @@ impl Bridge {
             .await
     }
     #[tool(
-        description = "Persist a message under existing grants. To reply, set from to your registered local recipient (received to / Delivered to), to to the exact received from / Reply to, and parent to received id / Message reference. Check connection_status matches your session broker. Returns id and state; verbose includes the full record. Reuse the UUID after a timeout. Submitted is not read or completed."
+        description = "Persist a message under existing grants. To reply, set from to your registered local recipient (received to / Delivered to), to to the exact received from / Reply to, and parent to received id / Message reference. Check connection_status matches your session broker. Successful sends return id and state; verbose includes the full record. Errors return request_id for safe retries, not proof of persistence. persisted=false means no message was stored; persistence=unknown means the send may have succeeded. Retry the same request with request_id as id; do not create a new ID after an uncertain outcome. Submitted is not read or completed."
     )]
     async fn send_message(&self, Parameters(args): Parameters<SendArgs>) -> CallToolResult {
         let id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
