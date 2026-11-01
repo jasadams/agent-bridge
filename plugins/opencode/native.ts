@@ -288,6 +288,44 @@ try {
     return request;
   }
 
+  // Exercise the actual supported V2 session.move API, not just a mocked
+  // location response. Both directories and all native state are disposable.
+  const movedDirectory = join(root, "moved-worktree");
+  await mkdir(movedDirectory, { recursive: true });
+  await api(`/api/session/${first.id}/move`, { directory: movedDirectory });
+  await waitFor("native session moved", async () => (await api(`/api/session/${first.id}`)).location.directory === movedDirectory);
+  const movedPeer = await sendPeer(first, `Moved session input ${randomUUID()}`);
+  await acceptedInput(first, movedPeer);
+  const movedInputs = await messages(first.id);
+  assert(movedInputs.filter(item => item.id === movedPeer.native).length <= 1, "Moved session duplicated native input");
+  console.log(JSON.stringify({ phase: "native_session_move", session: first.id, directory: movedDirectory, delivered: movedPeer.id, native: movedPeer.native }));
+
+  // Seed an upgrade-shaped legacy Unknown only in this disposable broker DB.
+  // The schema-12 migration itself is exercised by the Rust migration test;
+  // this verifies the resulting row alongside the real V2 native runtime.
+  await brokerRpc(state, { op: "pause", paused: true });
+  const legacy = await sendPeer(first, `Legacy unknown fixture ${randomUUID()}`);
+  const legacyNative = "msg_" + legacy.id.replaceAll("-", "").toLowerCase();
+  const fixtureDb = new Database(join(state, "messages.sqlite3"));
+  try {
+    fixtureDb.transaction(() => {
+      fixtureDb.query("UPDATE opencode_deliveries SET phase='legacy',native_id=? WHERE id=?").run(legacyNative, legacy.id);
+      fixtureDb.query("UPDATE messages SET state='uncertain',detail='legacy fixture without acceptance proof' WHERE id=?").run(legacy.id);
+    }).immediate();
+  } finally { fixtureDb.close(); }
+  const afterLegacy = await sendPeer(first, `Newer native input after legacy Unknown ${randomUUID()}`);
+  await brokerRpc(state, { op: "pause", paused: false });
+  await acceptedInput(first, afterLegacy);
+  assert((await brokerRpc(state, { op: "get", id: legacy.id }) as any).state === "unknown", "Legacy Unknown was relabeled");
+  assert(!await nativeInput(first.id, legacyNative), "Legacy Unknown was replayed");
+  const legacyJournal = new Database(join(state, "opencode-receipts.sqlite3"), { readonly: true });
+  try { assert(!legacyJournal.query("SELECT id FROM receipts WHERE id=?").get(legacy.id), "Legacy Unknown gained a native attempt"); }
+  finally { legacyJournal.close(); }
+  console.log(JSON.stringify({ phase: "native_legacy_unknown", legacy: legacy.id, newer: afterLegacy.id, newer_native: afterLegacy.native, legacy_replayed: false }));
+
+  if (process.env.AGENT_BRIDGE_NATIVE_MOVE_ONLY === "1") {
+    console.log(JSON.stringify({ result: "passed", scenario: "native_session_move" }));
+  } else {
   await brokerRpc(state, { op: "pause", paused: true });
   const long = await session("Disposable AGB-16 active tool and long paused queue");
   await prompt(long.id, longMarker, undefined, owner("default"));
@@ -353,6 +391,7 @@ try {
   assert(!nativeEvents.some(event => event.type === "permission.replied") && !permissionFinished.has(permissionMarker), "Harness answered owner permission");
   await writeFile(join(root, "checks.json"), JSON.stringify({ result: "passed", ordinary_exact_input: normalInputSeen, ordinary_recipient_tools: 0, ordinary_receipt_replies: 0, correlated_reply: replyID, native_id: mapped, active_tool: longPeer, alias_fifo: aliasPeer, stream: streamPeer, stream_error: errorPeer, unanswered_permission: permissionPeer, long_wait_ms: Date.now() - heldLong.created, model_requests: modelRequests }, null, 2));
   console.log(JSON.stringify({ result: "passed", opencode: "2.2.5", standalone_bun: Bun.version, embedded_bun: embeddedBun, model: "scripted localhost OpenAI-compatible fixture", model_requests: modelRequests, exact_session: first.id, native_acceptance: true, correlated_reply: true, readonly_reconciliation: true, active_tool: { session: long.id, native: longPeer.native, alias_native: aliasPeer.native, original_not_aborted: true, next_request_time: toolRequest.time }, active_stream: { session: stream.id, native: streamPeer.native, original_not_aborted: true, next_request_time: streamRequest.time }, long_wait: { age_ms: Date.now() - heldLong.created, held: heldLong, permission: heldPermission }, permission_input_accepted_unanswered: true, broker_pause_preserved: true, queued_cancel_preserved: true, alias_fifo: true, stream_error_no_replay: true, native_cancel_calls: 0, permission_reply_calls: 0, retry_calls: 0, manual_fetch_calls: 0 }));
+  }
   success = true;
 } finally {
   async function stopChild(child: ReturnType<typeof Bun.spawn>) {

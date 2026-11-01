@@ -271,6 +271,109 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
 describe("V2 durable inbox proof", () => {
   const delivery = { op: "deliver", session: A, id: ID, content: "Exact held native input" };
 
+  // Adapted from the AGB-33 P0 investigation fixture: the approved contract
+  // requires successful same-session delivery, rather than deferral.
+  test("P0: same session delivers after a location move", async () => {
+    const s = await setup(); await s.created(); s.admitInbox();
+    s.sessions.get(A).location = { directory: join(s.directory, "new-worktree") };
+    expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
+    expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
+    expect(s.prompts).toHaveLength(1);
+  });
+
+  test("P0: location move during native lookup preserves exact-session delivery", async () => {
+    const s = await setup(); await s.created(); s.admitInbox();
+    const gate = s.blockNext("get");
+    const pending = frame(s.endpoint(), delivery);
+    await gate.entered;
+    s.sessions.get(A).location = { directory: join(s.directory, "new-worktree") };
+    gate.release(); await gate.settled();
+    expect((await pending).status).toBe("inserted");
+    expect(s.prompts).toHaveLength(1);
+  });
+
+  test("P0: startup scan reopens a session after its location moved", async () => {
+    const s = await setup([A]);
+    await s.created();
+    s.sessions.get(A).location = { directory: join(s.directory, "new-worktree") };
+    await s.reload();
+    for (let i = 0; i < 20 && !s.registrations.has(A); i++) await Bun.sleep(10);
+    expect(s.registrations.has(A)).toBe(true);
+    s.admitInbox();
+    expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
+    expect(s.prompts).toHaveLength(1);
+  });
+
+  test("P0: a known pre-attempt lookup rejection does not claim native uncertainty", async () => {
+    const s = await setup(); await s.created();
+    const gate = s.blockNext("get", 0, true);
+    const pending = frame(s.endpoint(), delivery);
+    await gate.entered; gate.release(); await gate.settled();
+    expect((await pending).status).toBe("deferred");
+    expect(s.prompts).toHaveLength(0);
+    expect(s.requests.filter(r => r.op === "opencode_admit")).toHaveLength(0);
+  });
+
+  test("P0: lookup rejection cannot downgrade an existing native attempt", async () => {
+    const s = await setup(); await s.created();
+    const journal = await Journal.open(s.directory);
+    const identity = { namespace: NAMESPACE, session: A, id: ID, content: delivery.content, native_message_id: NATIVE };
+    journal.prepare(identity); expect(journal.attempt(identity)).toBe(true); journal.close();
+    const gate = s.blockNext("get", 0, true);
+    const pending = frame(s.endpoint(), delivery);
+    await gate.entered; gate.release(); await gate.settled();
+    expect((await pending).status).toBe("uncertain");
+    expect(s.prompts).toHaveLength(0);
+  });
+
+  test("P0: lost close response does not erase a proven pre-attempt deferral", async () => {
+    const s = await setup(); await s.created();
+    s.brokerResponse(async request => request.op === "opencode_close" ? false : undefined);
+    const gate = s.blockNext("get", 0, true);
+    const pending = frame(s.endpoint(), delivery);
+    await gate.entered; gate.release(); await gate.settled();
+    const result = await pending;
+    s.brokerResponse(undefined);
+    expect(result.status).toBe("deferred");
+    expect(s.prompts).toHaveLength(0);
+  }, 15000);
+
+  test("P0: rejected pre-admission transcript lookup defers an untouched attempt", async () => {
+    const s = await setup(); await s.created();
+    const gate = s.blockNext("context", 0, true);
+    const pending = frame(s.endpoint(), delivery);
+    await gate.entered; gate.release(); await gate.settled();
+    expect((await pending).status).toBe("deferred");
+    expect(s.prompts).toHaveLength(0);
+    expect(s.requests.filter(r => r.op === "opencode_admit")).toHaveLength(0);
+    expect(s.journalState()).toEqual([]);
+  });
+
+  test("P0: rejected transcript lookup cannot downgrade an existing attempt", async () => {
+    const s = await setup(); await s.created();
+    const journal = await Journal.open(s.directory);
+    const identity = { namespace: NAMESPACE, session: A, id: ID, content: delivery.content, native_message_id: NATIVE };
+    journal.prepare(identity); expect(journal.attempt(identity)).toBe(true); journal.close();
+    const gate = s.blockNext("context", 0, true);
+    const pending = frame(s.endpoint(), delivery);
+    await gate.entered; gate.release(); await gate.settled();
+    expect((await pending).status).toBe("uncertain");
+    expect(s.prompts).toHaveLength(0);
+  });
+
+  test("P0: transcript rejection checks an attempt created while lookup was in flight", async () => {
+    const s = await setup(); await s.created();
+    const gate = s.blockNext("context", 0, true);
+    const pending = frame(s.endpoint(), delivery);
+    await gate.entered;
+    const journal = await Journal.open(s.directory);
+    const identity = { namespace: NAMESPACE, session: A, id: ID, content: delivery.content, native_message_id: NATIVE };
+    journal.prepare(identity); expect(journal.attempt(identity)).toBe(true); journal.close();
+    gate.release(); await gate.settled();
+    expect((await pending).status).toBe("uncertain");
+    expect(s.prompts).toHaveLength(0);
+  });
+
   test("held tool or permission accepts once before transcript/model consumption", async () => {
     const s = await setup(); await s.created(); s.admitInbox();
     expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
@@ -618,12 +721,12 @@ describe("V2 plugin with real private Unix sockets", () => {
     expect(s.prompts).toHaveLength(0);
     expect(s.registrations.has(A)).toBe(false);
   });
-  test("sessions outside this location are ignored everywhere", async () => {
+  test("live session events remain valid after a location move", async () => {
     const s = await setup();
     await s.created();
     pushForeign(s, "session.created", { sessionID: B });
     await Bun.sleep(30);
-    expect(s.registrations.has(B)).toBe(false);
+    expect(s.registrations.has(B)).toBe(true);
     expect(s.prompts).toHaveLength(0);
     function pushForeign(fixture: any, type: string, data: any) {
       fixture.pushEvent({ type, data, location: { directory: "/other/location" } });
@@ -684,6 +787,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created(); s.sessions.get(A).time.archived = 1;
     const result = await frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "hello" });
     expect(result.ok).toBe(false); expect(s.prompts).toHaveLength(0);
+    expect(result.status).toBe("deferred");
     expect(s.registrations.has(A)).toBe(false);
   });
   test("receipt mismatch never reports submission", async () => {
@@ -1161,10 +1265,10 @@ describe("V2 session context without peer transcript setup", () => {
     expect(output).toEqual([part("native system")]);
     expect(s.prompts).toHaveLength(0);
   });
-  test("wrong native session and directory omit context while preserving native chat", async () => {
+  test("a moved native session keeps context but wrong identity omits it", async () => {
     const s = await setup(); await s.created();
     s.sessions.get(A).location.directory = "/other/plugin-instance";
-    expect(await systemContext(s, A)).toEqual([part("native system")]);
+    expect(partsOf(await systemContext(s, A)).join("\n")).toContain("opencode-" + A);
     s.sessions.get(A).location.directory = s.directory; s.wrongIdentity();
     expect(await systemContext(s, A)).toEqual([part("native system")]); expect(s.prompts).toHaveLength(0);
   });

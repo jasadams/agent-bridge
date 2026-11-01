@@ -33,6 +33,16 @@ pub(crate) struct Dispatch {
     pub endpoint: String,
 }
 impl Db {
+    pub(crate) fn opencode_attempt_diagnostic(&self, id: &str) -> Result<Option<Value>> {
+        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> = self.conn.query_row(
+            "SELECT d.session,json_extract(c.destination,'$.opencode_attempt_detail'),json_extract(c.destination,'$.opencode_attempt_generation'),json_extract(c.destination,'$.opencode_attempt_id'),json_extract(c.destination,'$.opencode_attempt_timestamp'),json_extract(c.destination,'$.opencode_attempt_timestamp_kind') FROM message_context c JOIN opencode_deliveries d ON d.id=c.id JOIN messages m ON m.id=d.id WHERE c.id=? AND (json_extract(c.destination,'$.opencode_attempt_detail') IS NOT NULL OR m.state='uncertain' OR d.phase IN ('legacy','reconcile') OR (d.phase='inserted' AND length(d.native_id)=36 AND substr(d.native_id,1,4)='msg_'))",
+            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).optional()?;
+        Ok(row.map(|(session, detail, generation, attempt, timestamp, timestamp_kind)| match detail {
+            Some(detail) => json!({"status":"recorded","message_id":id,"session":session,"detail":detail,"generation":generation,"attempt":attempt,"timestamp":timestamp,"timestamp_kind":timestamp_kind}),
+            None => json!({"status":"unavailable","message_id":id,"session":session}),
+        }))
+    }
     pub(crate) fn opencode_alias_admission(&self, agent: &Agent) -> Result<()> {
         let valid: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_leases WHERE session=?1 AND endpoint=?2 AND expires>?3)",params![agent.session,agent.endpoint,now()],|r|r.get(0))?;
         ensure!(
@@ -65,7 +75,7 @@ impl Db {
         let mut recovery = json!({"total":total,"truncated":total>LIMIT as i64,"items":items});
         if total > 0 {
             recovery["instruction"] = json!(
-                "Delivery may remain blocked by uncertain native insertion. Inspect each ID, then explicitly run agent-bridge --state-dir SAME_BROKER_STATE_DIR retry ID (default allow_duplicate=false). Retry reads existing native proof only; missing proof remains uncertain. Queued reconciliation has not necessarily run; after restart or lease change, explicitly retry the same ID again if it remains queued. Route or lease mismatches may require restoring the original exact session registration before retry."
+                "An uncertain native insertion does not block later eligible messages, though queue capacity and route or lease restrictions still apply. Inspect each ID, then explicitly run agent-bridge --state-dir SAME_BROKER_STATE_DIR retry ID (default allow_duplicate=false). Retry reads existing native proof only; missing proof remains uncertain. Queued reconciliation has not necessarily run; after restart or lease change, explicitly retry the same ID again if it remains queued. Route or lease mismatches may require restoring the original exact session registration before retry."
             );
         }
         Ok(recovery)
@@ -331,7 +341,33 @@ impl Db {
         detail: &str,
     ) -> Result<()> {
         let valid: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id JOIN opencode_leases l ON l.session=d.session WHERE m.state='sending' AND d.id=?1 AND d.generation=?2 AND d.attempt=?3 AND l.generation=d.generation AND l.endpoint=?4 AND l.expires>?5)",params![id,dispatch.generation,dispatch.attempt,dispatch.endpoint,now()],|r|r.get(0))?;
+        if dispatch.frame["op"] == "deliver"
+            && state != "queued"
+            && (state != "submitted" || !valid)
+        {
+            let original_detail = if state == "submitted" && !valid {
+                "OpenCode generation changed before receipt; read-only reconciliation required"
+            } else {
+                detail
+            };
+            self.conn.execute(
+                "UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail',?1,'$.opencode_attempt_generation',?2,'$.opencode_attempt_id',?3,'$.opencode_attempt_timestamp',?5,'$.opencode_attempt_timestamp_kind','detected') WHERE id=?4 AND json_type(destination,'$.opencode_attempt_detail') IS NULL AND json_type(destination,'$.opencode_attempt_generation') IS NULL AND json_type(destination,'$.opencode_attempt_id') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp_kind') IS NULL AND EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id WHERE d.id=?4 AND d.generation=?2 AND d.attempt=?3 AND m.state='sending')",
+                params![original_detail, dispatch.generation, dispatch.attempt, id, now()],
+            )?;
+        }
         if !valid {
+            if state == "queued" && dispatch.frame["op"] == "deliver" {
+                // A correlated deferred receipt proves this dispatch made no
+                // native attempt. Lease loss still requires explicit retry: do
+                // not silently rebind it or affect a newer in-flight attempt.
+                let tx = self.conn.unchecked_transaction()?;
+                let changed = tx.execute("UPDATE opencode_deliveries SET phase='queued' WHERE id=?1 AND generation=?2 AND attempt=?3 AND phase='dispatched' AND EXISTS(SELECT 1 FROM messages m WHERE m.id=?1 AND m.state='sending')", params![id,dispatch.generation,dispatch.attempt])?;
+                if changed == 1 {
+                    tx.execute("UPDATE messages SET state='failed',detail=?1,updated=?2 WHERE id=?3 AND state='sending'", params![format!("OpenCode deferred before native attempt; lease changed, explicitly retry: {detail}"),now(),id])?;
+                }
+                tx.commit()?;
+                return Ok(());
+            }
             self.conn.execute("UPDATE messages SET state='uncertain',detail='OpenCode generation changed before receipt; read-only reconciliation required',updated=?1 WHERE id=?2 AND state='sending' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=?2 AND d.generation=?3 AND d.attempt=?4)",params![now(),id,dispatch.generation,dispatch.attempt])?;
             self.conn.execute("UPDATE opencode_deliveries SET phase='uncertain' WHERE id=?1 AND generation=?2 AND attempt=?3",params![id,dispatch.generation,dispatch.attempt])?;
             return Ok(());
@@ -469,6 +505,378 @@ mod tests {
             .opencode_dispatch(&msg, &agent, "stable rendered envelope")
             .unwrap();
         (msg, dispatch)
+    }
+
+    #[test]
+    fn unknown_attempt_does_not_block_later_delivery_or_replay() {
+        let (_root, mut db, agent, _) = setup();
+        let first = send(&db, &agent.name);
+        let (claimed, attempt) = dispatch(&mut db);
+        assert_eq!(claimed.id, first.id);
+        db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
+            .unwrap();
+        let second = send(&db, &agent.name);
+        let (claimed, next) = dispatch(&mut db);
+        assert_eq!(claimed.id, second.id);
+        assert_eq!(next.frame["op"], "deliver");
+        db.opencode_finish(&second.id, &next, "submitted", "accepted")
+            .unwrap();
+        assert_eq!(
+            db.delivery_state(&db.get(&first.id).unwrap()).unwrap(),
+            "unknown"
+        );
+        assert!(db.claim().unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_unknown_does_not_block_new_delivery() {
+        let (_root, mut db, agent, _) = setup();
+        let legacy = send(&db, &agent.name);
+        db.conn
+            .execute(
+                "UPDATE opencode_deliveries SET phase='legacy' WHERE id=?",
+                [&legacy.id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE messages SET state='uncertain' WHERE id=?",
+                [&legacy.id],
+            )
+            .unwrap();
+        let second = send(&db, &agent.name);
+        let (claimed, attempt) = dispatch(&mut db);
+        assert_eq!(claimed.id, second.id);
+        assert_eq!(attempt.frame["op"], "deliver");
+        assert_eq!(
+            db.delivery_state(&db.get(&legacy.id).unwrap()).unwrap(),
+            "unknown"
+        );
+        let phase: String = db
+            .conn
+            .query_row(
+                "SELECT phase FROM opencode_deliveries WHERE id=?",
+                [&legacy.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "legacy");
+    }
+
+    #[test]
+    fn failed_head_does_not_block_later_delivery() {
+        let (_root, mut db, agent, _) = setup();
+        let first = send(&db, &agent.name);
+        db.conn
+            .execute("UPDATE messages SET state='failed' WHERE id=?", [&first.id])
+            .unwrap();
+        let second = send(&db, &agent.name);
+        let (claimed, attempt) = dispatch(&mut db);
+        assert_eq!(claimed.id, second.id);
+        assert_eq!(attempt.frame["op"], "deliver");
+        assert_eq!(db.get(&first.id).unwrap().state, "failed");
+    }
+
+    #[test]
+    fn original_attempt_diagnostic_survives_readonly_reconciliation() {
+        let (_root, mut db, agent, _) = setup();
+        let first = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        db.opencode_finish(
+            &first.id,
+            &attempt,
+            "uncertain",
+            "original lookup rejection",
+        )
+        .unwrap();
+        db.retry(&first.id, false).unwrap();
+        let (_, reconcile) = dispatch(&mut db);
+        db.opencode_finish(
+            &first.id,
+            &reconcile,
+            "uncertain",
+            "reconciliation found no proof",
+        )
+        .unwrap();
+        let diagnostic: Option<String> = db.conn.query_row(
+            "SELECT json_extract(destination,'$.opencode_attempt_detail') FROM message_context WHERE id=?",
+            [&first.id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(diagnostic.as_deref(), Some("original lookup rejection"));
+        assert_eq!(
+            db.get(&first.id).unwrap().detail.as_deref(),
+            Some("reconciliation found no proof")
+        );
+    }
+
+    #[test]
+    fn original_diagnostic_includes_identity_and_survives_reconciliations_and_restart() {
+        let (root, mut db, agent, _) = setup();
+        let first = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        let before = now();
+        db.opencode_finish(&first.id, &attempt, "uncertain", "native receipt lost")
+            .unwrap();
+        let original = db.opencode_attempt_diagnostic(&first.id).unwrap().unwrap();
+        assert_eq!(original["message_id"], first.id);
+        assert_eq!(original["session"], SESSION);
+        assert_eq!(original["generation"], attempt.generation);
+        assert_eq!(original["attempt"], attempt.attempt);
+        assert!(original["timestamp"].as_i64().unwrap() >= before);
+        for _ in 0..2 {
+            db.retry(&first.id, false).unwrap();
+            let (_, reconcile) = dispatch(&mut db);
+            db.opencode_finish(
+                &first.id,
+                &reconcile,
+                "uncertain",
+                "latest readback unavailable",
+            )
+            .unwrap();
+            assert_eq!(
+                db.opencode_attempt_diagnostic(&first.id).unwrap().unwrap(),
+                original
+            );
+        }
+        drop(db);
+        let reopened = Db::open(&root.path().join("db")).unwrap();
+        assert_eq!(
+            reopened
+                .opencode_attempt_diagnostic(&first.id)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert_eq!(
+            reopened.get(&first.id).unwrap().detail.as_deref(),
+            Some("latest readback unavailable")
+        );
+    }
+
+    #[test]
+    fn legacy_unknown_reports_original_evidence_unavailable() {
+        let (_root, db, agent, _) = setup();
+        let legacy = send(&db, &agent.name);
+        db.conn
+            .execute(
+                "UPDATE opencode_deliveries SET phase='legacy' WHERE id=?",
+                [&legacy.id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE messages SET state='uncertain',detail='latest reconciliation' WHERE id=?",
+                [&legacy.id],
+            )
+            .unwrap();
+        let diagnostic = db.opencode_attempt_diagnostic(&legacy.id).unwrap().unwrap();
+        assert_eq!(diagnostic["status"], "unavailable");
+        assert!(diagnostic.get("detail").is_none());
+    }
+
+    #[test]
+    fn restart_during_dispatch_retains_original_identity_across_reconciliations() {
+        let (root, mut db, agent, _) = setup();
+        let message = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        drop(db);
+        let mut db = Db::open(&root.path().join("db")).unwrap();
+        let original = db
+            .opencode_attempt_diagnostic(&message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original["status"], "recorded");
+        assert_eq!(original["attempt"], attempt.attempt);
+        assert_eq!(original["generation"], attempt.generation);
+        assert!(original["detail"].as_str().unwrap().contains("stopped"));
+        assert!(original["timestamp"].is_number());
+        db.opencode_observe(&agent, true).unwrap();
+        for _ in 0..2 {
+            db.retry(&message.id, false).unwrap();
+            let (_, readback) = dispatch(&mut db);
+            db.opencode_finish(&message.id, &readback, "uncertain", "readback unresolved")
+                .unwrap();
+            assert_eq!(
+                db.opencode_attempt_diagnostic(&message.id)
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn restart_does_not_fill_missing_timestamp_of_existing_original_evidence() {
+        let (root, mut db, agent, _) = setup();
+        let message = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        db.conn.execute("UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail','historical original','$.opencode_attempt_generation',?1,'$.opencode_attempt_id',?2) WHERE id=?3", params![attempt.generation, attempt.attempt, message.id]).unwrap();
+        drop(db);
+        let db = Db::open(&root.path().join("db")).unwrap();
+        let original = db
+            .opencode_attempt_diagnostic(&message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original["detail"], "historical original");
+        assert!(original["timestamp"].is_null());
+        assert!(original["timestamp_kind"].is_null());
+    }
+
+    #[test]
+    fn later_outcome_does_not_fill_missing_original_evidence() {
+        let (_root, mut db, agent, _) = setup();
+        let message = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        db.conn.execute("UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail','historical original') WHERE id=?", [&message.id]).unwrap();
+        db.opencode_finish(&message.id, &attempt, "uncertain", "later outcome")
+            .unwrap();
+        let original = db
+            .opencode_attempt_diagnostic(&message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original["detail"], "historical original");
+        assert!(original["timestamp"].is_null());
+        assert!(original["generation"].is_null());
+        assert!(original["attempt"].is_null());
+    }
+
+    #[test]
+    fn stale_success_records_generation_change_as_unknown_cause() {
+        let (_root, mut db, agent, generation) = setup();
+        let message = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        db.opencode_close(SESSION, &agent.endpoint, &generation)
+            .unwrap();
+        db.opencode_finish(
+            &message.id,
+            &attempt,
+            "submitted",
+            "native acceptance verified",
+        )
+        .unwrap();
+        let original = db
+            .opencode_attempt_diagnostic(&message.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            original["detail"]
+                .as_str()
+                .unwrap()
+                .contains("generation changed")
+        );
+        assert_eq!(original["attempt"], attempt.attempt);
+    }
+
+    #[test]
+    fn legacy_unavailable_evidence_remains_visible_after_positive_reconciliation() {
+        let (_root, mut db, agent, _) = setup();
+        let message = send(&db, &agent.name);
+        let legacy_native = format!("msg_{}", message.id.replace('-', ""));
+        db.conn
+            .execute(
+                "UPDATE opencode_deliveries SET phase='legacy',native_id=?1 WHERE id=?2",
+                params![legacy_native, message.id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE messages SET state='uncertain' WHERE id=?",
+                [&message.id],
+            )
+            .unwrap();
+        db.retry(&message.id, false).unwrap();
+        let (_, readback) = dispatch(&mut db);
+        assert_eq!(readback.frame["op"], "reconcile");
+        db.opencode_finish(&message.id, &readback, "submitted", "verified")
+            .unwrap();
+        assert_eq!(
+            db.opencode_attempt_diagnostic(&message.id)
+                .unwrap()
+                .unwrap()["status"],
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn uncertain_attempt_diagnostic_supersedes_earlier_safe_deferral() {
+        let (_root, mut db, agent, generation) = setup();
+        let message = send(&db, &agent.name);
+        let (_, deferred) = dispatch(&mut db);
+        db.opencode_finish(&message.id, &deferred, "queued", "safe lookup deferral")
+            .unwrap();
+        db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
+            .unwrap();
+        let (_, attempted) = dispatch(&mut db);
+        db.opencode_finish(&message.id, &attempted, "uncertain", "native receipt lost")
+            .unwrap();
+        db.retry(&message.id, false).unwrap();
+        let (_, reconcile) = dispatch(&mut db);
+        db.opencode_finish(
+            &message.id,
+            &reconcile,
+            "uncertain",
+            "reconciliation absent",
+        )
+        .unwrap();
+        let diagnostic = db
+            .opencode_attempt_diagnostic(&message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(diagnostic["detail"], "native receipt lost");
+        assert_eq!(diagnostic["attempt"], attempted.attempt);
+        assert_eq!(diagnostic["generation"], attempted.generation);
+    }
+
+    #[test]
+    fn proven_pre_attempt_deferral_survives_generation_close_without_unknown() {
+        let (_root, mut db, agent, generation) = setup();
+        let message = send(&db, &agent.name);
+        let (_, attempt) = dispatch(&mut db);
+        db.opencode_close(SESSION, &agent.endpoint, &generation)
+            .unwrap();
+        db.opencode_finish(
+            &message.id,
+            &attempt,
+            "queued",
+            "lookup rejected before admission",
+        )
+        .unwrap();
+        assert_eq!(
+            db.delivery_state(&db.get(&message.id).unwrap()).unwrap(),
+            "failed"
+        );
+        let phase: String = db
+            .conn
+            .query_row(
+                "SELECT phase FROM opencode_deliveries WHERE id=?",
+                [&message.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "queued");
+        let mut replacement = agent.clone();
+        replacement.endpoint = format!("/tmp/{}.sock", uuid::Uuid::new_v4());
+        db.opencode_observe(&replacement, true).unwrap();
+        db.retry(&message.id, false).unwrap();
+        let (_, newer) = dispatch(&mut db);
+        db.opencode_finish(&message.id, &attempt, "queued", "late stale deferred")
+            .unwrap();
+        assert_eq!(db.get(&message.id).unwrap().state, "sending");
+        let phase: String = db
+            .conn
+            .query_row(
+                "SELECT phase FROM opencode_deliveries WHERE id=?",
+                [&message.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "dispatched");
+        db.opencode_finish(&message.id, &newer, "uncertain", "new native receipt lost")
+            .unwrap();
+        assert_eq!(
+            db.delivery_state(&db.get(&message.id).unwrap()).unwrap(),
+            "unknown"
+        );
     }
 
     #[test]
@@ -867,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_alias_fifo_deferred_and_uncertain_heads_remain_barriers() {
+    fn canonical_alias_fifo_deferral_and_unknown_reconciliation() {
         let (_root, mut db, agent, generation) = setup();
         let mut alias = agent.clone();
         alias.name = "alias".into();
@@ -887,7 +1295,11 @@ mod tests {
             .unwrap();
         db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
             .unwrap();
-        assert!(db.claim().unwrap().is_none());
+        let (msg, next) = dispatch(&mut db);
+        assert_eq!(msg.id, second.id);
+        assert_eq!(next.frame["op"], "deliver");
+        db.opencode_finish(&second.id, &next, "submitted", "accepted")
+            .unwrap();
         db.retry(&first.id, false).unwrap();
         let (msg, reconcile) = dispatch(&mut db);
         assert_eq!(msg.id, first.id);
@@ -895,7 +1307,7 @@ mod tests {
         assert_eq!(reconcile.frame["content"], "stable rendered envelope");
         db.opencode_finish(&first.id, &reconcile, "submitted", "verified readonly")
             .unwrap();
-        assert_eq!(db.claim().unwrap().unwrap().0.id, second.id);
+        assert!(db.claim().unwrap().is_none());
     }
     #[test]
     fn admission_refreshes_pause_and_cancel_and_queue_capacity_includes_retries() {
@@ -1247,7 +1659,15 @@ mod tests {
         db.opencode_observe(&agent, true).unwrap();
         db.pause(false).unwrap();
         let newer = send(&db, &agent.name);
-        assert!(db.claim().unwrap().is_none());
+        let (tail, tail_attempt) = dispatch(&mut db);
+        assert_eq!(tail.id, newer.id);
+        assert_eq!(tail_attempt.frame["op"], "deliver");
+        db.opencode_finish(&tail.id, &tail_attempt, "submitted", "accepted")
+            .unwrap();
+        assert_eq!(
+            db.delivery_state(&db.get(&legacy.id).unwrap()).unwrap(),
+            "unknown"
+        );
         db.retry(&legacy.id, true).unwrap();
         let (msg, reconcile) = dispatch(&mut db);
         assert_eq!(msg.id, legacy.id);
@@ -1284,7 +1704,7 @@ mod tests {
             "Exact old native insertion verified read-only; no new prompt",
         )
         .unwrap();
-        assert_eq!(db.claim().unwrap().unwrap().0.id, newer.id);
+        assert!(db.claim().unwrap().is_none());
     }
     #[test]
     fn attempted_reconciliation_cannot_cancel_or_disappear_on_alias_replacement() {
@@ -1330,7 +1750,12 @@ mod tests {
             .unwrap();
         db.retry(&first.id, false).unwrap();
         db.retry(&second.id, false).unwrap();
-        db.retry(&earlier.id, false).unwrap(); // Older row ID cannot outrank an unresolved attempt.
+        db.retry(&earlier.id, false).unwrap();
+        let (msg, attempt) = dispatch(&mut db);
+        assert_eq!(msg.id, earlier.id);
+        assert_eq!(attempt.frame["op"], "deliver");
+        db.opencode_finish(&msg.id, &attempt, "submitted", "accepted")
+            .unwrap();
         let (msg, attempt) = dispatch(&mut db);
         assert_eq!(msg.id, first.id);
         assert_eq!(attempt.frame["op"], "reconcile");
@@ -1381,7 +1806,7 @@ mod tests {
         assert_eq!(phase, "queued");
     }
     #[test]
-    fn revoked_unshared_or_disabled_remote_reconciliation_never_releases_fresh_tail() {
+    fn revoked_remote_reconciliation_is_readonly_and_independent_tail_can_deliver() {
         use crate::network::wire::{Envelope, RemoteAgent};
         for policy_change in ["revoke", "unshare", "disable"] {
             let (_root, mut db, agent, _) = setup();
@@ -1436,13 +1861,10 @@ mod tests {
                 _ => db.unregister(&agent.name, &agent.session).unwrap(),
             }
             let tail = send(&db, &alias.name);
-            if let Some((claimed, target)) = db.claim().unwrap() {
+            let (mut claimed, mut target) = db.claim().unwrap().unwrap();
+            if claimed.id == old.id {
                 // Historical exact readback is local and read-only: it requires
                 // no fresh Receive grant and can never become native submission.
-                assert_eq!(
-                    claimed.id, old.id,
-                    "Fresh tail bypassed unresolved policy-blocked attempt"
-                );
                 let proof = db
                     .opencode_dispatch(&claimed, &target, "stable rendered envelope")
                     .unwrap();
@@ -1454,13 +1876,16 @@ mod tests {
                     "native insertion remains unverified",
                 )
                 .unwrap();
+                (claimed, target) = db.claim().unwrap().unwrap();
             }
             assert_eq!(db.get(&old.id).unwrap().state, "uncertain");
-            assert_eq!(db.get(&tail.id).unwrap().state, "queued");
-            assert!(
-                db.claim().unwrap().is_none(),
-                "Unresolved native attempt lost its canonical barrier"
-            );
+            assert_eq!(claimed.id, tail.id);
+            let next = db
+                .opencode_dispatch(&claimed, &target, "stable rendered envelope")
+                .unwrap();
+            assert_eq!(next.frame["op"], "deliver");
+            db.opencode_finish(&tail.id, &next, "submitted", "accepted")
+                .unwrap();
             if policy_change != "disable" {
                 assert!(
                     !db.peer_allowed(
@@ -1488,7 +1913,11 @@ mod tests {
             .to_owned();
         db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
             .unwrap();
-        assert!(db.claim().unwrap().is_none());
+        let (tail, tail_attempt) = dispatch(&mut db);
+        assert_eq!(tail.id, second.id);
+        assert_eq!(tail_attempt.frame["op"], "deliver");
+        db.opencode_finish(&tail.id, &tail_attempt, "submitted", "accepted")
+            .unwrap();
         let now = crate::db::now();
         assert_eq!(db.opencode_sweep_uncertain(now).unwrap(), 1);
         let row = |db: &Db| -> (String, i64, Option<i64>) {
@@ -1520,9 +1949,7 @@ mod tests {
         assert_eq!(phase, "inserted");
         assert_eq!(attempts, 0, "terminal insertion resets backoff");
         assert_eq!(at, None);
-        // The follower queued behind the resolved head is no longer starved.
-        let (next, _) = dispatch(&mut db);
-        assert_eq!(next.id, second.id);
+        assert!(db.claim().unwrap().is_none());
     }
 
     #[test]

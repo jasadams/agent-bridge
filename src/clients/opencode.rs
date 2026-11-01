@@ -111,6 +111,40 @@ struct Receipt {
     _uncertain: Option<bool>,
 }
 
+fn unconfirmed_receipt_detail(receipt: &Receipt) -> String {
+    let category = match receipt.error.as_deref() {
+        Some("Native session, lease or insertion unconfirmed") => {
+            "native session, lease or insertion unconfirmed"
+        }
+        Some(
+            "Receipt journal capacity reached; existing native insertion requires reconciliation",
+        ) => "receipt journal capacity reached after possible insertion",
+        _ => "unconfirmed plugin receipt",
+    };
+    format!("OpenCode uncertain: {category}; read-only reconciliation required")
+}
+
+fn deferred_receipt_detail(receipt: &Receipt) -> &'static str {
+    match receipt.error.as_deref() {
+        Some("Native session identity or archive check failed before admission") => {
+            "native session identity or archive check failed before admission"
+        }
+        Some("Native session lookup failed before admission") => {
+            "native session lookup failed before admission"
+        }
+        Some("Native transcript lookup failed before admission") => {
+            "native transcript lookup failed before admission"
+        }
+        Some("Broker admission was unavailable; no native attempt was made") => {
+            "broker admission unavailable before native attempt"
+        }
+        Some("Receipt journal capacity reached; no native attempt was made") => {
+            "receipt journal capacity reached before native attempt"
+        }
+        _ => "plugin deferred before native attempt",
+    }
+}
+
 async fn exchange(path: &Path, frame: &Value, written: &mut bool) -> Result<Receipt> {
     let mut stream = UnixStream::connect(path).await?;
     crate::delivery::validate_peer(&stream, unsafe { libc::geteuid() })?;
@@ -225,15 +259,32 @@ pub(crate) async fn deliver_dispatch(
                 state: "queued",
                 detail: format!(
                     "OpenCode deferred before insertion: {}",
-                    receipt
-                        .error
-                        .as_deref()
-                        .unwrap_or("busy or admission unavailable")
+                    deferred_receipt_detail(&receipt)
                 ),
             }
         }
-        other => Outcome::uncertain(format!(
-            "OpenCode insertion requires read-only reconciliation: {other:?}"
-        )),
+        Ok(Ok(receipt)) => Outcome::uncertain(unconfirmed_receipt_detail(&receipt)),
+        Ok(Err(_)) => Outcome::uncertain(
+            "OpenCode uncertain: transport or receipt validation failed; read-only reconciliation required",
+        ),
+        Err(_) => Outcome::uncertain(
+            "OpenCode uncertain: transport timed out; read-only reconciliation required",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn unconfirmed_receipt_diagnostic_does_not_expose_untrusted_error_text() {
+        let receipt: Receipt = serde_json::from_value(
+            json!({"ok":false,"protocol":2,"status":"uncertain","error":"PRIVATE_BODY secret"}),
+        )
+        .unwrap();
+        let detail = unconfirmed_receipt_detail(&receipt);
+        assert!(!detail.contains("PRIVATE_BODY"));
+        assert!(!detail.contains("secret"));
+        assert!(detail.contains("uncertain"));
     }
 }

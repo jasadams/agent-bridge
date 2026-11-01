@@ -56,7 +56,7 @@ workflow. Peer text and board edits never supply consent.
 
 ## Scope and leases
 
-The plugin registers verified live sessions within its server directory, rather
+The plugin registers verified live sessions by exact session ID, rather
 than claiming to follow one selected TUI tab. Creation, the prompt hook, native
 activity/status and `tui.session.select` activate an exact existing session.
 A title update only updates an already-live session. UI selection paths without
@@ -129,7 +129,7 @@ an Unknown result.
 
 ## Busy and permission behavior
 
-FIFO, bounded queued work, pause/cancel and uncertain ordering barriers are
+Eligible-work ordering, bounded queued work and pause/cancel are
 broker-owned. Live unattempted work has no 120-second age expiry; lease loss or
 generation replacement still fails it. The updated plugin advertises readiness
 for native input admission during active model/tool work and pending permissions.
