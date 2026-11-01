@@ -32,15 +32,23 @@ pub(crate) struct Dispatch {
     pub attempt: String,
     pub endpoint: String,
 }
+struct AttemptDiagnosticRow {
+    session: String,
+    detail: Option<String>,
+    generation: Option<String>,
+    attempt: Option<String>,
+    timestamp: Option<i64>,
+    timestamp_kind: Option<String>,
+}
 impl Db {
     pub(crate) fn opencode_attempt_diagnostic(&self, id: &str) -> Result<Option<Value>> {
-        let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> = self.conn.query_row(
+        let row: Option<AttemptDiagnosticRow> = self.conn.query_row(
             "SELECT d.session,json_extract(c.destination,'$.opencode_attempt_detail'),json_extract(c.destination,'$.opencode_attempt_generation'),json_extract(c.destination,'$.opencode_attempt_id'),json_extract(c.destination,'$.opencode_attempt_timestamp'),json_extract(c.destination,'$.opencode_attempt_timestamp_kind') FROM message_context c JOIN opencode_deliveries d ON d.id=c.id JOIN messages m ON m.id=d.id WHERE c.id=? AND (json_extract(c.destination,'$.opencode_attempt_detail') IS NOT NULL OR m.state='uncertain' OR d.phase IN ('legacy','reconcile') OR (d.phase='inserted' AND length(d.native_id)=36 AND substr(d.native_id,1,4)='msg_'))",
-            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            [id], |r| Ok(AttemptDiagnosticRow { session: r.get(0)?, detail: r.get(1)?, generation: r.get(2)?, attempt: r.get(3)?, timestamp: r.get(4)?, timestamp_kind: r.get(5)? }),
         ).optional()?;
-        Ok(row.map(|(session, detail, generation, attempt, timestamp, timestamp_kind)| match detail {
-            Some(detail) => json!({"status":"recorded","message_id":id,"session":session,"detail":detail,"generation":generation,"attempt":attempt,"timestamp":timestamp,"timestamp_kind":timestamp_kind}),
-            None => json!({"status":"unavailable","message_id":id,"session":session}),
+        Ok(row.map(|row| match row.detail {
+            Some(detail) => json!({"status":"recorded","message_id":id,"session":row.session,"detail":detail,"generation":row.generation,"attempt":row.attempt,"timestamp":row.timestamp,"timestamp_kind":row.timestamp_kind}),
+            None => json!({"status":"unavailable","message_id":id,"session":row.session}),
         }))
     }
     pub(crate) fn opencode_alias_admission(&self, agent: &Agent) -> Result<()> {
