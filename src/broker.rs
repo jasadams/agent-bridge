@@ -60,6 +60,7 @@ pub(crate) struct NetworkSnapshot {
 
 #[derive(Clone)]
 pub struct Broker {
+    service_lock: std::sync::Weak<File>,
     pub(crate) db: Arc<Mutex<Db>>,
     pub(crate) monitor_control: Arc<Mutex<crate::monitor::Control>>,
     pub(crate) wake: Arc<Notify>,
@@ -99,7 +100,7 @@ pub fn private_dir(path: &Path) -> Result<()> {
 pub struct BoundServer {
     pub listener: UnixListener,
     pub broker: Broker,
-    _lock: File,
+    _lock: Arc<File>,
     socket: PathBuf,
 }
 impl Drop for BoundServer {
@@ -193,6 +194,7 @@ impl Broker {
             .open(state_dir.join("service.lock"))?;
         lock.try_lock_exclusive()
             .context("Another agent-bridge service owns this state directory")?;
+        let lock = Arc::new(lock);
         let socket = state_dir.join("bridge.sock");
         ensure!(
             socket.as_os_str().len() < 104,
@@ -232,6 +234,7 @@ impl Broker {
         let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         let broker = Self {
+            service_lock: Arc::downgrade(&lock),
             db: Arc::new(Mutex::new(db)),
             monitor_control: Arc::new(Mutex::new(crate::monitor::Control::default())),
             wake: Arc::new(Notify::new()),
@@ -338,11 +341,28 @@ impl Broker {
         self.network_wake.notify_one();
         Ok(result)
     }
+    // A started blocking task is not cancelled when its waiter is dropped.
+    // Retain exclusive broker ownership until that task has actually finished.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(Broker) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let ownership = self
+            .service_lock
+            .upgrade()
+            .context("Broker ownership ended")?;
+        let broker = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ownership = ownership;
+            work(broker)
+        })
+        .await?
+    }
+
     pub async fn request_async(&self, req: Request) -> Result<Value> {
         match req {
             req @ (Request::OpenCodeObserve { .. } | Request::OpenCodeHeartbeat { .. }) => {
-                let broker = self.clone();
-                tokio::task::spawn_blocking(move || broker.request(req)).await?
+                self.blocking(move |broker| broker.request(req)).await
             }
             req @ Request::Register {
                 agent:
@@ -351,10 +371,7 @@ impl Broker {
                         ..
                     },
                 ..
-            } => {
-                let broker = self.clone();
-                tokio::task::spawn_blocking(move || broker.request(req)).await?
-            }
+            } => self.blocking(move |broker| broker.request(req)).await,
             Request::MonitorEnable { port } => {
                 self.monitor_control.lock().unwrap().enable(port);
                 timeout(Duration::from_secs(5), async {
@@ -447,7 +464,7 @@ impl Broker {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 self.start_contact(&contact.peer_id, routes, seconds, cancel, &snapshot, false)
             }
-            other => self.request(other),
+            other => self.blocking(move |broker| broker.request(other)).await,
         }
     }
 
@@ -2069,8 +2086,8 @@ impl Broker {
         let mut workers = JoinSet::new();
         let mut codex_workers = CodexWorkers::default();
         loop {
-            {
-                let db = self.db.lock().unwrap();
+            self.blocking(move |broker| -> Result<()> {
+                let db = broker.db.lock().unwrap();
                 let now = crate::db::now();
                 db.opencode_tick(now)?;
                 // Unresolved receipts block their session queue; reconcile them
@@ -2078,25 +2095,28 @@ impl Broker {
                 if let Err(error) = db.opencode_sweep_uncertain(now) {
                     eprintln!("OpenCode reconciliation sweep failed: {error:#}");
                 }
-                let mut state = self.board_notifications.lock().unwrap();
+                let mut state = broker.board_notifications.lock().unwrap();
                 state.reconcile(
                     crate::board_notifications::available(&db)?,
                     "OpenCode lease expired",
                 );
                 state.prune(|name| db.agent(name).ok());
-            }
+                Ok(())
+            })
+            .await?;
             // Construct and enable before querying so arrivals cannot be lost between query and wait.
             let notified = self.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             while workers.len() < 16 {
-                let next = {
-                    let mut db = self.db.lock().unwrap();
-                    self.revoke_event_controls_locked(&db)?;
-                    db.claim_excluding_codex(&codex_workers.sessions())?.map(|(msg, agent)| {
-                        let machines = json!({"source_machine":self.message_machine(&db, &msg.sender)?,"destination_machine":self.message_machine(&db, &msg.recipient)?,"sender_name":self.message_sender_name(&db, &msg.sender)});
+                let busy_codex = codex_workers.sessions();
+                let next = self.blocking(move |broker| -> Result<_> {
+                    let mut db = broker.db.lock().unwrap();
+                    broker.revoke_event_controls_locked(&db)?;
+                    Ok(db.claim_excluding_codex(&busy_codex)?.map(|(msg, agent)| {
+                        let machines = json!({"source_machine":broker.message_machine(&db, &msg.sender)?,"destination_machine":broker.message_machine(&db, &msg.recipient)?,"sender_name":broker.message_sender_name(&db, &msg.sender)});
                         let dispatch = if agent.provider==Provider::OpenCode {
-                            let content = crate::clients::Adapter::OpenCode.message_content(&msg,&self.state_dir,&machines);
+                            let content = crate::clients::Adapter::OpenCode.message_content(&msg,&broker.state_dir,&machines);
                             match db.opencode_dispatch(&msg,&agent,&content) {
                                 Ok(dispatch) => Some(dispatch),
                                 Err(error) => {
@@ -2108,8 +2128,8 @@ impl Broker {
                         let raw_codex_notice = agent.provider == Provider::Codex && db.codex_is_notice(&msg.id)?;
                         let event_token = db.event_control_token(&msg.id)?;
                         Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch, raw_codex_notice, event_token)))
-                    }).transpose()?.flatten()
-                };
+                    }).transpose()?.flatten())
+                }).await?;
                 let Some((msg, agent, machines, dispatch, raw_codex_notice, event_token)) = next
                 else {
                     break;
@@ -2149,15 +2169,24 @@ impl Broker {
                     {
                         this.board_notifications.lock().unwrap().lost(token, &agent);
                     }
-                    let db = this.db.lock().unwrap();
-                    let result = if let Some(dispatch) = &dispatch {
-                        db.opencode_finish(&msg.id, dispatch, outcome.state, &outcome.detail)
-                    } else {
-                        db.finish(&msg.id, outcome.state, &outcome.detail)
-                    };
-                    drop(db);
+                    let finish_id = msg.id.clone();
+                    let result = this
+                        .blocking(move |finish_broker| {
+                            let db = finish_broker.db.lock().unwrap();
+                            if let Some(dispatch) = &dispatch {
+                                db.opencode_finish(
+                                    &msg.id,
+                                    dispatch,
+                                    outcome.state,
+                                    &outcome.detail,
+                                )
+                            } else {
+                                db.finish(&msg.id, outcome.state, &outcome.detail)
+                            }
+                        })
+                        .await;
                     if let Err(e) = result {
-                        eprintln!("Could not persist delivery outcome {}: {e:#}", msg.id);
+                        eprintln!("Could not persist delivery outcome {}: {e:#}", finish_id);
                     }
                     this.wake.notify_one();
                     this.network_wake.notify_one();
@@ -2342,6 +2371,104 @@ pub async fn rpc(state_dir: &Path, req: &Request) -> Result<Value> {
     timeout(Duration::from_secs(seconds), operation)
         .await
         .context("Service request timed out; retry sends with the same --id")?
+}
+
+#[cfg(test)]
+mod request_scheduling_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_blocking_request_retains_service_ownership_until_finished() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+        let broker = bound.broker.clone();
+        let held = broker.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let _guard = held.db.lock().unwrap();
+            ready.wait();
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        barrier.wait();
+        let request =
+            tokio::spawn(async move { broker.request_async(Request::List { all: false }).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        request.abort();
+        let _ = request.await;
+        drop(bound);
+        let replacement_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state.join("service.lock"))
+            .unwrap();
+        let acquired = replacement_lock.try_lock_exclusive().is_ok();
+        if acquired {
+            FileExt::unlock(&replacement_lock).unwrap();
+        }
+        release.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(
+            !acquired,
+            "replacement broker acquired ownership while an old blocking request could still mutate state"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn database_contention_does_not_block_async_request_timers() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = bound.broker.clone();
+        let held = broker.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let owner = std::thread::spawn(move || {
+            let _guard = held.db.lock().unwrap();
+            ready.wait();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        barrier.wait();
+        let started = std::time::Instant::now();
+        let request =
+            tokio::spawn(async move { broker.request_async(Request::List { all: false }).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let elapsed = started.elapsed();
+        request.await.unwrap().unwrap();
+        owner.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "database contention blocked the async runtime for {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn database_contention_in_dispatch_does_not_block_async_timers() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = bound.broker.clone();
+        let held = broker.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let owner = std::thread::spawn(move || {
+            let _guard = held.db.lock().unwrap();
+            ready.wait();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        barrier.wait();
+        let started = std::time::Instant::now();
+        let dispatcher = tokio::spawn(async move { broker.dispatch().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let elapsed = started.elapsed();
+        dispatcher.abort();
+        let _ = dispatcher.await;
+        owner.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "dispatch blocked the async runtime for {elapsed:?}"
+        );
+    }
 }
 
 #[cfg(test)]
