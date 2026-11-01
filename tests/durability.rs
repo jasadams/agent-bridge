@@ -135,7 +135,7 @@ fn replies_are_correlated_and_bounded() {
             .is_err()
     );
     let (mut sender, mut recipient) = ("b", "a");
-    for hop in 1..=8 {
+    for hop in 1..=100 {
         let next = id();
         assert_eq!(
             db.send(&next, sender, recipient, "reply", &Some(parent))
@@ -146,10 +146,10 @@ fn replies_are_correlated_and_bounded() {
         parent = next;
         std::mem::swap(&mut sender, &mut recipient);
     }
-    assert!(
-        db.send(&id(), sender, recipient, "loop", &Some(parent))
-            .is_err()
-    );
+    let error = db
+        .send(&id(), sender, recipient, "too far", &Some(parent))
+        .unwrap_err();
+    assert!(error.to_string().contains("100-hop limit"));
 }
 
 #[test]

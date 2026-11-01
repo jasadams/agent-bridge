@@ -85,7 +85,7 @@ Retain the existing rule that an interrupted native submission becomes `uncertai
 
 Persist destination status events with monotonically increasing sequence numbers. The origin acknowledges its last persisted sequence and resumes synchronization after reconnect. Display the timestamp of the latest remote observation so stale status is visible. Agent acknowledgement propagates as a status event without waking the sender; an explicit reply is a new message and can wake its destination.
 
-Keep the eight-hop reply limit and validate parent references against known conversation records where available. Hop counts alone cannot prevent fresh-message loops, so add per-peer and per-recipient rate limits. Replies remain subject to directional grants; pairing setup should show whether both directions are permitted.
+Keep the 100-hop reply limit and validate parent references against known conversation records where available. Hop counts alone cannot prevent fresh-message loops, so add per-peer and per-recipient rate limits. Replies remain subject to directional grants; pairing setup should show whether both directions are permitted. Peers running older versions may still reject replies beyond eight hops.
 
 For the first release, cancellation stops transfers that have not started. After an attempted transfer, a lost receipt makes acceptance ambiguous; report that ambiguity and do not claim remote cancellation. Accepted remote deliveries continue at the destination. A later protocol can add explicit cancellation with race-aware results.
 
