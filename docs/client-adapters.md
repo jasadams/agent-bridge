@@ -6,8 +6,8 @@ message transport, lifecycle registration, and capabilities. Inbox has no native
 adapter: its history and message availability remain broker-owned.
 
 The Claude adapter owns private Unix socket validation and user-frame generation.
-The OpenCode adapter uses its pinned V1 plugin private socket, verifies exact live
-sessions and application insertion receipts, and shares native title metadata.
+The OpenCode adapter uses its pinned V2 plugin private socket, verifies exact live
+sessions and native client acceptance receipts, and shares native title metadata.
 Its durable canonical queue, generation leases and admission remain broker-owned;
 typed OpenCode controls enter that same queue with their raw control text.
 Direct adapter delivery without the broker's durable context fails closed. See
@@ -34,7 +34,7 @@ unchanged.
 Claude ordinary messages retain its native peer wrapper, sanitized sender display
 label, and compact stable references; Codex retains the shared peer envelope and
 reply references. OpenCode ordinary messages use a sender-labelled body
-with complete compact route/message references. Its V1 system context hook
+with complete compact route/message references. Its V2 system context hook
 supplies session-specific messaging guidance separately from peer message text.
 Locally generated `ControlNotice::BoardChanged` and `ControlNotice::Pairing` travel
 through a separate typed entry point and retain their existing text without a peer

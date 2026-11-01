@@ -2185,10 +2185,15 @@ impl Broker {
                     if raw_codex_notice && outcome.state == "submitted" {
                         outcome.detail = "Native accepted typed control".into();
                     }
-                    if outcome.state != "submitted"
+                    if outcome.state == "failed"
                         && let Some(token) = &event_token
                     {
                         this.board_notifications.lock().unwrap().lost(token, &agent);
+                    } else if outcome.state == "uncertain"
+                        && let Some(token) = &event_token
+                    {
+                        this.board_notifications.lock().unwrap().uncertain(token, &agent);
+                        eprintln!("Control {} has Unknown delivery after an ambiguous native attempt; lifecycle transitions require explicit snapshot recovery, without native resubmission: {}", msg.id, outcome.detail);
                     }
                     let finish_id = msg.id.clone();
                     let result = this

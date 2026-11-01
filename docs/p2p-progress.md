@@ -86,7 +86,7 @@ version does not synchronize boards between machines. See [shared board](board.m
 
 ## OpenCode local sessions
 
-A pinned OpenCode 1.18.35 V1 plugin and built-in local adapter register observed
+A pinned OpenCode 2.2.5 V2 plugin and built-in local adapter register verified
 live sessions, retain shared native titles and submit peer messages to exact
 existing conversations with ordinary retry deduplication. Native insertion
 receipts remain distinct from model read, task completion and correlated replies.

@@ -1,8 +1,9 @@
 # Message delivery outcomes
 
 Agent Bridge records one durable message lifecycle, exposed as four outcomes.
-AGB-33 retains existing disk/wire names through a single public projection; it
-introduces no migration or parallel lifecycle.
+AGB-33 retains existing broker disk/wire names through a single public projection;
+it introduces no broker migration or parallel lifecycle. The existing OpenCode
+plugin receipt journal has a separate additive schema-2 upgrade described below.
 
 | Outcome (`state`) | Meaning |
 | --- | --- |
@@ -25,13 +26,64 @@ Neither Delivered nor a correlated reply is an owner approval or a permission gr
 | --- | --- | --- |
 | Codex | A validated, request-correlated native queue receipt matching the submitted UUID and exact input; or a validated active `turn/steer` response matching the selected exact active turn. Private same-user socket, canonical home, loaded-thread and capability checks still apply. | Merely writing the socket, mismatched/lost response or malformed/contradictory receipt is Unknown. Active steer acceptance returns a turn ID, not proof of model consumption. Queue acceptance may wait behind existing native work. The exact recognized native queue-capacity rejection is Failed. |
 | Claude Code | The current socket-only adapter has no native acceptance receipt and therefore cannot establish Delivered from a successful write. | A successful socket write is Unknown, not acceptance. A definite pre-write rejection/failure is Failed; ambiguous writes stay Unknown. A later fixture-observed model request or reply is independent round-trip evidence, not a fabricated native receipt. |
-| OpenCode | Protocol-2 `inserted` receipt fenced to the exact broker namespace, session, generation, attempt and native message ID, after exact native readback verifies user role, session, ID and complete text. Read-only reconciliation can recover the same proof. | HTTP 204 from `promptAsync` alone is not insertion evidence. Lost/malformed/mismatched receipts, corrupt/missing attempt evidence or absent exact native readback remain Unknown. `deferred` is pre-attempt Pending, not hidden accepted work. |
+| OpenCode V2 | Exact supported `session.prompt` durable user-admission receipt, validated and committed to the existing receipt journal before success; alternatively exact scoped native transcript evidence. Protocol-2 `inserted` remains the compatibility token for verified client acceptance, not a transcript/model-processing claim. | Lost/malformed/mismatched native returns or a failed proof commit remain Unknown. Same-generation read-only reconciliation can use the original guarded durable journal proof. Missing proof, old/null-proof rows or a changed generation require independent exact transcript readback; absence never authorizes another prompt. `deferred` remains pre-attempt Pending. |
 | Local inbox | Durable acceptance into the exact local inbox. | Inbox acceptance does not mean an agent read it. |
 
 See [Codex delivery](codex-delivery.md), [OpenCode recovery](opencode-recovery.md)
 and [native sessions](native-sessions.md). Remote bridge durable transfer acceptance
 is not native acceptance: the sender synchronizes the destination's latest known
 outcome. Remote observations can be stale; inspect their observation timestamp.
+
+### OpenCode V2 proof and retained journal fields
+
+OpenCode **2.2.5**'s installed OpenAPI describes `POST /api/session/{sessionID}/prompt`
+as durable admission, returning `Session.Inbox.User`. This is not inferred from a
+type name: the versioned canonical [Session.prompt implementation](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/core/src/session/session.ts)
+awaits `SessionInbox.admit` and then returns the admitted input. The
+[inbox implementation](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/core/src/session/inbox.ts)
+publishes `InboxEnqueued`; the [Bus implementation](https://github.com/anomalyco/opencode/blob/v2.2.5/packages/core/src/bus.ts)
+commits the event and its projection in one immediate database transaction before
+publication returns. First admission wins by ID/session/type, even if a caller
+supplies changed text, so comparing the **returned** complete text is essential.
+Steered input is promoted from the durable inbox into transcript at a later safe
+step boundary; a held tool, stream or permission can delay that promotion.
+
+The plugin validates returned native ID, exact session, `type: user`, complete
+text, `delivery: steer`, finite creation time and absence of unexpected attachments.
+The existing namespace/generation/attempt guards and winning attempt CAS remain
+mandatory. The supported plugin API returns this receipt but does **not** expose
+the HTTP client's inbox-list method. Production uses no cast, guessed plugin API,
+configured HTTP integration or native-state scraping.
+
+Journal schema 2 transactionally adds one nullable `acceptance` column to the
+existing `receipts` table. A receipt commit atomically writes existing `inserted`
+state plus bounded JSON facts: original `generation`, original `attempt`, native
+`type`, `delivery`, and `created`. Namespace, message ID, session, native ID and
+complete text remain bound by the existing immutable row; text is not duplicated.
+No new table or lifecycle is added. Historical `inserted` rows retain NULL proof:
+they fence replay but do not fabricate a V2 admission receipt. Older journal
+readers reject schema 2; preserve the matching journal/plugin/broker backup for
+rollback. No tombstone deletion or down-migration is provided.
+
+`Journal.accepted()` is the only receipt-proof writer, after the original guarded
+native call. `hasAcceptance()` is consumed by duplicate delivery and read-only
+reconciliation; it checks immutable row identity, original proof shape and current
+generation. An ordinary delivery also checks the original attempt. Reconciliation
+instead has a **fresh request nonce**, echoed unchanged for the broker's current
+response fence: it does not overwrite or pretend to equal the original proof
+attempt. Original provenance is established by the guarded journal commit, not an
+invented independent broker field. `Journal.inserted()` retains the independent
+transcript-proof path and never manufactures receipt JSON. Exact transcript
+readback remains usable across a generation change or a missing receipt mapping.
+
+Both row preparation and proof commit count UTF-8 `content` **plus** `acceptance`
+bytes against the same 64-MiB ceiling; the 65,536-row ceiling is unchanged. A failed
+capacity/write commit after native admission remains Unknown with the original
+attempt fence. A lost native response **before** journal proof cannot be recovered
+from a pending inbox by this plugin; it remains Unknown until exact transcript
+evidence exists. A lost broker response **after** proof commit can reconcile in
+the same generation. Replaced generation, malformed proof, or legacy NULL proof
+requires exact transcript evidence. No recovery path calls `prompt` again.
 
 ## Capacity, recovery and cancellation
 
@@ -87,7 +139,7 @@ attempt never executed.
 | Historical stored `submitted`, `acknowledged`, `uncertain` labels | Read old history without destructive rewriting, replay or loss of provenance. Historical acknowledgement is receipt evidence only. Submitted rows need immutable captured provider evidence: Codex/OpenCode/inbox acceptance projects to Delivered; Claude or unknown provider projects to Unknown. Keep until an explicit, independently validated migration/rollback policy replaces old storage. |
 | Peer protocol-v1 legacy labels | Mixed-version peers must continue parsing and synchronizing accepted history. Accept legacy `submitted`/`acknowledged` as acceptance evidence and `uncertain` as Unknown; retain legacy wire encoding where required by old readers. This is compatibility decoding/encoding, not a recipient acknowledgement API. Remove only with explicit peer protocol negotiation/version retirement. Old peers can still have their own receipt-based admission limit; this release cannot silently repair their installation. |
 | Internal `queued`, `sending`, `blocked`, `cancelled` phases | Dispatcher claims, permission recovery and cancellation still need operational distinctions. Project queued/sending/blocked to Pending and cancelled to Failed, preserving reasons. These are not extra public outcomes or a parallel lifecycle. |
-| OpenCode protocol-2 `inserted`, `deferred`, `uncertain` receipts and journal phases | Existing installed plugins and durable attempt fences require this adapter evidence. `uncertain` maps to Unknown, not automatic replay; `inserted` needs exact native proof. Change only with a separately negotiated adapter protocol and journal compatibility plan. |
+| OpenCode protocol-2 `inserted`, `deferred`, `uncertain` receipts and journal phases | Retain adapter tokens and attempt fences, not a parallel public lifecycle. `inserted` means validated native client acceptance (guarded durable V2 receipt or exact transcript proof), never model consumption. Plugin journal schema 2 adds nullable bounded acceptance provenance; old NULL-proof rows remain transcript-only. Retire these tokens/schema compatibility only with an explicit adapter/journal compatibility plan. |
 | Legacy OpenCode IDs and reconcile-only mappings | Old retries could erase attempt provenance. Absence of native proof cannot safely authorize a new prompt or a new namespaced ID. Remove only when retained historical attempts can be resolved safely; never expire them into replay permission. |
 | Transport receipt/status cursors and transfer diagnostics | Remote durable acceptance, deduplication and reconnect progress are still necessary. Cursor acknowledgements are transport bookkeeping, not model tool calls. They never establish model read or task completion. |
 | Dated reports, release notes, `docs/diagnostics/native-compatibility.json` | These record what older binaries actually did, including legacy tool calls. Preserve evidence honestly; a modern runner's changed assertions are not a rerun of those artifacts. |
@@ -112,6 +164,16 @@ They are not claimed again on restart; explicit duplicate authorization remains
 required for native retry. Retained inbound history still counts toward the real
 8,192-message/64-MiB per-peer and 32,768-message/256-MiB global storage quotas,
 regardless of outcome. Those are history/dedup bounds, not receipt debt.
+
+A completed Claude frame retains internal `submitted`, distinct from an actual
+partial/lost native write (`uncertain`); immutable provider projection makes both
+publicly Unknown without claiming acceptance. Completed submissions preserve normal
+opt-in lifecycle transport behavior. Genuine ambiguous lifecycle attempts mark the
+existing stream desynchronized, fence unattempted old controls and require an
+explicit fresh snapshot, but never enqueue automatic native resync/replay. Definite
+failure/overflow keeps its existing bounded resync behavior. Board revision hints
+and pairing phase notices report ambiguity locally without false acceptance or
+automatic resend.
 
 ## Focused verification
 

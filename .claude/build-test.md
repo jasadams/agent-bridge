@@ -10,11 +10,11 @@ rustfmt --component clippy` and select it with `rustup override set 1.98.0` in t
 worktree. Python 3 and a POSIX shell support installer/release checks. Linux needs
 a C compiler and standard build tools for native dependencies (SQLite is bundled).
 Rust-only work needs no Node.js toolchain. OpenCode plugin work additionally
-requires Bun 1.3.11; `plugins/opencode/bun.lock` pins the V1 plugin/SDK packages
-at 1.18.35 and TypeScript dependencies. Run `bun install --frozen-lockfile`,
+requires Bun 1.3.11; `plugins/opencode/bun.lock` pins the V2 plugin/client packages
+at 2.2.5 and TypeScript dependencies. Run `bun install --frozen-lockfile`,
 `bun run typecheck`, and `bun test` from that directory. The release matrix runs
 these checks on Linux and macOS. See `docs/opencode.md` and the plugin README for
-the isolated native compatibility harness; it needs OpenCode 1.18.35 and never
+the isolated native compatibility harness; it needs OpenCode 2.2.5 and never
 uses owner configuration or credentials.
 
 Read the relevant feature docs and the Trakkt ticket before changing behavior.

@@ -32,7 +32,8 @@ pub(crate) fn envelope_with_machines(
 
 pub struct Outcome {
     /// Existing persisted/wire-v1 lifecycle spelling, not a second status field.
-    /// `submitted` is client acceptance; public outcomes use delivery_state.
+    /// `submitted` records transport submission. Only provider-qualified proof
+    /// establishes public Delivered; a completed Claude socket write is Unknown.
     pub state: &'static str,
     pub detail: String,
 }

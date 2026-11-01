@@ -106,6 +106,9 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
   const transcripts = new Map<string, any[]>();
   const prompts: any[] = [];
   const native = new Map<string, { id: string; type: string; text: string }>();
+  const inbox = new Map<string, any[]>();
+  let admitInbox = false;
+  let promptReceipt: ((receipt: any) => unknown) | undefined;
   const writes: string[] = [];
   let wrongIdentity = false;
   let blocked: { kind: "get" | "context" | "prompt"; skip: number; fail: boolean; enter: () => void; release: Promise<void>; returned: () => void } | undefined;
@@ -148,9 +151,11 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
         if (gate.fail) throw new Error("delayed prompt failure");
       }
       prompts.push({ session: sessionID, body: { id, text } });
-      if (!defer) native.set(`${sessionID}/${id}`, { id, type: "user", text });
+      if (admitInbox) inbox.set(sessionID, [{ id, sessionID, type: "user", payload: { text }, delivery: "steer", time: { created: Date.now() } }]);
+      else if (!defer) native.set(`${sessionID}/${id}`, { id, type: "user", text });
       const session = sessions.get(sessionID);
-      return { id, sessionID, time: { created: Date.now() }, type: "user", payload: { text }, delivery: "steer", ...(session ? { location: session.location } : {}) };
+      const receipt = { id, sessionID, time: { created: Date.now() }, type: "user", payload: { text }, delivery: "steer", ...(session ? { location: session.location } : {}) };
+      return promptReceipt ? promptReceipt(receipt) : defer && !admitInbox ? undefined : receipt;
     },
     context: async ({ sessionID }: { sessionID: string }) => {
       writes.push(`/${sessionID}/context`);
@@ -260,8 +265,69 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
     const db = new Database(join(directory, "opencode-receipts.sqlite3"), { readonly: true });
     try { return db.query("SELECT namespace,id,session,state FROM receipts ORDER BY id").all(); } finally { db.close(); }
   };
-  return { directory, registrations, requests, close, socketState: () => ({ accepted: acceptedSockets, ended: endedSockets, closed: closedSockets, active: brokerSockets.size }), brokerResponse: (hook: typeof brokerResponse) => { brokerResponse = hook; }, denyAdmission: (denied: boolean, hook?: () => void) => { admissionDenied = denied; admissionHook = hook; }, sessions, transcripts, native, prompts, writes, get hooks() { return hooks; }, reload, journalState, event, pushEvent, created, endpoint, blockNext, blockAdmission, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; } };
+  return { directory, registrations, requests, close, socketState: () => ({ accepted: acceptedSockets, ended: endedSockets, closed: closedSockets, active: brokerSockets.size }), brokerResponse: (hook: typeof brokerResponse) => { brokerResponse = hook; }, denyAdmission: (denied: boolean, hook?: () => void) => { admissionDenied = denied; admissionHook = hook; }, sessions, transcripts, native, inbox, promptReceipt: (hook: typeof promptReceipt) => { promptReceipt = hook; }, admitInbox: () => { admitInbox = true; }, prompts, writes, get hooks() { return hooks; }, reload, journalState, event, pushEvent, created, endpoint, blockNext, blockAdmission, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; } };
 }
+
+describe("V2 durable inbox proof", () => {
+  const delivery = { op: "deliver", session: A, id: ID, content: "Exact held native input" };
+
+  test("held tool or permission accepts once before transcript/model consumption", async () => {
+    const s = await setup(); await s.created(); s.admitInbox();
+    expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
+    expect(s.native.size).toBe(0); expect(s.inbox.get(A)).toHaveLength(1);
+    expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
+    expect(s.prompts).toHaveLength(1);
+  });
+
+  test("lost broker response reconciles durable receipt; replacement generation needs transcript", async () => {
+    const s = await setup(); await s.created(); s.admitInbox();
+    await frame(s.endpoint(), delivery); // Native receipt journal committed before a broker can lose this response.
+    const before = s.journalState();
+    expect((await frame(s.endpoint(), { ...delivery, op: "reconcile" })).status).toBe("inserted");
+    const freshNonce = randomUUID();
+    const reconciled = await frame(s.endpoint(), { ...delivery, op: "reconcile", attempt: freshNonce });
+    expect(reconciled.status).toBe("inserted"); expect(reconciled.attempt).toBe(freshNonce);
+    expect((await frame(s.endpoint(), { ...delivery, attempt: freshNonce })).status).toBe("uncertain");
+    await s.reload(); await s.created();
+    expect((await frame(s.endpoint(), { ...delivery, op: "reconcile" })).status).toBe("uncertain");
+    s.native.set(`${A}/${NATIVE}`, { id: NATIVE, type: "user", text: delivery.content });
+    expect((await frame(s.endpoint(), { ...delivery, op: "reconcile" })).status).toBe("inserted");
+    expect(s.journalState()).toEqual(before); expect(s.prompts).toHaveLength(1);
+  });
+
+  test("lost native response stays unknown until exact transcript promotion, without replay", async () => {
+    const s = await setup(); await s.created(); s.admitInbox();
+    s.promptReceipt(() => { throw new Error("native response lost after admission"); });
+    expect((await frame(s.endpoint(), delivery)).status).toBe("uncertain");
+    expect((await frame(s.endpoint(), { ...delivery, op: "reconcile" })).status).toBe("uncertain");
+    expect((await frame(s.endpoint(), delivery)).status).toBe("uncertain");
+    const before = s.journalState();
+    s.native.set(`${A}/${NATIVE}`, { id: NATIVE, type: "user", text: delivery.content }); s.inbox.delete(A);
+    expect((await frame(s.endpoint(), { ...delivery, op: "reconcile" })).status).toBe("inserted");
+    expect(s.prompts).toHaveLength(1); expect(s.journalState()).toEqual(before);
+  });
+
+  test("receipt journal write failure never reports acceptance before durable proof", async () => {
+    const s = await setup(); await s.created(); s.admitInbox();
+    const db = new Database(join(s.directory, "opencode-receipts.sqlite3"));
+    db.exec("CREATE TRIGGER fail_acceptance BEFORE UPDATE OF acceptance ON receipts BEGIN SELECT RAISE(ABORT,'injected receipt write failure'); END;"); db.close();
+    expect((await frame(s.endpoint(), delivery)).status).toBe("uncertain");
+    expect(s.journalState()[0]).toMatchObject({ state: "attempting" });
+    expect((await frame(s.endpoint(), { ...delivery, op: "reconcile" })).status).toBe("uncertain");
+    expect((await frame(s.endpoint(), delivery)).status).toBe("uncertain"); expect(s.prompts).toHaveLength(1);
+  });
+
+  test("wrong session/ID/type/content/delivery and malformed or rejected receipts remain unknown", async () => {
+    const mutations = [(r: any) => null, (r: any) => ({}), (r: any) => ({ ...r, sessionID: B }), (r: any) => ({ ...r, id: "msg_wrong" }), (r: any) => ({ ...r, type: "synthetic" }), (r: any) => ({ ...r, payload: { text: "changed" } }), (r: any) => ({ ...r, payload: null }), (r: any) => ({ ...r, delivery: "queue" }), (r: any) => ({ ...r, time: {} }), (r: any) => ({ ...r, rejected: true, type: "rejected" }), (r: any) => ({ ...r, payload: { text: r.payload.text, files: [{ uri: "file:///unexpected" }] } })];
+    for (const mutate of mutations) {
+      const s = await setup(); await s.created(); s.admitInbox(); s.promptReceipt(mutate);
+      expect((await frame(s.endpoint(), delivery)).status).toBe("uncertain");
+      expect((await frame(s.endpoint(), delivery)).status).toBe("uncertain");
+      expect((await frame(s.endpoint(), { ...delivery, op: "reconcile" })).status).toBe("uncertain");
+      expect(s.prompts).toHaveLength(1);
+    }
+  });
+});
 
 describe("fixture cleanup deadline", () => {
   test("awaits queued observation, compensating close and live close before removing resources", async () => {
@@ -594,12 +660,10 @@ describe("V2 plugin with real private Unix sockets", () => {
     expect((await frame(s.endpoint(), { ...delivery, content: "changed" })).ok).toBe(false);
     expect([...s.native.keys()].every(key => !key.startsWith(`${B}/`))).toBe(true);
   });
-  test("materialisation after the 3s receipt window is uncertain, then reconciles to inserted with exactly one prompt", async () => {
+  test("missing native receipt stays uncertain, then exact materialisation reconciles with one prompt", async () => {
     const s = await setup(); await s.created(); s.defer(true);
     const delivery = { op: "deliver", session: A, id: ID, content: "hello" };
-    const started = Date.now();
     const reply = await frame(s.endpoint(), delivery);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(3000);
     expect(reply.ok).toBe(false); expect(reply.status).toBe("uncertain");
     expect(s.prompts).toHaveLength(1);
     // The native message materialises only after the receipt window closed.
@@ -670,16 +734,16 @@ describe("V2 plugin with real private Unix sockets", () => {
   }
   test("native deletion suppresses a late insertion receipt without rewriting history", async () => {
     const s = await setup(); await s.created();
-    // Skip the initial native-ID absence lookup and block the receipt lookup
-    // after prompt() has already admitted the exact native user message.
-    const gate = s.blockNext("context", 1);
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    s.promptReceipt(async receipt => { enter(); await held; return receipt; });
     const delivery = frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "before-delete" });
-    await gate.entered;
+    await entered;
     expect(s.prompts).toHaveLength(1);
     expect(s.native.size).toBe(1);
     await s.event("session.deleted", { sessionID: A });
-    gate.release();
-    await gate.settled();
+    release();
     expect((await delivery).ok).toBe(false);
     expect(s.registrations.size).toBe(0);
     expect(s.prompts).toHaveLength(1);
@@ -789,20 +853,43 @@ describe("V2 plugin with real private Unix sockets", () => {
     journal.prepare(identity); journal.inserted(identity);
     const db = new Database(join(s.directory, "opencode-receipts.sqlite3"));
     try {
-      db.exec(`WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<${MAX_JOURNAL_ROWS-1}) INSERT INTO receipts SELECT 'capacity','id-'||n,'session','','native-'||n,'inserted' FROM x`);
+      db.exec(`WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<${MAX_JOURNAL_ROWS-1}) INSERT INTO receipts(namespace,id,session,content,native_message_id,state) SELECT 'capacity','id-'||n,'session','','native-'||n,'inserted' FROM x`);
       expect(() => journal.prepare({ ...identity, id: "new", native_message_id: "new" })).toThrow("capacity");
       expect(journal.prepare(identity).state).toBe("inserted");
       expect((db.query("SELECT count(*) AS n FROM receipts").get() as any).n).toBe(MAX_JOURNAL_ROWS);
     } finally { db.close(); journal.close(); }
+  });
+  test("schema-one inserted history upgrades atomically without fabricated receipt provenance", async () => {
+    const directory = await mkdtemp("/tmp/aboc-journal-upgrade-"); await chmod(directory, 0o700);
+    const path = join(directory, "opencode-receipts.sqlite3");
+    const identity = { namespace: NAMESPACE, id: ID, session: A, content: "historical exact transcript", native_message_id: NATIVE, generation: randomUUID(), attempt: randomUUID() };
+    const db = new Database(path);
+    db.exec("CREATE TABLE receipts(namespace TEXT NOT NULL,id TEXT NOT NULL,session TEXT NOT NULL,content TEXT NOT NULL,native_message_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL CHECK(state IN ('prepared','attempting','inserted')),PRIMARY KEY(namespace,id)) STRICT; PRAGMA user_version=1;");
+    db.query("INSERT INTO receipts VALUES(?,?,?,?,?,'inserted')").run(identity.namespace, identity.id, identity.session, identity.content, identity.native_message_id); db.close(); await chmod(path, 0o600);
+    try {
+      const journals = await Promise.all([Journal.open(directory), Journal.open(directory)]);
+      try {
+        for (const journal of journals) { expect(journal.find(identity)).toMatchObject({ state: "inserted", content: identity.content, acceptance: null }); expect(journal.hasAcceptance(identity, true)).toBe(false); }
+        const upgraded = new Database(path, { readonly: true });
+        try { expect(upgraded.query("PRAGMA user_version").get()).toEqual({ user_version: 2 }); expect(upgraded.query("SELECT count(*) AS n FROM receipts").get()).toEqual({ n: 1 }); }
+        finally { upgraded.close(); }
+      } finally { for (const journal of journals) journal.close(); }
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
   test("journal UTF-8 byte capacity is durable across handles", async () => {
     const s = await setup();
     const db = new Database(join(s.directory, "opencode-receipts.sqlite3"));
     const journal = await Journal.open(s.directory);
     try {
-      db.exec(`WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<512) INSERT INTO receipts SELECT 'capacity','id-'||n,'session',printf('%0*d',${MAX_JOURNAL_BYTES/512},0),'native-'||n,'inserted' FROM x`);
+      db.exec(`WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<512) INSERT INTO receipts(namespace,id,session,content,native_message_id,state) SELECT 'capacity','id-'||n,'session',printf('%0*d',${MAX_JOURNAL_BYTES/512},0),'native-'||n,'inserted' FROM x`);
       expect(() => journal.prepare({ namespace: NAMESPACE, session: A, id: ID, content: "€", native_message_id: NATIVE })).toThrow("capacity");
       expect((db.query("SELECT sum(length(CAST(content AS BLOB))) AS n FROM receipts").get() as any).n).toBe(MAX_JOURNAL_BYTES);
+      // Leave enough room for the message but not its bounded original receipt.
+      db.exec("UPDATE receipts SET content=substr(content,1,length(content)-64) WHERE id='id-1'");
+      const identity = { namespace: NAMESPACE, session: A, id: ID, content: "x", native_message_id: NATIVE, generation: randomUUID(), attempt: randomUUID() };
+      journal.prepare(identity); expect(journal.attempt(identity)).toBe(true);
+      expect(() => journal.accepted(identity, { id: NATIVE, sessionID: A, type: "user", payload: { text: "x" }, delivery: "steer", time: { created: 1 } })).toThrow("byte capacity");
+      expect(journal.find(identity)?.state).toBe("attempting"); expect(journal.hasAcceptance(identity)).toBe(false);
     } finally { db.close(); journal.close(); }
   });
   test("corrupt or symlinked receipt journals fail closed without replacement", async () => {
@@ -893,7 +980,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created();
     const db = new Database(join(s.directory, "opencode-receipts.sqlite3"));
     try {
-      db.exec(`WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<${MAX_JOURNAL_ROWS}) INSERT INTO receipts SELECT 'capacity','id-'||n,'session','','native-'||n,'inserted' FROM x`);
+      db.exec(`WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<${MAX_JOURNAL_ROWS}) INSERT INTO receipts(namespace,id,session,content,native_message_id,state) SELECT 'capacity','id-'||n,'session','','native-'||n,'inserted' FROM x`);
       const result = await frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "over-capacity" });
       expect(result.status).toBe("deferred"); expect(result.error).toContain("capacity");
       expect(s.prompts).toHaveLength(0);
@@ -918,6 +1005,7 @@ describe("V2 plugin with real private Unix sockets", () => {
   });
   test("identical in-flight deliveries share admission and cannot defer beside a pending prompt", async () => {
     const s = await setup(); await s.created(); s.defer(true);
+    s.promptReceipt(receipt => receipt);
     const admission = s.blockAdmission();
     const promptGate = s.blockNext("prompt");
     const request = { op: "deliver", session: A, id: ID, content: "coalesced-admission" };

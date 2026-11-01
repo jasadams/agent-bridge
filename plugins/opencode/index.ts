@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { brokerRpc, MAX_FRAME } from "./rpc.ts";
 import { sameUser } from "./peer.ts";
-import { Journal, JournalCapacityError, nativeID, type Identity } from "./journal.ts";
+import { Journal, JournalCapacityError, nativeID, validateAcceptance, type Identity } from "./journal.ts";
 
 const SESSION = /^ses_[a-zA-Z0-9]{26}$/;
 const UUID = /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/;
@@ -196,6 +196,7 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
           if (!readonly) journal.inserted(frame);
           return response(frame, "inserted");
         }
+        if (journal.hasAcceptance(frame, readonly)) return response(frame, "inserted");
         if (readonly) break;
         await Bun.sleep(25);
       } while (Date.now() < deadline);
@@ -225,6 +226,7 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
         journal.prepare(frame); journal.inserted(frame);
         return response(frame, "inserted");
       }
+      if (journal.hasAcceptance(frame)) return response(frame, "inserted");
       if (row && row.state !== "prepared") return response(frame, "uncertain");
       try { row = journal.prepare(frame); }
       catch (error) {
@@ -245,9 +247,17 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       // FULL-sync CAS and the plugin API invocation share this JS turn: no await
       // or background queue can cross a deferred result or lose the generation guard.
       if (!journal.attempt(frame)) return receipt(frame, true);
-      try { await ctx.session.prompt({ sessionID: frame.session, id: frame.native_message_id, text: frame.content, delivery: "steer" }); }
+      try {
+        // V2 Session.prompt returns only after durable InboxEnqueued admission
+        // (Session.prompt -> SessionInbox.admit -> Bus transaction). This is
+        // recipient-client acceptance, not transcript/model consumption.
+        const accepted = await ctx.session.prompt({ sessionID: frame.session, id: frame.native_message_id, text: frame.content, delivery: "steer" });
+        guard(frame.session, frame);
+        validateAcceptance(frame, accepted);
+        journal.accepted(frame, accepted); // FULL-sync state and exact receipt atomically, before broker response.
+        return response(frame, "inserted"); // Existing adapter token; means verified acceptance.
+      }
       catch { return response(frame, "uncertain"); }
-      return receipt(frame, false);
     }
 
     function dispatch(frame: Frame): ReturnType<typeof handle> {

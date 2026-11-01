@@ -83,14 +83,14 @@ when qualifying a new client version.
 
 ## OpenCode
 
-For supported OpenCode **1.18.35** V1, install the bundled native plugin and MCP
+For supported OpenCode **2.2.5** V2, install the bundled native plugin and MCP
 connection explicitly:
 
 ```sh
 agent-bridge opencode install
 ```
 
-Fully restart OpenCode after installation or updates. Send a prompt in the
+V2 reloads changed configuration. Send a prompt in the
 existing conversation you want to use, then check its live registration:
 
 ```sh
@@ -98,7 +98,7 @@ agent-bridge list
 ```
 
 Its exact route is `opencode-SESSION_ID`, where the native ID starts with `ses_`.
-Stored conversation history is not advertised automatically. The setup command
+Routes are verified against the current native server. The setup command
 does not start a native session or model, change permissions, or enable peer
 sharing. Repeat it after upgrading Agent Bridge to update the extracted plugin.
 

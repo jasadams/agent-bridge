@@ -334,9 +334,14 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
                 crate::clients::ControlNotice::Pairing(&text),
             )
             .await;
-            if outcome.state != "submitted" {
+            if outcome.state == "failed" {
                 eprintln!(
-                    "Pairing notification {} was not submitted: {}",
+                    "Pairing notification {} failed: {}",
+                    notice.id, outcome.detail
+                );
+            } else if outcome.state == "uncertain" {
+                eprintln!(
+                    "Pairing notification {} has Unknown delivery after an ambiguous native attempt; no automatic resend: {}",
                     notice.id, outcome.detail
                 );
             }

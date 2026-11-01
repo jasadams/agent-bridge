@@ -51,10 +51,10 @@ for client scopes and approvals.
 
 ## Connect OpenCode
 
-Use `agent-bridge opencode install` to opt into the bundled V1 plugin and the
+Use `agent-bridge opencode install` to opt into the bundled V2 plugin and the
 existing `agent-bridge` stdio MCP connection. See [installation](install.md) for
-config selection, preservation, updates and removal. Restart OpenCode after a
-change. The exact session route and broker state directory are supplied through
+config selection, preservation, updates and removal. V2 reloads changed
+configuration. The exact session route and broker state directory are supplied through
 its verified native system context; check `connection_status` before using a
 connection shared by several conversations. No new transport or per-message
 setup prompt is required.
@@ -220,9 +220,11 @@ Closure removes subscriptions and pending notices; reconnect/reopen requires
 explicit opt-in. Subscriptions and event history do not survive broker restart:
 resubscribe and use the returned snapshot.
 
-An overflow or Failed or Unknown lifecycle delivery makes the event stream
-incomplete. The broker attempts at most one `resync.required` control notice for
-that gap and suppresses further lifecycle transitions until you explicitly call
+An overflow, definite failure or genuinely ambiguous native lifecycle write makes
+the event stream incomplete. Overflow/definite failure permits at most one
+`resync.required` notice. An ambiguous attempted write instead records a local
+Unknown diagnostic and suppresses transitions **without submitting any resync or
+replay**. Further lifecycle transitions wait until you explicitly call
 `subscribe` with a lifecycle selector to obtain a fresh atomic snapshot. Adding
 only a board selector does not recover the lifecycle stream. A failed resync
 attempt is not replayed automatically; after a transport interruption, explicitly
@@ -230,6 +232,11 @@ resubscribe even if no resync notice arrived. Recovery invalidates older pending
 lifecycle notices. Preserve per-identity transition order when interpreting
 notices. Native hooks/events, confirmed socket cleanup and OpenCode lease expiry
 have observation delays; `/exit` is not a universally synchronous callback.
+
+A fully completed Claude socket submission remains transport-submitted internally
+and keeps the event stream functioning. Its public diagnostic is still Unknown:
+the socket interface does not confirm native acceptance or model reading. This
+differs from an interrupted/partial write, whose stream may contain a genuine gap.
 
 Unsubscribe, closure, recipient replacement and broker restart prevent pending
 notices from starting native delivery for an invalid subscription or recipient.

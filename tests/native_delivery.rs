@@ -94,18 +94,24 @@ async fn claude_socket_only_history_allows_65_sends_without_receipts_or_status_p
     })
     .await
     .unwrap();
+    // Fixture-only diagnostic after the complete send-and-continue flow: native
+    // submission is retained internally, never promoted to public acceptance.
+    assert_eq!(
+        bound.broker.request(Request::Status).unwrap()["messages"]["unknown"],
+        65
+    );
     let server = tokio::spawn(broker::serve(bound));
     let persisted = rusqlite::Connection::open(dir.path().join("state/messages.sqlite3")).unwrap();
-    let uncertain: i64 = persisted
+    let submitted: i64 = persisted
         .query_row(
-            "SELECT count(*) FROM messages WHERE state='uncertain'",
+            "SELECT count(*) FROM messages WHERE state='submitted'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(
-        uncertain, 65,
-        "Socket-only history remains Unknown after recovery"
+        submitted, 65,
+        "Completed socket submissions remain distinct from ambiguous writes"
     );
     assert!(
         timeout(Duration::from_millis(750), sink.accept())
