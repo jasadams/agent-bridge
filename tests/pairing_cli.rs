@@ -1,3 +1,5 @@
+mod support;
+
 use agent_bridge::broker::{self, Broker};
 use serde_json::{Value, json};
 use std::{path::Path, process::Stdio};
@@ -101,6 +103,7 @@ async fn mutual_pairing_cli_uses_stdin_persists_offer_and_grants_no_access() {
     );
     alice.abort();
     let _ = alice.await;
+    support::wait_for_shutdown(&a).await;
     let alice = start(&a);
     let finished = value(
         &a,

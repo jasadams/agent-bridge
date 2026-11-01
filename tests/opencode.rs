@@ -1,3 +1,5 @@
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     clients, delivery,
@@ -664,6 +666,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
         server.abort();
         let _ = server.await;
         drop(broker);
+        support::wait_for_shutdown(&state).await;
         // The plugin may return after the old lease expired; stored queued
         // reconciliation must stay read-only while an explicit retry rebinds it.
         rusqlite::Connection::open(state.join("messages.sqlite3"))

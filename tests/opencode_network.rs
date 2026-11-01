@@ -1,4 +1,6 @@
 //! OpenCode sharing exercises real QUIC brokers and the private native socket boundary.
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     protocol::{Agent, Provider, Request},
@@ -570,6 +572,7 @@ async fn queued_opencode_survives_origin_restart_and_destination_offline_recover
         "pending"
     );
     a.stop().await;
+    support::wait_for_shutdown(&ap).await;
     let a = Running::start(&ap);
     na.observe(&a, "Origin live after broker restart");
     assert_eq!(
@@ -580,6 +583,7 @@ async fn queued_opencode_survives_origin_restart_and_destination_offline_recover
         enabled: true,
         listen: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
     });
+    support::wait_for_shutdown(&bp).await;
     let b = Running::start(&bp);
     nb.observe(&b, "Destination live after broker restart");
     assert_eq!(b.listening().await, address);

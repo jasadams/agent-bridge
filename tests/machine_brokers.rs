@@ -1,3 +1,5 @@
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     network::{
@@ -314,6 +316,7 @@ async fn cli_sets_persistent_machine_name_without_changing_identity() {
             .success()
     );
     bridge.stop().await;
+    support::wait_for_shutdown(&state).await;
     let bridge = Running::start(&state);
     let restored = cli_json(&state, &["machine", "show"]).await;
     assert_eq!(restored["machine_name"], "workstation");

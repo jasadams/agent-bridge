@@ -1,5 +1,7 @@
 //! Black-box MCP stdio checks against the real broker. No native model, global
 //! client configuration or existing bridge state is touched.
+mod support;
+
 use agent_bridge::{
     broker::{self, Broker},
     db::Db,
@@ -1184,8 +1186,7 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
         .await;
     assert!(!failed(&subscribed), "{subscribed}");
     drop(running);
-    // Aborting the serve task drops its state lock at the next scheduler turn.
-    tokio::task::yield_now().await;
+    support::wait_for_shutdown(&state).await;
     let _restarted = Running::start(&state);
     let current = mcp.call("read_board", json!({})).await;
     let revision = structured(&current)["result"]["revision"].clone();
