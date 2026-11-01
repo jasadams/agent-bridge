@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -234,6 +234,50 @@ CREATE TRIGGER opencode_enqueue_binding AFTER INSERT ON messages WHEN (SELECT pr
 END;",
         )?;
         tx.pragma_update(None, "user_version", 17)?;
+    }
+    if version < 18 {
+        tx.execute_batch(
+            "CREATE TABLE topics(
+ bridge_id TEXT NOT NULL,
+ topic_id TEXT NOT NULL,
+ name TEXT NOT NULL,
+ archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
+ created INTEGER NOT NULL,
+ updated INTEGER NOT NULL,
+ high_water INTEGER NOT NULL DEFAULT 0 CHECK(high_water>=0),
+ retained_body_bytes INTEGER NOT NULL DEFAULT 0 CHECK(retained_body_bytes>=0),
+ PRIMARY KEY(bridge_id,topic_id)
+);
+CREATE TABLE topic_posts(
+ bridge_id TEXT NOT NULL,
+ id TEXT NOT NULL,
+ topic_id TEXT NOT NULL,
+ sequence INTEGER NOT NULL CHECK(sequence>0),
+ author_id TEXT NOT NULL,
+ author_display_name TEXT NOT NULL,
+ body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 65536),
+ parent TEXT,
+ created INTEGER NOT NULL,
+ PRIMARY KEY(bridge_id,id),
+ UNIQUE(bridge_id,topic_id,sequence),
+ UNIQUE(bridge_id,topic_id,id),
+ FOREIGN KEY(bridge_id,topic_id) REFERENCES topics(bridge_id,topic_id),
+ FOREIGN KEY(bridge_id,topic_id,parent) REFERENCES topic_posts(bridge_id,topic_id,id)
+);
+CREATE INDEX topic_posts_author ON topic_posts(bridge_id,author_id,created DESC,id DESC);
+CREATE TABLE topic_mentions(
+ bridge_id TEXT NOT NULL,
+ post_id TEXT NOT NULL,
+ agent_id TEXT NOT NULL,
+ PRIMARY KEY(bridge_id,post_id,agent_id),
+ FOREIGN KEY(bridge_id,post_id) REFERENCES topic_posts(bridge_id,id)
+);
+CREATE TRIGGER topic_posts_immutable_update BEFORE UPDATE ON topic_posts BEGIN SELECT RAISE(ABORT,'topic_conflict: immutable post'); END;
+CREATE TRIGGER topic_posts_immutable_delete BEFORE DELETE ON topic_posts BEGIN SELECT RAISE(ABORT,'topic_conflict: immutable post'); END;
+CREATE TRIGGER topic_mentions_immutable_update BEFORE UPDATE ON topic_mentions BEGIN SELECT RAISE(ABORT,'topic_conflict: immutable mention'); END;
+CREATE TRIGGER topic_mentions_immutable_delete BEFORE DELETE ON topic_mentions BEGIN SELECT RAISE(ABORT,'topic_conflict: immutable mention'); END;",
+        )?;
+        tx.pragma_update(None, "user_version", 18)?;
     }
     tx.commit()?;
     Ok(())

@@ -535,6 +535,71 @@ impl Broker {
         };
         let result = (|| -> Result<Value> {
             Ok(match req {
+                Request::TopicCreate { name } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!(db.topic_create(&local, &name, &Default::default())?)
+                }
+                Request::TopicList { include_archived } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!({"topics": db.topic_list(&local, include_archived)?})
+                }
+                Request::TopicAgents {} => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!({"agents": db.topic_agents(&local)?})
+                }
+                Request::TopicInspect { topic } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!(db.topic_inspect(&local, &topic)?)
+                }
+                Request::TopicRename { topic, name } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!(db.topic_rename(&local, &topic, &name)?)
+                }
+                Request::TopicArchive { topic } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!(db.topic_archive(&local, &topic, true)?)
+                }
+                Request::TopicRestore { topic } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!(db.topic_archive(&local, &topic, false)?)
+                }
+                Request::TopicPublish {
+                    topic,
+                    id,
+                    author,
+                    body,
+                    parent,
+                    mentions,
+                } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!(db.topic_publish(
+                        &local,
+                        &crate::topics::TopicPublication {
+                            topic,
+                            id,
+                            author,
+                            body,
+                            parent,
+                            mentions,
+                        },
+                        &Default::default(),
+                    )?)
+                }
+                Request::TopicRead {
+                    topic,
+                    cursor,
+                    before,
+                    limit,
+                } => {
+                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                    json!(db.topic_read(
+                        &local,
+                        &topic,
+                        cursor.as_deref(),
+                        before.as_deref(),
+                        limit
+                    )?)
+                }
                 // Board edits share the broker's local administration mutex. No
                 // network request can invoke this API or select a filesystem path.
                 Request::BoardMessageSend { request } => {
