@@ -1,6 +1,6 @@
 use crate::{
     network::trust::{Grant, Peer, Permission},
-    protocol::{Agent, MAX_BODY, Message, Provider},
+    protocol::{Agent, MAX_BODY, MAX_REPLY_HOPS, Message, Provider},
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -554,8 +554,8 @@ impl Db {
             0
         };
         ensure!(
-            hops <= 8,
-            "Conversation reached the eight-hop limit; ask the user to start a new exchange"
+            hops <= MAX_REPLY_HOPS,
+            "Conversation reached the {MAX_REPLY_HOPS}-hop limit; ask the user to start a new exchange"
         );
         let count: i64 = self.conn.query_row(
             "SELECT count(*) FROM messages WHERE state='queued'",

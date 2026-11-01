@@ -67,7 +67,7 @@ agent-bridge send --from reviewer --to PEER_ID/source-agent \
   --in-reply-to RECEIVED_LOCAL_UUID --message 'Review complete'
 ```
 
-A correlated reply pins the original source session from the received envelope and does not require rediscovery. Explicit replies can wake agents. Receipt and acknowledgement synchronization only updates records. The eight-hop conversation limit remains in force.
+A correlated reply pins the original source session from the received envelope and does not require rediscovery. Explicit replies can wake agents. Receipt and acknowledgement synchronization only updates records. The conversation limit is 100 reply hops; peers running older versions may still enforce the previous eight-hop limit.
 
 ## Interpret receipts and native status
 

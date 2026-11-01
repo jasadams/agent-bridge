@@ -190,6 +190,99 @@ fn reply_uses_original_parent_session_and_correlates_local_ids() {
 }
 
 #[test]
+fn remote_reply_chain_continues_beyond_eight_hops() {
+    let p = Pair::new();
+    let original = p.send("start");
+    p.b.accept_remote(&p.bid, &p.aid, &original).unwrap();
+    let mut parent = p.b.history(&None, 1).unwrap()[0].id.clone();
+    for hop in 1..=10 {
+        let (sender, receiver, source_peer, destination_peer, destination) = if hop % 2 == 1 {
+            (&p.b, &p.a, &p.bid, &p.aid, "alice/user")
+        } else {
+            (&p.a, &p.b, &p.aid, &p.bid, "bob/user")
+        };
+        let message_id = id();
+        sender
+            .send_remote(
+                source_peer,
+                &message_id,
+                "user",
+                destination,
+                "reply",
+                &Some(parent),
+            )
+            .unwrap();
+        let envelope = sender
+            .pending_transfers(destination_peer, 100)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        assert_eq!(envelope.hops, hop);
+        receiver
+            .accept_remote(destination_peer, source_peer, &envelope)
+            .unwrap();
+        parent = receiver.history(&None, 1).unwrap()[0].id.clone();
+    }
+}
+
+#[test]
+fn remote_reply_hop_boundaries_apply_on_send_and_receive() {
+    for hop in [9, 100] {
+        let p = Pair::new();
+        let original = p.send("question");
+        p.b.accept_remote(&p.bid, &p.aid, &original).unwrap();
+        let parent = p.b.history(&None, 1).unwrap().pop().unwrap().id;
+        // Model a validated prior exchange at the boundary without bypassing
+        // the per-minute rate limits with 100 artificial network deliveries.
+        let a = rusqlite::Connection::open(p._dir.path().join("a.sqlite")).unwrap();
+        let b = rusqlite::Connection::open(&p.bpath).unwrap();
+        a.execute(
+            "UPDATE outbound_transfers SET envelope=json_set(envelope,'$.hops',?1) WHERE id=?2",
+            rusqlite::params![hop - 1, original.id],
+        )
+        .unwrap();
+        b.execute("UPDATE inbound_transfers SET envelope=json_set(envelope,'$.hops',?1) WHERE local_id=?2", rusqlite::params![hop - 1, parent]).unwrap();
+        let reply_id = id();
+        p.b.send_remote(
+            &p.bid,
+            &reply_id,
+            "user",
+            "alice/user",
+            "answer",
+            &Some(parent.clone()),
+        )
+        .unwrap();
+        let reply = p.b.pending_transfers(&p.aid, 1).unwrap().pop().unwrap();
+        assert_eq!(reply.hops, hop);
+        p.a.accept_remote(&p.aid, &p.bid, &reply).unwrap();
+        if hop == 100 {
+            b.execute("UPDATE inbound_transfers SET envelope=json_set(envelope,'$.hops',100) WHERE local_id=?1", [&parent]).unwrap();
+            let error =
+                p.b.send_remote(
+                    &p.bid,
+                    &id(),
+                    "user",
+                    "alice/user",
+                    "too far",
+                    &Some(parent),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("100-hop limit"));
+            let mut excessive = reply;
+            excessive.id = id();
+            excessive.hops = 101;
+            let error = p.a.accept_remote(&p.aid, &p.bid, &excessive).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Invalid message body or hop count")
+            );
+        }
+    }
+}
+
+#[test]
 fn revocation_blocks_queued_work_and_clears_cached_directory_even_while_paused() {
     let mut p = Pair::new();
     let env = p.send("pending");

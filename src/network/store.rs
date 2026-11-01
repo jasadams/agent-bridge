@@ -8,7 +8,7 @@ use crate::{
             WireResponse,
         },
     },
-    protocol::{MAX_BODY, MAX_FRAME, Message},
+    protocol::{MAX_BODY, MAX_FRAME, MAX_REPLY_HOPS, Message},
 };
 use anyhow::{Context, Result, bail, ensure};
 use libp2p::Multiaddr;
@@ -344,7 +344,10 @@ impl Db {
         };
         validate_agent(&remote(&source))?;
         validate_agent(&destination)?;
-        ensure!(hops <= 8, "Conversation reached the eight-hop limit");
+        ensure!(
+            hops <= MAX_REPLY_HOPS,
+            "Conversation reached the {MAX_REPLY_HOPS}-hop limit"
+        );
         let envelope = Envelope {
             origin_peer: local_peer.into(),
             id: id.into(),
@@ -528,7 +531,7 @@ impl Db {
         ensure!(
             !envelope.body.trim().is_empty()
                 && envelope.body.len() <= MAX_BODY
-                && envelope.hops <= 8,
+                && envelope.hops <= MAX_REPLY_HOPS,
             "Invalid message body or hop count"
         );
         let existing: Option<String> = self

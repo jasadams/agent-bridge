@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 256 * 1024;
 pub const MAX_BODY: usize = 64 * 1024;
+pub const MAX_REPLY_HOPS: u32 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
