@@ -1,3 +1,7 @@
+-- Remove local topics introduced after this fixture schema, children first.
+DROP TABLE IF EXISTS topic_mentions;
+DROP TABLE IF EXISTS topic_posts;
+DROP TABLE IF EXISTS topics;
 -- Remove named-board lifecycle state introduced after this fixture schema.
 DROP TABLE IF EXISTS board_lifecycle;
 -- Remove durable board composer receipts introduced after this fixture schema.

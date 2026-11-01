@@ -107,6 +107,46 @@ pub(crate) fn delivery_outcome(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    TopicCreate {
+        name: String,
+    },
+    TopicList {
+        #[serde(default)]
+        include_archived: bool,
+    },
+    TopicAgents {},
+    TopicInspect {
+        topic: crate::topics::TopicRef,
+    },
+    TopicRename {
+        topic: crate::topics::TopicRef,
+        name: String,
+    },
+    TopicArchive {
+        topic: crate::topics::TopicRef,
+    },
+    TopicRestore {
+        topic: crate::topics::TopicRef,
+    },
+    TopicPublish {
+        topic: crate::topics::TopicRef,
+        id: String,
+        author: crate::topics::AgentRef,
+        body: String,
+        #[serde(default)]
+        parent: Option<String>,
+        #[serde(default)]
+        mentions: Vec<crate::topics::AgentRef>,
+    },
+    TopicRead {
+        topic: crate::topics::TopicRef,
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        before: Option<String>,
+        #[serde(default = "topic_limit")]
+        limit: usize,
+    },
     Register {
         agent: Agent,
         #[serde(default)]
@@ -435,6 +475,10 @@ impl Request {
             }
         }
     }
+}
+
+fn topic_limit() -> usize {
+    50
 }
 
 fn history_limit() -> usize {

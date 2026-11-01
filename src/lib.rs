@@ -29,6 +29,7 @@ pub mod migrations;
 pub mod network;
 pub mod protocol;
 pub mod service;
+pub mod topics;
 pub mod update;
 
 pub mod monitor;
