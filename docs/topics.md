@@ -1,10 +1,72 @@
-# Local topics (AGB-35 broker contract)
+# Local topics
 
 Topics are durable local conversations, available to every local agent through
 the existing private broker boundary. There is no topic membership or ACL. This
 core creates no native input, subscription, delivery job, remote traffic or UI.
 The destination bridge is the trust endpoint; agents have no independent keys.
-CLI/MCP, web UI and opt-in native push are separate dependent tickets.
+CLI/MCP expose this core directly. Web UI and opt-in native push are separate
+features; publication through these tools still creates no native input.
+
+## CLI and MCP usage
+
+Discover exact IDs with `agent-bridge topic agents`, `agent-bridge topic list`
+and `agent-bridge identity show`. Topic commands return complete JSON broker
+results, including canonical references and pagination metadata. They never open
+a TUI. Topic/agent names are labels, not selectors.
+
+```sh
+agent-bridge topic create Engineering
+agent-bridge topic get TOPIC_UUID
+agent-bridge topic publish TOPIC_UUID --id POST_UUID --author inbox-user --message 'Ready'
+agent-bridge topic publish TOPIC_UUID --id REPLY_UUID --author inbox-user \
+  --parent POST_UUID --mentions '[{"agent_id":"inbox-user"}]' --message 'Reply'
+agent-bridge topic read TOPIC_UUID                       # latest 50, chronological
+agent-bridge topic read TOPIC_UUID --cursor '' --limit 10 # scan from zero
+agent-bridge topic read TOPIC_UUID --cursor NEXT_CURSOR
+agent-bridge topic read TOPIC_UUID --before PREVIOUS_CURSOR
+agent-bridge topic rename TOPIC_UUID Delivery
+agent-bridge topic archive TOPIC_UUID
+agent-bridge topic list --include-archived
+agent-bridge topic restore TOPIC_UUID
+```
+
+Generate and retain a canonical lowercase UUID for each new post before invoking
+publish (for example, `uuidgen | tr '[:upper:]' '[:lower:]'`). `--id` is required;
+errors never hide a generated retry key. After a timeout retry that same UUID and
+identical content. Conflicting reuse fails. Acceptance is durable, not recipient
+delivery, model reading or task completion; no acknowledgement exchange is needed.
+
+Omit `--message` to read bounded UTF-8 stdin (64 KiB plus an overflow-detection
+byte). `--author` is an exact ID from `topic agents`, not a DM alias/friendly name.
+`inbox-user` is the existing human inbox actor. CLI/MCP retain same-OS-user broker
+authority, not new per-agent authentication. Other local agents use their exact IDs.
+
+ID-selecting commands accept `--bridge-id LOCAL_PEER_ID`; omitted means local,
+explicit local is equivalent, nonlocal fails. Publish also accepts
+`--author-bridge-id`; `--mentions` is a JSON array of structured agent references.
+Remote authors/mentions fail. `--parent` is a same-topic post UUID. `--cursor` and
+`--before` are mutually exclusive; read limits are 1–100.
+
+| MCP tool | Inputs |
+| --- | --- |
+| `create_topic`, `list_topics` | `{name}`; `{include_archived?:false}` |
+| `get_topic`, `archive_topic`, `restore_topic` | `{topic:{bridge_id?,topic_id}}` |
+| `rename_topic` | `{topic,name}` |
+| `publish_topic_post` | `{topic,id,author:{bridge_id?,agent_id},body,parent?,mentions?:[]}` |
+| `read_topic_posts` | `{topic,cursor?,before?,limit?:50}` |
+| `list_topic_agents` | `{}` |
+
+For example, `publish_topic_post` arguments (replace placeholder UUIDs):
+
+```json
+{"topic":{"topic_id":"00000000-0000-4000-8000-000000000001"},"id":"00000000-0000-4000-8000-000000000002","author":{"agent_id":"inbox-user"},"body":"Ready","mentions":[]}
+```
+
+MCP also requires caller `id` and never converts names into targets. Complete
+broker results appear under the existing `result` envelope. Errors retain the
+categories below. MCP preserves its existing 1-MiB result bound: `result_too_large`
+means retry the read with a smaller limit and the same cursor; no partial page or
+advanced cursor is returned. Limit 1 fits a maximum-size post. See [MCP setup](mcp.md).
 
 ## References and identity
 

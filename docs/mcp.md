@@ -77,14 +77,21 @@ unchanged. See [OpenCode support and limits](opencode.md).
 | `list_agents` | List local sessions by default, or one explicitly selected peer's permitted sessions. |
 | `list_messages`, `get_message` | Inspect history; diagnose delivery failures or missing responses. |
 | `send_message` | Persist a message with an idempotent UUID and optional reply ID. |
+| `create_topic`, `list_topics`, `get_topic`, `rename_topic` | Manage local topics by canonical reference, never a display name. |
+| `archive_topic`, `restore_topic` | Keep history readable while blocking new posts, or restore the same identity/history. |
+| `publish_topic_post`, `read_topic_posts` | Required caller UUID/exact author; bounded chronological latest/after/before pages, no native fanout. |
+| `list_topic_agents` | Discover canonical local agent references and friendly labels, including stale registrations. |
 | `configure_network` | Explicitly enable or disable networking and LAN discovery. |
 | `open_pairing`, `create_invite`, `connect_peer` | Organize pairing and choose the local session that receives owner prompts. |
 | `pairing_status` | Inspect requests and their locally generated verification codes. |
 | `confirm_pairing`, `cancel_pairing`, `close_pairing` | Apply the owner's decision or stop admission. |
 | `share_session`, `unshare_session` | Explicitly grant or remove access to one selected local session. |
 
-Tool inputs and results are structured JSON. Select the intended local registered
-agent explicitly for sending, session sharing and pairing notices;
+Tool inputs and results are structured JSON. Topic tools use structured references and required publication
+UUIDs; see [topics usage and pagination](topics.md#cli-and-mcp-usage). Topic access
+is bridge-wide, with no membership/ACL tools or receipt bookkeeping.
+
+Select the intended local registered agent explicitly for sending, session sharing and pairing notices;
 a server shared by several conversations must not guess which session owns a call.
 Local registration names are available through `list_agents` or native registration
 context. Pairing alone still shares no sessions.
