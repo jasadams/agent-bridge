@@ -182,7 +182,7 @@ async fn typed_controls_use_native_frames_without_peer_envelopes() {
         (ControlNotice::Pairing(pairing), pairing),
     ] {
         let outcome = deliver_notice(&agent, &msg, notice).await;
-        assert_eq!(outcome.state, "submitted");
+        assert_eq!(outcome.state, "uncertain");
         let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
             .await
             .unwrap()
@@ -205,7 +205,8 @@ async fn typed_controls_use_native_frames_without_peer_envelopes() {
         assert!(!line.contains(&msg.body));
     }
     let outcome = crate::delivery::deliver(&agent, &msg, Path::new("/missing"), root.path()).await;
-    assert_eq!(outcome.state, "submitted");
+    assert_eq!(outcome.state, "uncertain");
+    assert_eq!(crate::protocol::delivery_state(outcome.state), "unknown");
     let (stream, _) = timeout(Duration::from_secs(2), listener.accept())
         .await
         .unwrap()

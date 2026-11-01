@@ -419,8 +419,8 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       if (result.accepted !== true || result.id !== submission.id || result.message?.id !== submission.id || result.message?.body !== submission.text || result.message?.sender !== "user" || result.message?.recipient !== m.owner.name || result.message?.recipient_session !== m.owner.session || typeof result.state !== "string") throw new Error("Unconfirmed message acceptance");
       m.submission = null; m.state = "editing";
       if (m.version === version) { m.value = ""; m.input.value = ""; }
-      m.feedbackText = ["queued", "sending", "sent", "delivered", "acknowledged", "accepted"].includes(result.state)
-        ? "" : `Message ${result.state}`;
+      const outcome = ["pending", "delivered", "failed", "unknown"].includes(result.state) ? result.state : "unknown";
+      m.feedbackText = `Message ${outcome}`;
       if (m.present && m.control && writable(m)) { m.revision = m.currentRevision; m.controlId = m.control.id; m.stale = false; }
     } catch (e) {
       if (!current(c) || !active || messageDrafts.get(m.key) !== m || m.submission !== submission) return;

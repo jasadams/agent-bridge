@@ -2,7 +2,9 @@
 
 Qualification combines real client execution with a deterministic loopback model
 fixture. It verifies transport and actual native MCP tool execution, including
-explicit acknowledgements and correlated replies. Scripted tool choices do not
+confirmed native acceptance and correlated replies without receipt tool calls.
+Claude socket writes remain Unknown; separate fixture observations can demonstrate
+model input without changing the adapter's proof boundary. Scripted tool choices do not
 establish an external model's judgment, comprehension, or task quality.
 
 The [2026-10-29 run report](compatibility-2026-10-29.md) records the measured source,
@@ -93,8 +95,10 @@ steering from idle/compatibility queue delivery; the
 [original diagnosis](codex-delivery-diagnosis.md) records the earlier queue-only
 behavior. No owner deployment is implied by source qualification.
 
-`submitted` means adapter acceptance/insertion, `acknowledged` requires an explicit
-recipient tool call, and neither state alone proves task completion. Native final
+Current outcomes are `pending`, `delivered`, `failed` and `unknown`; historical
+reports below retain the older labels and tool calls as evidence, not current
+requirements. Delivered means validated native acceptance, never model read or
+task completion. Claude socket-only writes remain Unknown. Native final
 fixture output is scripted completion only. Confirmed production failures must be
 fixed or linked to a narrow bug before declaring a row qualified. Platform and
 interactive checks that were unavailable remain outstanding, not inferred passes.

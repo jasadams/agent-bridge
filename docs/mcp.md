@@ -59,8 +59,8 @@ its verified native system context; check `connection_status` before using a
 connection shared by several conversations. No new transport or per-message
 setup prompt is required.
 
-OpenCode supports the same message and shared-board tools, including explicit
-acknowledgement and correlated replies. It cannot be selected for native owner
+OpenCode supports the same message and shared-board tools, including correlated
+replies. It cannot be selected for native owner
 pairing prompts; retain explicit owner CLI confirmation. Native permissions are
 unchanged. See [OpenCode support and limits](opencode.md).
 
@@ -75,9 +75,8 @@ unchanged. See [OpenCode support and limits](opencode.md).
 | `subscribe`, `unsubscribe` | Add/remove explicit local board-change and agent-lifecycle event selectors for an exact registered route. |
 | `connection_status` | Inspect the local broker and peer connections. |
 | `list_agents` | List local sessions by default, or one explicitly selected peer's permitted sessions. |
-| `list_messages`, `get_message` | Inspect message history and delivery state. |
+| `list_messages`, `get_message` | Inspect history; diagnose delivery failures or missing responses. |
 | `send_message` | Persist a message with an idempotent UUID and optional reply ID. |
-| `acknowledge_message` | Confirm receipt separately from task completion. |
 | `configure_network` | Explicitly enable or disable networking and LAN discovery. |
 | `open_pairing`, `create_invite`, `connect_peer` | Organize pairing and choose the local session that receives owner prompts. |
 | `pairing_status` | Inspect requests and their locally generated verification codes. |
@@ -85,7 +84,7 @@ unchanged. See [OpenCode support and limits](opencode.md).
 | `share_session`, `unshare_session` | Explicitly grant or remove access to one selected local session. |
 
 Tool inputs and results are structured JSON. Select the intended local registered
-agent explicitly for sending, acknowledging, session sharing and pairing notices;
+agent explicitly for sending, session sharing and pairing notices;
 a server shared by several conversations must not guess which session owns a call.
 Local registration names are available through `list_agents` or native registration
 context. Pairing alone still shares no sessions.
@@ -101,13 +100,14 @@ blocker and restore the broker/MCP connection; do not fall back to direct file w
 
 Codex peer deliveries contain a trust marker and JSON message data, without
 repeated tool instructions or shell commands. The MCP tool descriptions explain
-how to acknowledge and reply: use the incoming `to` as your local `agent` or
-`from`, its `id` as the acknowledgement `id` or reply `parent`, and its `from` as
+how to reply: use the incoming `to` as your local
+`from`, its `id` as the reply `parent`, and its `from` as
 the reply `to`. Claude uses the equivalent `Delivered to`, `Message reference`,
 and `Reply to` fields. Preserve these exact routes rather than display names.
 Session startup supplies the broker state directory and CLI fallback once; check
 `connection_status` identifies that broker before using a configured MCP server.
-Acknowledgement confirms receipt, not task completion or permission.
+Send and continue working. For delivery failures or missing responses, see
+[diagnostic outcomes and adapter proof](delivery-outcomes.md).
 
 Board names are lowercase ASCII slugs matching `[a-z0-9][a-z0-9_-]{0,63}`.
 Call `create_board({"board":"streamr"})` before using a non-main board; duplicates
@@ -220,7 +220,7 @@ Closure removes subscriptions and pending notices; reconnect/reopen requires
 explicit opt-in. Subscriptions and event history do not survive broker restart:
 resubscribe and use the returned snapshot.
 
-An overflow or failed or uncertain lifecycle delivery makes the event stream
+An overflow or Failed or Unknown lifecycle delivery makes the event stream
 incomplete. The broker attempts at most one `resync.required` control notice for
 that gap and suppresses further lifecycle transitions until you explicitly call
 `subscribe` with a lifecycle selector to obtain a fresh atomic snapshot. Adding
@@ -235,7 +235,7 @@ Unsubscribe, closure, recipient replacement and broker restart prevent pending
 notices from starting native delivery for an invalid subscription or recipient.
 Native I/O already admitted before that boundary may complete; these operations
 do not cancel it. Unsubscribing one selector does not cancel retained selectors'
-work. Failed or uncertain native attempts are not automatically replayed.
+work. Failed or Unknown native attempts are not automatically replayed.
 
 Subscribe/unsubscribe receipts always include
 `recovery:{"total":0,"truncated":false,"items":[]}` when no attempted OpenCode
@@ -261,9 +261,9 @@ insertion. A matching live route/lease is needed to perform native readback;
 A queued or pending reconciliation has not necessarily run. After a lease/generation
 change or broker restart, explicitly retry that same ID again if readback remains
 queued; this still reads proof and cannot insert another prompt.
-Missing or mismatched proof remains uncertain and may continue blocking delivery.
-There is no automatic retry, automatic promotion to submitted, or cancel escape
-that proves an uncertain attempt never happened. After reconciliation, explicitly
+Missing or mismatched proof remains Unknown and may continue blocking delivery.
+There is no automatic retry, automatic promotion to Delivered, or cancel escape
+that proves an Unknown attempt never happened. After reconciliation, explicitly
 subscribe to lifecycle events again if a fresh snapshot is needed.
 
 These notices are control data, require no acknowledgement or peer reply, do not
@@ -333,10 +333,9 @@ always returns its new full snapshot. This changes only MCP output;
 message persistence, delivery, CLI output and access checks are unchanged.
 
 - `update_board` returns `{"result":{"board":"main","revision":"…"}}` on success.
-- `send_message` returns `{"result":{"id":"…","state":"queued"},"id":"…"}`
+- `send_message` returns `{"result":{"id":"…","state":"pending"},"id":"…"}`
   on success. On error it returns `request_id` for safe retry, plus either
   `persisted: false` when confirmed or `persistence: "unknown"` otherwise.
-- `acknowledge_message` returns `{"result":{"id":"…","state":"acknowledged"}}`.
 - Subscriptions retain the effective `events` and complete `agents` snapshot, including in compact results.
   Pairing tools retain the exchange ID, verification state, invitation link and
   expiry needed for the next action; sharing returns the peer, agent and requested
@@ -384,7 +383,7 @@ with the same agent scope. Continue while `has_more` is true. An empty page reta
 the cursor and can be reused after new messages arrive. Omit `agent` to select all
 messages. Cursors survive broker restarts and reject malformed values or a different
 scope. They track **newly inserted messages**, not subsequent delivery-state changes;
-use `get_message` to check delivery or acknowledgement state, and incremental reads
+use `get_message` to check delivery outcome, and incremental reads
 to receive new replies. If a cursor
 anchor has been removed, restart with an empty cursor. No waiting or polling behavior
 is introduced by these options.

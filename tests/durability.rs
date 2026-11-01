@@ -91,19 +91,20 @@ fn one_in_flight_per_recipient_preserves_fifo_without_blocking_other_agents() {
 }
 
 #[test]
-fn fast_ack_cannot_be_overwritten_by_transport_completion() {
+fn native_completion_prevents_normal_retries_but_allows_explicit_duplicate_override() {
     let temp = tempfile::tempdir().unwrap();
     let mut db = Db::open(&temp.path().join("db")).unwrap();
     db.register(&agent("worker"), false).unwrap();
     let mid = id();
     db.send(&mid, "user", "worker", "message", &None).unwrap();
     db.claim().unwrap();
-    assert!(db.ack(&mid, "user").is_err());
-    db.ack(&mid, "worker").unwrap();
     db.finish(&mid, "submitted", "transport finished later")
         .unwrap();
-    assert_eq!(db.get(&mid).unwrap().state, "acknowledged");
-    assert!(db.retry(&mid, true).is_err());
+    assert_eq!(db.get(&mid).unwrap().state, "submitted");
+    assert!(db.claim().unwrap().is_none());
+    assert!(db.retry(&mid, false).is_err());
+    db.retry(&mid, true).unwrap();
+    assert_eq!(db.claim().unwrap().unwrap().0.id, mid);
 }
 
 #[test]

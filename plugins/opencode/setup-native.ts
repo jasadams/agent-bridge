@@ -70,12 +70,11 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
           const agents = readToolResult(body, "setup_discover");
           assert(Array.isArray(agents) && agents.some(a => a.name === selected && a.provider === "opencode" && a.session === session), "Actual MCP discovery omitted the exact installed native session");
           discoveryVerified = true;
-          call = invoke("acknowledge_message", { id: incoming, agent: selected }, "setup_ack");
+          call = invoke("send_message", { from: selected, to: "native-probe", body: `Reply ${marker}`, id: replyID, parent: incoming }, "setup_reply");
         }
-        if (stage === 2) call = invoke("send_message", { from: selected, to: "native-probe", body: `Reply ${marker}`, id: replyID, parent: incoming }, "setup_reply");
-        if (stage === 3) call = invoke("read_board", {}, "setup_read");
-        if (stage === 4) call = invoke("subscribe", { agent: selected, events: [{ event: "board.changed", board: "main" }] }, "setup_subscribe");
-        if (stage === 5) call = invoke("update_board", { agent: selected, expected_revision: readToolResult(body, "setup_read").revision, edits: [{ op: "set", markdown: ownBoard }] }, "setup_update");
+        if (stage === 2) call = invoke("read_board", {}, "setup_read");
+        if (stage === 3) call = invoke("subscribe", { agent: selected, events: [{ event: "board.changed", board: "main" }] }, "setup_subscribe");
+        if (stage === 4) call = invoke("update_board", { agent: selected, expected_revision: readToolResult(body, "setup_read").revision, edits: [{ op: "set", markdown: ownBoard }] }, "setup_update");
       } else if (phase === "pairing" && stage === 0) call = invoke("open_pairing", { agent: selected, seconds: 30 }, "setup_pairing_denied");
       else if (phase === "pairing" && stage === 1) {
         const result = body.messages.findLast((m: any) => m.role === "tool" && m.tool_call_id === "setup_pairing_denied");
@@ -147,10 +146,10 @@ try {
   }
   await brokerRpc(state, { op: "register", agent: { name: "native-probe", provider: "inbox", session: "native-probe", endpoint: "", enabled: true }, replace: false });
   await brokerRpc(state, { op: "send", id: incoming, sender: "native-probe", recipient: selected, body: marker, parent: null });
-  await waitFor("actual MCP ack reply and board update", async () => {
+  await waitFor("actual MCP reply and board update", async () => {
     const original = await brokerRpc(state, { op: "get", id: incoming }) as any, reply = await brokerRpc(state, { op: "get", id: replyID }) as any;
     const board = await brokerRpc(state, { op: "board_read" }) as any;
-    return discoveryVerified && stage === 6 && original.state === "acknowledged" && reply.parent === incoming && reply.sender === selected && reply.recipient === "native-probe" && board.markdown === ownBoard;
+    return discoveryVerified && stage === 5 && original.state === "delivered" && reply.parent === incoming && reply.sender === selected && reply.recipient === "native-probe" && board.markdown === ownBoard;
   }, 60000);
   await idle();
   const pairingBefore = JSON.stringify(await brokerRpc(state, { op: "lan_pairing_list" }));
@@ -203,7 +202,7 @@ try {
   assert(captures.length === afterEnd, "Session cleanup retained a board notification/model task");
   assert(modelErrors.length === 0, `Local model assertions: ${modelErrors.join("; ")}`);
   assert(captures.filter(c => c.tools > 0).every(c => c.systemBlocks === 1 && c.exactIdentity && !c.transcriptSetup), "Per-request context invariant failed");
-  console.log(JSON.stringify({ result: "passed", opencode: "1.18.35", installed_assets: true, installed_mcp: true, exact_session: session, incoming, reply: replyID, parent: incoming, model_requests: captures.length, context_requests: captures.filter(c => c.tools > 0).length, compaction_context: true, context_after_compaction: true, context_after_reload: true, compact_peer_body: true, real_mcp_discovery: true, real_mcp_ack_reply: true, mcp_board_read_update: true, board_opt_in: true, cli_mcp_pairing_preflight: true, own_write_suppression: true, paused_coalesced_notification: true, unsubscribe: true, deleted_registration_cleanup: true }));
+  console.log(JSON.stringify({ result: "passed", opencode: "1.18.35", installed_assets: true, installed_mcp: true, exact_session: session, incoming, reply: replyID, parent: incoming, model_requests: captures.length, context_requests: captures.filter(c => c.tools > 0).length, compaction_context: true, context_after_compaction: true, context_after_reload: true, compact_peer_body: true, real_mcp_discovery: true, native_acceptance: true, real_mcp_reply: true, mcp_board_read_update: true, board_opt_in: true, cli_mcp_pairing_preflight: true, own_write_suppression: true, paused_coalesced_notification: true, unsubscribe: true, deleted_registration_cleanup: true }));
   passed = true;
 } finally {
   await Promise.all(children.map(stop)); model.stop(true);

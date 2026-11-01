@@ -106,9 +106,11 @@ compaction; preserve it with the matching broker state.
 
 A 204 response only accepts background native work. The plugin verifies the exact
 native user message's ID, role, session and complete text before committing
-`inserted` and returning success. This means **submitted**, never model
-acknowledgement, completion or permission approval. The agent explicitly uses
-existing broker MCP tools to acknowledge and reply with the broker ID as parent.
+`inserted` and returning success. The broker records **Delivered**, never model
+read, completion or permission approval. A useful reply uses the broker ID as
+parent. The plugin's protocol-2 status tokens
+are adapter evidence, not an additional public lifecycle. See
+[delivery outcomes](../../docs/delivery-outcomes.md).
 
 Reconciliation is strictly read-only: no admission, journal transition or prompt
 call, including ordinary retries and `--allow-duplicate`. Exact native readback can prove insertion, including after a missing journal
@@ -116,7 +118,7 @@ mapping or legacy migration. This never creates or mutates a journal row.
 An existing mapping must still match the immutable identity/content. Corrupt
 journals, missing native messages or mismatched text remain uncertain; none
 proves no attempt. A crash after the attempt fence but before insertion may therefore
-require manual inspection/acknowledgement. Legacy UUID-based native IDs are
+require manual inspection. Legacy UUID-based native IDs are
 accepted only for read-only reconciliation; absent legacy mappings require exact native proof or remain
 uncertain. No same-ID replay repairs an unknown result.
 
@@ -133,14 +135,14 @@ In 1.18.35 `promptAsync` persists input before joining an existing runner withou
 cancelling it. OpenCode owns that native input; a subsequent normal model request
 can see it at the next runner iteration. An in-flight request cannot. Appending
 input does not answer a pending permission. Native errors and early stops may
-leave inserted input unprocessed: `submitted` proves insertion, not processing,
-acknowledgement or completion, and never authorizes another prompt.
+leave inserted input unprocessed: Delivered proves insertion, not processing
+or completion, and never authorizes another prompt.
 
 Reinstall with `opencode install` and fully restart OpenCode to load this behavior.
 Protocol 2 is unchanged and does not itself advertise active support. An older
 loaded plugin remains idle-only; an older broker retains its age-expiry policy.
-The 64-per-session/1000-global bounds cover broker queued/sending/uncertain work,
-not submitted native records. Journal lifetime row/byte ceilings still apply.
+The 64-per-session/1000-global bounds cover broker queued/sending/Unknown barrier work,
+not Delivered native records. Journal lifetime row/byte ceilings still apply.
 See [the recovery contract](../../docs/opencode-recovery.md).
 
 ## Disposable native validation
@@ -152,7 +154,7 @@ tools/opencode-setup-native.sh /absolute/path/to/agent-bridge /absolute/path/to/
 
 The harness uses isolated HOME/XDG/config/session/broker state and a scripted
 localhost OpenAI-compatible model fixture. It exercises the actual pinned native
-runtime, plugin, broker and MCP acknowledgement/reply path, insertion during held
+runtime, plugin, broker and correlated MCP reply path, insertion during held
 native tools/model streams, next-boundary model visibility, owner selection,
 alias FIFO, pause/cancel, a 125-second live wait, pending permission input and
 no replay after native stream error. Temporary
@@ -165,7 +167,7 @@ owner settings or physical-network behavior.
 
 The setup harness runs the real installer in temporary HOME/XDG directories,
 loads its extracted assets and MCP connection, and checks model-visible context,
-actual compaction/reload, compact peer text, explicit acknowledgement/reply and
+actual compaction/reload, compact peer text, correlated replies and
 board tool/notification behavior. It also checks unavailable native owner pairing
 selection before any exchange is created. Its scripted provider demonstrates
 transport and tool execution, not independent model judgement. Linux execution

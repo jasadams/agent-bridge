@@ -27,7 +27,7 @@ Write board links as `[label](https://example.com)` to keep ticket and PR labels
 - **Stay in control of access.** Persistent machine identities, owner-approved
   pairing and explicit session grants determine who can communicate. Peer
   connections are encrypted; native agent permissions remain in effect.
-- **See what happened.** Durable message history, acknowledgements, correlated
+- **See what happened.** Durable message history, delivery outcomes, correlated
   replies and a local browser monitor make communication inspectable. Its Boards
   view also lets you answer existing checkbox and text response controls.
 
@@ -209,15 +209,15 @@ The CLI is available alongside MCP:
 agent-bridge list
 agent-bridge send --to AGENT_NAME --message 'Please review the latest changes.'
 agent-bridge history --agent user
-agent-bridge get MESSAGE_ID
 ```
 
 The default sender is your `user` inbox. An agent sending a message uses its
 registered name with `--from AGENT_NAME`. For sensitive or multiline text, pipe
 the body to `send` instead of passing `--message`.
 
-A submitted message has reached a transport or inbox. An acknowledgement confirms
-receipt; task completion is communicated by a reply. See [delivery and trust](docs/peer-trust.md).
+Send your message and continue working. Use a correlated reply for useful results
+or questions. If delivery fails or a response is missing, see
+[delivery diagnostics](docs/delivery-outcomes.md).
 
 ## Update
 

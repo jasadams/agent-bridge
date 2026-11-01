@@ -3,10 +3,12 @@
 This is the local AGB-4 state-transition contract. OpenCode 1.18.35 embeds Bun
 1.3.14; standalone plugin tests use pinned Bun 1.3.11 and the V1 SDK 1.18.35.
 Schema 13 follows the sharing grant migration 12 without changing its constraints.
+Public outcomes are [Pending, Delivered, Failed and Unknown](delivery-outcomes.md);
+legacy phase names and protocol-2 receipt tokens are internal compatibility data.
 
 * One broker queue owns FIFO, keyed by provider and exact native session across
   aliases. A deferred or unresolved attempted head blocks fresh submissions,
-  including earlier row IDs requeued after a later attempt became uncertain.
+  including earlier row IDs requeued after a later attempt became Unknown.
   Pause and queued cancellation remain broker operations. The plugin never
   retains an accepted hidden queue of future prompts.
 * Every message has immutable native identity and rendered content. Native IDs
@@ -15,7 +17,7 @@ Schema 13 follows the sharing grant migration 12 without changing its constraint
   attempt provenance. They keep their original native IDs and cannot receive a new
   namespaced ID or another prompt. Native readback must match session, user role, ID and exact text.
 * Before sending a new delivery, the broker persists its attempt fence. A lost
-  transport response becomes uncertain, never permission for another new prompt.
+  transport response becomes Unknown, never permission for another new prompt.
   Explicit reconciliation is read-only, even with `--allow-duplicate`.
 * The private plugin SQLite journal commits prepared, then atomically compares
   and changes prepared to attempting before invoking the prompt API. Only the
@@ -52,24 +54,24 @@ Session updates fence selection changes through broker admission.
 
 OpenCode owns inserted input. Its next normal runner iteration reads the new
 user record; an in-flight model request cannot see input added after it started.
-Insertion is `submitted`, not acknowledgement or proof of model processing.
+Exact verified insertion is `delivered`, not proof of model processing.
 Native errors, permission denial, structured-output or compaction stops may end a
 run without consuming inserted input. These outcomes never authorize replay or a
 bridge-controlled second inference loop. The integration never cancels work,
 answers permissions, changes owner policy or claims exactly-once model execution.
 
-The 64-per-session and 1000-global broker limits cover queued/sending/uncertain
-work, not submitted native records awaiting model consumption. Durable journal
+The 64-per-session and 1000-global broker limits cover queued/sending/unknown barrier
+work, not Delivered native records awaiting model consumption. Durable journal
 row/byte ceilings still bound lifetime insertion. Protocol 2 retains its existing
 frames and receipts; older loaded plugins remain idle-only. Reinstall and fully
 restart OpenCode to activate the new plugin behavior. Heartbeats use events,
 not continuous model polling.
 
 Crash outcomes: before the attempt fence, no prompt has been authorized; after the
-fence but before insertion, the outcome may remain uncertain. After insertion but
-before receipt, exact native readback recovers submitted. After a persisted receipt,
+fence but before insertion, the outcome may remain Unknown. After insertion but
+before receipt, exact native readback recovers Delivered. After a persisted receipt,
 reconciliation verifies the native insertion without invoking another prompt.
-An uncertain head stays a barrier until verified insertion or explicit operator
+An Unknown head stays a barrier until verified insertion or explicit operator
 resolution; lease renewal alone does not resolve it.
 
 Policy revocation, unsharing and registration replacement preserve attempted
@@ -77,4 +79,4 @@ uncertainty instead of converting it to a cancellable blocked/failed queue entry
 An explicit pending read-only reconciliation may still inspect historical native
 proof without restoring a revoked Receive grant; it needs the current exact live
 registration and never grants native submission authority. A failed proof remains
-uncertain, and no heartbeat automatically retries it.
+Unknown, and no heartbeat automatically retries it.

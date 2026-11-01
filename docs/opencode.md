@@ -20,7 +20,7 @@ transcript files.
 
 The V1 system transform supplies one stable messaging block on each model request
 for a verified live session. It names the exact `opencode-SESSION_ID` route and
-broker state directory, explains explicit acknowledgement and correlated replies,
+broker state directory, explains sending and correlated replies,
 and gives brief shared-board guidance. It replaces its own block if a hook array
 is reused. Missing, expired or replaced identities omit the block; context hooks
 do not activate stored history. Native compaction receives additional summary
@@ -35,7 +35,7 @@ model-visible: the system block still costs tokens on each request. This is plai
 native text, with no claim of Claude-style peer cards or a custom rich renderer.
 Display labels never replace exact route references.
 
-The existing MCP connection provides discovery, send, acknowledge, correlated
+The existing MCP connection provides discovery, send, correlated
 reply and shared-board read/update. Board notifications remain off by default;
 subscribe with the exact session identity, attribute own writes, and unsubscribe
 when no longer needed. Keep board task/status/blocker or user-action entries
@@ -116,12 +116,12 @@ Waiting is bounded by the queue count and message byte limits, rather than a
 queued work without native events; restart does not extend a lease. Historical
 failed messages stay failed until explicit operator retry. A queued *reconciliation* of an earlier attempt cannot be cancelled as if
 it were unattempted work. Unresolved attempts remain barriers to fresh native
-submissions; read-only reconciliation can inspect multiple uncertain messages.
+submissions; read-only reconciliation can inspect multiple Unknown messages.
 
-These queue bounds apply to broker queued/sending/uncertain messages, not to input
-already inserted into the native conversation. Submitted input is owned by
-OpenCode; the journal's durable row/byte limits still apply. `submitted` proves
-exact native insertion, not model consumption, acknowledgement or completion.
+These queue bounds apply to broker queued/sending/unknown barrier work, not to input
+already inserted into the native conversation. Delivered input is owned by
+OpenCode; the journal's durable row/byte limits still apply. `delivered` proves
+exact native insertion, not model consumption or completion.
 Native errors, permission denial, structured-output stops or other early exits
 may leave inserted input unprocessed. The bridge never replays it to force another
 run. The owner retains control of permission and native continuation.
@@ -144,15 +144,15 @@ pruning is provided.
 
 `session.promptAsync` returning HTTP 204 is **not** evidence of durable insertion.
 The plugin verifies exact native user-message ID, session, role and text before a
-successful receipt. The broker records **submitted**, never acknowledged or
-complete. A lost, malformed, mismatched or missing response after an attempted
-write is uncertain. `retry MESSAGE_ID` for attempted OpenCode work is **read-only
+successful receipt. The broker records **Delivered**, never model read or task
+completion. A lost, malformed, mismatched or missing response after an attempted
+write is **Unknown**. `retry MESSAGE_ID` for attempted OpenCode work is **read-only
 reconciliation**, even with `--allow-duplicate`: exact existing native content can
 prove insertion, including when a journal mapping is missing; absence cannot prove
 no attempt, and never authorizes another prompt. Missing/corrupt journals do not
 create permission to repeat an attempt. All migrated legacy IDs reconcile read-only. An old broker's explicit retry could
-turn a submitted/uncertain message back into queued without preserving attempt
-provenance, so even migrated queued work is uncertain and blocks fresh submissions.
+turn a legacy submitted/uncertain message back into queued without preserving attempt
+provenance, so even migrated queued work projects to Unknown and blocks fresh submissions.
 Legacy absence cannot authorize a new prompt or a replacement namespaced ID;
 genuine unattempted legacy work is indistinguishable and requires conservative
 operator resolution. Only modern durable pre-attempt records can be retried as new
@@ -163,8 +163,8 @@ owner selection. Input can be inserted during existing native work; the supporte
 runner joins that work without cancelling it. Subsequent processing follows
 native behavior. Admission linearizes
 an in-flight submission: a later pause cannot recall it. No native cancellation or
-permission response is sent. A model must explicitly acknowledge and send a reply
-with the broker parent ID. There is no exactly-once model-processing or completion
+permission response is sent. A useful reply uses the broker parent ID.
+There is no exactly-once model-processing or completion
 claim. See [recovery invariants](opencode-recovery.md) for crash transitions.
 
 ## Sharing with a paired machine
@@ -224,7 +224,7 @@ plugin/MCP assets, checking model-visible context, native compaction/reload,
 compact peer presentation and board opt-in/notification behavior. These checks
 use the same credential-free local provider boundary.
 The deterministic native harness uses a local model fixture; it checks real
-OpenCode/plugin/broker execution, acknowledgement/reply, read-only reconciliation,
+OpenCode/plugin/broker execution, native acceptance/reply, read-only reconciliation,
 native insertion during held tools and SSE model streams, next-boundary model
 visibility, preserved owner agent/model/variant, alias FIFO, queued pause/cancel,
 more than 125 seconds of paused unattempted work, unanswered permission input and

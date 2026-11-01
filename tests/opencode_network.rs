@@ -305,7 +305,7 @@ fn setup(a: &Running, b: &Running, na: &Native, nb: &Native) {
 }
 
 #[tokio::test]
-async fn shared_opencode_sessions_submit_once_and_exchange_exact_acknowledged_reply_chains() {
+async fn shared_opencode_sessions_submit_once_and_exchange_exact_delivered_reply_chains() {
     let root = temp();
     let a = Running::start(&root.path().join("a"));
     let b = Running::start(&root.path().join("b"));
@@ -358,8 +358,8 @@ async fn shared_opencode_sessions_submit_once_and_exchange_exact_acknowledged_re
     }
     let incoming = received(&b, body).await;
     let local = incoming["id"].as_str().unwrap();
-    state(&b, local, "submitted").await;
-    state(&a, &id, "submitted").await;
+    state(&b, local, "delivered").await;
+    state(&a, &id, "delivered").await;
     assert_eq!(incoming["recipient_session"], B);
     assert_eq!(incoming["source_machine"]["peer_id"], a.identity());
     assert_eq!(incoming["source_machine"]["machine_name"], "machine-a");
@@ -381,11 +381,7 @@ async fn shared_opencode_sessions_submit_once_and_exchange_exact_acknowledged_re
     );
     assert!(!content.contains("Prefer the configured"));
     assert!(!content.contains("--in-reply-to"));
-    b.request(Request::Ack {
-        id: local.into(),
-        agent: nb.name(),
-    });
-    state(&a, &id, "acknowledged").await;
+    state(&a, &id, "delivered").await;
     let reply_id = uuid::Uuid::new_v4().to_string();
     b.send(
         &reply_id,
@@ -396,17 +392,13 @@ async fn shared_opencode_sessions_submit_once_and_exchange_exact_acknowledged_re
     );
     let reply = received(&a, "Correlated reply").await;
     let reply_local = reply["id"].as_str().unwrap();
-    state(&a, reply_local, "submitted").await;
+    state(&a, reply_local, "delivered").await;
     assert_eq!(reply["parent"], id);
     assert_eq!(reply["hops"], 1);
     assert_eq!(reply["recipient_session"], A);
     assert_eq!(reply["source_machine"]["peer_id"], b.identity());
     assert_eq!(reply["destination_machine"]["peer_id"], a.identity());
-    a.request(Request::Ack {
-        id: reply_local.into(),
-        agent: na.name(),
-    });
-    state(&b, &reply_id, "acknowledged").await;
+    state(&b, &reply_id, "delivered").await;
     a.share("bob", &na.name(), false);
     assert!(
         a.broker
@@ -450,7 +442,7 @@ async fn unsharing_and_revocation_block_queued_opencode_before_native_submission
             None,
         );
         let queued = received(&b, "Queued policy change").await;
-        assert_eq!(queued["state"], "queued");
+        assert_eq!(queued["state"], "pending");
         match policy {
             "revoke" => {
                 b.request(Request::PeerRevoke {
@@ -472,7 +464,23 @@ async fn unsharing_and_revocation_block_queued_opencode_before_native_submission
             _ => b.share("alice", &nb.name(), false),
         }
         b.request(Request::Pause { paused: false });
-        state(&b, queued["id"].as_str().unwrap(), "blocked").await;
+        let stored = rusqlite::Connection::open_with_flags(
+            root.path().join("b/messages.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        wait("queued OpenCode message blocked by policy", || {
+            let blocked: bool = stored
+                .query_row(
+                    "SELECT state='blocked' FROM messages WHERE id=?",
+                    [queued["id"].as_str().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            blocked.then_some(Value::Null)
+        })
+        .await;
+        state(&b, queued["id"].as_str().unwrap(), "pending").await;
         assert!(nb.frames().is_empty());
         a.stop().await;
         b.stop().await;
@@ -593,13 +601,8 @@ async fn queued_opencode_survives_origin_restart_and_destination_offline_recover
     });
     let incoming = received(&b, "Durable OpenCode offline").await;
     let local = incoming["id"].as_str().unwrap();
-    state(&b, local, "submitted").await;
-    state(&a, &id, "submitted").await;
-    b.request(Request::Ack {
-        id: local.into(),
-        agent: nb.name(),
-    });
-    state(&a, &id, "acknowledged").await;
+    state(&b, local, "delivered").await;
+    state(&a, &id, "delivered").await;
     assert_eq!(nb.frames().len(), 1);
     a.stop().await;
     b.stop().await;
@@ -620,8 +623,8 @@ async fn lost_native_receipt_is_uncertain_and_duplicate_remote_send_never_resubm
     a.send(&id, &na.name(), &recipient, "Lost insertion receipt", None);
     let incoming = received(&b, "Lost insertion receipt").await;
     let local = incoming["id"].as_str().unwrap();
-    state(&b, local, "uncertain").await;
-    state(&a, &id, "uncertain").await;
+    state(&b, local, "unknown").await;
+    state(&a, &id, "unknown").await;
     a.send(&id, &na.name(), &recipient, "Lost insertion receipt", None);
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(nb.frames().len(), 1);
@@ -634,7 +637,7 @@ async fn lost_native_receipt_is_uncertain_and_duplicate_remote_send_never_resubm
     );
     assert_eq!(
         b.request(Request::Get { id: local.into() })["state"],
-        "uncertain"
+        "unknown"
     );
     a.stop().await;
     b.stop().await;

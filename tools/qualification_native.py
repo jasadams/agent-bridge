@@ -176,7 +176,7 @@ def http_json(base, path, body=None, method=None, timeout=60):
 class Fixture:
     """Only emits scripted calls through tools actually exposed by native MCP.
 
-    The provider never performs acknowledgement/send itself. Main-thread RPC
+    The provider never sends itself. Main-thread RPC
     observes those effects independently, after actual native tool execution.
     """
     def __init__(self):
@@ -235,13 +235,17 @@ class Fixture:
         message = next((m for m in records if m["body"] == wanted_body and m["recipient"] == route), None)
         require(message, "Model request had marker but no exact broker recipient record")
         step = self.stages.get((route, original), 0)
-        if step == 0:
-            suffix, args = "acknowledge_message", {"agent": route, "id": message["id"]}
-        elif step == 1 and not is_reply:
-            suffix, args = "send_message", {"from": route, "to": message["sender"],
-                "body": "Reply " + original, "id": row["reply_id"], "parent": message["id"]}
-        else:
+        if step != 0:
             return None
+        self.stages[(route, original)] = 1
+        # Record actual model input in each direction, without a receipt tool call.
+        self.receipts.append({"route": route, "marker": original, "message": message["id"],
+            "sender_label_visible": message["sender"] in text,
+            "correlation_visible": message["id"] in text, "tool": None if is_reply else "send_message"})
+        if is_reply:
+            return None
+        suffix, args = "send_message", {"from": route, "to": message["sender"],
+            "body": "Reply " + original, "id": row["reply_id"], "parent": message["id"]}
         if info["provider"] == "codex":
             namespace = next(t for t in tools if t.get("name") == "mcp__bridge")
             found = next(t for t in namespace["tools"] if t["name"].endswith(suffix))
@@ -249,11 +253,6 @@ class Fixture:
         else:
             name = next(t.get("name", t.get("function", {}).get("name", "")) for t in tools
                         if t.get("name", t.get("function", {}).get("name", "")).endswith(suffix))
-        self.stages[(route, original)] = step + 1
-        # No prompts, credentials or raw transcripts are retained in evidence.
-        self.receipts.append({"route": route, "marker": original, "message": message["id"],
-            "sender_label_visible": message["sender"] in text,
-            "correlation_visible": message["id"] in text, "tool": suffix})
         return {"name": name, "arguments": args, "id": "call_" + uid().replace("-", "")}
 
     def respond(self, path, body):
@@ -380,7 +379,7 @@ class Qualification:
         mcp = root / "claude-mcp.json"
         mcp.write_text(json.dumps({"mcpServers": {"bridge": {"command": self.args.binary, "args": ["--state-dir", str(state), "mcp"]}}}))
         argv = [self.args.claude, "--bare", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(mcp), "--tools", "",
-            "--allowedTools", "mcp__bridge__acknowledge_message,mcp__bridge__send_message", "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            "--allowedTools", "mcp__bridge__send_message", "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--replay-user-messages", "--model", "claude-fixture", "--session-id", session, "--messaging-socket-path", str(endpoint)]
         native = self.processes.start("claude", argv, env, self.work("a"), stdin=subprocess.PIPE)
         native.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": "Initialize disposable qualification session."}}) + "\n")
@@ -399,7 +398,7 @@ class Qualification:
         require(stat.S_ISDIR(meta.st_mode) and meta.st_uid == os.getuid() and stat.S_IMODE(meta.st_mode) & 0o077 == 0, "Codex socket directory is not private")
         self.codex_socket = shared / ("agb7-" + uid() + ".sock")
         config = Path(env["CODEX_HOME"]) / "config.toml"
-        config.write_text('[mcp_servers.bridge]\nenabled_tools = ["acknowledge_message", "send_message"]\ncommand = ' + json.dumps(self.args.binary) + '\nargs = ["--state-dir", ' + json.dumps(str(self.states['a'])) + ', "mcp"]\n[mcp_servers.bridge.tools.acknowledge_message]\napproval_mode = "approve"\n[mcp_servers.bridge.tools.send_message]\napproval_mode = "approve"\n')
+        config.write_text('[mcp_servers.bridge]\nenabled_tools = ["send_message"]\ncommand = ' + json.dumps(self.args.binary) + '\nargs = ["--state-dir", ' + json.dumps(str(self.states['a'])) + ', "mcp"]\n[mcp_servers.bridge.tools.send_message]\napproval_mode = "approve"\n')
         # A unique provider endpoint is filled after thread/start identifies the route.
         argv = [self.args.codex, "app-server", "--listen", "unix://" + str(self.codex_socket)]
         for setting in ['model_provider="fixture"', 'model="fixture"', 'model_providers.fixture.name="fixture"',
@@ -442,21 +441,24 @@ class Qualification:
             original = rpc(source["state"], {"op": "get", "id": row["id"]})
             replies = rpc(source["state"], {"op": "history", "agent": sender, "limit": 100})
             reply = next((m for m in replies if m["body"] == "Reply " + row["marker"] and m["recipient"] == sender), None)
-            return (original, reply) if original["state"] == "acknowledged" and reply and reply["state"] == "acknowledged" else None
-        original, reply = wait_for("native explicit ack/reply " + sender + " -> " + target, complete, 90)
+            observed = {r["route"] for r in self.fixture.receipts if r["marker"] == row["marker"]}
+            source_outcome = "unknown" if dest["provider"] == "claude" else "delivered"
+            reply_outcome = "unknown" if source["provider"] == "claude" else "delivered"
+            return (original, reply) if original["state"] == source_outcome and reply and reply["state"] == reply_outcome and observed == {sender, recipient} else None
+        original, reply = wait_for("native model input and correlated reply " + sender + " -> " + target, complete, 90)
         require(reply["parent"] == row["id"] and reply["hops"] == 1 and reply["recipient_session"] == source["session"], "Reply correlation/session mismatch")
         records = rpc(dest["state"], {"op": "history", "agent": recipient, "limit": 100})
         incoming = next(m for m in records if m["body"] == row["marker"] and m["recipient"] == recipient)
         require(incoming["recipient_session"] == dest["session"], "Destination native identity mismatch")
         receipts = [r for r in self.fixture.receipts if r["marker"] == row["marker"]]
-        require(len(receipts) == 3 and all(r["sender_label_visible"] and r["correlation_visible"] for r in receipts), "Missing actual model-visible sender/reference or tool execution")
+        require(len(receipts) == 2 and sum(r["tool"] == "send_message" for r in receipts) == 1 and all(r["sender_label_visible"] and r["correlation_visible"] for r in receipts), "Missing actual model-visible sender/reference or reply execution")
         for route, marker in [(recipient, row["marker"]), (sender, "Reply " + row["marker"])]:
             info = self.fixture.routes[route]
             if info["provider"] == "opencode":
                 self.oc_exact_message(route, marker)
         row.update(incoming_id=incoming["id"], reply_local_id=reply["id"], parent=reply["parent"], original_state=original["state"], reply_state=reply["state"],
-                   source_model_receipt=True, destination_model_receipt=True, scripted_mcp_calls=len(receipts),
-                   task_completion="not established by ack/reply; scripted tools only")
+                   source_model_receipt=True, destination_model_receipt=True, scripted_mcp_calls=1,
+                   task_completion="not established by native acceptance or reply; scripted tools only")
         self.evidence["pairs"].append(row)
         self.fixture.active = None
 
@@ -498,7 +500,7 @@ class Qualification:
         require(rpc(state, {"op": "status"})["paused"], "Broker restart lost pause")
         require(rpc(state, {"op": "identity"}) == identity, "Broker restart changed identity")
         require(durable_grants() == grants, "Broker restart lost exact session grants")
-        require(rpc(state, {"op": "get", "id": history_id})["state"] == "acknowledged", "Broker restart lost retained history")
+        require(rpc(state, {"op": "get", "id": history_id})["state"] == self.evidence["pairs"][0]["original_state"], "Broker restart lost retained history")
         rpc(state, {"op": "pause", "paused": False})
         self.processes.stop(native["process"])
         wait_for("closed plugin expires native routes", lambda: not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})))

@@ -213,12 +213,6 @@ enum Commands {
     Get {
         id: String,
     },
-    /// Confirm receipt, independently of task completion.
-    Ack {
-        #[arg(long)]
-        agent: String,
-        id: String,
-    },
     Retry {
         id: String,
         #[arg(long)]
@@ -1037,7 +1031,6 @@ async fn main() -> Result<()> {
         }
         Commands::History { agent, limit } => Request::History { agent, limit },
         Commands::Get { id } => Request::Get { id },
-        Commands::Ack { id, agent } => Request::Ack { id, agent },
         Commands::Retry {
             id,
             allow_duplicate,

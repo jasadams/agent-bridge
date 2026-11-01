@@ -10,7 +10,7 @@ not a version allowlist. An active thread with
 `canAcceptDirectInput: true` receives one `turn/steer` using its latest exact
 `inProgress` turn ID as `expectedTurnId`. The lookup is bounded to one descending
 summary turn. Input retains the original bridge UUID and peer envelope; steer
-returns only a turn ID. Acceptance is not recipient acknowledgement, task completion
+returns only a turn ID. Validated acceptance is Delivered, not model read, task completion
 or proof of model judgement. A running tool may finish before the next model
 request sees the input; the adapter does not cancel it to reduce latency.
 
@@ -27,8 +27,8 @@ not an allowlist.
 Contradictory/malformed metadata, unavailable threads, unsupported required lookup
 APIs and a stale active-turn selection fail before submission. If the active turn
 changes after the lookup, the steer may be rejected; no queue fallback or second
-write occurs. A lost/mismatched/rejected steer receipt remains uncertain. Lookup
-timeouts before a write are failed; timeouts after a write attempt remain uncertain.
+write occurs. A lost/mismatched/ambiguous steer receipt remains Unknown. Lookup
+timeouts before a write are Failed; timeouts after a write attempt remain Unknown.
 The bridge never automatically retries an ambiguous write or sends the same UUID
 through both native methods. The idle read and queue write are not atomic with a user starting a turn. That
 one queued handoff can still wait for the new turn to finish; it is never resent
@@ -38,18 +38,17 @@ private message content.
 
 ## Backpressure and recovery
 
-Each canonical Codex native session has at most **64 unresolved broker messages**
-across all aliases. Ordinary `queued`, `sending`, `submitted` and `uncertain`
-messages use slots. Submission alone does not free an ordinary peer receipt slot;
-the recipient's explicit acknowledgement does. Typed board/pairing notices require
-no acknowledgement: their submitted state does not use an unresolved slot, while
-queued/sending/uncertain notices remain bounded. No acknowledgements are fabricated
-and uncertain notices are not silently expired or replayed.
+Each canonical Codex native session has at most **64 pending broker deliveries**
+across all aliases. Delivered history does not use admission slots, whether or not
+the model ever processes it. No recipient receipt tool call is required. Unknown
+history is not pending queue work and is never automatically replayed. Typed
+board/pairing notices use the same delivery rule. Retained history and native queue
+capacity still have independent resource limits; delivery is not history deletion.
 
 The existing global bound remains 1000 queued messages and dispatcher concurrency
 remains bounded, with at most one active delivery worker per canonical Codex
-session. Its runtime fence lasts until task completion even if a fast native
-acknowledgement changes the durable message state first.
+session. Its runtime fence lasts until the delivery worker finishes, even if
+another operation observes the durable outcome first.
 Local sends, explicit retries, inbound remote messages and typed controls share
 admission. Idempotent sends return the existing record before new admission checks.
 Captured provider/native identity is immutable across alias replacement; a rebound
@@ -57,21 +56,22 @@ alias cannot redirect an old attempt to another provider, even if the UUID match
 
 The exercised native queue holds 100 entries and can include messages sent
 outside this broker. The exact validated capacity rejection produces a failed
-message with a sanitized queue-full diagnostic, distinct from an uncertain write.
+message with a sanitized queue-full diagnostic, distinct from an Unknown write.
 Only that exact code/message and an unambiguous error-only response qualify;
-generic errors, malformed error envelopes and contradictory receipts remain uncertain.
+generic errors, malformed error envelopes and contradictory receipts remain Unknown.
 Capacity classification uses the correlated error-only response and exact known
 code/message semantics, independently of runtime version.
 There is no automatic retry when native capacity becomes available. A result
-describes only the latest attempt: an earlier explicitly retried uncertain or
-submitted attempt may still execute. A definite latest rejection does not prove
+describes only the latest attempt: an earlier explicitly retried Unknown or
+Delivered attempt may still execute. A definite latest rejection does not prove
 historical absence or make blind retries safe.
 
 When admission is full, inspect exact message IDs using `agent-bridge history`
-and `agent-bridge get ID`. Resolve actual ordinary receipts through the recipient's
-normal acknowledgement tool. Only queued work can be cancelled. Failed definite
-rejections can be explicitly retried once capacity is available. For uncertain or
-submitted work, inspect both native conversation/queue and broker state before any
+and `agent-bridge get ID`. Only unattempted queued work can be cancelled (public
+Failed with a cancellation reason). Policy blocks remain Pending with an explicit
+retry reason, not permanent failure. Failed definite
+rejections can be explicitly retried once capacity is available. For Unknown or
+Delivered work, inspect both native conversation/queue and broker state before any
 explicit duplicate-authorized retry; an old native submission can still execute.
 Do not use repeated inbox polling as delivery or recovery automation.
 
@@ -95,7 +95,7 @@ The [production native regression report](codex-active-delivery-regression.md)
 records historical executable evidence; the [capability-driven follow-up](codex-capability-delivery-regression.md)
 records the current 0.166 runtime and version-independent contract tests.
 `tools/codex-native-delivery.py --production` exercises the built adapter through
-actual broker sends and MCP acknowledgement/reply against a deterministic localhost
+actual broker sends and correlated MCP replies against a deterministic localhost
 Responses fixture. It also verifies held-tool success, same-turn continuation,
 observer disconnection and exact native capacity rejection. Synthetic model
 fixtures prove runtime/API correlation, not external-model understanding or UI

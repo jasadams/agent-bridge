@@ -149,7 +149,7 @@ async fn broker_delivery(plugin: &PluginSocket) -> Message {
                 .await
                 .unwrap();
             let msg: Message = serde_json::from_value(value).unwrap();
-            if !["queued", "sending"].contains(&msg.state.as_str()) {
+            if msg.state != "pending" {
                 break msg;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -166,12 +166,12 @@ async fn broker_delivery(plugin: &PluginSocket) -> Message {
 async fn exact_session_receipts_bind_native_and_broker_ids() {
     let plugin = PluginSocket::start(2, receipt);
     let outcome = broker_delivery(&plugin).await;
-    assert_eq!(outcome.state, "submitted", "{:?}", outcome.detail);
+    assert_eq!(outcome.state, "delivered", "{:?}", outcome.detail);
     assert!(
         outcome
             .detail
             .unwrap()
-            .contains("acknowledgement and completion remain unconfirmed")
+            .contains("does not prove model reading or task completion")
     );
     plugin.finish();
 }
@@ -188,7 +188,7 @@ async fn wrong_instance_session_and_message_receipts_never_submit() {
             value
         });
         let outcome = broker_delivery(&plugin).await;
-        assert_eq!(outcome.state, "uncertain");
+        assert_eq!(outcome.state, "unknown");
         plugin.finish();
     }
     let plugin = PluginSocket::start(0, receipt);
@@ -336,7 +336,7 @@ async fn rejected_oversized_and_extra_field_receipts_fail_closed() {
             }
         });
         let outcome = broker_delivery(&plugin).await;
-        assert_eq!(outcome.state, "uncertain");
+        assert_eq!(outcome.state, "unknown");
         plugin.finish();
     }
 }
@@ -577,7 +577,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
         .await
         .unwrap();
         let event_id = event["id"].as_str().unwrap().to_owned();
-        wait_message_state(&broker, &event_id, "uncertain").await;
+        wait_message_state(&broker, &event_id, "unknown").await;
         let tail_id = uuid::Uuid::new_v4().to_string();
         broker
             .request(Request::Send {
@@ -592,7 +592,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
         let recovery = broker.request(subscribe()).unwrap()["recovery"].clone();
         assert_eq!(recovery["total"], 1);
         assert_eq!(recovery["items"][0]["id"], event_id);
-        assert_eq!(recovery["items"][0]["state"], "uncertain");
+        assert_eq!(recovery["items"][0]["state"], "unknown");
         assert_eq!(recovery["items"][0]["reconciliation_pending"], false);
         assert_eq!(recovery["items"][0]["lease_available"], true);
         assert!(
@@ -625,7 +625,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                     id: tail_id.clone()
                 })
                 .unwrap()["state"],
-            "queued"
+            "pending"
         );
         broker.request(Request::Pause { paused: true }).unwrap();
         broker
@@ -653,13 +653,14 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
             removed["recovery"]["items"][0]["reconciliation_pending"],
             true
         );
+        assert_eq!(removed["recovery"]["items"][0]["state"], "unknown");
         assert_eq!(
             broker
                 .request(Request::Get {
                     id: event_id.clone()
                 })
                 .unwrap()["state"],
-            "queued"
+            "unknown"
         );
         // Restart while explicitly requested read-only work is queued. Old
         // subscription revocation cannot erase its attempted provenance/barrier.
@@ -685,13 +686,15 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                     id: event_id.clone()
                 })
                 .unwrap()["state"],
-            "queued"
+            "unknown"
         );
         broker.request_async(observe()).await.unwrap();
+        let resumed = broker.request(subscribe()).unwrap();
         assert_eq!(
-            broker.request(subscribe()).unwrap()["recovery"]["items"][0]["reconciliation_pending"],
+            resumed["recovery"]["items"][0]["reconciliation_pending"],
             true
         );
+        assert_eq!(resumed["recovery"]["items"][0]["state"], "unknown");
         broker
             .request(Request::Retry {
                 id: event_id.clone(),
@@ -728,8 +731,8 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
             .unwrap();
         broker.request(Request::Pause { paused: false }).unwrap();
         if proof_available {
-            wait_message_state(&broker, &event_id, "submitted").await;
-            wait_message_state(&broker, &tail_id, "submitted").await;
+            wait_message_state(&broker, &event_id, "delivered").await;
+            wait_message_state(&broker, &tail_id, "delivered").await;
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     if native.lock().unwrap().inserted.len() == 3 {
@@ -762,7 +765,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                     .contains("fresh-worker")
             );
         } else {
-            wait_message_state(&broker, &event_id, "uncertain").await;
+            wait_message_state(&broker, &event_id, "unknown").await;
             tokio::time::sleep(std::time::Duration::from_millis(350)).await;
             assert_eq!(
                 native.lock().unwrap().inserted.len(),
@@ -775,7 +778,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                         id: tail_id.clone()
                     })
                     .unwrap()["state"],
-                "queued"
+                "pending"
             );
         }
         server.abort();

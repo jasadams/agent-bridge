@@ -78,10 +78,10 @@ fn empty_cursor_sees_future_inserts_but_does_not_replay_state_updates() {
     assert_eq!(page.messages[0].id, id);
     assert!(!page.has_more);
     db.claim().unwrap().unwrap();
-    db.ack(&id, "worker").unwrap();
+    db.finish(&id, "submitted", "native accepted").unwrap();
     let next = db.history_since(&None, Some(&page.cursor), 1).unwrap();
     assert!(next.messages.is_empty());
-    assert_eq!(db.get(&id).unwrap().state, "acknowledged");
+    assert_eq!(db.get(&id).unwrap().state, "submitted");
 }
 
 #[test]

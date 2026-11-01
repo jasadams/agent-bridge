@@ -213,7 +213,7 @@ pub(crate) async fn deliver_dispatch(
     match result {
         Ok(Ok(receipt)) if receipt.ok && receipt.status.as_deref() == Some("inserted") => {
             Outcome::submitted(
-                "OpenCode native insertion verified by exact readback; model acknowledgement and completion remain unconfirmed",
+                "OpenCode native insertion verified by exact readback; this does not prove model reading or task completion",
             )
         }
         Ok(Ok(receipt))

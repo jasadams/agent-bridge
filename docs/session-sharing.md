@@ -102,8 +102,8 @@ pre-OpenCode commit `8fde538`. An older peer that successfully answers the legac
 directory is explicitly unsupported for an OpenCode transfer; an extension failure
 without that successful fallback is retried rather than treated as proof.
 
-The receiver must explicitly acknowledge and send a correlated reply. Submitted
-status is not proof of receipt or task completion. Stop-sharing and revocation
+Send and continue working; use a correlated reply for useful results or questions.
+Stop-sharing and revocation
 check current policy at acceptance and before queued native submission; cached
 remote directories cannot override a withdrawn grant. Already attempted network transfers may still arrive if the destination still
 permits them; already submitted native work cannot be recalled.

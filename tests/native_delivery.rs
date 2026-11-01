@@ -22,6 +22,102 @@ fn temp() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn claude_socket_only_history_allows_65_sends_without_receipts_or_status_polling() {
+    let dir = temp();
+    let socket = dir.path().join("native.sock");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sink = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let state = dir.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    broker::rpc(
+        &state,
+        &Request::Register {
+            agent: Agent {
+                name: "claude-flow".into(),
+                provider: Provider::Claude,
+                session: id(),
+                endpoint: socket.to_string_lossy().into_owned(),
+                enabled: true,
+            },
+            replace: false,
+        },
+    )
+    .await
+    .unwrap();
+    for index in 0..65 {
+        let mid = id();
+        let body = format!("Independent handoff {index}");
+        let sent = broker::rpc(
+            &state,
+            &Request::Send {
+                id: mid.clone(),
+                sender: "user".into(),
+                recipient: "claude-flow".into(),
+                body: body.clone(),
+                parent: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent["id"], mid);
+        assert_eq!(sent["state"], "pending");
+        let (stream, _) = timeout(Duration::from_secs(3), sink.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).await.unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["msg_id"], mid);
+        assert!(
+            frame["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains(&body)
+        );
+    }
+    server.abort();
+    let _ = server.await;
+    // In-flight blocking persistence retains broker ownership until it exits.
+    let bound = timeout(Duration::from_secs(3), async {
+        loop {
+            match Broker::bind(state.clone(), "/missing/codex".into()) {
+                Ok(bound) => break bound,
+                Err(error) if error.to_string().contains("owns this state directory") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                Err(error) => panic!("Restart failed: {error:#}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    let persisted = rusqlite::Connection::open(dir.path().join("state/messages.sqlite3")).unwrap();
+    let uncertain: i64 = persisted
+        .query_row(
+            "SELECT count(*) FROM messages WHERE state='uncertain'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        uncertain, 65,
+        "Socket-only history remains Unknown after recovery"
+    );
+    assert!(
+        timeout(Duration::from_millis(750), sink.accept())
+            .await
+            .is_err(),
+        "Restart must not resend socket-only Unknown history"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn real_broker_routes_native_claude_frame_and_accepts_correlated_reply() {
     let dir = temp();
     let sink_dir = dir.path().join("claude");
@@ -83,16 +179,19 @@ async fn real_broker_routes_native_claude_frame_and_accepts_correlated_reply() {
     )));
     assert!(!text.contains("Agent Bridge"));
     assert!(!text.contains("ack --state-dir"));
-    let ack = broker::rpc(
-        &state,
-        &Request::Ack {
-            id: mid.clone(),
-            agent: name.into(),
-        },
-    )
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let delivered = broker::rpc(&state, &Request::Get { id: mid.clone() })
+                .await
+                .unwrap();
+            if delivered["state"] == "unknown" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
     .await
     .unwrap();
-    assert_eq!(ack["state"], "acknowledged");
     let reply = id();
     broker::rpc(
         &state,

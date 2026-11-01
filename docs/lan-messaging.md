@@ -96,7 +96,7 @@ agent-bridge send --from reviewer --to workstation/reviewer --message 'Please re
 
 Discovery, receiving and sending permissions are independent. A default `--from user` needs its own grants. Private sessions remain absent from remote directories. Friendly peer aliases are local labels; queued work pins the peer identity and destination session rather than following later alias changes.
 
-Remote directories normally refresh within five seconds. Native envelopes include acknowledgement and reply commands using the receiving bridge's local message UUID. Receipts and status updates do not wake model sessions; explicit messages and replies do. See [delivery and retry semantics](explicit-peer-messaging.md) for durable acceptance, uncertain native submissions and cancellation limits.
+Remote directories normally refresh within five seconds. Native envelopes include reply references using the receiving bridge's local message UUID. Send and continue working; use replies for useful results or questions. See [delivery diagnostics](delivery-outcomes.md) if delivery fails or a response is missing.
 
 ## Reconnect and revoke
 

@@ -123,13 +123,12 @@ class Probe:
                                    "name": "exec_command", "arguments": json.dumps({"cmd": command, "yield_time_ms": 10000, "max_output_tokens": 100}), "status": "completed"}
                 else:
                     stage = case["stage"]
-                    if stage < 2:
-                        suffix = "acknowledge_message" if stage == 0 else "send_message"
+                    if stage == 0:
+                        suffix = "send_message"
                         namespace = next(t for t in body["tools"] if t.get("name") == "mcp__bridge")
                         tool = next(t for t in namespace["tools"] if t["name"].endswith(suffix))
-                        arguments = ({"id": case["incoming"], "agent": case["alias"]} if stage == 0
-                                     else {"id": case["reply"], "from": case["alias"], "to": "user",
-                                           "body": case["marker"] + " reply", "parent": case["incoming"]})
+                        arguments = {"id": case["reply"], "from": case["alias"], "to": "user",
+                                     "body": case["marker"] + " reply", "parent": case["incoming"]}
                         message = {"id": f"fc_{stage}", "type": "function_call",
                                    "call_id": f"call_{stage}", "name": tool["name"],
                                    "namespace": "mcp__bridge", "arguments": json.dumps(arguments),
@@ -138,7 +137,7 @@ class Probe:
                     else:
                         message = {"id": "msg_fixture", "type": "message", "role": "assistant",
                                    "status": "completed", "content": [{"type": "output_text",
-                                   "text": "QUEUED_PUSH_ACK_REPLY_COMPLETE", "annotations": []}]}
+                                    "text": "QUEUED_PUSH_REPLY_COMPLETE", "annotations": []}]}
                 response = {"id": "resp_" + uuid.uuid4().hex, "object": "response",
                             "created_at": int(time.time()), "model": "fixture", "status": "completed",
                             "output": [message], "usage": {"input_tokens": 1, "output_tokens": 1,
@@ -158,7 +157,7 @@ class Probe:
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
-                if queued and case["stage"] == 2 and message["type"] == "message":
+                if queued and case["stage"] == 1 and message["type"] == "message":
                     case["model_finished"].set()
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -270,7 +269,7 @@ class Probe:
                     while not case["gate_entered"].is_set():
                         await asyncio.sleep(.05)
             if name.startswith("steer"):
-                case["stage"] = 2  # Direct API feasibility, no broker send or MCP claim.
+                case["stage"] = 1  # Direct API feasibility, no broker send or MCP claim.
                 fresh = await self.connect()
                 try:
                     read = await self.rpc(fresh, "thread/read", {"threadId": case["thread"]})
@@ -316,7 +315,7 @@ class Probe:
                     entry = str(uuid.uuid4())
                     added = await self.rpc(ws, "thread/queue/add", {"threadId": case["thread"], "clientUserMessageId": entry, "input": [{"type": "text", "text": f"DISPOSABLE_QUEUE_{index}", "text_elements": []}]})
                     assert added["queuedSubmission"]["clientUserMessageId"] == entry
-                case["stage"] = 2
+                case["stage"] = 1
             self.broker({"op": "send", "id": case["incoming"], "sender": "user", "recipient": case["alias"], "body": case["marker"], "parent": None})
             # Read only native queue diagnostics; no inbox reads trigger execution.
             if ws is None:
@@ -325,11 +324,11 @@ class Probe:
             async with asyncio.timeout(8):
                 while True:
                     state = self.broker({"op": "get", "id": case["incoming"]})
-                    if state["state"] != "queued" and state["state"] != "sending":
+                    if state["state"] != "pending":
                         break
                     await asyncio.sleep(.05)
             if name == "saturation":
-                assert state["state"] == ("failed" if self.args.production else "uncertain"), state
+                assert state["state"] == ("failed" if self.args.production else "unknown"), state
                 queue = await self.rpc(ws, "thread/queue/list", {"threadId": case["thread"], "limit": 100})
                 assert len(queue["data"]) == 100 and queue["nextCursor"] is None, queue
                 assert all(row["clientUserMessageId"] != case["incoming"] for row in queue["data"])
@@ -346,7 +345,7 @@ class Probe:
                 self.event("saturation_drained", case=name)
                 self.cases.append({key: value for key, value in case.items() if key not in ("release", "gate_entered", "model_finished")})
                 return
-            assert state["state"] in ("submitted", "acknowledged"), state
+            assert state["state"] == "delivered", state
             queue = await self.rpc(ws, "thread/queue/list", {"threadId": case["thread"], "limit": 100})
             self.event("queue_snapshot", case=name, result=queue)
             if self.args.production and name != "idle":
@@ -364,7 +363,7 @@ class Probe:
                 self.event("fixture_released", case=name)
             if name == "disconnected":
                 # Fresh metadata-only connections receive no turn subscription events.
-                # The third model request follows both actual MCP tool results.
+                # The second model request follows the actual correlated reply result.
                 async with asyncio.timeout(40):
                     while not case["model_finished"].is_set():
                         await asyncio.sleep(.05)
@@ -374,7 +373,7 @@ class Probe:
                         value = json.loads(await ws.recv())
                         self.event("native_frame", frame=value)
                         assert not (value.get("method") and "id" in value), "unexpected native request"
-                        if value.get("method") == "turn/completed" and case["stage"] == 2:
+                        if value.get("method") == "turn/completed" and case["stage"] == 1:
                             assert value["params"]["turn"]["status"] == "completed" and value["params"]["turn"]["error"] is None, value
                             break
             async with asyncio.timeout(15):
@@ -386,7 +385,7 @@ class Probe:
             assert case["marker"] in text_of(final)
             original = self.broker({"op": "get", "id": case["incoming"]})
             reply = self.broker({"op": "get", "id": case["reply"]})
-            assert original["state"] == "acknowledged", original
+            assert original["state"] == "delivered", original
             assert reply["parent"] == case["incoming"] and reply["sender"] == case["alias"] and reply["recipient"] == "user", reply
             self.event("case_verified", case=name, incoming=original, reply=reply)
             self.cases.append({key: value for key, value in case.items() if key not in ("release", "gate_entered", "model_finished")})
@@ -401,8 +400,8 @@ class Probe:
         assert stat.S_IMODE(meta.st_mode) & 0o077 == 0
         assert not self.sock.exists(), "unique proxy path already exists"
         self.fixture()
-        config = '[mcp_servers.bridge]\nenabled_tools = ["acknowledge_message", "send_message"]\ncommand = ' + json.dumps(self.args.broker) + '\nargs = ["--state-dir", ' + json.dumps(str(self.root / "state")) + ', "mcp"]\n'
-        config += '\n[mcp_servers.bridge.tools.acknowledge_message]\napproval_mode = "approve"\n[mcp_servers.bridge.tools.send_message]\napproval_mode = "approve"\n'
+        config = '[mcp_servers.bridge]\nenabled_tools = ["send_message"]\ncommand = ' + json.dumps(self.args.broker) + '\nargs = ["--state-dir", ' + json.dumps(str(self.root / "state")) + ', "mcp"]\n'
+        config += '\n[mcp_servers.bridge.tools.send_message]\napproval_mode = "approve"\n'
         (self.root / "codex" / "config.toml").write_text(config)
         self.spawn("broker", [self.args.broker, "--state-dir", str(self.root / "state"), "serve", "--no-discovery"])
         await self.wait_path(self.root / "state" / "bridge.sock")
@@ -503,13 +502,12 @@ def verify_production_active(case, rows, wire, outgoing, models, timeline):
     assert receipt["frame"]["result"]["turnId"] == case["active_turn"]
     assert metadata["monotonic_ns"] < query["monotonic_ns"] < turns["monotonic_ns"] < request["monotonic_ns"]
     verified = next(event for event in rows if event["kind"] == "case_verified")
-    assert verified["incoming"]["id"] == case["incoming"] and verified["incoming"]["state"] == "acknowledged"
+    assert verified["incoming"]["id"] == case["incoming"] and verified["incoming"]["state"] == "delivered"
     assert verified["reply"]["id"] == case["reply"] and verified["reply"]["parent"] == case["incoming"]
     assert verified["reply"]["sender"] == case["alias"] and verified["reply"]["recipient"] == "user"
-    assert len(models) == 3
+    assert len(models) == 2
     outputs = {item["call_id"]: item["output"] for item in models[-1]["body"]["input"] if item.get("type") == "function_call_output"}
-    assert case["incoming"] in outputs.get("call_0", "") and '"state":"acknowledged"' in outputs["call_0"]
-    assert case["reply"] in outputs.get("call_1", "") and '"state":"queued"' in outputs["call_1"]
+    assert case["reply"] in outputs.get("call_0", "") and '"state":"pending"' in outputs["call_0"]
     reads = [event["frame"].get("result", {}).get("thread", {}) for event in wire]
     original = [turn for read in reads if read.get("id") == case["thread"] for turn in read.get("turns", []) if turn["id"] == case["active_turn"]]
     assert any(turn["status"] == "completed" and turn.get("error") is None for turn in original)
@@ -531,7 +529,7 @@ def verify_production_active(case, rows, wire, outgoing, models, timeline):
         assert case["tool_marker"] in outputs[0]["output"]
         assert tools[0]["monotonic_ns"] < models[0]["monotonic_ns"]
         timeline["held_tool_completed"] = tools[0]["utc"]
-    timeline.update(path="production_active_steer", native_accepted=receipt["utc"], model_received=models[0]["utc"], ack_and_reply_verified=verified["utc"])
+    timeline.update(path="production_active_steer", native_accepted=receipt["utc"], model_received=models[0]["utc"], reply_verified=verified["utc"])
 
 
 def verify_artifacts(root):
@@ -629,7 +627,7 @@ def verify_artifacts(root):
             if name == "saturation":
                 assert reply["frame"]["error"] == {"code": -32600, "message": "queue cannot contain more than 100 submissions"}
                 verified = next(event for event in rows if event["kind"] == "saturation_verified")
-                assert verified["accepted_count"] == 100 and verified["rejected"]["state"] == ("failed" if case.get("production") else "uncertain")
+                assert verified["accepted_count"] == 100 and verified["rejected"]["state"] == ("failed" if case.get("production") else "unknown")
                 accepted_ids = set()
                 for entry in wire:
                     frame = entry["frame"]
@@ -675,11 +673,11 @@ def verify_artifacts(root):
                 assert queued["clientUserMessageId"] == identifier
                 assert queued["input"] == request["frame"]["params"]["input"]
                 verified = next(event for event in rows if event["kind"] == "case_verified")
-                assert verified["incoming"]["id"] == identifier and verified["incoming"]["state"] == "acknowledged"
+                assert verified["incoming"]["id"] == identifier and verified["incoming"]["state"] == "delivered"
                 assert verified["reply"]["parent"] == identifier
-                assert len(models) == 3, (name, len(models))
+                assert len(models) == 2, (name, len(models))
                 timeline.update(native_queue_id=queued["id"], model_received=models[0]["utc"],
-                                ack_and_reply_verified=verified["utc"])
+                                reply_verified=verified["utc"])
                 if name == "disconnected":
                     reads = [event["frame"].get("result", {}).get("thread", {}) for event in wire
                              if event["frame"].get("result", {}).get("thread", {}).get("id") == case["thread"]]

@@ -50,24 +50,22 @@ Discovery lets the peer see this session. Receive lets it deliver here. Send let
 
 Remote directories refresh automatically while networking is enabled, normally within five seconds of a change. Only permitted sessions appear. Cached entries remain available offline and show `online: false`, allowing enqueueing to a previously known session. Each peer can export up to 100 agents; narrow discovery grants if that limit is reported.
 
-## Send acknowledge and reply
+## Send and reply
 
 ```sh
 agent-bridge send --from reviewer --to workstation/reviewer --message 'Please review this change'
-agent-bridge get MESSAGE_UUID
 ```
 
 Remote names resolve to a peer ID, provider and destination session when queued. Later alias replacement cannot redirect that work. Retrying an identical send with the same `--id` and original arguments returns the original record even if aliases or directories changed. Conflicting reuse fails.
 
-The receiver assigns its own local message UUID and displays the source as `PEER_ID/source-agent`. The native envelope includes that UUID and shell-quoted acknowledgement and reply commands:
+Send and continue working. The receiver assigns its own local message UUID and displays the source as `PEER_ID/source-agent`. The native envelope includes that UUID and exact reply references for useful responses:
 
 ```sh
-agent-bridge ack --agent reviewer RECEIVED_LOCAL_UUID
 agent-bridge send --from reviewer --to PEER_ID/source-agent \
   --in-reply-to RECEIVED_LOCAL_UUID --message 'Review complete'
 ```
 
-A correlated reply pins the original source session from the received envelope and does not require rediscovery. Explicit replies can wake agents. Receipt and acknowledgement synchronization only updates records. The conversation limit is 100 reply hops; peers running older versions may still enforce the previous eight-hop limit.
+A correlated reply pins the original source session from the received envelope and does not require rediscovery. Explicit replies can wake agents. Delivery-status synchronization only updates records. The conversation limit is 100 reply hops; peers running older versions may still enforce the previous eight-hop limit.
 
 ## Interpret receipts and native status
 
@@ -82,11 +80,18 @@ Outbound remote `get` results include a separate `transfer` object:
 | `blocked` | Local trust or sending permission no longer permits transfer. |
 | `cancelled` | An unattempted transfer was cancelled locally. |
 
-The top-level message `state` can reflect local queueing, rejection, blocking or cancellation. After remote status synchronization it reports the latest known destination delivery state. `submitted` still means native transport submission, not execution or completion. `transfer.observed_at` records when the latest remote observation was stored locally; offline observations can be stale.
+The top-level message `state` is `pending`, `delivered`, `failed` or `unknown`.
+After remote synchronization it reports the latest known destination outcome.
+Transfer acceptance alone is not native acceptance. Policy-blocked work remains
+Pending with an explicit retry reason; cancelled unattempted work is Failed.
+Delivered never proves model read or completion. `transfer.observed_at` records
+when the latest remote observation was stored locally; offline observations can
+be stale. Transfer states above are diagnostics, not another public message lifecycle.
+See [adapter proof and compatibility](delivery-outcomes.md).
 
 The origin commits its outbox before network I/O. The receiver atomically commits the immutable envelope, deduplication identity and native queue record before returning acceptance. Lost receipts retry with the same origin-peer/message-ID pair. Identical duplicates return acceptance without scheduling native delivery again, even if the queue is now full or the destination session disappeared. Conflicting duplicates fail.
 
-Ambiguous network transfers retry automatically with bounded exponential backoff and jitter. Queues and status cursors survive restarts. An interrupted destination native submission becomes `uncertain` and is never replayed automatically. Network deduplication cannot guarantee exactly-once model execution.
+Ambiguous network transfers retry automatically with bounded exponential backoff and jitter. Queues and status cursors survive restarts. An interrupted destination native submission becomes `unknown` and is never replayed automatically. Network deduplication cannot guarantee exactly-once model execution.
 
 Cancel is available only before the first transfer attempt. After an attempt, a lost receipt means remote acceptance may already have happened. Accepted native deliveries must be inspected and, if needed, explicitly retried at the destination using its local UUID and the existing duplicate-override rules. Rejected or locally blocked outbound transfers can be retried after fixing permissions. Replaying an accepted envelope never bypasses receiver deduplication or reruns native delivery.
 

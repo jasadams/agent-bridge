@@ -191,11 +191,11 @@ class Isolation(unittest.TestCase):
                                         ("/opencode/v1/chat/completions", "opencode-dest", "Your identity is opencode-dest")]:
                 body = {"messages": [{"role": "system", "content": systems},
                                      {"role": "user", "content": "MARKER from opencode-source"}],
-                        "tools": [{"name": "bridge_acknowledge_message"}]}
+                         "tools": [{"name": "bridge_send_message"}]}
                 record = {"body": "MARKER", "recipient": route, "sender": "opencode-source", "id": "incoming"}
                 with patch("qualification_native.rpc", return_value=[record]):
                     action = fixture.action(path, body)
-                self.assertEqual(action["arguments"], {"agent": route, "id": "incoming"})
+                self.assertEqual(action["arguments"], {"from": route, "to": "opencode-source", "body": "Reply MARKER", "id": "reply", "parent": "incoming"})
         finally:
             fixture.close()
 

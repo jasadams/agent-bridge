@@ -26,6 +26,8 @@ const env = {
   OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_DISABLE_AUTOUPDATE: "true", OPENCODE_DISABLE_SHARE: "true", OPENCODE_DISABLE_MCP_OAUTH: "true", DO_NOT_TRACK: "1",
 };
 const incoming = randomUUID(), replyID = randomUUID(), marker = `AGB4-IDLE-${randomUUID()}`;
+const normalID = randomUUID(), normalMarker = `SEND-CONTINUE-${randomUUID()}`;
+let normalInputSeen = false;
 const busyMarker = `AGB4-BUSY-${randomUUID()}`, raceMarker = `AGB4-RACE-${randomUUID()}`, permissionMarker = `AGB4-PERMISSION-${randomUUID()}`;
 const longMarker = `AGB16-LONG-${randomUUID()}`, streamMarker = `AGB16-STREAM-${randomUUID()}`, errorMarker = `AGB16-ERROR-${randomUUID()}`;
 const captures = new Map<string, any[]>(), nativeEvents: any[] = [];
@@ -58,6 +60,7 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, async 
   const body = await request.json() as any;
   modelRequests++;
   const tools = (body.tools ?? []) as any[], text = JSON.stringify(body.messages ?? []);
+  if (tools.length && text.includes(normalMarker)) normalInputSeen = true;
   let toolCall: any;
   const scenario = tools.length ? [permissionMarker, longMarker, streamMarker, errorMarker, raceMarker, busyMarker, marker].find(value => text.includes(value)) : undefined;
   const stage = scenario ? stages.get(scenario) ?? 0 : -1;
@@ -74,8 +77,7 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, async 
   // Title/summarization calls have no tools; never advance scenario state there.
   if (tools.length) {
     if (scenario === marker && selected) {
-      if (stage === 0) toolCall = tool("acknowledge_message", { id: incoming, agent: selected }, "call_ack");
-      if (stage === 1) toolCall = tool("send_message", { from: selected, to: "native-probe", body: `Reply ${marker}`, id: replyID, parent: incoming }, "call_reply");
+      if (stage === 0) toolCall = tool("send_message", { from: selected, to: "native-probe", body: `Reply ${marker}`, id: replyID, parent: incoming }, "call_reply");
     } else if (scenario && stage === 0 && ![streamMarker, errorMarker].includes(scenario)) {
       toolCall = tool(scenario === permissionMarker ? "fixture_permission" : "fixture_block", { token: scenario }, `call_${scenario.slice(0, 16)}`);
     }
@@ -176,10 +178,24 @@ try {
   async function nativeMessage(id: string, messageID: string) { const result = await client.session.message({ path: { id, messageID } }); return result.data; }
   const first = await session("Disposable AGB-4 idle probe"); selected = `opencode-${first.id}`;
   await brokerRpc(state, { op: "register", agent: { name: "native-probe", provider: "inbox", session: "native-probe", endpoint: "", enabled: true }, replace: false });
+  // Ordinary messaging completes without any recipient tool call or reply.
+  await brokerRpc(state, { op: "send", id: normalID, sender: "native-probe", recipient: selected, body: normalMarker, parent: null });
+  await waitFor("ordinary native input without receipt exchange", async () => {
+    const outcome = await brokerRpc(state, { op: "get", id: normalID }) as any;
+    return outcome.state === "delivered" && normalInputSeen;
+  });
+  await waitFor("ordinary native idle", () => idle(first.id));
+  const normalDispatch = query<any>("SELECT * FROM opencode_deliveries WHERE id=?", normalID);
+  const normalRecord = await nativeMessage(first.id, normalDispatch.native_id);
+  assert(normalRecord?.info.role === "user" && normalRecord.info.sessionID === first.id && normalRecord.parts.some((part: any) => part.type === "text" && part.text.includes(normalMarker)), "Ordinary send lacks native input proof");
+  const normalHistory = await client.session.messages({ path: { id: first.id } });
+  assert(normalHistory.data && normalHistory.data.filter(item => item.info.id === normalDispatch.native_id).length === 1 && normalHistory.data.every(item => item.parts.every(part => part.type !== "tool")), "Ordinary send duplicated input or invoked recipient tools");
+  assert(query<any>("SELECT count(*) AS count FROM messages WHERE parent=?", normalID).count === 0, "Ordinary send generated a receipt-only reply");
+  console.log(JSON.stringify({ phase: "normal_send_continue", native_input: true, recipient_tool_calls: 0, receipt_replies: 0 }));
   await brokerRpc(state, { op: "send", id: incoming, sender: "native-probe", recipient: selected, body: marker, parent: null });
-  await waitFor("native MCP acknowledgement and correlated reply", async () => {
+  await waitFor("native acceptance and correlated MCP reply", async () => {
     const original = await brokerRpc(state, { op: "get", id: incoming }) as any, reply = await brokerRpc(state, { op: "get", id: replyID }) as any;
-    return original.state === "acknowledged" && reply.parent === incoming && reply.sender === selected && reply.recipient === "native-probe" && reply.body === `Reply ${marker}`;
+    return original.state === "delivered" && reply.parent === incoming && reply.sender === selected && reply.recipient === "native-probe" && reply.body === `Reply ${marker}`;
   }, 60000);
   const dispatch = query<any>("SELECT * FROM opencode_deliveries WHERE id=?", incoming);
   assert(dispatch?.namespace && dispatch.attempt && dispatch.native_id, "Missing durable native dispatch mapping");
@@ -210,7 +226,8 @@ try {
   async function inserted(target: { id: string }, peer: { id: string; native: string }, variant?: string) {
     const record = await waitFor<any>("verified native insertion", async () => {
       const record = await nativeMessage(target.id, peer.native);
-      return record && waiting(peer.id).state === "submitted" && record;
+      const outcome = await brokerRpc(state, { op: "get", id: peer.id }) as any;
+      return record && outcome.state === "delivered" && record;
     });
     if (variant) assert(record.info.agent === "owner" && record.info.model.providerID === "fixture" && record.info.model.modelID === "owner" && record.info.model.variant === variant, "Peer insertion changed native owner selection");
     return record;
@@ -281,9 +298,10 @@ try {
   await waitFor("controlled native stream error", async () => nativeEvents.some(event => event.type === "session.error" && event.properties.sessionID === errored.id));
   await Bun.sleep(1200);
   const errorHistory = await client.session.messages({ path: { id: errored.id } });
-  assert(errorHistory.data?.filter(item => item.info.id === errorPeer.native).length === 1 && waiting(errorPeer.id).state === "submitted", "Later native error replayed input or invented acknowledgement");
+  const errorOutcome = await brokerRpc(state, { op: "get", id: errorPeer.id }) as any;
+  assert(errorHistory.data?.filter(item => item.info.id === errorPeer.native).length === 1 && errorOutcome.state === "delivered", "Later native error replayed input or erased confirmed acceptance");
   assert(!nativeEvents.some(event => event.type === "permission.replied") && !permissionFinished.has(permissionMarker), "Harness answered owner permission");
-  console.log(JSON.stringify({ result: "passed", opencode: "1.18.35", standalone_bun: Bun.version, embedded_bun: embeddedBun, model: "scripted localhost OpenAI-compatible fixture", model_requests: modelRequests, exact_session: first.id, explicit_acknowledgement: true, correlated_reply: true, readonly_reconciliation: true, active_tool: { session: long.id, native: longPeer.native, alias_native: aliasPeer.native, original_not_aborted: true, next_model_request: toolRequest }, active_stream: { session: stream.id, native: streamPeer.native, original_not_aborted: true, next_model_request: streamRequest }, long_wait: { age_ms: Date.now() - heldLong.created, held: heldLong, permission: heldPermission }, permission_input_inserted_unanswered: true, broker_pause_preserved: true, queued_cancel_preserved: true, alias_fifo: true, stream_error_no_replay: true, native_cancel_calls: 0, permission_reply_calls: 0, retry_calls: 0, manual_fetch_calls: 0 }));
+  console.log(JSON.stringify({ result: "passed", opencode: "1.18.35", standalone_bun: Bun.version, embedded_bun: embeddedBun, model: "scripted localhost OpenAI-compatible fixture", model_requests: modelRequests, exact_session: first.id, native_acceptance: true, correlated_reply: true, readonly_reconciliation: true, active_tool: { session: long.id, native: longPeer.native, alias_native: aliasPeer.native, original_not_aborted: true, next_model_request: toolRequest }, active_stream: { session: stream.id, native: streamPeer.native, original_not_aborted: true, next_model_request: streamRequest }, long_wait: { age_ms: Date.now() - heldLong.created, held: heldLong, permission: heldPermission }, permission_input_inserted_unanswered: true, broker_pause_preserved: true, queued_cancel_preserved: true, alias_fifo: true, stream_error_no_replay: true, native_cancel_calls: 0, permission_reply_calls: 0, retry_calls: 0, manual_fetch_calls: 0 }));
   success = true;
 } finally {
   async function stopChild(child: ReturnType<typeof Bun.spawn>) {

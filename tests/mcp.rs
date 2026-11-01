@@ -408,6 +408,45 @@ async fn unclassified_broker_rejection_does_not_claim_no_persistence() {
 }
 
 #[tokio::test]
+async fn normal_send_continues_without_recipient_calls_or_status_exchange() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    running.inbox("alice");
+    running.inbox("bob");
+    let mut sender = Mcp::start(&state);
+    sender.initialize().await;
+    let sent = sender
+        .call(
+            "send_message",
+            json!({"from":"alice","to":"bob","body":"handoff"}),
+        )
+        .await;
+    assert!(!failed(&sent));
+    let id = structured(&sent)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The sender proceeds with unrelated work; no recipient MCP process or
+    // status request participates in accepting the message.
+    assert!(!failed(&sender.call("list_agents", json!({})).await));
+    let stored = rusqlite::Connection::open_with_flags(
+        state.join("messages.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let count: i64 = stored
+        .query_row(
+            "SELECT count(*) FROM messages WHERE id=? AND sender='alice' AND recipient='bob' AND body='handoff'",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    sender.close().await;
+}
+
+#[tokio::test]
 async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries() {
     let root = root();
     let state = root.path().join("state");
@@ -422,7 +461,6 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     for name in [
         "connection_status",
         "send_message",
-        "acknowledge_message",
         "connect_peer",
         "confirm_pairing",
         "share_session",
@@ -430,29 +468,38 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
         assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
     }
     assert!(!tools.iter().any(|tool| tool["name"] == "rpc"));
-    for (name, fields) in [
-        (
-            "acknowledge_message",
-            [("agent", "Delivered to"), ("id", "Message reference")],
-        ),
-        (
-            "send_message",
-            [("to", "Reply to"), ("parent", "Message reference")],
-        ),
-    ] {
-        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
-        let description = tool["description"].as_str().unwrap();
-        assert!(description.contains("connection_status"));
-        for (field, source) in fields {
-            assert!(description.contains(source));
-            assert!(
-                tool["inputSchema"]["properties"][field]["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains(source),
-                "{name}.{field} must explain its incoming routing field"
-            );
-        }
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool["name"] == "acknowledge_message")
+    );
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "send_message")
+        .unwrap();
+    let description = tool["description"].as_str().unwrap();
+    assert!(description.contains("connection_status"));
+    assert!(description.contains("then continue your work"));
+    assert!(!description.to_lowercase().contains("acknowledg"));
+    assert!(!description.to_lowercase().contains("poll"));
+    assert!(!description.contains("get_message"));
+    assert!(description.contains("retry the same request"));
+    let diagnostic = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_message")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap();
+    assert!(diagnostic.contains("Diagnose a failed send or nonresponse"));
+    for (field, source) in [("to", "Reply to"), ("parent", "Message reference")] {
+        assert!(description.contains(source));
+        assert!(
+            tool["inputSchema"]["properties"][field]["description"]
+                .as_str()
+                .unwrap()
+                .contains(source),
+            "send_message.{field} must explain its incoming routing field"
+        );
     }
     assert_eq!(
         tools
@@ -502,21 +549,6 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     let rows = structured(&history)["result"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["body"], body);
-    timeout(Duration::from_secs(3), async {
-        loop {
-            let message = mcp.call("get_message", json!({"id":id})).await;
-            if structured(&message)["result"]["state"] == "submitted" {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let ack = mcp
-        .call("acknowledge_message", json!({"id":id,"agent":"bob"}))
-        .await;
-    assert_eq!(structured(&ack)["result"]["state"], "acknowledged");
     assert_eq!(mcp.child.id(), pid);
     assert_eq!(running.request(Request::PeersList), json!([]));
     running.request(Request::Unregister {
@@ -1391,32 +1423,6 @@ async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
         // The compact receipt did not truncate or alter the persisted message.
         let stored = mcp.call("get_message", json!({"id":id})).await;
         assert_eq!(structured(&stored)["result"]["body"], body);
-        timeout(Duration::from_secs(3), async {
-            loop {
-                let stored = mcp.call("get_message", json!({"id":id})).await;
-                if structured(&stored)["result"]["state"] == "submitted" {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let ack = mcp
-            .call("acknowledge_message", json!({"id":id,"agent":"bob"}))
-            .await;
-        assert_eq!(
-            structured(&ack)["result"],
-            json!({"id":id,"state":"acknowledged"})
-        );
-        assert!(ack.to_string().len() < 400);
-        let ack = mcp
-            .call(
-                "acknowledge_message",
-                json!({"id":id,"agent":"bob","verbose":true}),
-            )
-            .await;
-        assert_eq!(structured(&ack)["result"]["body"], body);
         let updated = mcp
             .call(
                 "update_board",

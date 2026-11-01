@@ -279,7 +279,7 @@ pub(crate) async fn deliver_guarded(
     })
     .await;
     match result {
-        Ok(Ok(())) => Outcome::submitted(
+        Ok(Ok(())) => Outcome::uncertain(
             "Written to Claude inbox socket; native acceptance and model execution are unconfirmed",
         ),
         other => {

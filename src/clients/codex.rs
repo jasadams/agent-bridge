@@ -209,7 +209,7 @@ async fn deliver_at_tracking(
     match rpc(&mut socket, 100, method, params).await {
         Ok(value) if turn.as_ref().is_some_and(|turn| value["turnId"] == *turn) => {
             Outcome::submitted(
-                "Native active turn accepted peer input; execution waits for a safe native boundary, and recipient acknowledgement is unconfirmed",
+                "Native active turn accepted peer input; execution waits for a safe native boundary. This does not prove model reading or task completion",
             )
         }
         Ok(value)
@@ -221,7 +221,7 @@ async fn deliver_at_tracking(
                     .is_some_and(|value| !value.is_empty()) =>
         {
             Outcome::submitted(
-                "Native queue accepted peer input; it may wait for the whole active turn to finish. Recipient acknowledgement is unconfirmed",
+                "Native queue accepted peer input; it may wait for the whole active turn to finish. This does not prove model reading or task completion",
             )
         }
         Err(error)

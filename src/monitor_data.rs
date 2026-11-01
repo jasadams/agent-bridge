@@ -8,6 +8,14 @@ use serde_json::{Value, json};
 const ROWS: &str = r#"
 WITH contexts AS (
  SELECT m.*, coalesce(o.envelope,i.envelope) AS envelope,
+ CASE
+ WHEN m.state='submitted' AND coalesce(json_extract(o.envelope,'$.destination.provider'),json_extract(c.destination,'$.provider'),'') NOT IN ('codex','opencode','inbox') THEN 'unknown'
+ WHEN m.state='queued' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=m.id AND d.phase<>'queued') THEN 'unknown'
+ WHEN m.state='sending' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=m.id AND d.phase IN ('reconcile','legacy','uncertain')) THEN 'unknown'
+ WHEN m.state IN ('queued','sending','blocked','pending') THEN 'pending'
+ WHEN m.state IN ('submitted','acknowledged','delivered') THEN 'delivered'
+ WHEN m.state IN ('failed','cancelled') THEN 'failed'
+ ELSE 'unknown' END AS public_state,
  CASE WHEN o.id IS NOT NULL THEN 'outbound' WHEN i.local_id IS NOT NULL THEN 'inbound' ELSE 'local' END AS direction,
  CASE WHEN o.id IS NOT NULL OR i.local_id IS NOT NULL THEN
  json_object('peer_id',json_extract(coalesce(o.envelope,i.envelope),'$.origin_peer'),
@@ -79,13 +87,13 @@ fn row_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         json!({"id":row.get::<_,String>(0)?,"created":row.get::<_,i64>(1)?,"updated":row.get::<_,i64>(2)?,"state":row.get::<_,String>(3)?,"detail":row.get::<_,Option<String>>(4)?,"body":row.get::<_,String>(5)?,"parent":parent,"source":serde_json::from_str::<Value>(&source).unwrap_or(Value::Null),"destination":serde_json::from_str::<Value>(&destination).unwrap_or(Value::Null),"direction":row.get::<_,String>(9)?,"body_truncated":row.get::<_,bool>(10)?}),
     )
 }
-const PREVIEW: &str = "SELECT id,created,updated,state,substr(detail,1,512),substr(body,1,512),parent,source,destination,direction,length(body)>512,json_extract(envelope,'$.parent') FROM rows ";
+const PREVIEW: &str = "SELECT id,created,updated,public_state,substr(detail,1,512),substr(body,1,512),parent,source,destination,direction,length(body)>512,json_extract(envelope,'$.parent') FROM rows ";
 
 impl Db {
     fn monitor_page(&self, query: &MonitorQuery, machine: &Value) -> Result<Value> {
         let cursor = query_valid(query)?;
         let sql = format!(
-            "{ROWS}{PREVIEW} WHERE ($machine IS NULL OR json_extract(source,'$.machine_name')=$machine OR json_extract(destination,'$.machine_name')=$machine OR json_extract(source,'$.peer_id')=$machine OR json_extract(destination,'$.peer_id')=$machine) AND ($agent IS NULL OR json_extract(source,'$.agent')=$agent OR json_extract(destination,'$.agent')=$agent OR json_extract(source,'$.session')=$agent OR json_extract(destination,'$.session')=$agent) AND ($state IS NULL OR state=$state) AND ($since IS NULL OR created>=$since) AND ($until IS NULL OR created<=$until) AND ($before_time IS NULL OR created<$before_time OR (created=$before_time AND id<$before_id)) ORDER BY created DESC,id DESC LIMIT $limit"
+            "{ROWS}{PREVIEW} WHERE ($machine IS NULL OR json_extract(source,'$.machine_name')=$machine OR json_extract(destination,'$.machine_name')=$machine OR json_extract(source,'$.peer_id')=$machine OR json_extract(destination,'$.peer_id')=$machine) AND ($agent IS NULL OR json_extract(source,'$.agent')=$agent OR json_extract(destination,'$.agent')=$agent OR json_extract(source,'$.session')=$agent OR json_extract(destination,'$.session')=$agent) AND ($state IS NULL OR public_state=$state) AND ($since IS NULL OR created>=$since) AND ($until IS NULL OR created<=$until) AND ($before_time IS NULL OR created<$before_time OR (created=$before_time AND id<$before_id)) ORDER BY created DESC,id DESC LIMIT $limit"
         );
         let mut statement = self.conn.prepare(&sql)?;
         let mut messages=statement.query_map(named_params!{
@@ -112,7 +120,7 @@ impl Db {
         let parsed = uuid::Uuid::parse_str(id).context("Invalid message ID")?;
         ensure!(parsed.to_string() == id, "Invalid message ID");
         let sql = format!(
-            "{ROWS} SELECT id,created,updated,state,detail,body,parent,source,destination,direction,0,json_extract(envelope,'$.parent') FROM rows WHERE id=$id"
+            "{ROWS} SELECT id,created,updated,public_state,detail,body,parent,source,destination,direction,0,json_extract(envelope,'$.parent') FROM rows WHERE id=$id"
         );
         let message=self.conn.query_row(&sql,named_params!{"$local_peer":machine["peer_id"].as_str(),"$local_name":machine["machine_name"].as_str(),"$id":id},row_value).optional()?.context("Message not found")?;
         let sql = format!(
@@ -248,7 +256,7 @@ mod tests {
         assert!(
             db.monitor_page(
                 &MonitorQuery {
-                    state: Some("acknowledged".into()),
+                    state: Some("delivered".into()),
                     ..Default::default()
                 },
                 &machine
@@ -300,6 +308,127 @@ mod tests {
             },
         ] {
             assert!(db.monitor_page(&query, &machine).is_err());
+        }
+    }
+    #[test]
+    fn monitor_public_outcomes_filter_before_pagination_and_match_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("db")).unwrap();
+        db.register(&agent("bob", "original-destination"), false)
+            .unwrap();
+        let machine = json!({"peer_id":null,"machine_name":"local"});
+        let mut expected = std::collections::HashMap::<&str, Vec<String>>::new();
+        for (raw, provider, outcome) in [
+            ("queued", Some("inbox"), "pending"),
+            ("sending", Some("inbox"), "pending"),
+            ("blocked", Some("inbox"), "pending"),
+            ("submitted", Some("inbox"), "delivered"),
+            ("submitted", Some("codex"), "delivered"),
+            ("submitted", Some("opencode"), "delivered"),
+            ("submitted", Some("claude"), "unknown"),
+            ("submitted", None, "unknown"),
+            ("acknowledged", Some("claude"), "delivered"),
+            ("delivered", Some("inbox"), "delivered"),
+            ("cancelled", Some("inbox"), "failed"),
+            ("failed", Some("inbox"), "failed"),
+            ("uncertain", Some("inbox"), "unknown"),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            db.send(&id, "user", "bob", "historical message", &None)
+                .unwrap();
+            db.conn
+                .execute("UPDATE messages SET state=? WHERE id=?", [raw, &id])
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE message_context SET destination=json_set(destination,'$.provider',?1) WHERE id=?2",
+                    rusqlite::params![provider, id],
+                )
+                .unwrap();
+            expected.entry(outcome).or_default().push(id);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        db.send(&id, "user", "bob", "reconciliation", &None)
+            .unwrap();
+        db.conn.execute("INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,phase,deadline) VALUES(?,'original-destination','legacy','legacy','pending','reconcile',0)", [&id]).unwrap();
+        expected.entry("unknown").or_default().push(id);
+        let before = db.conn.total_changes();
+        for (outcome, ids) in expected {
+            let mut query = MonitorQuery {
+                state: Some(outcome.into()),
+                limit: 1,
+                ..Default::default()
+            };
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                let page = db.monitor_page(&query, &machine).unwrap();
+                for message in page["messages"].as_array().unwrap() {
+                    let id = message["id"].as_str().unwrap();
+                    assert_eq!(message["state"], outcome);
+                    assert!(seen.insert(id.to_string()));
+                    assert_eq!(db.delivery_state(&db.get(id).unwrap()).unwrap(), outcome);
+                    assert_eq!(
+                        db.monitor_detail(id, &machine).unwrap()["message"]["state"],
+                        outcome
+                    );
+                }
+                query.before = page["next_cursor"].as_str().map(str::to_string);
+                if query.before.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(seen, ids.into_iter().collect());
+        }
+        assert_eq!(db.conn.total_changes(), before);
+    }
+    #[test]
+    fn monitor_sending_reconciliation_is_unknown_but_dispatched_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("db")).unwrap();
+        db.register(&agent("bob", "original-destination"), false)
+            .unwrap();
+        let machine = json!({"peer_id":null,"machine_name":"local"});
+        for (phase, outcome) in [
+            ("reconcile", "unknown"),
+            ("legacy", "unknown"),
+            ("uncertain", "unknown"),
+            ("dispatched", "pending"),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            db.send(&id, "user", "bob", "native attempt", &None)
+                .unwrap();
+            db.conn
+                .execute("UPDATE messages SET state='sending' WHERE id=?", [&id])
+                .unwrap();
+            db.conn.execute("INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,phase,deadline) VALUES(?1,'original-destination','legacy','legacy','pending',?2,0)", [&id, phase]).unwrap();
+            let before = db.conn.total_changes();
+            assert_eq!(
+                db.monitor_detail(&id, &machine).unwrap()["message"]["state"],
+                outcome,
+                "sending phase {phase}"
+            );
+            for filter in ["pending", "unknown"] {
+                let page = db
+                    .monitor_page(
+                        &MonitorQuery {
+                            state: Some(filter.into()),
+                            ..Default::default()
+                        },
+                        &machine,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    page["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|message| message["id"] == id),
+                    filter == outcome,
+                    "sending phase {phase}, filter {filter}"
+                );
+            }
+            assert_eq!(db.conn.total_changes(), before);
+            assert_eq!(db.get(&id).unwrap().state, "sending");
         }
     }
     #[test]

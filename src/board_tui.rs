@@ -959,13 +959,9 @@ impl View {
                 editor.cursor = 0;
                 editor.submission = None;
                 editor.uncertain = false;
-                let state = value["state"].as_str().unwrap_or("accepted");
-                self.notice = match state {
-                    "queued" | "sending" | "sent" | "delivered" | "acknowledged" | "accepted" => {
-                        None
-                    }
-                    _ => Some(format!("Message {}", safe_line(state))),
-                };
+                let state =
+                    crate::protocol::delivery_state(value["state"].as_str().unwrap_or("unknown"));
+                self.notice = Some(format!("Message {state}"));
             }
             Ok(value)
                 if value["accepted"] == false
@@ -3193,16 +3189,28 @@ mod tests {
         );
         assert!(view.editor.as_ref().unwrap().draft.is_empty());
         assert!(
-            view.notice.is_none(),
-            "Accepted send adds no success status"
+            view.notice.as_deref() == Some("Message pending"),
+            "Accepted send displays its public delivery outcome"
         );
         view.paste("next");
         press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
         assert_ne!(view.pending_message.as_ref().unwrap().id, request.id);
     }
     #[test]
-    fn historical_problem_states_remain_visible_after_confirmed_acceptance() {
-        for state in ["failed", "blocked", "cancelled", "uncertain"] {
+    fn historical_receipts_display_only_public_delivery_outcomes() {
+        for state in [
+            "queued",
+            "sending",
+            "submitted",
+            "acknowledged",
+            "failed",
+            "blocked",
+            "cancelled",
+            "uncertain",
+            "pending",
+            "delivered",
+            "unknown",
+        ] {
             let mut view = message_view();
             view.paste("exact historical message");
             press(&mut view, KeyCode::Enter, KeyModifiers::NONE);
@@ -3212,7 +3220,7 @@ mod tests {
             view.message_result(request, Ok(receipt));
             assert_eq!(
                 view.notice.as_deref(),
-                Some(format!("Message {state}").as_str())
+                Some(format!("Message {}", crate::protocol::delivery_state(state)).as_str())
             );
         }
     }

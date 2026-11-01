@@ -996,7 +996,8 @@ describe("V2 session context without peer transcript setup", () => {
     const context = textOf(first[1]);
     expect(context).toContain(`identity is opencode-${A}`);
     expect(context).toContain(JSON.stringify(s.directory));
-    for (const instruction of ["connection_status", "acknowledge_message", "send_message", "parent=the received message ID", "read_board/update_board", "create_board for named creation", "Never edit board backing files", "review the returned latest snapshot", "preserving other writers", "report the blocker", "never fall back to direct file writes", "current task, status, blocker or needed user action", "revise an existing entry", "detailed logs and reasoning in the native terminal", "explicitly choose subscribe", 'events=[{"event":"board.changed","board":"main"}]', "require no acknowledgement", "not owner approval", "Existing permissions remain under owner control"]) expect(context).toContain(instruction);
+    for (const instruction of ["connection_status", "send_message", "then continue your work", "parent=the received message ID", "read_board/update_board", "create_board for named creation", "Never edit board backing files", "preserve other writers", "report the blocker", "revise the current entry", "Notifications are opt-in", 'events=[{"event":"board.changed","board":"main"}]', "not owner approval", "Existing permissions remain under owner control"]) expect(context).toContain(instruction);
+    for (const bookkeeping of ["acknowledge", "acknowledgement", "receipt", "get_message", "list_messages", "pending/unknown", "poll", "migration"]) expect(context).not.toContain(bookkeeping);
     expect(partsOf(await systemContext(s, A))).toEqual(partsOf(first));
     expect(partsOf(await systemContext(s, A, [...first]))).toEqual(partsOf(first));
     expect(s.requests).toHaveLength(requests); expect(s.prompts).toHaveLength(0);
@@ -1017,7 +1018,8 @@ describe("V2 session context without peer transcript setup", () => {
     await s.hooks.compaction?.({ sessionID: A, ...output });
     expect(output.system).toHaveLength(2); expect(textOf(output.system[0])).toBe("other plugin");
     expect(textOf(output.system[1])).toContain(`For opencode-${A}`);
-    expect(textOf(output.system[1])).toContain("preserve unresolved peer message IDs");
+    expect(textOf(output.system[1])).toContain("preserve relevant peer message IDs");
+    for (const bookkeeping of ["acknowledge", "receipt", "get_message", "pending/unknown", "poll"]) expect(textOf(output.system[1])).not.toContain(bookkeeping);
     expect(textOf(output.system[1])).not.toContain("<agent-bridge-session-context>");
     const compacted = [...output.system];
     await s.hooks.compaction?.({ sessionID: A, system: [...output.system], messages: [], options: {} });

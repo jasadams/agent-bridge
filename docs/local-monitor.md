@@ -68,7 +68,7 @@ destination session, but historical source sessions were not recorded and appear
 as unknown. Remote machine aliases/names are display labels, not proof of human
 identity. The monitor never creates a peer identity just to display local messages.
 
-Message views remain read-only. There are no browser send, acknowledge, retry,
+Message views remain read-only. There are no browser send, retry,
 cancel, pairing or grant controls. Receipt/submission states have their existing meaning;
 monitoring does not establish that a model ran or completed a task.
 
@@ -268,8 +268,9 @@ input. Enter sends; Shift+Enter inserts a newline. IME composition Enter does no
 send, and blank text is not submitted. A Send button is also available. The
 composer keeps focus after acceptance and remains available for another message.
 
-Sending uses the normal broker user-to-agent queue. A broker acceptance/queued
-receipt does not mean the agent read, acknowledged or completed the request.
+Sending uses the normal broker user-to-agent queue. A broker Pending receipt does
+not mean native acceptance; Delivered does not mean model read or task completion.
+See [delivery diagnostics](delivery-outcomes.md) if a send fails or a response is missing.
 Message text goes into message history; sending does not rewrite the board or
 advance its content revision or Last Updated timestamp.
 

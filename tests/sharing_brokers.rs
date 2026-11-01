@@ -169,7 +169,7 @@ fn temp() -> tempfile::TempDir {
 }
 
 #[tokio::test]
-async fn shared_sessions_exchange_acknowledged_replies_and_enforce_unshare_across_restart() {
+async fn shared_sessions_exchange_delivered_replies_and_enforce_unshare_across_restart() {
     let root = temp();
     let a = Running::start(&root.path().join("a"));
     let b_path = root.path().join("b");
@@ -228,33 +228,41 @@ async fn shared_sessions_exchange_acknowledged_replies_and_enforce_unshare_acros
     let original = a.send("bob/user", "Shared session hello", None);
     let incoming = received(&b, "Shared session hello").await;
     let local_id = incoming["id"].as_str().unwrap().to_owned();
-    state(&b, &local_id, "submitted").await;
-    b.request(Request::Ack {
-        id: local_id.clone(),
-        agent: "user".into(),
-    });
-    state(&a, &original, "acknowledged").await;
+    state(&b, &local_id, "delivered").await;
+    state(&a, &original, "delivered").await;
     let reply_id = b.send("alice/user", "Shared session reply", Some(local_id));
     let reply = received(&a, "Shared session reply").await;
     assert_eq!(reply["parent"], original);
     assert_eq!(reply["hops"], 1);
-    a.request(Request::Ack {
-        id: reply["id"].as_str().unwrap().into(),
-        agent: "user".into(),
-    });
-    state(&b, &reply_id, "acknowledged").await;
+    state(&b, &reply_id, "delivered").await;
 
     b.request(Request::Pause { paused: true });
     let queued_id = a.send("bob/user", "Queued before stop sharing", None);
     let queued = received(&b, "Queued before stop sharing").await;
-    assert_eq!(queued["state"], "queued");
+    assert_eq!(queued["state"], "pending");
     // No await between revocation of the bundle and enqueue: A's directory is
     // deliberately stale, but the destination must recheck current policy.
     b.share("alice", "user", false);
     let denied_id = a.send("bob/user", "Denied after unshare", None);
     b.request(Request::Pause { paused: false });
-    state(&b, queued["id"].as_str().unwrap(), "blocked").await;
-    state(&a, &queued_id, "blocked").await;
+    let stored = rusqlite::Connection::open_with_flags(
+        b_path.join("messages.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    wait("queued message blocked after unshare", || {
+        let blocked: bool = stored
+            .query_row(
+                "SELECT state='blocked' FROM messages WHERE id=?",
+                [queued["id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        blocked.then_some(Value::Null)
+    })
+    .await;
+    state(&b, queued["id"].as_str().unwrap(), "pending").await;
+    state(&a, &queued_id, "pending").await;
     let rejected = state(&a, &denied_id, "failed").await;
     assert_eq!(rejected["transfer"]["state"], "rejected");
     assert!(
@@ -290,11 +298,8 @@ async fn shared_sessions_exchange_acknowledged_replies_and_enforce_unshare_acros
     directory(&a, "user").await;
     let after_restart = a.send("bob/user", "Shared grants survived restart", None);
     let incoming = received(&b, "Shared grants survived restart").await;
-    b.request(Request::Ack {
-        id: incoming["id"].as_str().unwrap().into(),
-        agent: "user".into(),
-    });
-    state(&a, &after_restart, "acknowledged").await;
+    state(&b, incoming["id"].as_str().unwrap(), "delivered").await;
+    state(&a, &after_restart, "delivered").await;
     b.request(Request::PeerRevoke {
         peer: "alice".into(),
     });
@@ -365,11 +370,8 @@ async fn replacing_shared_registration_does_not_authorize_its_new_session() {
     .await;
     let id = a.send("bob/worker", "Explicitly shared replacement", None);
     let incoming = received(&b, "Explicitly shared replacement").await;
-    b.request(Request::Ack {
-        id: incoming["id"].as_str().unwrap().into(),
-        agent: "worker".into(),
-    });
-    state(&a, &id, "acknowledged").await;
+    state(&b, incoming["id"].as_str().unwrap(), "delivered").await;
+    state(&a, &id, "delivered").await;
     a.stop().await;
     b.stop().await;
 }
