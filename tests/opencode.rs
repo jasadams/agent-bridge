@@ -167,11 +167,10 @@ async fn exact_session_receipts_bind_native_and_broker_ids() {
     let plugin = PluginSocket::start(2, receipt);
     let outcome = broker_delivery(&plugin).await;
     assert_eq!(outcome.state, "delivered", "{:?}", outcome.detail);
+    let detail = outcome.detail.unwrap();
+    assert!(detail.contains("exact native client acceptance verified"));
     assert!(
-        outcome
-            .detail
-            .unwrap()
-            .contains("does not prove model reading or task completion")
+        detail.contains("does not prove transcript consumption, model reading or task completion")
     );
     plugin.finish();
 }
