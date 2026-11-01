@@ -450,7 +450,7 @@ struct EventNativeStorage {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_restart_barriers() {
+async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_delivery() {
     use agent_bridge::protocol::EventSelector;
     use std::sync::{Arc, Mutex};
     for proof_available in [true, false] {
@@ -462,80 +462,77 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
         let native = Arc::new(Mutex::new(EventNativeStorage::default()));
         let storage = native.clone();
         let broker_state = state.clone();
-        // Two verified probes (before/after broker restart), one lost event,
-        // explicit reconciliation, and (with proof) ordinary + lifecycle tails.
-        let plugin = PluginSocket::start_optional(
-            if proof_available { 6 } else { 4 },
-            move |frame, instance| {
-                if frame["op"] == "probe" {
-                    return Some(receipt(frame, instance));
-                }
-                assert!(frame["op"] == "deliver" || frame["op"] == "reconcile");
-                if frame["op"] == "deliver" {
-                    // Exercise the same privileged broker admission RPC as the real
-                    // plugin before native insertion. Reconciliation never calls it.
-                    let admitted = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(broker::rpc(
-                            &broker_state,
-                            &Request::OpenCodeAdmit {
-                                id: frame["id"].as_str().unwrap().into(),
-                                session: SESSION.into(),
-                                generation: frame["generation"].as_str().unwrap().into(),
-                                instance: instance.into(),
-                                attempt: frame["attempt"].as_str().unwrap().into(),
-                            },
-                        ))
-                        .unwrap();
-                    assert_eq!(admitted["admitted"], true);
-                    let mut native = storage.lock().unwrap();
-                    assert!(
-                        !native
-                            .inserted
-                            .iter()
-                            .any(|old| old["native_message_id"] == frame["native_message_id"]),
-                        "No native input may be inserted twice"
-                    );
-                    native.inserted.push(frame.clone());
-                    native.frames.push(frame.clone());
-                    if native.lost_event.is_none() {
-                        assert!(frame["content"].as_str().unwrap().contains("agent.opened"));
-                        native.lost_event = Some(frame);
-                        // The native insert happened, but the connection closes
-                        // without its receipt: the real adapter must mark uncertain.
-                        return None;
-                    }
-                    return Some(receipt(frame, instance));
-                }
+        // Two probes, the lost event, an ordinary tail, explicit readback and
+        // a new lifecycle event. Missing proof must not block the latter two.
+        let plugin = PluginSocket::start_optional(6, move |frame, instance| {
+            if frame["op"] == "probe" {
+                return Some(receipt(frame, instance));
+            }
+            assert!(frame["op"] == "deliver" || frame["op"] == "reconcile");
+            if frame["op"] == "deliver" {
+                // Exercise the same privileged broker admission RPC as the real
+                // plugin before native insertion. Reconciliation never calls it.
+                let admitted = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(broker::rpc(
+                        &broker_state,
+                        &Request::OpenCodeAdmit {
+                            id: frame["id"].as_str().unwrap().into(),
+                            session: SESSION.into(),
+                            generation: frame["generation"].as_str().unwrap().into(),
+                            instance: instance.into(),
+                            attempt: frame["attempt"].as_str().unwrap().into(),
+                        },
+                    ))
+                    .unwrap();
+                assert_eq!(admitted["admitted"], true);
                 let mut native = storage.lock().unwrap();
-                let original = native.lost_event.as_ref().unwrap();
-                for key in ["id", "native_message_id", "session", "content", "namespace"] {
-                    assert_eq!(
-                        frame[key], original[key],
-                        "Reconciliation must retain {key}"
-                    );
-                }
+                assert!(
+                    !native
+                        .inserted
+                        .iter()
+                        .any(|old| old["native_message_id"] == frame["native_message_id"]),
+                    "No native input may be inserted twice"
+                );
+                native.inserted.push(frame.clone());
                 native.frames.push(frame.clone());
-                if proof_available
-                    && native.inserted.iter().any(|old| {
-                        ["native_message_id", "session", "content", "namespace"]
-                            .into_iter()
-                            .all(|key| old[key] == frame[key])
-                    })
-                {
-                    Some(receipt(frame, instance))
-                } else {
-                    let mut missing = receipt(frame, instance);
-                    missing.as_object_mut().unwrap().remove("status");
-                    missing["ok"] = json!(false);
-                    missing["uncertain"] = json!(true);
-                    missing["error"] = json!("native proof is unavailable");
-                    Some(missing)
+                if native.lost_event.is_none() {
+                    assert!(frame["content"].as_str().unwrap().contains("agent.opened"));
+                    native.lost_event = Some(frame);
+                    // The native insert happened, but the connection closes
+                    // without its receipt: the real adapter must mark uncertain.
+                    return None;
                 }
-            },
-        );
+                return Some(receipt(frame, instance));
+            }
+            let mut native = storage.lock().unwrap();
+            let original = native.lost_event.as_ref().unwrap();
+            for key in ["id", "native_message_id", "session", "content", "namespace"] {
+                assert_eq!(
+                    frame[key], original[key],
+                    "Reconciliation must retain {key}"
+                );
+            }
+            native.frames.push(frame.clone());
+            if proof_available
+                && native.inserted.iter().any(|old| {
+                    ["native_message_id", "session", "content", "namespace"]
+                        .into_iter()
+                        .all(|key| old[key] == frame[key])
+                })
+            {
+                Some(receipt(frame, instance))
+            } else {
+                let mut missing = receipt(frame, instance);
+                missing.as_object_mut().unwrap().remove("status");
+                missing["ok"] = json!(false);
+                missing["uncertain"] = json!(true);
+                missing["error"] = json!("native proof is unavailable");
+                Some(missing)
+            }
+        });
         let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
         let mut broker = bound.broker.clone();
         let mut server = tokio::spawn(broker::serve(bound));
@@ -587,7 +584,9 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                 parent: None,
             })
             .unwrap();
-        // Resubscribe exposes an ID but cannot implicitly reconcile or free FIFO.
+        // Later ordinary input may proceed, but resubscribe must not reconcile
+        // or replay the original uncertain control.
+        wait_message_state(&broker, &tail_id, "delivered").await;
         let recovery = broker.request(subscribe()).unwrap()["recovery"].clone();
         assert_eq!(recovery["total"], 1);
         assert_eq!(recovery["items"][0]["id"], event_id);
@@ -613,10 +612,30 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
             1
         );
         tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let frames = native.lock().unwrap().frames.clone();
         assert_eq!(
-            native.lock().unwrap().frames.len(),
-            1,
+            frames
+                .iter()
+                .filter(|frame| frame["op"] == "reconcile")
+                .count(),
+            0,
             "Snapshot must not run reconciliation"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["id"] == event_id && frame["op"] == "deliver")
+                .count(),
+            1,
+            "Unknown control must not be replayed"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["id"] == tail_id && frame["op"] == "deliver")
+                .count(),
+            1,
+            "Ordinary tail must arrive once"
         );
         assert_eq!(
             broker
@@ -624,7 +643,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                     id: tail_id.clone()
                 })
                 .unwrap()["state"],
-            "pending"
+            "delivered"
         );
         broker.request(Request::Pause { paused: true }).unwrap();
         broker
@@ -662,7 +681,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
             "unknown"
         );
         // Restart while explicitly requested read-only work is queued. Old
-        // subscription revocation cannot erase its attempted provenance/barrier.
+        // subscription revocation cannot erase its attempted provenance.
         server.abort();
         let _ = server.await;
         drop(broker);
@@ -700,22 +719,15 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                 allow_duplicate: false,
             })
             .unwrap();
-        // Existing lease rules correctly retire proven-unattempted ordinary
-        // work on expiry; explicitly retry that tail against its same identity.
+        // The ordinary tail already reached the native session before restart.
         assert_eq!(
             broker
                 .request(Request::Get {
                     id: tail_id.clone()
                 })
                 .unwrap()["state"],
-            "failed"
+            "delivered"
         );
-        broker
-            .request(Request::Retry {
-                id: tail_id.clone(),
-                allow_duplicate: false,
-            })
-            .unwrap();
         broker
             .request(Request::Register {
                 agent: Agent {
@@ -764,12 +776,48 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                     .contains("fresh-worker")
             );
         } else {
-            wait_message_state(&broker, &event_id, "unknown").await;
-            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            // The public Unknown state also covers queued/in-flight readback.
+            // Wait for this readback's own diagnostic before checking its
+            // final outcome, rather than accepting the earlier Unknown state.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = broker
+                        .request(Request::Get {
+                            id: event_id.clone(),
+                        })
+                        .unwrap();
+                    if event["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("unconfirmed plugin receipt"))
+                    {
+                        assert_eq!(event["state"], "unknown");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if native.lock().unwrap().inserted.len() == 3 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
             assert_eq!(
                 native.lock().unwrap().inserted.len(),
-                1,
-                "Missing proof never inserts a replacement or any tail"
+                3,
+                "Missing proof does not replay the original and later input proceeds"
+            );
+            assert!(
+                native.lock().unwrap().inserted[2]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("fresh-worker")
             );
             assert_eq!(
                 broker
@@ -777,7 +825,34 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_preserves_rest
                         id: tail_id.clone()
                     })
                     .unwrap()["state"],
-                "pending"
+                "delivered"
+            );
+        }
+        {
+            let native = native.lock().unwrap();
+            assert_eq!(
+                native
+                    .frames
+                    .iter()
+                    .filter(|frame| frame["op"] == "reconcile" && frame["id"] == event_id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                native
+                    .frames
+                    .iter()
+                    .filter(|frame| frame["op"] == "deliver" && frame["id"] == event_id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                native
+                    .frames
+                    .iter()
+                    .filter(|frame| frame["op"] == "deliver" && frame["id"] == tail_id)
+                    .count(),
+                1
             );
         }
         server.abort();

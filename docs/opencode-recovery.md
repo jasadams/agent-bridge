@@ -7,9 +7,9 @@ acceptance provenance to the existing receipt table; no broker migration is adde
 Public outcomes are [Pending, Delivered, Failed and Unknown](delivery-outcomes.md);
 legacy phase names and protocol-2 receipt tokens are internal compatibility data.
 
-* One broker queue owns FIFO, keyed by provider and exact native session across
-  aliases. A deferred or unresolved attempted head blocks fresh submissions,
-  including earlier row IDs requeued after a later attempt became Unknown.
+* One broker queue orders eligible ordinary work by exact native session across
+  aliases. An in-flight or deferred ordinary head remains ordered, but an unresolved
+  attempted message does not block later independent submissions.
   Pause and queued cancellation remain broker operations. The plugin never
   retains an accepted hidden queue of future prompts.
 * Every message has immutable native identity and rendered content. Native IDs
@@ -79,8 +79,8 @@ response fencing and never substituted for the original guarded proof attempt.
 Different-generation and historical NULL-proof rows require transcript evidence.
 A lost native return or proof-write failure cannot use pending-inbox readback:
 that HTTP method is not exposed by the supported plugin context. No recovery
-invokes another prompt. An Unknown head stays a barrier until verified acceptance or explicit operator
-resolution; lease renewal alone does not resolve it.
+invokes another prompt. An Unknown head does not block newer work; lease renewal
+alone does not resolve it.
 
 Policy revocation, unsharing and registration replacement preserve attempted
 uncertainty instead of converting it to a cancellable blocked/failed queue entry.

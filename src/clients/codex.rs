@@ -403,6 +403,9 @@ mod tests {
                             break;
                         }
                         let mut thread = json!({"id":if mode.starts_with("wrong-thread") {"other"} else {"123e4567-e89b-12d3-a456-426614174000"},"status":{"type":if mode.starts_with("unknown-status") {"mystery"} else if mode.starts_with("active") {"active"} else {"idle"}},"canAcceptDirectInput":!mode.contains("cap-false")});
+                        if mode == "moved-cwd" {
+                            thread["cwd"] = json!("/some/other/worktree");
+                        }
                         if mode.contains("cap-missing") {
                             thread
                                 .as_object_mut()
@@ -587,6 +590,24 @@ mod tests {
             requests[4]["params"]["input"][0]["text"],
             "literal $(command) secret"
         );
+    }
+    #[tokio::test]
+    async fn changed_thread_worktree_does_not_restrict_exact_session_delivery() {
+        let (_root, path, home, task, _ready) = fixture("moved-cwd").await;
+        let msg = message();
+        assert_eq!(
+            deliver_at(vec![path], &home, &msg, "peer input")
+                .await
+                .state,
+            "submitted"
+        );
+        let requests = task.await.unwrap();
+        let writes: Vec<_> = requests
+            .iter()
+            .filter(|r| r["method"] == "thread/queue/add")
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0]["params"]["threadId"], msg.recipient_session);
     }
     #[tokio::test]
     async fn wrong_home_or_unloaded_session_never_receives_body() {

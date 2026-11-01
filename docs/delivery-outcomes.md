@@ -95,10 +95,19 @@ journal lifetime limits remain bounded. Delivery is not permission to erase hist
 or deduplication tombstones.
 
 Unknown is not a hidden receipt debt. It never triggers automatic native replay.
-Codex Unknown history does not exhaust pending-work admission. OpenCode retains
-its attempt-aware FIFO barrier: inspect exact native history and explicitly request
-read-only reconciliation. Neither absence of proof nor `--allow-duplicate` authorizes
+Codex Unknown history does not exhaust pending-work admission. OpenCode allows
+later eligible messages past an Unknown, while retaining its per-message attempt
+fence: inspect exact native history and request read-only reconciliation. Neither absence of proof nor `--allow-duplicate` authorizes
 a second OpenCode prompt. Restarts preserve uncertainty and exact-session ownership.
+
+For OpenCode, `get_message` exposes `opencode_attempt` separately from the
+current `detail`: a recorded initiating Unknown includes its message, session,
+generation, attempt, timestamp in Unix milliseconds, and a privacy-safe error
+category. `timestamp_kind: detected` means the broker's detection time, not a
+claimed native failure time. Subsequent read-only reconciliation updates the current detail without
+replacing that original evidence. Historical Unknown records whose original
+evidence was not retained report `status: unavailable`; missing fields in older
+recorded evidence are not reconstructed from later reconciliation.
 
 Cancel remains available only for eligible unattempted work. It reports Failed with
 a cancellation reason; it cannot recall native input or a possibly accepted remote

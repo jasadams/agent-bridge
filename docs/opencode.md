@@ -56,7 +56,7 @@ native permission requests cannot supply pairing consent or change permissions.
 ## Live session scope
 
 The plugin belongs to one OpenCode server/plugin instance and may observe several
-live sessions. Startup verifies the current location's native session listing. Session creation,
+live sessions. Startup verifies the runtime's native session listing. Session creation,
 chat submission, observed activity/status, and the runtime `tui.session.select`
 event activate an existing session only after verification through the supplied
 client. Title updates refresh metadata for sessions already observed as live;
@@ -97,7 +97,7 @@ bind session, broker message ID, namespace, generation, dispatch attempt, origin
 rendered content and native message ID. Both plugin and broker must be upgraded
 together; protocol 1 cannot provide this recovery contract.
 
-FIFO and bounded backpressure belong to the broker, keyed by provider and native
+Ordering and bounded backpressure belong to the broker, keyed by provider and native
 session across aliases. At most 64 pending messages may target one OpenCode
 conversation; the shared 1000-message queued bound also applies to direct/remote
 enqueue and retries. The plugin submits native input once through V2 `session.prompt`,
@@ -115,8 +115,8 @@ Waiting is bounded by the queue count and message byte limits, rather than a
 120-second age limit. Lease loss, close or generation replacement still fails
 queued work without native events; restart does not extend a lease. Historical
 failed messages stay failed until explicit operator retry. A queued *reconciliation* of an earlier attempt cannot be cancelled as if
-it were unattempted work. Unresolved attempts remain barriers to fresh native
-submissions; read-only reconciliation can inspect multiple Unknown messages.
+it were unattempted work. Unresolved attempts do not block later eligible messages;
+they remain Unknown until positive read-only reconciliation proves acceptance.
 
 These queue bounds apply to broker queued/sending/unknown barrier work, not to input
 already accepted by the native client. Delivered input is owned by
@@ -153,7 +153,7 @@ transcript evidence. No absence or `--allow-duplicate` permits another prompt.
 See [exact proof, field consumers, migration and limits](delivery-outcomes.md#opencode-v2-proof-and-retained-journal-fields).
 All migrated legacy IDs reconcile read-only. An old broker's explicit retry could
 turn a legacy submitted/uncertain message back into queued without preserving attempt
-provenance, so even migrated queued work projects to Unknown and blocks fresh submissions.
+provenance, so even migrated queued work projects to Unknown but does not block fresh submissions.
 Legacy absence cannot authorize a new prompt or a replacement namespaced ID;
 genuine unattempted legacy work is indistinguishable and requires conservative
 operator resolution. Only modern durable pre-attempt records can be retried as new

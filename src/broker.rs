@@ -185,6 +185,9 @@ impl Broker {
         if let Some(transfer) = db.transfer_info(&message.id)? {
             value["transfer"] = transfer;
         }
+        if let Some(diagnostic) = db.opencode_attempt_diagnostic(&message.id)? {
+            value["opencode_attempt"] = diagnostic;
+        }
         Ok(value)
     }
 

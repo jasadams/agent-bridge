@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { brokerRpc, MAX_FRAME } from "./rpc.ts";
 import { sameUser } from "./peer.ts";
@@ -51,7 +51,6 @@ const AgentBridge = Plugin.define({
     const instance = randomUUID(), socketDirectory = await mkdtemp("/tmp/aboc-");
     await chmod(socketDirectory, 0o700);
     const endpoint = join(socketDirectory, instance + ".sock");
-    const locationDirectory = ctx.location.directory;
     const live = new Map<string, Live>(), connections = new Set<Bun.Socket<Data>>();
     const active = new Set<Promise<unknown>>();
     const deliveries = new Map<string, { fingerprint: string; pending: ReturnType<typeof handle> }>();
@@ -77,7 +76,7 @@ const AgentBridge = Plugin.define({
           new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Native session lookup timed out")), RECEIPT_MS); }),
         ]);
       } finally { if (timeout) clearTimeout(timeout); }
-      if (disposed || !info || info.id !== session || resolve(info.location.directory) !== resolve(locationDirectory) || info.time.archived) throw new InvalidNativeSession("Native session is unavailable");
+      if (disposed || !info || info.id !== session || info.time.archived) throw new InvalidNativeSession("Native session is unavailable");
       return info;
     }
     async function close(session: string, forget = true) {
@@ -206,7 +205,19 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       const initial = guard(frame.session, frame.op === "probe" ? undefined : frame);
       try { await verified(frame.session); }
       catch (error) {
-        if (live.get(frame.session) === initial && (frame.op === "probe" || initial.generation === frame.generation)) await close(frame.session, error instanceof InvalidNativeSession);
+        // Capture the pre-admission result while this exact generation is live;
+        // close below still invalidates missing/archived or unavailable sessions.
+        // The per-ID dispatch map prevents a sibling handler in this instance,
+        // and the durable journal prevents downgrading an earlier attempt.
+        const beforeClose = frame.op === "deliver" ? deferred(frame, error instanceof InvalidNativeSession ? "Native session identity or archive check failed before admission" : "Native session lookup failed before admission") : undefined;
+        if (live.get(frame.session) === initial && (frame.op === "probe" || initial.generation === frame.generation)) {
+          try { await close(frame.session, error instanceof InvalidNativeSession); }
+          catch (closeError) {
+            if (beforeClose?.status !== "deferred") throw closeError;
+            console.error("Agent Bridge: pre-attempt session close unavailable; lease expiry remains in force");
+          }
+        }
+        if (beforeClose) return beforeClose;
         throw error;
       }
       const entry = guard(frame.session, frame.op === "probe" ? undefined : frame);
@@ -219,7 +230,13 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
         return receipt(frame, true); // No journal mutation, admission or prompt API.
       }
       // Every native lookup has a generation guard on its return.
-      const existing = await findInContext(frame.session, frame.native_message_id);
+      let existing: NativeMessage | undefined;
+      try { existing = await findInContext(frame.session, frame.native_message_id); }
+      catch {
+        // No admission has been requested by this handler. Re-read the shared
+        // journal and lease after the failed lookup before promising deferral.
+        return deferred(frame, "Native transcript lookup failed before admission");
+      }
       guard(frame.session, frame);
       if (existing) {
         matches(existing, frame);
@@ -346,7 +363,8 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
     timer.unref();
     // The activation gate means plugin setup can run after the triggering
     // session exists, and events queued before subscribe() are already gone.
-    // Register every live session of this location once, then rely on events.
+    // Register verified live sessions once, then rely on events. The broker's
+    // session lease selects one owner even when several instances observe them.
     async function scanSessions() {
       if (disposed) return;
       let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -360,7 +378,7 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       const sessions = (result as { data?: V2SessionInfo[] }).data ?? [];
       for (const info of sessions) {
         if (disposed) return;
-        if (isAbsolute(info.location.directory) && resolve(info.location.directory) === resolve(locationDirectory) && !info.time.archived) enqueueSession(info.id, () => observe(info.id));
+        if (!info.time.archived) enqueueSession(info.id, () => observe(info.id));
       }
     }
     let scanTimer: ReturnType<typeof setTimeout> | undefined;
@@ -386,7 +404,7 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
           if (!event || typeof event !== "object") continue;
           const value = event as unknown as { type: string; location?: { directory?: unknown } };
           const data = ((event as unknown as { data?: Record<string, unknown> }).data ?? {}) as { sessionID?: unknown };
-          if (typeof data.sessionID !== "string" || typeof value.location?.directory === "string" && isAbsolute(value.location.directory) && resolve(value.location.directory) !== resolve(locationDirectory)) continue;
+          if (typeof data.sessionID !== "string") continue;
           if (value.type === "session.deleted" || value.type === "session.archived") {
             lifecycle.set(data.sessionID, (lifecycle.get(data.sessionID) ?? 0) + 1);
             const closing = close(data.sessionID).catch(() => { console.error("Agent Bridge: native session close is unavailable"); });

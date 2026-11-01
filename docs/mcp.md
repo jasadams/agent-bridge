@@ -275,7 +275,8 @@ insertion. A matching live route/lease is needed to perform native readback;
 A queued or pending reconciliation has not necessarily run. After a lease/generation
 change or broker restart, explicitly retry that same ID again if readback remains
 queued; this still reads proof and cannot insert another prompt.
-Missing or mismatched proof remains Unknown and may continue blocking delivery.
+Missing or mismatched proof remains Unknown but does not block later eligible
+messages. Queue capacity and exact route/lease restrictions still apply.
 There is no automatic retry, automatic promotion to Delivered, or cancel escape
 that proves an Unknown attempt never happened. After reconciliation, explicitly
 subscribe to lifecycle events again if a fresh snapshot is needed.
