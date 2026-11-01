@@ -251,6 +251,354 @@ fn root() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn topic_tools_discover_and_publish_durable_history_without_native_input() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    let mut native = Native::start(&running, &root.path().join("native"), "friendly-author");
+    running.inbox("reader");
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let tools = mcp.request("tools/list", json!({})).await;
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    for name in [
+        "create_topic",
+        "list_topics",
+        "get_topic",
+        "rename_topic",
+        "archive_topic",
+        "restore_topic",
+        "publish_topic_post",
+        "read_topic_posts",
+        "list_topic_agents",
+    ] {
+        assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
+    }
+    let publish = tools
+        .iter()
+        .find(|tool| tool["name"] == "publish_topic_post")
+        .unwrap();
+    assert!(
+        publish["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "id")
+    );
+    assert!(publish["description"].as_str().unwrap().contains("durable"));
+    let created = mcp
+        .call("create_topic", json!({"name":"Engineering"}))
+        .await;
+    let reference = structured(&created)["result"]["reference"].clone();
+    let topic = json!({"topic_id":reference["topic_id"]});
+    let catalog = mcp.call("list_topic_agents", json!({})).await;
+    let author = json!({"agent_id":format!("claude-{}", native.session)});
+    let agents = structured(&catalog)["result"]["agents"].as_array().unwrap();
+    assert!(
+        agents
+            .iter()
+            .any(|agent| agent["reference"]["agent_id"] == author["agent_id"]
+                && agent["reference"]["bridge_id"] == reference["bridge_id"]
+                && agent["display_name"].is_string())
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    let args = json!({"topic":topic,"id":id,"author":author,"body":"Exact body\n  ✓","mentions":[{"agent_id":"inbox-inbox-reader"},{"agent_id":"inbox-inbox-reader"}]});
+    let accepted = mcp.call("publish_topic_post", args.clone()).await;
+    let post = structured(&accepted)["result"]["post"].clone();
+    assert_eq!(structured(&accepted)["result"]["duplicate"], false);
+    assert_eq!(post["topic"], reference);
+    assert_eq!(post["body"], "Exact body\n  ✓");
+    assert_eq!(post["mentions"].as_array().unwrap().len(), 1);
+    assert!(post["author_display_name"].is_string());
+    assert!(post.get("delivered").is_none());
+    let mut explicit = args.clone();
+    explicit["topic"] = reference.clone();
+    explicit["author"]["bridge_id"] = reference["bridge_id"].clone();
+    let retried = mcp.call("publish_topic_post", explicit).await;
+    assert_eq!(structured(&retried)["result"]["duplicate"], true);
+    assert_eq!(structured(&retried)["result"]["post"], post);
+    let mut conflicting = args.clone();
+    conflicting["body"] = json!("different");
+    let conflict = mcp.call("publish_topic_post", conflicting).await;
+    assert!(failed(&conflict));
+    assert!(conflict.to_string().contains("topic_conflict"));
+    assert_eq!(conflict["result"]["structuredContent"]["request_id"], id);
+    let reply_id = uuid::Uuid::new_v4().to_string();
+    let reply = mcp.call("publish_topic_post", json!({"topic":reference,"id":reply_id,"author":{"agent_id":"inbox-inbox-reader"},"body":"Reply","parent":id})).await;
+    assert_eq!(structured(&reply)["result"]["post"]["parent"], id);
+    let read = mcp.call("read_topic_posts", json!({"topic":topic})).await;
+    assert_eq!(
+        structured(&read)["result"]["posts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let conn = rusqlite::Connection::open(state.join("messages.sqlite3")).unwrap();
+    let stored: String = conn
+        .query_row("SELECT body FROM topic_posts WHERE id=?", [&id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, "Exact body\n  ✓");
+    let dm_count: i64 = conn
+        .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(dm_count, 0);
+    running.request(Request::Unregister {
+        name: native.name.clone(),
+        session: native.session.clone(),
+    });
+    let disabled_author = mcp.call("publish_topic_post", json!({"topic":topic,"id":uuid::Uuid::new_v4().to_string(),"author":author,"body":"disabled author"})).await;
+    assert!(failed(&disabled_author));
+    assert!(disabled_author.to_string().contains("topic_agent_unknown"));
+    let stale = mcp.call("list_topic_agents", json!({})).await;
+    assert!(
+        structured(&stale)["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["reference"]["agent_id"] == author["agent_id"])
+    );
+    let renamed = mcp
+        .call("rename_topic", json!({"topic":topic,"name":"Delivery"}))
+        .await;
+    assert_eq!(structured(&renamed)["result"]["reference"], reference);
+    let archived = mcp.call("archive_topic", json!({"topic":topic})).await;
+    assert_eq!(structured(&archived)["result"]["archived"], true);
+    let retry = mcp.call("publish_topic_post", args).await;
+    assert_eq!(structured(&retry)["result"]["post"], post);
+    let denied = mcp.call("publish_topic_post", json!({"topic":topic,"id":uuid::Uuid::new_v4().to_string(),"author":{"agent_id":"inbox-inbox-reader"},"body":"archived"})).await;
+    assert!(failed(&denied));
+    assert!(denied.to_string().contains("topic_archived"));
+    let active = mcp.call("list_topics", json!({})).await;
+    assert_eq!(structured(&active)["result"]["topics"], json!([]));
+    let all = mcp
+        .call("list_topics", json!({"include_archived":true}))
+        .await;
+    assert_eq!(
+        structured(&all)["result"]["topics"][0]["reference"],
+        reference
+    );
+    let restored = mcp.call("restore_topic", json!({"topic":topic})).await;
+    assert_eq!(structured(&restored)["result"]["archived"], false);
+    let after_restore = mcp.call("publish_topic_post", json!({"topic":topic,"id":uuid::Uuid::new_v4().to_string(),"author":{"agent_id":"inbox-inbox-reader"},"body":"Restored","mentions":[author]})).await;
+    assert_eq!(structured(&after_restore)["result"]["post"]["sequence"], 3);
+    mcp.close().await;
+    drop(running);
+    support::wait_for_shutdown(&state).await;
+    let _restarted = Running::start(&state);
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let read = mcp.call("read_topic_posts", json!({"topic":topic})).await;
+    assert_eq!(structured(&read)["result"]["posts"][0], post);
+    assert!(
+        timeout(Duration::from_millis(350), native.received.recv())
+            .await
+            .is_err(),
+        "topics must not submit native input"
+    );
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn topic_reads_keep_default_latest_forward_before_and_all_page_flags() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    running.inbox("writer");
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let created = mcp.call("create_topic", json!({"name":"Pages"})).await;
+    let topic = structured(&created)["result"]["reference"].clone();
+    for index in 1..=52 {
+        let result = mcp.call("publish_topic_post", json!({"topic":topic,"id":uuid::Uuid::new_v4().to_string(),"author":{"agent_id":"inbox-inbox-writer"},"body":format!("post {index}")})).await;
+        assert_eq!(structured(&result)["result"]["post"]["sequence"], index);
+    }
+    let latest = mcp.call("read_topic_posts", json!({"topic":topic})).await;
+    let page = &structured(&latest)["result"];
+    assert_eq!(page["posts"].as_array().unwrap().len(), 50);
+    assert_eq!(page["posts"][0]["sequence"], 3);
+    assert_eq!(page["high_water"], 52);
+    assert_eq!(page["has_older"], true);
+    assert_eq!(page["has_more"], false);
+    let older = mcp
+        .call(
+            "read_topic_posts",
+            json!({"topic":topic,"before":page["previous_cursor"],"limit":2}),
+        )
+        .await;
+    let older = &structured(&older)["result"];
+    assert_eq!(older["posts"][0]["sequence"], 1);
+    assert_eq!(older["posts"][1]["sequence"], 2);
+    assert_eq!(older["has_older"], false);
+    assert_eq!(older["has_more"], true);
+    let forward = mcp
+        .call(
+            "read_topic_posts",
+            json!({"topic":topic,"cursor":older["next_cursor"],"limit":1}),
+        )
+        .await;
+    assert_eq!(structured(&forward)["result"]["posts"][0]["sequence"], 3);
+    let full = mcp
+        .call(
+            "read_topic_posts",
+            json!({"topic":topic,"cursor":"","limit":100}),
+        )
+        .await;
+    assert_eq!(
+        structured(&full)["result"]["posts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        52
+    );
+    let empty = mcp
+        .call(
+            "read_topic_posts",
+            json!({"topic":topic,"cursor":page["next_cursor"]}),
+        )
+        .await;
+    let empty = &structured(&empty)["result"];
+    assert_eq!(empty["posts"], json!([]));
+    assert_eq!(empty["next_cursor"], page["next_cursor"]);
+    assert_eq!(empty["has_more"], false);
+    for args in [
+        json!({"topic":topic,"limit":0}),
+        json!({"topic":topic,"limit":101}),
+        json!({"topic":topic,"cursor":"bad"}),
+        json!({"topic":topic,"before":""}),
+        json!({"topic":topic,"cursor":page["next_cursor"],"before":page["previous_cursor"]}),
+    ] {
+        let result = mcp.call("read_topic_posts", args).await;
+        assert!(failed(&result), "{result}");
+    }
+    let other = mcp.call("create_topic", json!({"name":"Other"})).await;
+    let wrong = mcp
+        .call(
+            "read_topic_posts",
+            json!({"topic":structured(&other)["result"]["reference"],"cursor":page["next_cursor"]}),
+        )
+        .await;
+    assert!(failed(&wrong));
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn topic_tools_reject_aliases_foreign_refs_and_malformed_publications() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    running.inbox("writer");
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let created = mcp.call("create_topic", json!({"name":"Same name"})).await;
+    let topic = structured(&created)["result"]["reference"].clone();
+    let second = mcp.call("create_topic", json!({"name":"Same name"})).await;
+    assert_ne!(structured(&second)["result"]["reference"], topic);
+    let foreign = libp2p_identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id()
+        .to_string();
+    for selector in [
+        json!("Same name"),
+        json!({"topic_id":"Same name"}),
+        json!({"topic_id":topic["topic_id"],"bridge_id":foreign}),
+        json!({"topic_id":topic["topic_id"],"name":"Same name"}),
+    ] {
+        let rejected = mcp.call("get_topic", json!({"topic":selector})).await;
+        assert!(failed(&rejected), "{rejected}");
+    }
+    let shorthand = mcp
+        .call(
+            "get_topic",
+            json!({"topic":{"topic_id":topic["topic_id"],"bridge_id":null}}),
+        )
+        .await;
+    assert_eq!(structured(&shorthand)["result"]["reference"], topic);
+    let base = json!({"topic":topic,"id":uuid::Uuid::new_v4().to_string(),"author":{"agent_id":"inbox-inbox-writer"},"body":"body"});
+    let mut missing_id = base.clone();
+    missing_id.as_object_mut().unwrap().remove("id");
+    assert!(failed(&mcp.call("publish_topic_post", missing_id).await));
+    for (key, value) in [
+        ("id", json!("bad")),
+        ("author", json!({"agent_id":"writer"})),
+        (
+            "author",
+            json!({"agent_id":"inbox-inbox-writer","bridge_id":foreign}),
+        ),
+        ("body", json!(" ")),
+        ("body", json!("x".repeat(65537))),
+        ("mentions", json!([{"agent_id":"writer"}])),
+        ("mentions", Value::Null),
+        ("parent", json!(uuid::Uuid::new_v4().to_string())),
+        ("unknown", json!(true)),
+    ] {
+        let mut args = base.clone();
+        args[key] = value;
+        let rejected = mcp.call("publish_topic_post", args).await;
+        assert!(failed(&rejected), "{rejected}");
+    }
+    let read = mcp.call("read_topic_posts", json!({"topic":topic})).await;
+    assert_eq!(structured(&read)["result"]["posts"], json!([]));
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn topic_capacity_and_oversized_pages_fail_explicitly_without_truncation() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    running.inbox("writer");
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let created = mcp.call("create_topic", json!({"name":"Large"})).await;
+    let topic = structured(&created)["result"]["reference"].clone();
+    for _ in 0..17 {
+        let post = mcp.call("publish_topic_post", json!({"topic":topic,"id":uuid::Uuid::new_v4().to_string(),"author":{"agent_id":"inbox-inbox-writer"},"body":"x".repeat(65536)})).await;
+        assert!(!failed(&post), "{post}");
+    }
+    let oversized = mcp
+        .call("read_topic_posts", json!({"topic":topic,"limit":100}))
+        .await;
+    assert!(failed(&oversized));
+    assert_eq!(
+        oversized["result"]["structuredContent"]["code"],
+        "result_too_large"
+    );
+    let smaller = mcp
+        .call(
+            "read_topic_posts",
+            json!({"topic":topic,"cursor":"","limit":1}),
+        )
+        .await;
+    assert_eq!(structured(&smaller)["result"]["posts"][0]["sequence"], 1);
+    assert_eq!(structured(&smaller)["result"]["has_more"], true);
+    let local = topic["bridge_id"].as_str().unwrap();
+    let mut db = Db::open(&state.join("messages.sqlite3")).unwrap();
+    // Seed real isolated storage at the production topic bound, without a new
+    // owner setting or a mock broker that bypasses the actual capacity check.
+    for index in 1..1000 {
+        db.topic_create(local, &format!("seed {index}"), &Default::default())
+            .unwrap();
+    }
+    let rejected = mcp
+        .call("create_topic", json!({"name":"Over capacity"}))
+        .await;
+    assert!(failed(&rejected));
+    assert!(rejected.to_string().contains("topic_capacity"));
+    let listed = mcp.call("list_topics", json!({})).await;
+    assert_eq!(
+        structured(&listed)["result"]["topics"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1000
+    );
+    mcp.close().await;
+}
+
+#[tokio::test]
 async fn rejected_opencode_send_does_not_return_a_phantom_message_id() {
     let root = root();
     let state = root.path().join("state");

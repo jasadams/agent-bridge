@@ -6,7 +6,7 @@ use agent_bridge::{
     service,
 };
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod update_install;
@@ -48,6 +48,11 @@ async fn subscription_revisions(
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Manage durable local topics using IDs, without opening a terminal UI.
+    Topic {
+        #[command(subcommand)]
+        action: TopicAction,
+    },
     /// Expose structured agent tools over a persistent local MCP stdio connection.
     Mcp,
     /// View and answer local shared Markdown board controls, or print its current Markdown.
@@ -529,6 +534,155 @@ enum ServiceAction {
     Uninstall,
 }
 
+#[derive(Args)]
+struct TopicTarget {
+    /// Stable topic UUID, never a topic display name.
+    topic_id: String,
+    /// Omit for the local bridge; explicit nonlocal references are unsupported.
+    #[arg(long)]
+    bridge_id: Option<String>,
+}
+
+impl From<TopicTarget> for agent_bridge::topics::TopicRef {
+    fn from(target: TopicTarget) -> Self {
+        Self {
+            bridge_id: target.bridge_id,
+            topic_id: target.topic_id,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum TopicAction {
+    Create {
+        name: String,
+    },
+    List {
+        #[arg(long)]
+        include_archived: bool,
+    },
+    /// Discover canonical agent IDs and friendly labels, including stale registrations.
+    Agents,
+    Get {
+        #[command(flatten)]
+        target: TopicTarget,
+    },
+    Rename {
+        #[command(flatten)]
+        target: TopicTarget,
+        name: String,
+    },
+    Archive {
+        #[command(flatten)]
+        target: TopicTarget,
+    },
+    Restore {
+        #[command(flatten)]
+        target: TopicTarget,
+    },
+    /// Durably publish a post, not native delivery or model consumption. Reuse --id on retry.
+    Publish {
+        #[command(flatten)]
+        target: TopicTarget,
+        /// Caller-owned canonical UUID, required so failures never hide a retry key.
+        #[arg(long)]
+        id: String,
+        /// Exact canonical agent ID (e.g. inbox-user), never an alias/display name.
+        #[arg(long)]
+        author: String,
+        #[arg(long)]
+        author_bridge_id: Option<String>,
+        /// Post body, or omit to read bounded UTF-8 from stdin.
+        #[arg(long)]
+        message: Option<String>,
+        /// Existing post UUID in this same topic.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Structured reference array, e.g. '[{"agent_id":"inbox-user"}]'.
+        #[arg(long, default_value = "[]")]
+        mentions: String,
+    },
+    /// Read chronological bounded pages; no cursor means latest, --cursor '' starts at zero.
+    Read {
+        #[command(flatten)]
+        target: TopicTarget,
+        #[arg(long, conflicts_with = "before")]
+        cursor: Option<String>,
+        /// Previous-page cursor for bounded Load older.
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+
+impl TopicAction {
+    fn request(self) -> Result<Request> {
+        Ok(match self {
+            Self::Create { name } => Request::TopicCreate { name },
+            Self::List { include_archived } => Request::TopicList { include_archived },
+            Self::Agents => Request::TopicAgents {},
+            Self::Get { target } => Request::TopicInspect {
+                topic: target.into(),
+            },
+            Self::Rename { target, name } => Request::TopicRename {
+                topic: target.into(),
+                name,
+            },
+            Self::Archive { target } => Request::TopicArchive {
+                topic: target.into(),
+            },
+            Self::Restore { target } => Request::TopicRestore {
+                topic: target.into(),
+            },
+            Self::Read {
+                target,
+                cursor,
+                before,
+                limit,
+            } => Request::TopicRead {
+                topic: target.into(),
+                cursor,
+                before,
+                limit,
+            },
+            Self::Publish {
+                target,
+                id,
+                author,
+                author_bridge_id,
+                message,
+                parent,
+                mentions,
+            } => {
+                let body = match message {
+                    Some(body) => body,
+                    None => {
+                        use std::io::Read;
+                        let mut body = String::new();
+                        std::io::stdin()
+                            .take((agent_bridge::protocol::MAX_BODY + 1) as u64)
+                            .read_to_string(&mut body)?;
+                        body
+                    }
+                };
+                Request::TopicPublish {
+                    topic: target.into(),
+                    id,
+                    author: agent_bridge::topics::AgentRef {
+                        bridge_id: author_bridge_id,
+                        agent_id: author,
+                    },
+                    body,
+                    parent,
+                    mentions: serde_json::from_str(&mentions)
+                        .context("Invalid --mentions structured agent reference array")?,
+                }
+            }
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -561,6 +715,7 @@ async fn main() -> Result<()> {
         None => service::default_state_dir()?,
     };
     let req = match cli.command {
+        Commands::Topic { action } => action.request()?,
         Commands::Update {
             check,
             disable_checks,
