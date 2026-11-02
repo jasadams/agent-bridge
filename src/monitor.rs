@@ -257,6 +257,9 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
     if path.starts_with("/api/") && !authorized(&request, &app.token) {
         return Ok(error(StatusCode::UNAUTHORIZED, "Access token required"));
     }
+    if request.method() == hyper::Method::POST && path == "/api/topic-actions" {
+        return Ok(topic_action(request, app).await);
+    }
     if request.method() == hyper::Method::POST
         && path.starts_with("/api/boards/")
         && (path.ends_with("/responses")
@@ -286,7 +289,23 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
     let board_read = path
         .strip_prefix("/api/boards/")
         .is_some_and(|name| !name.contains('/'));
-    if path != "/api/messages" && !board_read && query.is_some() {
+    let topic_posts = path
+        .strip_prefix("/api/topics/")
+        .and_then(|value| value.strip_suffix("/posts"));
+    let page_topic_query = path == "/"
+        && query.as_deref().is_some_and(|query| {
+            serde_urlencoded::from_str::<PageTopicQuery>(query).is_ok_and(|selection| {
+                !selection.topic.is_empty()
+                    && selection.topic.len() <= 100
+                    && !selection.topic.chars().any(char::is_control)
+            })
+        });
+    if path != "/api/messages"
+        && !board_read
+        && topic_posts.is_none()
+        && query.is_some()
+        && !page_topic_query
+    {
         return Ok(error(StatusCode::BAD_REQUEST, "Unexpected query"));
     }
     let response = match path.as_str() {
@@ -304,6 +323,11 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
             StatusCode::OK,
             "text/javascript; charset=utf-8",
             include_str!("../assets/monitor/boards.js"),
+        ),
+        "/topics.js" => response(
+            StatusCode::OK,
+            "text/javascript; charset=utf-8",
+            include_str!("../assets/monitor/topics.js"),
         ),
         "/app.js" => response(
             StatusCode::OK,
@@ -324,6 +348,92 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                     Err(_) => error(StatusCode::BAD_REQUEST, "Invalid message filters"),
                 },
                 Err(_) => error(StatusCode::BAD_REQUEST, "Invalid message filters"),
+            }
+        }
+        _ if topic_posts.is_some() => {
+            let topic_id = topic_posts.unwrap().to_owned();
+            let parameters =
+                serde_urlencoded::from_str::<TopicQuery>(query.as_deref().unwrap_or(""));
+            match parameters {
+                Ok(parameters) if !topic_id.contains('/') => {
+                    let Ok(permit) = app.reads.clone().try_acquire_owned() else {
+                        return Ok(error(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "Topic read limit reached",
+                        ));
+                    };
+                    let broker = app.broker.clone();
+                    let generation = app.generation;
+                    match tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let mut db = broker.db.lock().unwrap();
+                        let access = broker.monitor_control.lock().unwrap();
+                        if !access.current(generation) {
+                            return error(StatusCode::UNAUTHORIZED, "Monitor access expired");
+                        }
+                        let result =
+                            crate::network::identity::Identity::load_or_create(&broker.state_dir)
+                                .and_then(|identity| {
+                                    db.topic_read(
+                                        &identity.info().peer_id,
+                                        &crate::topics::TopicRef {
+                                            bridge_id: None,
+                                            topic_id,
+                                        },
+                                        parameters.cursor.as_deref(),
+                                        parameters.before.as_deref(),
+                                        parameters.limit.unwrap_or(50),
+                                    )
+                                });
+                        match result {
+                            Ok(page) => json_response(json!(page)),
+                            Err(_) => error(StatusCode::BAD_REQUEST, "Invalid topic or cursor"),
+                        }
+                    })
+                    .await
+                    {
+                        Ok(reply) => reply,
+                        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Topic unavailable"),
+                    }
+                }
+                _ => error(StatusCode::BAD_REQUEST, "Invalid topic query"),
+            }
+        }
+        "/api/topics" | "/api/topic-agents" => {
+            let Ok(permit) = app.reads.clone().try_acquire_owned() else {
+                return Ok(error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Topic read limit reached",
+                ));
+            };
+            let broker = app.broker.clone();
+            let generation = app.generation;
+            let agents = path == "/api/topic-agents";
+            match tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let db = broker.db.lock().unwrap();
+                let access = broker.monitor_control.lock().unwrap();
+                if !access.current(generation) {
+                    return error(StatusCode::UNAUTHORIZED, "Monitor access expired");
+                }
+                let result = crate::network::identity::Identity::load_or_create(&broker.state_dir)
+                    .and_then(|identity| {
+                        let local = identity.info().peer_id;
+                        if agents {
+                            Ok(json!({"agents": db.topic_agents(&local)?}))
+                        } else {
+                            Ok(json!({"topics": db.topic_list(&local, true)?}))
+                        }
+                    });
+                match result {
+                    Ok(value) => json_response(value),
+                    Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Topics unavailable"),
+                }
+            })
+            .await
+            {
+                Ok(reply) => reply,
+                Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Topics unavailable"),
             }
         }
         "/api/boards" | "/api/archived-boards" => {
@@ -422,6 +532,151 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
 #[serde(deny_unknown_fields)]
 struct BoardQuery {
     if_revision: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopicQuery {
+    cursor: Option<String>,
+    before: Option<String>,
+    limit: Option<usize>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageTopicQuery {
+    topic: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum TopicAction {
+    Create {
+        name: String,
+    },
+    Rename {
+        topic_id: String,
+        name: String,
+    },
+    Archive {
+        topic_id: String,
+    },
+    Restore {
+        topic_id: String,
+    },
+    Publish {
+        topic_id: String,
+        id: String,
+        body: String,
+        parent: Option<String>,
+        mentions: Vec<crate::topics::AgentRef>,
+    },
+}
+
+async fn topic_action(request: Request<Incoming>, app: App) -> Response<Body> {
+    if request.uri().query().is_some() {
+        return error(StatusCode::BAD_REQUEST, "Unexpected query");
+    }
+    if unique_header(&request, ORIGIN.as_str()) != Ok(Some(app.origin.as_str())) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Topic writes require the exact local Origin",
+        );
+    }
+    let content_type = unique_header(&request, CONTENT_TYPE.as_str())
+        .ok()
+        .flatten()
+        .map(str::to_ascii_lowercase);
+    if !matches!(
+        content_type.as_deref(),
+        Some(
+            "application/json"
+                | "application/json; charset=utf-8"
+                | "application/json;charset=utf-8"
+        )
+    ) || request.headers().contains_key("content-encoding")
+    {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Topic writes require unencoded JSON",
+        );
+    }
+    const MAX_BODY: usize = 512 * 1024;
+    if let Some(value) = request.headers().get(CONTENT_LENGTH)
+        && !matches!(value.to_str().ok().and_then(|v| v.parse::<usize>().ok()), Some(n) if n <= MAX_BODY)
+    {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Topic request exceeds the limit",
+        );
+    }
+    let Ok(permit) = app.writes.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "Topic write limit reached");
+    };
+    if !app.write_rate.lock().unwrap().allow_limit(10) {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Topic write rate limit reached",
+        );
+    }
+    let mut incoming = request.into_body();
+    let collected = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        while let Some(frame) = incoming.frame().await {
+            let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+            if let Some(data) = frame.data_ref() {
+                if bytes.len().saturating_add(data.len()) > MAX_BODY {
+                    return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+                bytes.extend_from_slice(data);
+            }
+        }
+        Ok(bytes)
+    })
+    .await;
+    let bytes = match collected {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(status)) => return error(status, "Invalid topic request body"),
+        Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Topic request timed out"),
+    };
+    let action = match serde_json::from_slice::<TopicAction>(&bytes) {
+        Ok(action) => action,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid topic request"),
+    };
+    let broker = app.broker.clone();
+    let generation = app.generation;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut db = broker.db.lock().unwrap();
+        let access = broker.monitor_control.lock().unwrap();
+        if !access.current(generation) {
+            return error(StatusCode::UNAUTHORIZED, "Monitor access expired");
+        }
+        let result: anyhow::Result<Value> = (|| {
+            let local = crate::network::identity::Identity::load_or_create(&broker.state_dir)?.info().peer_id;
+            let reference = |topic_id| crate::topics::TopicRef { bridge_id: None, topic_id };
+            Ok(match action {
+                TopicAction::Create { name } => json!(db.topic_create(&local, &name, &Default::default())?),
+                TopicAction::Rename { topic_id, name } => json!(db.topic_rename(&local, &reference(topic_id), &name)?),
+                TopicAction::Archive { topic_id } => json!(db.topic_archive(&local, &reference(topic_id), true)?),
+                TopicAction::Restore { topic_id } => json!(db.topic_archive(&local, &reference(topic_id), false)?),
+                TopicAction::Publish { topic_id, id, body, parent, mentions } => json!(db.topic_publish(&local,
+                    &crate::topics::TopicPublication { topic: reference(topic_id), id, body, parent, mentions,
+                        author: crate::topics::AgentRef { bridge_id: None, agent_id: "inbox-user".into() } },
+                    &Default::default())?),
+            })
+        })();
+        match result {
+            Ok(value) => json_response(value),
+            Err(problem) if problem.to_string().starts_with("topic_") =>
+                error(StatusCode::BAD_REQUEST, "Topic action rejected"),
+            Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "application/json; charset=utf-8",
+                json!({"code":"uncertain","uncertain":true,"error":"Outcome uncertain; retain the exact request for inspection or retry"}).to_string()),
+        }
+    }).await {
+        Ok(reply) if app.current() => reply,
+        Ok(_) => error(StatusCode::UNAUTHORIZED, "Monitor access expired"),
+        Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "application/json; charset=utf-8",
+            json!({"code":"uncertain","uncertain":true,"error":"Outcome uncertain; retain the exact request for inspection or retry"}).to_string()),
+    }
 }
 fn board_reply(reply: crate::monitor_board::Reply) -> Response<Body> {
     response(

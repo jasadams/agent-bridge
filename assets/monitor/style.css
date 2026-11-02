@@ -53,3 +53,18 @@ body[data-view=boards] .privacy-note{display:none}
 .board-document .board-control input[type=checkbox]{min-height:19px;padding:0;margin:0;vertical-align:middle}
 
 #board-lifecycle-status:empty{display:none}#board-lifecycle-review{margin-bottom:12px;padding:8px 12px;min-height:38px;background:var(--panel);color:var(--text);border:1px solid var(--border)}#archived-dialog{width:min(650px,calc(100vw - 32px));max-height:85vh;overflow:auto}.archived-row{padding:16px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere}.archived-row p{margin:8px 0}.archived-row time{display:inline}.archived-row h3{margin:0}.archived-row button{white-space:normal}#archive-confirm-description{overflow-wrap:anywhere}
+.topics-layout { display: grid; grid-template-columns: minmax(14rem, 20rem) minmax(0, 1fr); gap: 1rem; }
+.topics-layout > aside, .topics-layout > section { min-width: 0; }
+.topics-layout > aside, .topics-layout > section { padding: 18px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); }
+.topics-layout button { min-height: 38px; padding: 8px 12px; background: var(--panel-raised); color: var(--text); border: 1px solid var(--border); }
+.topics-layout button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); }
+.topics-layout textarea, .topics-layout select { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font: inherit; }
+.topics-layout textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+#topic-list, #topic-posts { list-style: none; margin: 0; padding: 0; }
+#topic-list button { width: 100%; text-align: left; }
+#topic-list small { display: block; overflow-wrap: anywhere; }
+#topic-posts li { padding: 0.75rem 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+#topic-posts p { white-space: pre-wrap; }
+#topic-composer { display: grid; gap: 0.5rem; margin-top: 1rem; }
+#topic-id { overflow-wrap: anywhere; }
+@media (max-width: 700px) { .topics-layout { grid-template-columns: minmax(0, 1fr); } }

@@ -90,6 +90,61 @@ async fn get(access: &Value, path: &str, headers: &str) -> String {
 fn auth(access: &Value) -> String {
     format!("Authorization: Bearer {}\r\n", key(access))
 }
+
+#[tokio::test]
+async fn topic_catalog_requires_monitor_access_and_respects_browser_origin() {
+    let root = tempfile::Builder::new()
+        .prefix("ab-topic-http-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    assert!(
+        get(&access, "/?topic=00000000-0000-4000-8000-000000000001", "")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        get(&access, "/?token=secret", "")
+            .await
+            .starts_with("HTTP/1.1 400")
+    );
+    assert!(
+        get(&access, "/?topic=invalid-id", "")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    for query in [
+        "?topic=",
+        "?topic=a&topic=b",
+        "?topic=a&token=secret",
+        "?topic=%0A",
+        &format!("?topic={}", "a".repeat(101)),
+    ] {
+        let response = get(&access, &format!("/{query}"), "").await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{query}: {response}");
+    }
+    assert!(
+        get(&access, "/api/topics", "")
+            .await
+            .starts_with("HTTP/1.1 401")
+    );
+    assert!(
+        get(
+            &access,
+            "/api/topics",
+            &format!("{}Origin: https://evil.example\r\n", auth(&access))
+        )
+        .await
+        .starts_with("HTTP/1.1 403")
+    );
+    let catalog = get(&access, "/api/topics", &auth(&access)).await;
+    assert!(catalog.starts_with("HTTP/1.1 200"), "{catalog}");
+    let payload = catalog.split_once("\r\n\r\n").unwrap().1;
+    let value: Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(value["topics"], serde_json::json!([]));
+}
+
 async fn first_event(stream: &mut TcpStream) -> String {
     timeout(Duration::from_secs(3), async {
         let mut bytes = Vec::new();
@@ -508,6 +563,126 @@ fn post_headers(access: &Value) -> String {
         "Origin: {}\r\nContent-Type: application/json\r\n",
         access["url"].as_str().unwrap()
     )
+}
+
+#[tokio::test]
+async fn topic_http_pins_human_identity_and_preserves_retry_and_archive_history() {
+    let root = tempfile::tempdir().unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let headers = post_headers(&access);
+    let create = r#"{"action":"create","name":"Work"}"#;
+    let mut unauthenticated = TcpStream::connect(host(&access)).await.unwrap();
+    unauthenticated
+        .write_all(
+            format!(
+                "POST /api/topic-actions HTTP/1.1\r\nHost: {}\r\n{}Content-Length: {}\r\n\r\n{}",
+                host(&access),
+                headers,
+                create.len(),
+                create
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    timeout(
+        Duration::from_secs(3),
+        unauthenticated.read_to_end(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 401"));
+    assert!(
+        post(
+            &access,
+            "/api/topic-actions",
+            "Content-Type: application/json\r\n",
+            create
+        )
+        .await
+        .starts_with("HTTP/1.1 403")
+    );
+    for (headers, status) in [
+        (
+            "Origin: https://evil.example\r\nContent-Type: application/json\r\n".to_owned(),
+            "403",
+        ),
+        (
+            format!(
+                "Origin: {}\r\nContent-Type: text/plain\r\n",
+                access["url"].as_str().unwrap()
+            ),
+            "415",
+        ),
+        (format!("{}{}", post_headers(&access), auth(&access)), "401"),
+    ] {
+        let rejected = post(&access, "/api/topic-actions", &headers, create).await;
+        assert!(
+            rejected.starts_with(&format!("HTTP/1.1 {status}")),
+            "{rejected}"
+        );
+    }
+    let created = post(&access, "/api/topic-actions", &headers, create).await;
+    assert!(created.starts_with("HTTP/1.1 200"), "{created}");
+    let topic = json_body(&created)["reference"]["topic_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = uuid::Uuid::new_v4().to_string();
+    let body = serde_json::json!({"action":"publish","topic_id":topic,"id":id,"body":"Hello <script>","parent":null,"mentions":[]});
+    let mut spoof = body.clone();
+    spoof["author"] = serde_json::json!({"agent_id":"inbox-other"});
+    assert!(
+        post(&access, "/api/topic-actions", &headers, &spoof.to_string())
+            .await
+            .starts_with("HTTP/1.1 400")
+    );
+    let published = post(&access, "/api/topic-actions", &headers, &body.to_string()).await;
+    assert!(published.starts_with("HTTP/1.1 200"), "{published}");
+    let published = json_body(&published);
+    assert_eq!(published["post"]["author"]["agent_id"], "inbox-user");
+    assert_eq!(published["duplicate"], false);
+    let retried =
+        json_body(&post(&access, "/api/topic-actions", &headers, &body.to_string()).await);
+    assert_eq!(retried["duplicate"], true);
+    assert_eq!(retried["post"]["id"], id);
+    let archive = serde_json::json!({"action":"archive","topic_id":topic}).to_string();
+    assert!(
+        post(&access, "/api/topic-actions", &headers, &archive)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    let read = get(
+        &access,
+        &format!("/api/topics/{topic}/posts"),
+        &auth(&access),
+    )
+    .await;
+    assert!(read.starts_with("HTTP/1.1 200"), "{read}");
+    assert_eq!(json_body(&read)["posts"].as_array().unwrap().len(), 1);
+    for query in [
+        "?cursor=garbage",
+        "?limit=0",
+        "?cursor=a&before=b",
+        "?unexpected=x",
+    ] {
+        let result = get(
+            &access,
+            &format!("/api/topics/{topic}/posts{query}"),
+            &auth(&access),
+        )
+        .await;
+        assert!(result.starts_with("HTTP/1.1 400"), "{query}: {result}");
+    }
+    let restore = serde_json::json!({"action":"restore","topic_id":topic}).to_string();
+    assert!(
+        post(&access, "/api/topic-actions", &headers, &restore)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
 }
 #[tokio::test]
 async fn board_http_reads_controls_save_conditional_conflict_and_narrow_security() {
