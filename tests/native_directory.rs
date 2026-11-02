@@ -9,10 +9,7 @@ mod native_claude;
 
 #[tokio::test]
 async fn claude_native_membership_replaces_stored_discovery_without_registration() {
-    let root = tempfile::Builder::new()
-        .prefix("ab43-")
-        .tempdir()
-        .unwrap();
+    let root = tempfile::Builder::new().prefix("ab43-").tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let native = uuid::Uuid::new_v4().to_string();
     let stale = uuid::Uuid::new_v4().to_string();
@@ -66,10 +63,7 @@ async fn claude_native_membership_replaces_stored_discovery_without_registration
 
 #[tokio::test]
 async fn unavailable_native_directory_is_explicit_and_does_not_erase_other_results() {
-    let root = tempfile::Builder::new()
-        .prefix("ab43-")
-        .tempdir()
-        .unwrap();
+    let root = tempfile::Builder::new().prefix("ab43-").tempdir().unwrap();
     let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = bound
         .broker
