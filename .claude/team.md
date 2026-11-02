@@ -26,7 +26,8 @@ workflow: .github/workflows/release.yml
 Only strict semantic version tags publish releases. The release pipeline validates
 the tag's commit on main, checks and builds all three platforms, packages complete
 corresponding source and notices, and publishes immutable versioned assets.
-Plain main pushes and pull requests run validation without publishing releases.
+Pull requests and manual branch runs validate without publishing releases. Plain
+main pushes do not trigger another run; tagged releases validate the merged commit.
 
 ## Post-release verification
 
