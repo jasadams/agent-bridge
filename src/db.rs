@@ -771,10 +771,36 @@ impl Db {
         if let Some(message) = self.retry_transfer(id)? {
             return Ok(message);
         }
+        let topic_work: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM topic_push_work WHERE message_id=?)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if topic_work {
+            let phase: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT phase FROM opencode_deliveries WHERE id=?",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if phase.as_deref() == Some("queued") {
+                let message = self.get(id)?;
+                self.topic_push_authorize(id, &self.agent(&message.recipient)?)?;
+            }
+        }
         if let Some(message) = self.opencode_retry(id)? {
             return Ok(message);
         }
         let m = self.get(id)?;
+        if topic_work {
+            ensure!(
+                !matches!(m.state.as_str(), "uncertain" | "submitted"),
+                "Topic push has an ambiguous native outcome; it cannot be replayed"
+            );
+            self.topic_push_authorize(id, &self.agent(&m.recipient)?)?;
+        }
         ensure!(
             ["failed", "blocked"].contains(&m.state.as_str())
                 || (allow_duplicate && ["uncertain", "submitted"].contains(&m.state.as_str())),

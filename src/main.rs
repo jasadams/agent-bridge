@@ -563,6 +563,35 @@ enum TopicAction {
     },
     /// Discover canonical agent IDs and friendly labels, including stale registrations.
     Agents,
+    /// Inspect a canonical local agent's push preference.
+    PushGet {
+        #[command(flatten)]
+        target: TopicTarget,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        agent_bridge_id: Option<String>,
+    },
+    /// Select manual, all, or mentions; manual unsubscribes without replay.
+    PushSet {
+        #[command(flatten)]
+        target: TopicTarget,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        agent_bridge_id: Option<String>,
+        #[arg(long, value_parser = ["manual", "all", "mentions"])]
+        mode: String,
+    },
+    /// Stop future pushes and revoke work not yet admitted.
+    PushUnsubscribe {
+        #[command(flatten)]
+        target: TopicTarget,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        agent_bridge_id: Option<String>,
+    },
     Get {
         #[command(flatten)]
         target: TopicTarget,
@@ -622,6 +651,42 @@ impl TopicAction {
             Self::Create { name } => Request::TopicCreate { name },
             Self::List { include_archived } => Request::TopicList { include_archived },
             Self::Agents => Request::TopicAgents {},
+            Self::PushGet {
+                target,
+                agent,
+                agent_bridge_id,
+            } => Request::TopicPushGet {
+                topic: target.into(),
+                agent: agent_bridge::topics::AgentRef {
+                    bridge_id: agent_bridge_id,
+                    agent_id: agent,
+                },
+            },
+            Self::PushSet {
+                target,
+                agent,
+                agent_bridge_id,
+                mode,
+            } => Request::TopicPushSet {
+                topic: target.into(),
+                agent: agent_bridge::topics::AgentRef {
+                    bridge_id: agent_bridge_id,
+                    agent_id: agent,
+                },
+                mode,
+            },
+            Self::PushUnsubscribe {
+                target,
+                agent,
+                agent_bridge_id,
+            } => Request::TopicPushSet {
+                topic: target.into(),
+                agent: agent_bridge::topics::AgentRef {
+                    bridge_id: agent_bridge_id,
+                    agent_id: agent,
+                },
+                mode: "manual".into(),
+            },
             Self::Get { target } => Request::TopicInspect {
                 topic: target.into(),
             },

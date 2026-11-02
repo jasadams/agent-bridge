@@ -442,6 +442,139 @@ async fn wait_message_state(broker: &Broker, id: &str, state: &str) -> Value {
     })
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topic_push_opencode_admission_fences_old_epoch_but_not_accepted_work() {
+    use agent_bridge::topics::{AgentRef, TopicRef};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    // In the first run the fixture pauses before the actual broker admission
+    // RPC. In the second it pauses after admission, before native acceptance.
+    for admit_first in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let broker_state = state.clone();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let reached_tx = Mutex::new(Some(reached_tx));
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let inserted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let native = inserted.clone();
+        let plugin = PluginSocket::start(2, move |frame, instance| {
+            if frame["op"] == "probe" {
+                return receipt(frame, instance);
+            }
+            assert_eq!(frame["op"], "deliver");
+            let admit = || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(broker::rpc(
+                        &broker_state,
+                        &Request::OpenCodeAdmit {
+                            id: frame["id"].as_str().unwrap().into(),
+                            session: SESSION.into(),
+                            generation: frame["generation"].as_str().unwrap().into(),
+                            instance: instance.into(),
+                            attempt: frame["attempt"].as_str().unwrap().into(),
+                        },
+                    ))
+            };
+            let early = admit_first.then(&admit);
+            reached_tx
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(frame.clone())
+                .unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let admission = early.unwrap_or_else(admit);
+            if admit_first {
+                assert_eq!(admission.unwrap()["admitted"], true);
+                native
+                    .lock()
+                    .unwrap()
+                    .push(frame["id"].as_str().unwrap().into());
+                receipt(frame, instance)
+            } else {
+                assert!(
+                    admission.is_err(),
+                    "old epoch must be denied after resubscription"
+                );
+                let mut deferred = receipt(frame, instance);
+                deferred["ok"] = json!(false);
+                deferred["status"] = json!("deferred");
+                deferred["error"] =
+                    json!("Broker admission was unavailable; no native attempt was made");
+                deferred
+            }
+        });
+        let bound = Broker::bind(state, "/missing/codex".into()).unwrap();
+        let broker = bound.broker.clone();
+        let server = tokio::spawn(broker::serve(bound));
+        broker
+            .request_async(Request::OpenCodeObserve {
+                session: SESSION.into(),
+                endpoint: plugin.agent().endpoint,
+                title: None,
+                ready: true,
+            })
+            .await
+            .unwrap();
+        let topic: TopicRef = serde_json::from_value(
+            broker
+                .request(Request::TopicCreate {
+                    name: "Admission race".into(),
+                })
+                .unwrap()["reference"]
+                .clone(),
+        )
+        .unwrap();
+        let agent = AgentRef {
+            bridge_id: None,
+            agent_id: format!("opencode-{SESSION}"),
+        };
+        let set = |mode: &str| Request::TopicPushSet {
+            topic: topic.clone(),
+            agent: agent.clone(),
+            mode: mode.into(),
+        };
+        broker.request(set("all")).unwrap();
+        broker
+            .request(Request::TopicPublish {
+                topic: topic.clone(),
+                id: uuid::Uuid::new_v4().to_string(),
+                author: AgentRef {
+                    bridge_id: None,
+                    agent_id: "inbox-user".into(),
+                },
+                body: "gated topic push".into(),
+                parent: None,
+                mentions: vec![],
+            })
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), reached_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let id = frame["id"].as_str().unwrap().to_owned();
+        broker.request(set("manual")).unwrap();
+        broker.request(set("all")).unwrap();
+        resume_tx.send(()).unwrap();
+        wait_message_state(
+            &broker,
+            &id,
+            if admit_first { "delivered" } else { "failed" },
+        )
+        .await;
+        assert_eq!(inserted.lock().unwrap().len(), usize::from(admit_first));
+        server.abort();
+        let _ = server.await;
+        plugin.finish();
+    }
+}
+
 #[derive(Default)]
 struct EventNativeStorage {
     frames: Vec<Value>,

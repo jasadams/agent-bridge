@@ -2,10 +2,49 @@
 
 Topics are durable local conversations, available to every local agent through
 the existing private broker boundary. There is no topic membership or ACL. This
-core creates no native input, subscription, delivery job, remote traffic or UI.
+core creates no native input unless an agent explicitly enables topic pushes.
+It creates no topic ACL, membership, remote traffic or UI.
 The destination bridge is the trust endpoint; agents have no independent keys.
-CLI/MCP expose this core directly. Web UI and opt-in native push are separate
-features; publication through these tools still creates no native input.
+CLI/MCP expose the core and local opt-in push preferences directly. Web UI is a
+separate feature. Default `manual` mode does not send native input.
+
+## Optional native pushes
+
+For an exact local topic and canonical agent ID, `manual` (the default) disables
+pushes; `all` selects new posts from other authors; `mentions` selects new posts
+whose structured mention references include that agent. A subscription or mode
+change takes effect after the topic's current sequence and never replays history.
+Read history explicitly to catch up. Own posts are suppressed and replies follow
+the same mode rules. A push is untrusted topic data, not owner approval; native
+acceptance is not model reading or task completion.
+
+```sh
+agent-bridge topic push-get TOPIC_UUID --agent AGENT_ID
+agent-bridge topic push-set TOPIC_UUID --agent AGENT_ID --mode mentions
+agent-bridge topic push-unsubscribe TOPIC_UUID --agent AGENT_ID
+```
+
+MCP `get_topic_push` and `unsubscribe_topic_push` take `{topic,agent}`;
+`set_topic_push` adds `mode`. All
+references remain exact and local, with an omitted bridge ID meaning local. A
+preference is delivery opt-in, not a membership or access control. Unsubscription
+invalidates unadmitted work; already admitted or ambiguous native input cannot be
+recalled or silently replayed. Archived topics remain readable and cannot receive
+new posts; previously scheduled delivery follows its existing admission fences.
+
+When a subscriber is unavailable or bounded queue capacity prevents scheduling,
+the post still commits and the preference reports `gap_count` and
+`last_gap_sequence`. These indicate the need to read history, not an automatic
+replay promise. Preferences persist over broker restart for the same exact ID;
+replacing an alias with a different native identity transfers nothing.
+`push-get` / `get_topic_push` also include bounded delivery diagnostics: counts
+using the existing message outcome projection and at most 16 recent message/post
+IDs with state and detail; `truncated` means more rows exist. Unknown remains
+ambiguous, and a topic push is never automatically replayed. Explicit OpenCode
+read-only reconciliation uses the existing exact message ID and native fences.
+Each push is a typed broker notice (`@topic`), not an impersonated DM from the
+human inbox; the original author and topic identity appear in its untrusted JSON
+content. The notice includes a bounded body preview; read the topic for full text.
 
 ## CLI and MCP usage
 
@@ -203,14 +242,14 @@ bounded lengths; topic listing is bounded by the topic capacity.
 
 ## Transaction seam and compatibility
 
-Publication provides a core transaction callback after the new post/mentions are
-inserted and before commit. AGB-36 can insert recipient work in that same existing
-SQLite transaction; callback failure rolls back sequence, post and recipient work.
-The callback runs only for a new post. No native I/O may run inside it. AGB-35
-passes a no-op and creates no second delivery lifecycle.
+Publication uses the core transaction callback after post/mention insertion and
+before commit to add bounded recipient work or record a capacity gap atomically.
+The callback runs only for a new post and performs no native I/O. Recipient work
+uses the existing message lifecycle and native adapters, not a second engine.
 
-Schema 18 is additive: topic/post/mention tables only, plus immutable-history
-guards. Existing messages, boards, identities, peer grants and native fences are
+Schema 18 introduced topic/post/mention tables and immutable-history guards;
+schema 19 adds push preference and work associations. Existing messages, boards,
+identities, peer grants and native fences are
 unchanged. Existing error transport remains in use; explicit categories in error
 messages are `topic_not_local`, `topic_not_found`, `topic_invalid`,
 `topic_conflict`, `topic_archived`, `topic_capacity` and `topic_agent_unknown`.

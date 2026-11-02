@@ -25,6 +25,61 @@ async fn success(state: &Path, args: &[&str]) -> Value {
 }
 
 #[tokio::test]
+async fn topic_push_preferences_use_exact_ids_and_report_gaps() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    let created = success(&state, &["topic", "create", "Preferences"]).await;
+    let topic = created["reference"]["topic_id"].as_str().unwrap();
+    assert_eq!(
+        success(
+            &state,
+            &["topic", "push-get", topic, "--agent", "inbox-user"]
+        )
+        .await["mode"],
+        "manual"
+    );
+    assert_eq!(
+        success(
+            &state,
+            &[
+                "topic",
+                "push-set",
+                topic,
+                "--agent",
+                "inbox-user",
+                "--mode",
+                "all"
+            ]
+        )
+        .await["mode"],
+        "all"
+    );
+    assert!(
+        !command(
+            &state,
+            &[
+                "topic", "push-set", topic, "--agent", "user", "--mode", "all"
+            ]
+        )
+        .await
+        .status
+        .success()
+    );
+    assert_eq!(
+        success(
+            &state,
+            &["topic", "push-unsubscribe", topic, "--agent", "inbox-user"]
+        )
+        .await["mode"],
+        "manual"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn topic_cli_persists_id_addressed_conversations_without_delivery_work() {
     let root = tempfile::tempdir().unwrap();
     let state = root.path().join("state");

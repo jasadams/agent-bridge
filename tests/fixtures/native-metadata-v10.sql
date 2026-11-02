@@ -1,4 +1,7 @@
 -- Remove local topics introduced after this fixture schema, children first.
+DROP TRIGGER IF EXISTS topic_push_failed_gap;
+DROP TABLE IF EXISTS topic_push_work;
+DROP TABLE IF EXISTS topic_push_preferences;
 DROP TABLE IF EXISTS topic_mentions;
 DROP TABLE IF EXISTS topic_posts;
 DROP TABLE IF EXISTS topics;

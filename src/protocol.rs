@@ -107,6 +107,15 @@ pub(crate) fn delivery_outcome(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    TopicPushGet {
+        topic: crate::topics::TopicRef,
+        agent: crate::topics::AgentRef,
+    },
+    TopicPushSet {
+        topic: crate::topics::TopicRef,
+        agent: crate::topics::AgentRef,
+        mode: String,
+    },
     TopicCreate {
         name: String,
     },
