@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -278,6 +278,41 @@ CREATE TRIGGER topic_mentions_immutable_update BEFORE UPDATE ON topic_mentions B
 CREATE TRIGGER topic_mentions_immutable_delete BEFORE DELETE ON topic_mentions BEGIN SELECT RAISE(ABORT,'topic_conflict: immutable mention'); END;",
         )?;
         tx.pragma_update(None, "user_version", 18)?;
+    }
+    if version < 19 {
+        tx.execute_batch(
+            "CREATE TABLE topic_push_preferences(
+ bridge_id TEXT NOT NULL,
+ topic_id TEXT NOT NULL,
+ agent_id TEXT NOT NULL,
+ mode TEXT NOT NULL CHECK(mode IN ('manual','all','mentions')),
+ epoch TEXT NOT NULL,
+ effective_after INTEGER NOT NULL CHECK(effective_after>=0),
+ gap_count INTEGER NOT NULL DEFAULT 0 CHECK(gap_count>=0),
+ last_gap_sequence INTEGER,
+ PRIMARY KEY(bridge_id,topic_id,agent_id),
+ FOREIGN KEY(bridge_id,topic_id) REFERENCES topics(bridge_id,topic_id)
+);
+CREATE TABLE topic_push_work(
+ bridge_id TEXT NOT NULL,
+ topic_id TEXT NOT NULL,
+ post_id TEXT NOT NULL,
+ agent_id TEXT NOT NULL,
+ epoch TEXT NOT NULL,
+ message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+ gap_recorded INTEGER NOT NULL DEFAULT 0 CHECK(gap_recorded IN (0,1)),
+ PRIMARY KEY(bridge_id,topic_id,post_id,agent_id),
+ FOREIGN KEY(bridge_id,topic_id,post_id) REFERENCES topic_posts(bridge_id,topic_id,id)
+);
+CREATE INDEX topic_push_work_recipient ON topic_push_work(bridge_id,topic_id,agent_id);
+CREATE TRIGGER topic_push_failed_gap AFTER UPDATE OF state ON messages WHEN OLD.state<>NEW.state AND NEW.state='failed' BEGIN
+ UPDATE topic_push_preferences SET gap_count=gap_count+1,
+  last_gap_sequence=max(coalesce(last_gap_sequence,0),(SELECT p.sequence FROM topic_push_work w JOIN topic_posts p ON p.bridge_id=w.bridge_id AND p.id=w.post_id WHERE w.message_id=NEW.id))
+ WHERE EXISTS(SELECT 1 FROM topic_push_work w WHERE w.message_id=NEW.id AND w.gap_recorded=0 AND w.bridge_id=topic_push_preferences.bridge_id AND w.topic_id=topic_push_preferences.topic_id AND w.agent_id=topic_push_preferences.agent_id AND w.epoch=topic_push_preferences.epoch AND topic_push_preferences.mode<>'manual');
+ UPDATE topic_push_work SET gap_recorded=1 WHERE message_id=NEW.id AND gap_recorded=0 AND EXISTS(SELECT 1 FROM topic_push_preferences p WHERE p.bridge_id=topic_push_work.bridge_id AND p.topic_id=topic_push_work.topic_id AND p.agent_id=topic_push_work.agent_id AND p.epoch=topic_push_work.epoch AND p.mode<>'manual');
+END;",
+        )?;
+        tx.pragma_update(None, "user_version", 19)?;
     }
     tx.commit()?;
     Ok(())

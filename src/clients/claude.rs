@@ -378,6 +378,50 @@ mod tests {
         assert!(received.is_empty());
     }
 
+    #[tokio::test]
+    async fn topic_epoch_is_checked_at_claude_socket_write_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncReadExt;
+        for revoke in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.path().join("native.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let agent = Agent {
+                name: "claude-race".into(),
+                provider: crate::protocol::Provider::Claude,
+                session: uuid::Uuid::new_v4().to_string(),
+                endpoint: path.to_string_lossy().into_owned(),
+                enabled: true,
+            };
+            let fixture =
+                super::super::topic_race_fixture::Fixture::new(&root.path().join("state"), agent);
+            let guard = fixture.guard(revoke);
+            let outcome = deliver_guarded(
+                &fixture.agent,
+                &fixture.message,
+                "topic notice",
+                Some(&guard),
+            )
+            .await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            if revoke {
+                assert_eq!(outcome.state, "failed");
+                assert!(
+                    received.is_empty(),
+                    "revoked epoch must not write native bytes"
+                );
+            } else {
+                assert_eq!(outcome.state, "submitted");
+                assert!(!received.is_empty());
+                fixture.unsubscribe(); // The already-written frame cannot be recalled.
+            }
+        }
+    }
+
     #[test]
     fn liveness_checks_listener_not_just_socket_file() {
         use std::os::unix::{fs::PermissionsExt, net::UnixListener};

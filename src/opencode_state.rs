@@ -1648,7 +1648,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         // Reconstitute schema 12, then exactly the old public retry transition:
         // submitted/uncertain -> queued with erased detail and no attempt record.
-        conn.execute_batch("DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER opencode_enqueue_bound; DROP TRIGGER opencode_retry_bound; DROP TRIGGER opencode_enqueue_binding; DROP TABLE opencode_deliveries; DROP TABLE opencode_leases; PRAGMA user_version=12;").unwrap();
+        conn.execute_batch("DROP TRIGGER topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER opencode_enqueue_bound; DROP TRIGGER opencode_retry_bound; DROP TRIGGER opencode_enqueue_binding; DROP TABLE opencode_deliveries; DROP TABLE opencode_leases; PRAGMA user_version=12;").unwrap();
         conn.execute(
             "UPDATE messages SET state='submitted',detail='Native insertion confirmed' WHERE id=?",
             [&legacy.id],
@@ -2076,7 +2076,10 @@ mod tests {
         // reconciliation columns. Db::open must upgrade it in place.
         db.conn
             .execute_batch(
-                "DROP TABLE topic_mentions;
+                "DROP TRIGGER topic_push_failed_gap;
+DROP TABLE topic_push_work;
+DROP TABLE topic_push_preferences;
+DROP TABLE topic_mentions;
 DROP TABLE topic_posts;
 DROP TABLE topics;
 ALTER TABLE opencode_deliveries DROP COLUMN reconcile_at;

@@ -251,6 +251,56 @@ fn root() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn topic_push_preference_tools_default_manual_and_require_exact_identity() {
+    let root = root();
+    let state = root.path().join("state");
+    let _running = Running::start(&state);
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    let listing = mcp.request("tools/list", json!({})).await;
+    for name in ["get_topic_push", "set_topic_push", "unsubscribe_topic_push"] {
+        assert!(
+            listing["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name)
+        );
+    }
+    let created = mcp
+        .call("create_topic", json!({"name":"Preferences"}))
+        .await;
+    let topic = structured(&created)["result"]["reference"].clone();
+    let agent = json!({"agent_id":"inbox-user"});
+    let default = mcp
+        .call("get_topic_push", json!({"topic":topic,"agent":agent}))
+        .await;
+    assert_eq!(structured(&default)["result"]["mode"], "manual");
+    let set = mcp
+        .call(
+            "set_topic_push",
+            json!({"topic":topic,"agent":agent,"mode":"mentions"}),
+        )
+        .await;
+    assert_eq!(structured(&set)["result"]["mode"], "mentions");
+    let invalid = mcp
+        .call(
+            "set_topic_push",
+            json!({"topic":topic,"agent":{"agent_id":"user"},"mode":"all"}),
+        )
+        .await;
+    assert!(failed(&invalid));
+    let off = mcp
+        .call(
+            "unsubscribe_topic_push",
+            json!({"topic":topic,"agent":agent}),
+        )
+        .await;
+    assert_eq!(structured(&off)["result"]["mode"], "manual");
+    mcp.close().await;
+}
+
+#[tokio::test]
 async fn topic_tools_discover_and_publish_durable_history_without_native_input() {
     let root = root();
     let state = root.path().join("state");
