@@ -15,7 +15,9 @@ struct Running {
 }
 impl Running {
     fn start(state: &Path) -> Self {
-        let bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let mut bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let claude = support::claude_directory::write_cli(state, &json!([]));
+        bound.broker = bound.broker.clone().with_claude_binary(claude);
         Self {
             broker: bound.broker.clone(),
             task: tokio::spawn(broker::serve(bound)),

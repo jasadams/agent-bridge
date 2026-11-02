@@ -46,20 +46,60 @@ retains queue-only evidence and historical uncertainty.
 
 ## Claude Code
 
-Install lifecycle hooks, then start a new session or restart the relevant session:
+Discovery uses the installed native CLI, independently of hooks:
+
+```sh
+claude agents --json
+agent-bridge list
+```
+
+Claude Code **2.1.300** is the verified version. Bridge reads full native UUIDs,
+names, working directories and native status on demand; it does not scan private
+registries or transcripts, install a mod, or maintain an active-session catalog.
+An idle ordinary terminal is discoverable without any Bridge registration. Rename
+and resume retain the UUID; a different session with the same name remains a
+different identity. Names that match several UUIDs are ambiguous.
+
+The local list result is `{agents, providers}`. `providers.claude.state` is
+`complete`, `unavailable`, or `incomplete`; a failed query is not an empty directory.
+Other providers' results remain visible. Old array-only `list` RPC callers receive
+an error when a queried provider is unavailable/incomplete. Native background work
+can be listed without a live process; missing runtime status stays unknown.
+`native_status` preserves Claude's process status and background state separately.
+`startedAt` is start time, **not last activity**. Claude has no inactivity-age
+filter; `--max-age-days` is passed only to providers with native update evidence.
+
+Discovery is not delivery. Claude's current delivery adapter still needs the
+native inbox socket supplied through the existing lifecycle hooks. To configure
+that delivery binding (not native discovery):
 
 ```sh
 agent-bridge hooks install
 ```
 
-The startup hook registers the session's native inbox socket and the end hook
-disables its automatic registration. Default local listings also check that the
-private native socket still accepts connections, hiding missing or refused sockets
-immediately. The broker checks enabled Claude registrations every minute and disables
-them after two consecutive failures; a successful check or registration clears the
-first failure. This repairs missed end hooks after crashes or disconnects. Hooks run through Claude Code's normal
-workspace trust flow. Check the client session's status if it does not expose an
-inbox socket.
+The startup hook binds the session's native inbox socket; the end hook retires that
+binding. Hooks run through Claude Code's normal workspace trust flow. Native rows
+without a binding remain discoverable with `deliverable:false` and
+`delivery_unavailable_reason:delivery_binding_missing`. A refused socket also makes
+delivery unavailable; it does not prove that a native conversation has vanished.
+Exact registered routes retain their existing delivery checks, even if directory
+queries fail. Bridge never starts, resumes or prompts an agent for discovery.
+
+Existing aliases, grants and disabled registrations are preserved. Old `enabled`
+flags mixed lifecycle availability with explicit disable, so a legacy false value
+is conservatively retained rather than automatically re-enabled from discovery.
+Schema 20 separates that durable owner intent in `agent_owner_policy` from binding
+availability. Explicit register/unregister changes owner policy; native hooks,
+rebinds, end events and failed socket probes do not. Thus a failed delivery binding
+cannot hide a still-present native UUID, and native rebind cannot undo an explicit
+owner disable. Alias policy is pinned to name/provider/UUID, not inherited by a
+same-name replacement. Delivery binding retirement and lifecycle control cleanup
+remain active independently of discovery.
+After verifying the exact UUID and intended binding, explicitly register that
+route again to restore it. No permission is inferred from a native name, and no
+same-name replacement inherits grants. Native-only discovery creates no DB row,
+delivery binding or peer grant. Message IDs, outcomes, deduplication and Unknown's
+no-automatic-replay behavior are unchanged.
 
 When incoming messages are held, review the client's cross-session message
 settings. Agent Bridge leaves those choices and tool approvals under the owner's
@@ -109,7 +149,7 @@ shared sessions.
 
 ## Session names
 
-`agent-bridge list` shows available registrations, native display names and stable
+`agent-bridge list` shows native directory observations, retained bindings, native display names and stable
 routing names. Automatically registered names use `codex-<thread-UUID>`,
 `claude-<session-UUID>` or `opencode-<ses_ID>`. Qualified display names such as `codex:reviewer` are also
 accepted for messaging. If a display name is ambiguous, use the stable name.
@@ -120,15 +160,15 @@ agent-bridge send --to 'codex:reviewer' --message 'Ready for review.'
 ```
 
 Use `list --all` or MCP `list_agents({"include_stale":true})` to inspect hidden local
-registrations. Stale rows include `stale_reason`: `disabled`, `socket_missing`,
-`socket_refused`, or `socket_invalid`. Socket checks send no message; inconclusive
-errors such as a full accept backlog do not retire a session. A disabled session
-needs native registration again to become enabled.
+bindings. For Claude, absent native rows carry `native_absent`; failed native reads
+carry `directory_unavailable`. These diagnostic binding rows are not export
+candidates. Socket checks describe delivery readiness separately from membership.
+They send no message. An unbound native row does not become deliverable merely
+because discovery succeeded.
 
-Socket availability cannot distinguish a live background spare from an interactive
-session, or prove that a session behind a shared process socket is still open.
-Process kinds, stable restart aliases, activity timestamps and result pagination
-are not currently recorded by this check. Display names remain labels; use stable
+Claude's native process kind/status and UUID, not the inbox socket or a Bridge
+lease, describe directory membership. No last-active timestamp is invented from
+process start or file modification time. Display names remain labels; use stable
 routing names when names collide.
 
 An available session indicates transport availability. It does not establish that

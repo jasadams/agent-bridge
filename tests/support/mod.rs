@@ -1,5 +1,28 @@
+// Each integration target compiles its own copy and uses a different subset.
+// This exemption is only for shared test utilities, never production code.
+#![allow(dead_code)]
 use fs2::FileExt;
 use std::{fs::OpenOptions, io::ErrorKind, path::Path, time::Duration};
+
+pub mod claude_directory;
+
+/// Keep unrelated provider/board fixtures off the owner's native directory.
+pub fn bind(
+    state: std::path::PathBuf,
+    codex: std::path::PathBuf,
+) -> anyhow::Result<agent_bridge::broker::BoundServer> {
+    let mut bound = agent_bridge::broker::Broker::bind(state, codex)?;
+    let fixture = bound.broker.state_dir.join("native-cli");
+    std::fs::create_dir_all(&fixture)?;
+    bound.broker = bound
+        .broker
+        .clone()
+        .with_claude_binary(claude_directory::write_cli(
+            &fixture,
+            &serde_json::json!([]),
+        ));
+    Ok(bound)
+}
 
 /// Aborting and joining an async server does not cancel started blocking jobs.
 /// Wait for their ownership fence before rebinding or modifying its database.

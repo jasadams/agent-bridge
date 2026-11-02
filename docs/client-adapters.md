@@ -6,6 +6,11 @@ message transport, lifecycle registration, and capabilities. Inbox has no native
 adapter: its history and message availability remain broker-owned.
 
 The Claude adapter owns private Unix socket validation and user-frame generation.
+Its request-scoped directory adapter separately invokes `claude agents --json`
+(verified on 2.1.300), with bounded output/deadline and full UUID validation.
+It requires no discovery hooks, plugin/mod, transcript/registry scanning or extra
+runtime. The old transcript title watcher is retired. Existing hooks remain only
+for genuine native delivery bindings and startup messaging context.
 The OpenCode adapter uses its pinned V2 plugin private socket, verifies exact live
 sessions and native client acceptance receipts, and shares native title metadata.
 Its durable canonical queue, generation leases and admission remain broker-owned;
@@ -57,13 +62,37 @@ mapping. Notification providers must use capabilities rather than new provider
 whitelists. Add adapter contracts alongside `tests/clients_contracts.rs` and the
 private `clients` tests; retain real socket and mock-daemon integration coverage.
 
-Native display metadata is stored in `session_metadata`, keyed by provider and
+Legacy native display metadata is stored in `session_metadata`, keyed by provider and
 native session ID. It is optional and independent of lifecycle registration:
 metadata alone never enables a destination. Exact registered aliases take
 precedence; otherwise display names resolve only to enabled automatic
 `provider-session` routes. Use `provider:title` to qualify a title; duplicate
 titles within that provider remain ambiguous. Renames update metadata without
 changing route identity, messages, delivery history, or session grants.
+
+For converted providers, `src/directory.rs` instead joins a complete request-local
+native snapshot to existing `Agent` policy/aliases/bindings, without registering
+observations. Claude names resolve from that snapshot, not cached title metadata.
+Native-only UUIDs use existing local defaults but acquire no grants or transport.
+Provider failures are explicit in the additive `Directory` response, with healthy
+provider rows preserved. Legacy `List` stays an array but fails closed rather than
+silently returning an incomplete directory. Peer export reuses projected candidates
+with the existing exact-session Discover checks and bounded wire format; local
+native metadata/endpoints are not transmitted. Codex/OpenCode conversion is staged
+in AGB-44/45; their transport APIs are not duplicated by this module.
+
+Schema 20 transactionally preserves legacy alias flags in `agent_owner_policy`,
+separating explicit owner intent from delivery-binding availability. The shared
+`Db::owner_policy_enabled(provider, session, name)` is the sole policy resolver:
+exact alias/identity policy wins; an otherwise-unconfigured canonical route uses
+any-enabled sibling policy, with no policy retaining existing local defaults.
+This is not a peer grant. Explicit registration/unregister writes policy atomically;
+native `bind_native`, hook `DeliveryBind`, close and heartbeat paths do not.
+DeliveryBind is restricted to exact canonical Claude/Codex hook bindings;
+OpenCode continues verified observe/heartbeat/generation admission. Native
+observations never create policy rows. The table is an owner overlay, not another
+authoritative recipient catalog. Older binaries reject this schema; restore a
+matching pre-upgrade backup and binary together rather than downgrading in place.
 
 Schema version 11 transactionally copies Claude and Codex titles (including NULL
 and empty titles) into this shared table and removes their old tables. Reopening

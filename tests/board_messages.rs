@@ -1,3 +1,4 @@
+mod support;
 use agent_bridge::{
     board::{self, Edit, Name, Snapshot},
     board_interaction::{self, Kind},
@@ -78,7 +79,7 @@ fn set(broker: &Broker, snapshot: &Snapshot, markdown: String) {
 async fn repeated_controls_named_boards_and_durable_exact_retry_never_cross_route() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     register(broker, "one");
     register(broker, "two");
@@ -124,7 +125,7 @@ async fn repeated_controls_named_boards_and_durable_exact_retry_never_cross_rout
     collision.text.push('!');
     assert_eq!(send(broker, &collision)["code"], "conflict");
     drop(bound);
-    let rebound = Broker::bind(state, "/missing/codex".into()).unwrap();
+    let rebound = support::bind(state, "/missing/codex".into()).unwrap();
     assert_eq!(send(&rebound.broker, &request)["duplicate"], true);
     let history = rebound
         .broker
@@ -138,7 +139,7 @@ async fn repeated_controls_named_boards_and_durable_exact_retry_never_cross_rout
 #[tokio::test]
 async fn changed_removed_duplicate_malformed_and_replaced_owner_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
-    let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = support::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     let owner = register(broker, "owner");
     let main = Name::default();
@@ -175,7 +176,7 @@ async fn changed_removed_duplicate_malformed_and_replaced_owner_fail_closed() {
 async fn full_queue_rejects_atomically_and_foreign_uuid_cannot_be_adopted() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     register(broker, "owner");
     let snapshot = add(broker, &Name::default(), "owner", "compose");
@@ -249,7 +250,7 @@ async fn composer_uses_actual_native_claude_delivery_and_closed_owner_is_unavail
     let listener = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let state = dir.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let broker = bound.broker.clone();
     let owner = Agent {
         name: "coordinator".into(),
@@ -344,7 +345,7 @@ fn markers_exclude_examples_nested_comments_and_response_bodies_and_share_ids() 
 #[tokio::test]
 async fn authoring_rejects_duplicate_unsafe_alias_and_stale_inputs_without_writing() {
     let dir = tempfile::tempdir().unwrap();
-    let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = support::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     register(broker, "owner");
     let board = Name::default();
@@ -396,7 +397,7 @@ async fn authoring_rejects_duplicate_unsafe_alias_and_stale_inputs_without_writi
 async fn receipt_insert_failure_rolls_back_message_and_same_uuid_can_retry_once() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     register(broker, "owner");
     let snapshot = add(broker, &Name::default(), "owner", "compose");
@@ -426,7 +427,7 @@ async fn receipt_insert_failure_rolls_back_message_and_same_uuid_can_retry_once(
 #[tokio::test]
 async fn reauthoring_identical_user_id_creates_new_identity_but_accepted_retry_survives() {
     let dir = tempfile::tempdir().unwrap();
-    let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = support::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     register(broker, "owner");
     let name = Name::default();
@@ -473,7 +474,7 @@ async fn reauthoring_identical_user_id_creates_new_identity_but_accepted_retry_s
 #[tokio::test]
 async fn authoring_requires_the_new_instance_to_be_an_active_control() {
     let dir = tempfile::tempdir().unwrap();
-    let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = support::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     register(broker, "owner");
     let board = Name::default();

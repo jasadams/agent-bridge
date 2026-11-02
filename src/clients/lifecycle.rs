@@ -52,7 +52,7 @@ async fn run_inner(state: &Path, provider: Provider) -> Result<()> {
     }
     rpc(
         state,
-        &Request::Register {
+        &Request::DeliveryBind {
             agent: Agent {
                 name: name.clone(),
                 provider: provider.clone(),
@@ -60,7 +60,6 @@ async fn run_inner(state: &Path, provider: Provider) -> Result<()> {
                 endpoint,
                 enabled: true,
             },
-            replace: false,
         },
     )
     .await?;

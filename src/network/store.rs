@@ -8,7 +8,7 @@ use crate::{
             WireResponse,
         },
     },
-    protocol::{MAX_BODY, MAX_FRAME, MAX_REPLY_HOPS, Message},
+    protocol::{Agent, MAX_BODY, MAX_FRAME, MAX_REPLY_HOPS, Message},
 };
 use anyhow::{Context, Result, bail, ensure};
 use libp2p::Multiaddr;
@@ -233,14 +233,32 @@ impl Db {
         peer: &str,
         providers: &[String],
     ) -> Result<Vec<RemoteAgent>> {
+        self.export_directory_candidates(peer, providers, self.listed_agents(false)?)
+    }
+
+    pub(crate) fn export_directory_candidates(
+        &self,
+        peer: &str,
+        providers: &[String],
+        candidates: Vec<Agent>,
+    ) -> Result<Vec<RemoteAgent>> {
         super::wire::validate_providers(providers)?;
         self.require_peer(peer)?;
         let mut result = Vec::new();
-        for agent in self.listed_agents(false)? {
-            if providers
-                .iter()
-                .any(|provider| provider == agent.provider.label())
-                && self.peer_allowed(peer, &agent.provider, &agent.session, Permission::Discover)?
+        for agent in candidates {
+            if agent.enabled
+                && providers
+                    .iter()
+                    .any(|provider| provider == agent.provider.label())
+                && self.owner_policy_enabled(&agent.provider, &agent.session, &agent.name)?
+                // Candidates already carry current directory membership. Discover
+                // requires exact consent, not a live delivery binding; Send and
+                // Receive continue using their binding-dependent admission.
+                && self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM peer_grants WHERE peer_id=? AND provider=? AND session=? AND permission='discover')",
+                    params![peer, agent.provider.label(), agent.session],
+                    |row| row.get::<_, bool>(0),
+                )?
             {
                 validate_agent(&remote(&agent))?;
                 result.push(remote(&agent));

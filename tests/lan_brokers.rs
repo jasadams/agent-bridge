@@ -8,7 +8,7 @@ use agent_bridge::{
     protocol::{Agent, Provider, Request},
 };
 use libp2p::{Multiaddr, multiaddr::Protocol};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use tokio::{task::JoinHandle, time::timeout};
 
@@ -19,7 +19,9 @@ struct Running {
 
 impl Running {
     fn start(state: &Path) -> Self {
-        let bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let mut bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let claude = support::claude_directory::write_cli(state, &json!([]));
+        bound.broker = bound.broker.clone().with_claude_binary(claude);
         Self {
             broker: bound.broker.clone(),
             task: Some(tokio::spawn(broker::serve(bound))),

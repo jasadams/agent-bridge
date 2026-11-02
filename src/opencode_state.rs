@@ -206,13 +206,14 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("INSERT INTO opencode_leases VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session) DO UPDATE SET generation=excluded.generation,instance=excluded.instance,endpoint=excluded.endpoint,expires=excluded.expires,ready=excluded.ready", params![agent.session,generation,instance,agent.endpoint,time+LEASE_MS,ready])?;
         tx.commit()?;
-        self.register(agent, false)?;
+        self.bind_native(agent, false)?;
         let namespace: String = self.conn.query_row(
             "SELECT value FROM settings WHERE key='opencode_namespace'",
             [],
             |r| r.get(0),
         )?;
-        Ok(json!({"agent":agent,"generation":generation,"namespace":namespace}))
+        let persisted = self.agent(&agent.name)?;
+        Ok(json!({"agent":persisted,"generation":generation,"namespace":namespace}))
     }
 
     pub(crate) fn opencode_heartbeat(
@@ -228,10 +229,18 @@ impl Db {
             changed == 1,
             "OpenCode heartbeat has expired or belongs to a stale generation"
         );
-        self.conn.execute(
-            "UPDATE agents SET enabled=1 WHERE provider='opencode' AND session=?1 AND endpoint=?2",
-            params![session, endpoint],
-        )?;
+        let names = {
+            let mut statement = self.conn.prepare(
+                "SELECT name FROM agents WHERE provider='opencode' AND session=?1 AND endpoint=?2",
+            )?;
+            statement
+                .query_map(params![session, endpoint], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for name in names {
+            let enabled = self.owner_policy_enabled(&Provider::OpenCode, session, &name)?;
+            self.conn.execute("UPDATE agents SET enabled=?1 WHERE name=?2 AND provider='opencode' AND session=?3 AND endpoint=?4",params![enabled,name,session,endpoint])?;
+        }
         Ok(json!({"renewed":true}))
     }
 
@@ -506,6 +515,22 @@ mod tests {
             &None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn observation_receipt_preserves_owner_denial_and_generation() {
+        let (_root, mut db, agent, generation) = setup();
+        db.unregister(&agent.name, &agent.session).unwrap();
+        let receipt = db.opencode_observe(&agent, true).unwrap();
+        assert!(!db.agent(&agent.name).unwrap().enabled);
+        assert_eq!(receipt["generation"], generation);
+        assert_eq!(
+            receipt["agent"]["enabled"], false,
+            "receipt must report the persisted owner-policy clamp"
+        );
+        db.opencode_heartbeat(&agent.session, &agent.endpoint, &generation, true)
+            .unwrap();
+        assert!(!db.agent(&agent.name).unwrap().enabled);
     }
     fn dispatch(db: &mut Db) -> (Message, Dispatch) {
         let (msg, agent) = db.claim().unwrap().unwrap();
@@ -1648,7 +1673,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         // Reconstitute schema 12, then exactly the old public retry transition:
         // submitted/uncertain -> queued with erased detail and no attempt record.
-        conn.execute_batch("DROP TRIGGER topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER opencode_enqueue_bound; DROP TRIGGER opencode_retry_bound; DROP TRIGGER opencode_enqueue_binding; DROP TABLE opencode_deliveries; DROP TABLE opencode_leases; PRAGMA user_version=12;").unwrap();
+        conn.execute_batch("DROP TABLE agent_owner_policy; DROP TRIGGER topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER opencode_enqueue_bound; DROP TRIGGER opencode_retry_bound; DROP TRIGGER opencode_enqueue_binding; DROP TABLE opencode_deliveries; DROP TABLE opencode_leases; PRAGMA user_version=12;").unwrap();
         conn.execute(
             "UPDATE messages SET state='submitted',detail='Native insertion confirmed' WHERE id=?",
             [&legacy.id],
@@ -2076,7 +2101,8 @@ mod tests {
         // reconciliation columns. Db::open must upgrade it in place.
         db.conn
             .execute_batch(
-                "DROP TRIGGER topic_push_failed_gap;
+                "DROP TABLE agent_owner_policy;
+DROP TRIGGER topic_push_failed_gap;
 DROP TABLE topic_push_work;
 DROP TABLE topic_push_preferences;
 DROP TABLE topic_mentions;

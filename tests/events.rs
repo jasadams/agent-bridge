@@ -1,10 +1,11 @@
 use agent_bridge::{
-    broker::{self, Broker},
+    broker,
     protocol::{Agent, EventSelector, Provider, Request},
 };
 use serde_json::{Value, json};
 use std::{os::unix::fs::PermissionsExt, time::Duration};
 use tokio::{io::AsyncReadExt, net::UnixListener, time::timeout};
+mod support;
 
 fn inbox(name: &str) -> Agent {
     Agent {
@@ -52,7 +53,7 @@ async fn actual_broker_claude_control_preserves_quick_close_reopen_and_history()
         .tempdir_in("/tmp")
         .unwrap();
     let state = root.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let broker = bound.broker.clone();
     let path = state.join("claude.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -191,7 +192,7 @@ async fn selectors_are_strict_and_failed_changes_are_atomic() {
         );
     }
     let root = tempfile::tempdir().unwrap();
-    let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = support::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     let agent = Agent {
         provider: Provider::Codex,
@@ -273,7 +274,7 @@ async fn selectors_are_strict_and_failed_changes_are_atomic() {
 #[tokio::test]
 async fn oversized_lifecycle_snapshot_rejects_the_entire_selector_change() {
     let root = tempfile::tempdir().unwrap();
-    let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = support::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     broker
         .request(Request::Register {
@@ -324,7 +325,7 @@ async fn native_lifecycle_sources_deduplicate_aliases_and_preserve_confirmed_clo
         .tempdir_in("/tmp")
         .unwrap();
     let state = root.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let broker = bound.broker.clone();
     let endpoint = state.join("coordinator.sock");
     let listener = UnixListener::bind(&endpoint).unwrap();
@@ -576,7 +577,7 @@ async fn native_lifecycle_sources_deduplicate_aliases_and_preserve_confirmed_clo
 #[tokio::test]
 async fn snapshot_byte_bound_is_atomic_and_native_titles_are_bounded_for_events() {
     let root = tempfile::tempdir().unwrap();
-    let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = support::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
     broker
         .request(Request::Register {

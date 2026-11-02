@@ -2,10 +2,14 @@ mod support;
 
 use agent_bridge::{
     broker::{self, Broker},
-    network::trust::Permission,
+    network::{
+        transport::Transport,
+        trust::Permission,
+        wire::{Operation, WireRequest, WireResponse},
+    },
     protocol::{Agent, Provider, Request},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -26,7 +30,9 @@ struct Running {
 
 impl Running {
     fn start(state: &Path) -> Self {
-        let bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let mut bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let claude = support::claude_directory::write_cli(state, &json!([]));
+        bound.broker = bound.broker.clone().with_claude_binary(claude);
         let broker = bound.broker.clone();
         Self {
             broker,
@@ -188,11 +194,16 @@ async fn two_brokers_deliver_once_to_native_socket_and_sync_delivery_and_reply()
     let native_path = native_dir.join("inbox.sock");
     let native = UnixListener::bind(&native_path).unwrap();
     std::fs::set_permissions(&native_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    support::claude_directory::set_rows(
+        &bob.state,
+        &json!([{"sessionId":session,"name":"reviewer","cwd":"/fixture/reviewer","kind":"interactive","startedAt":1,"status":"idle"}]),
+    );
     bob.request(Request::Register {
         agent: Agent {
             name: "reviewer".into(),
             provider: Provider::Claude,
-            session: uuid::Uuid::new_v4().to_string(),
+            session,
             endpoint: native_path.to_string_lossy().into_owned(),
             enabled: true,
         },
@@ -218,13 +229,19 @@ async fn two_brokers_deliver_once_to_native_socket_and_sync_delivery_and_reply()
         .await
         .unwrap();
     }
-    let (stream, _) = timeout(Duration::from_secs(20), native.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).await.unwrap();
-    let frame: Value = serde_json::from_str(&line).unwrap();
+    let frame: Value = timeout(Duration::from_secs(20), async {
+        loop {
+            let (stream, _) = native.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).await.unwrap();
+            // Directory delivery-readiness probes connect without a message.
+            if !line.is_empty() {
+                break serde_json::from_str(&line).unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
     let local_id = frame["msg_id"].as_str().unwrap().to_owned();
     assert_ne!(local_id, id);
     let content = frame["message"]["content"].as_str().unwrap();
@@ -413,5 +430,215 @@ async fn revocation_blocks_a_durably_received_message_before_native_submission()
             .is_empty()
     );
     alice.stop().await;
+    bob.stop().await;
+}
+
+#[tokio::test]
+async fn peer_directory_omits_live_bound_claude_absent_native_and_retries_unavailable_native() {
+    let root = temp();
+    let bob = Running::start(&root.path().join("b"));
+    let native_dir = root.path().join("native");
+    std::fs::create_dir(&native_dir).unwrap();
+    std::fs::set_permissions(&native_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let native_path = native_dir.join("inbox.sock");
+    let _native = UnixListener::bind(&native_path).unwrap();
+    std::fs::set_permissions(&native_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    bob.request(Request::Register {
+        agent: Agent {
+            name: "stale-reviewer".into(),
+            provider: Provider::Claude,
+            session: session.clone(),
+            endpoint: native_path.to_string_lossy().into_owned(),
+            enabled: true,
+        },
+        replace: false,
+    });
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let peer = key.public().to_peer_id().to_string();
+    bob.request(Request::PeerPair {
+        peer_id: peer.clone(),
+        fingerprint: peer.clone(),
+        alias: Some("probe".into()),
+    });
+    grant(&bob, "probe", "stale-reviewer");
+    grant(&bob, "probe", "user");
+    bob.request(Request::NetworkConfigure {
+        enabled: true,
+        listen: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
+    });
+    let address: libp2p::Multiaddr = bob.listening().await.parse().unwrap();
+    let bob_id: libp2p::PeerId = bob.identity().parse().unwrap();
+    let probe = Transport::start(
+        key,
+        "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+        vec![bob_id],
+    )
+    .unwrap();
+    for operation in [
+        Operation::Directory,
+        Operation::DirectorySupported {
+            providers: vec!["inbox".into(), "claude".into()],
+        },
+    ] {
+        let response = probe
+            .handle
+            .request(bob_id, address.clone(), WireRequest::new(operation))
+            .await
+            .unwrap();
+        let agents = match response {
+            WireResponse::Directory { agents }
+            | WireResponse::SupportedDirectory { agents, .. } => agents,
+            other => panic!("expected complete native directory, got {other:?}"),
+        };
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "user");
+        assert_eq!(agents[0].provider, Provider::Inbox);
+    }
+    // Native presence plus explicit sharing survives delivery-only retirement.
+    support::claude_directory::set_rows(
+        &bob.state,
+        &json!([{
+            "sessionId":session,"name":"resumed reviewer","cwd":"/fixture",
+            "kind":"interactive","startedAt":1_700_000_000_000_u64,"status":"idle"
+        }]),
+    );
+    let db = rusqlite::Connection::open(bob.state.join("messages.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE agents SET enabled=0 WHERE name='stale-reviewer'",
+        [],
+    )
+    .unwrap();
+    let response = probe
+        .handle
+        .request(
+            bob_id,
+            address.clone(),
+            WireRequest::new(Operation::Directory),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(response, WireResponse::Directory {ref agents} if agents.iter().any(|agent| agent.session==session)),
+        "native-present shared UUID must survive retired delivery binding: {response:?}"
+    );
+    bob.request(Request::PeerGrant {
+        peer: "probe".into(),
+        agent: "stale-reviewer".into(),
+        permission: Permission::Discover,
+        allow: false,
+    });
+    let response = probe
+        .handle
+        .request(
+            bob_id,
+            address.clone(),
+            WireRequest::new(Operation::Directory),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(response, WireResponse::Directory {ref agents} if !agents.iter().any(|agent| agent.session==session)),
+        "Discover revocation must hide even a natively present UUID: {response:?}"
+    );
+    bob.request(Request::Register {
+        agent: Agent {
+            name: "stale-reviewer".into(),
+            provider: Provider::Claude,
+            session: session.clone(),
+            endpoint: native_path.to_string_lossy().into_owned(),
+            enabled: true,
+        },
+        replace: false,
+    });
+    grant(&bob, "probe", "stale-reviewer");
+    bob.request(Request::Unregister {
+        name: "stale-reviewer".into(),
+        session: session.clone(),
+    });
+    let response = probe
+        .handle
+        .request(
+            bob_id,
+            address.clone(),
+            WireRequest::new(Operation::Directory),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(response, WireResponse::Directory {ref agents} if !agents.iter().any(|agent| agent.session==session)),
+        "explicit owner disable must hide the UUID: {response:?}"
+    );
+    let replacement = uuid::Uuid::new_v4().to_string();
+    bob.request(Request::Register {
+        agent: Agent {
+            name: "stale-reviewer".into(),
+            provider: Provider::Claude,
+            session: replacement.clone(),
+            endpoint: native_path.to_string_lossy().into_owned(),
+            enabled: true,
+        },
+        replace: true,
+    });
+    support::claude_directory::set_rows(
+        &bob.state,
+        &json!([{
+            "sessionId":replacement,"name":"resumed reviewer","cwd":"/fixture",
+            "kind":"interactive","startedAt":1_700_000_000_000_u64,"status":"idle"
+        }]),
+    );
+    let response = probe
+        .handle
+        .request(
+            bob_id,
+            address.clone(),
+            WireRequest::new(Operation::Directory),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(response, WireResponse::Directory {ref agents} if agents.len()==1 && agents[0].name=="user"),
+        "same-name replacement must not inherit the old UUID's grant: {response:?}"
+    );
+    // An unavailable native provider must not masquerade as an authoritative
+    // empty snapshot, even when other providers have exportable sessions.
+    std::fs::remove_file(bob.state.join("claude")).unwrap();
+    let healthy = probe
+        .handle
+        .request(
+            bob_id,
+            address.clone(),
+            WireRequest::new(Operation::DirectorySupported {
+                providers: vec!["inbox".into()],
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(healthy, WireResponse::SupportedDirectory {ref agents,..} if agents.len()==1 && agents[0].name=="user"),
+        "an unselected unavailable provider must not block a healthy selected directory: {healthy:?}"
+    );
+    for operation in [
+        Operation::Directory,
+        Operation::DirectorySupported {
+            providers: vec!["inbox".into(), "claude".into()],
+        },
+    ] {
+        let response = probe
+            .handle
+            .request(bob_id, address.clone(), WireRequest::new(operation))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response,
+                WireResponse::Rejected {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "unavailable native directory must be retryable, got {response:?}"
+        );
+    }
     bob.stop().await;
 }

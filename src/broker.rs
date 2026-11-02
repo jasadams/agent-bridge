@@ -79,6 +79,7 @@ pub struct Broker {
     claude_failures: Arc<Mutex<std::collections::HashMap<String, (String, String)>>>,
     pub state_dir: PathBuf,
     codex_bin: PathBuf,
+    claude_bin: PathBuf,
     discovery_status: Arc<Mutex<Value>>,
 }
 
@@ -107,6 +108,41 @@ impl Drop for BoundServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+/// Resolve human-facing local labels once, through the same directory projection
+/// used for listing. Exact registrations and immutable remote routes stay exact.
+fn map_local_agent_names(
+    req: &mut Request,
+    mut map: impl FnMut(&mut String) -> Result<()>,
+) -> Result<()> {
+    match req {
+        Request::Send {
+            sender, recipient, ..
+        } => {
+            map(sender)?;
+            map(recipient)?;
+        }
+        Request::Unregister { name, .. } => map(name)?,
+        Request::PeerGrant { agent, .. }
+        | Request::PeerShare { agent, .. }
+        | Request::LanPairingWatch { agent, .. }
+        | Request::AddBoardMessageInput { agent, .. }
+        | Request::Subscribe { agent, .. }
+        | Request::Unsubscribe { agent, .. } => map(agent)?,
+        Request::History { agent, .. } | Request::HistorySince { agent, .. } => {
+            if let Some(agent) = agent {
+                map(agent)?;
+            }
+        }
+        Request::BoardUpdate { actor, .. } | Request::NamedBoardUpdate { actor, .. } => {
+            if let Some(actor) = actor {
+                map(actor)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 impl Broker {
@@ -264,6 +300,7 @@ impl Broker {
             claude_failures: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_dir,
             codex_bin,
+            claude_bin: PathBuf::from("claude"),
             discovery_status: Arc::new(Mutex::new(json!({"state":"disabled"}))),
         };
         Ok(BoundServer {
@@ -272,6 +309,58 @@ impl Broker {
             _lock: lock,
             socket,
         })
+    }
+
+    /// Select the installed native CLI without changing the process environment.
+    pub fn with_claude_binary(mut self, binary: PathBuf) -> Self {
+        self.claude_bin = binary;
+        self
+    }
+
+    pub(crate) fn native_directory_snapshots(
+        &self,
+        providers: &[Provider],
+    ) -> Vec<(Provider, crate::directory::NativeSnapshot)> {
+        if !providers.contains(&Provider::Claude) {
+            return vec![];
+        }
+        use crate::directory::{NativeSession, NativeSnapshot};
+        let snapshot = match crate::clients::claude_directory::query_blocking(&self.claude_bin, Duration::from_secs(5)) {
+            Ok(snapshot) if snapshot.unaddressable_rows == 0 => NativeSnapshot::Complete(snapshot.sessions.into_iter().map(|session| NativeSession {
+                session: session.session,
+                name: session.name,
+                cwd: Some(session.cwd),
+                status: Some(json!({"status":session.status,"kind":session.kind,"pid":session.pid,"state":session.state,"waitingFor":session.waiting_for,"startedAt":session.started_at})),
+                updated: None,
+            }).collect()),
+            Ok(_) => NativeSnapshot::Incomplete("Native Claude rows lack a full session UUID".into()),
+            Err(error) => NativeSnapshot::Unavailable(format!("{error:#}")),
+        };
+        vec![(Provider::Claude, snapshot)]
+    }
+
+    pub(crate) fn project_directory(
+        &self,
+        db: &Db,
+        snapshots: &[(Provider, crate::directory::NativeSnapshot)],
+        all: bool,
+    ) -> Result<crate::directory::Directory> {
+        let mut directory = crate::directory::project(db, snapshots, all)?;
+        let machine = self.local_machine(db)?;
+        for row in &mut directory.agents {
+            row["machine_name"] = machine["machine_name"].clone();
+            row["peer_id"] = machine["peer_id"].clone();
+            row["machine_display_name"] = machine["display_name"].clone();
+        }
+        Ok(directory)
+    }
+
+    pub(crate) async fn read_native_snapshots(
+        &self,
+        providers: Vec<Provider>,
+    ) -> Result<Vec<(Provider, crate::directory::NativeSnapshot)>> {
+        self.blocking(move |broker| Ok(broker.native_directory_snapshots(&providers)))
+            .await
     }
 
     async fn ready_network(&self, cancel: u64) -> Result<NetworkSnapshot> {
@@ -478,7 +567,25 @@ impl Broker {
         }
     }
 
-    pub fn request(&self, req: Request) -> Result<Value> {
+    pub fn request(&self, mut req: Request) -> Result<Value> {
+        // Native processes finish before acquiring the database administration lock.
+        let mut needs_native = matches!(&req, Request::List { .. } | Request::Directory { .. });
+        {
+            let db = self.db.lock().unwrap();
+            map_local_agent_names(&mut req, |name| {
+                needs_native |= !name.contains('/') && db.agent(name).is_err();
+                Ok(())
+            })?;
+        }
+        let snapshots = if needs_native {
+            self.native_directory_snapshots(&[
+                Provider::Claude,
+                Provider::Codex,
+                Provider::OpenCode,
+            ])
+        } else {
+            vec![]
+        };
         // A native probe may trigger lifecycle cleanup through this same broker.
         // Complete transport I/O before holding the database administration lock.
         let candidate = match &req {
@@ -507,6 +614,14 @@ impl Broker {
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("Database lock poisoned"))?;
+        if !snapshots.is_empty() {
+            map_local_agent_names(&mut req, |name| {
+                if !name.contains('/') && db.agent(name).is_err() {
+                    *name = crate::directory::resolve(&db, &snapshots, name)?.name;
+                }
+                Ok(())
+            })?;
+        }
         db.opencode_tick(crate::db::now())?;
         {
             let mut state = self.board_notifications.lock().unwrap();
@@ -518,7 +633,9 @@ impl Broker {
         }
         let registration = matches!(
             &req,
-            Request::Register { .. } | Request::OpenCodeObserve { .. }
+            Request::Register { .. }
+                | Request::DeliveryBind { .. }
+                | Request::OpenCodeObserve { .. }
         );
         let req = match req {
             Request::BoardRead => Request::NamedBoardRead {
@@ -841,6 +958,25 @@ impl Broker {
                     }
                     json!(agent)
                 }
+                Request::DeliveryBind { mut agent } => {
+                    ensure!(
+                        matches!(agent.provider, Provider::Claude | Provider::Codex),
+                        "This native hook cannot bind this provider; OpenCode requires verified generation admission"
+                    );
+                    ensure!(
+                        agent.name == crate::hook::routing_name(&agent.provider, &agent.session),
+                        "Native hook binding must use the exact canonical route"
+                    );
+                    crate::clients::validate_registration(&mut agent)?;
+                    db.bind_native(&agent, false)?;
+                    if agent.provider == Provider::Claude {
+                        self.claude_failures
+                            .lock()
+                            .unwrap()
+                            .retain(|_, (session, _)| session != &agent.session);
+                    }
+                    json!(db.agent(&agent.name)?)
+                }
                 Request::OpenCodeObserve {
                     session,
                     endpoint,
@@ -997,35 +1133,19 @@ impl Broker {
                     json!({"unregistered":name})
                 }
                 Request::List { all } => {
-                    let mut agents = Vec::new();
-                    let machine = self.local_machine(&db)?;
-                    for agent in db.listed_agents(all)? {
-                        let stale_reason = if !agent.enabled {
-                            Some("disabled".to_owned())
-                        } else if agent.provider == Provider::Claude {
-                            crate::clients::claude::stale_reason(Path::new(&agent.endpoint))
-                        } else {
-                            None
-                        };
-                        if !all && stale_reason.is_some() {
-                            continue;
-                        }
-                        let display = db.display_name(&agent.provider, &agent.session)?;
-                        let mut value = json!(agent);
-                        if let Some(reason) = stale_reason {
-                            value["stale_reason"] = json!(reason);
-                        }
-                        value["machine_name"] = machine["machine_name"].clone();
-                        value["peer_id"] = machine["peer_id"].clone();
-                        value["machine_display_name"] = machine["display_name"].clone();
-                        if let Some(display) = display {
-                            value["display_name"] = json!(display);
-                            value["qualified_name"] =
-                                json!(format!("{}:{display}", agent.provider.label()));
-                        }
-                        agents.push(value);
-                    }
-                    json!(agents)
+                    json!(
+                        self.project_directory(&db, &snapshots, all)?
+                            .complete_agents()?
+                    )
+                }
+                Request::Directory { all, max_age_days } => {
+                    ensure!(
+                        (1..=3650).contains(&max_age_days),
+                        "max_age_days must be between 1 and 3650"
+                    );
+                    // Claude has no last-active timestamp. Only a provider with native
+                    // update-time evidence may apply this age selection.
+                    json!(self.project_directory(&db, &snapshots, all)?)
                 }
                 Request::Send {
                     id,
@@ -2539,8 +2659,7 @@ mod request_scheduling_tests {
             let _ = wait.recv_timeout(Duration::from_secs(2));
         });
         barrier.wait();
-        let request =
-            tokio::spawn(async move { broker.request_async(Request::List { all: false }).await });
+        let request = tokio::spawn(async move { broker.request_async(Request::Status).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         request.abort();
         let _ = request.await;
@@ -2577,8 +2696,7 @@ mod request_scheduling_tests {
         });
         barrier.wait();
         let started = std::time::Instant::now();
-        let request =
-            tokio::spawn(async move { broker.request_async(Request::List { all: false }).await });
+        let request = tokio::spawn(async move { broker.request_async(Request::Status).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         let elapsed = started.elapsed();
         request.await.unwrap().unwrap();

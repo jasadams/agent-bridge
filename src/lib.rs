@@ -20,6 +20,8 @@ pub use clients::claude_discovery;
 mod codex_admission;
 pub mod db;
 pub mod delivery;
+pub mod directory;
+mod directory_policy;
 pub mod opencode_install;
 mod opencode_state;
 pub use clients::codex_discovery as discovery;

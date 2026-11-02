@@ -161,6 +161,10 @@ pub enum Request {
         #[serde(default)]
         replace: bool,
     },
+    /// Native hook supplies a delivery binding, never owner enable/disable intent.
+    DeliveryBind {
+        agent: Agent,
+    },
     #[serde(rename = "opencode_observe")]
     OpenCodeObserve {
         session: String,
@@ -219,6 +223,13 @@ pub enum Request {
     List {
         #[serde(default)]
         all: bool,
+    },
+    /// Native directory with explicit per-provider availability diagnostics.
+    Directory {
+        #[serde(default)]
+        all: bool,
+        #[serde(default = "directory_age")]
+        max_age_days: u32,
     },
     Send {
         id: String,
@@ -444,6 +455,9 @@ pub enum Request {
     PeerRevoke {
         peer: String,
     },
+}
+fn directory_age() -> u32 {
+    7
 }
 impl Request {
     /// Main has no archive lifecycle and keeps its frozen legacy read wire.

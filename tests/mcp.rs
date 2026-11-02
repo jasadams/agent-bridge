@@ -1,6 +1,7 @@
 //! Black-box MCP stdio checks against the real broker. No native model, global
 //! client configuration or existing bridge state is touched.
 mod support;
+use support::claude_directory;
 
 use agent_bridge::{
     broker::{self, Broker},
@@ -10,7 +11,11 @@ use agent_bridge::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap, os::unix::fs::PermissionsExt, path::Path, process::Stdio, time::Duration,
+    collections::BTreeMap,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -22,14 +27,33 @@ use tokio::{
 struct Running {
     broker: Broker,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    native_directory: PathBuf,
 }
 impl Running {
     fn start(state: &Path) -> Self {
-        let bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let mut bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let native_directory = state.join("native-directory");
+        std::fs::create_dir_all(&native_directory).unwrap();
+        let cli = claude_directory::write_cli(&native_directory, &json!([]));
+        bound.broker = bound.broker.clone().with_claude_binary(cli);
         Self {
             broker: bound.broker.clone(),
             task: tokio::spawn(broker::serve(bound)),
+            native_directory,
         }
+    }
+    fn native_rows(&self, natives: &[&Native]) {
+        // Native presence is explicit fixture input, never inferred from registrations.
+        let rows: Vec<_> = natives
+            .iter()
+            .map(|native| {
+                json!({
+                    "sessionId": native.session, "name": native.name,
+                    "cwd": "/fixture", "kind": "interactive", "startedAt": 0
+                })
+            })
+            .collect();
+        claude_directory::set_rows(&self.native_directory, &json!(rows));
     }
     fn request(&self, request: Request) -> Value {
         self.broker.request(request).unwrap()
@@ -121,8 +145,22 @@ struct Mcp {
 }
 impl Mcp {
     fn start(state: &Path) -> Self {
+        let directory = state.join("native-directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        if !directory.join("claude").exists() {
+            claude_directory::write_cli(&directory, &json!([]));
+        }
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
             .args(["--state-dir", state.to_str().unwrap(), "mcp"])
+            .env(
+                "PATH",
+                std::env::join_paths([
+                    directory.as_path(),
+                    Path::new("/usr/bin"),
+                    Path::new("/bin"),
+                ])
+                .unwrap(),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -306,6 +344,7 @@ async fn topic_tools_discover_and_publish_durable_history_without_native_input()
     let state = root.path().join("state");
     let running = Running::start(&state);
     let mut native = Native::start(&running, &root.path().join("native"), "friendly-author");
+    running.native_rows(&[&native]);
     running.inbox("reader");
     let mut mcp = Mcp::start(&state);
     mcp.initialize().await;
@@ -918,7 +957,7 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     assert!(!failed(&stale));
     let agents = mcp.call("list_agents", json!({})).await;
     assert!(
-        structured(&agents)["result"]
+        structured(&agents)["result"]["agents"]
             .as_array()
             .unwrap()
             .iter()
@@ -955,7 +994,7 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     });
     let available = mcp.call("list_agents", json!({})).await;
     assert!(
-        !structured(&available)["result"]
+        !structured(&available)["result"]["agents"]
             .as_array()
             .unwrap()
             .iter()
@@ -963,7 +1002,7 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     );
     let all = mcp.call("list_agents", json!({"include_stale":true})).await;
     let data = structured(&all);
-    let row = data["result"]
+    let row = data["result"]["agents"]
         .as_array()
         .unwrap()
         .iter()
@@ -1014,6 +1053,82 @@ async fn strict_tools_reject_unknown_fields_and_cannot_supply_owner_approval() {
     assert_eq!(running.request(Request::PeersList), json!([]));
     // A malformed tool call does not kill the persistent server.
     assert!(!failed(&mcp.call("connection_status", json!({})).await));
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn local_directory_keeps_native_presence_separate_from_delivery_and_registered_membership() {
+    let root = root();
+    let state = root.path().join("state");
+    let running = Running::start(&state);
+    let native = Native::start(&running, &root.path().join("native"), "live-native");
+    let overlay = Native::start(&running, &root.path().join("overlay"), "overlay-only");
+    let unbound = uuid::Uuid::new_v4().to_string();
+    let unbound_route = format!("claude-{unbound}");
+    claude_directory::set_rows(
+        &running.native_directory,
+        &json!([
+            {"sessionId":native.session,"name":"Native title","cwd":"/fixture","kind":"interactive","startedAt":0},
+            {"sessionId":unbound,"name":"Without binding","cwd":"/fixture","kind":"interactive","startedAt":0}
+        ]),
+    );
+    let mut mcp = Mcp::start(&state);
+    mcp.initialize().await;
+    for verbose in [false, true] {
+        let response = mcp.call("list_agents", json!({"verbose":verbose})).await;
+        let directory = &structured(&response)["result"];
+        assert_eq!(
+            directory["providers"]["claude"]["state"], "complete",
+            "{response}"
+        );
+        let agents = directory["agents"]
+            .as_array()
+            .expect("local directory envelope");
+        let row = agents
+            .iter()
+            .find(|row| row["name"] == native.name)
+            .expect("explicit native row");
+        assert_eq!(row["native_available"], true);
+        assert_eq!(row["deliverable"], true);
+        assert_eq!(row["display_name"], "Native title");
+        let row = agents
+            .iter()
+            .find(|row| row["name"] == unbound_route)
+            .expect("native UUID without binding remains visible");
+        assert_eq!(row["native_available"], true);
+        assert_eq!(row["deliverable"], false);
+        assert_eq!(
+            row["delivery_unavailable_reason"],
+            "delivery_binding_missing"
+        );
+        assert!(
+            !agents.iter().any(|row| row["name"] == overlay.name),
+            "socket registration cannot establish native membership: {response}"
+        );
+    }
+    let all = mcp.call("list_agents", json!({"include_stale":true})).await;
+    let overlay_row = structured(&all)["result"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == overlay.name)
+        .expect("retain inactive registration diagnostics");
+    assert_eq!(overlay_row["native_available"], false);
+    assert_eq!(overlay_row["stale_reason"], "native_absent");
+    native.task.abort();
+    while !native.task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let response = mcp.call("list_agents", json!({})).await;
+    let row = structured(&response)["result"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == native.name)
+        .expect("socket failure does not erase native presence");
+    assert_eq!(row["native_available"], true);
+    assert_eq!(row["deliverable"], false);
+    assert_eq!(row["delivery_unavailable_reason"], "socket_refused");
     mcp.close().await;
 }
 
@@ -1074,7 +1189,14 @@ async fn list_agents_defaults_to_local_and_requires_one_explicit_trusted_remote_
     assert!(list["inputSchema"]["properties"].get("remote").is_none());
     for arguments in [json!({}), json!({"peer":null})] {
         let response = mcp.call("list_agents", arguments).await;
-        let agents = structured(&response)["result"].as_array().unwrap();
+        let directory = &structured(&response)["result"];
+        assert_eq!(
+            directory["providers"]["claude"]["state"], "complete",
+            "{response}"
+        );
+        let agents = directory["agents"]
+            .as_array()
+            .expect("local directory agents");
         assert!(agents.iter().any(|agent| agent["name"] == "local-agent"));
         assert!(agents.iter().all(|agent| agent["peer_alias"].is_null()));
         assert!(
@@ -1242,6 +1364,8 @@ async fn two_mcp_clients_pair_real_brokers_only_after_both_owners_approve_then_s
     let b = Running::start(&b_state);
     let a_native = Native::start(&a, &root.path().join("a-native"), "a-owner");
     let b_native = Native::start(&b, &root.path().join("b-native"), "b-owner");
+    a.native_rows(&[&a_native]);
+    b.native_rows(&[&b_native]);
     a.inbox("private-existing-session");
     let mut a_mcp = Mcp::start(&a_state);
     let mut b_mcp = Mcp::start(&b_state);
@@ -1386,6 +1510,7 @@ async fn event_subscription_compact_results_keep_effective_set_and_atomic_snapsh
     let running = Running::start(&state);
     let coordinator = Native::start(&running, &root.path().join("coordinator"), "coordinator");
     let worker = Native::start(&running, &root.path().join("worker"), "worker");
+    running.native_rows(&[&coordinator, &worker]);
     let mut mcp = Mcp::start(&state);
     mcp.initialize().await;
     let events = json!([{"event":"agent.opened"},{"event":"agent.closed"}]);
@@ -1465,6 +1590,7 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
     let state = root.path().join("state");
     let running = Running::start(&state);
     let mut native = Native::start(&running, &root.path().join("native"), "board-owner");
+    running.native_rows(&[&native]);
     running.inbox("not-native");
     let mut mcp = Mcp::start(&state);
     mcp.initialize().await;
@@ -1855,16 +1981,29 @@ async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
     assert!(send_sizes[0].abs_diff(send_sizes[1]) < 32);
     assert_eq!(board_sizes[0], board_sizes[1]);
     let compact = mcp.call("list_agents", json!({})).await;
-    for agent in structured(&compact)["result"].as_array().unwrap() {
+    assert_eq!(
+        structured(&compact)["result"]["providers"]["claude"]["state"],
+        "complete",
+        "{compact}"
+    );
+    for agent in structured(&compact)["result"]["agents"].as_array().unwrap() {
         assert!(agent.get("endpoint").is_none());
         assert!(agent.get("session").is_none());
         assert!(agent.get("machine_name").is_none());
         assert_eq!(agent["enabled"], true);
     }
     let verbose = mcp.call("list_agents", json!({"verbose":true})).await;
-    assert!(structured(&verbose)["result"][0].get("session").is_some());
+    assert_eq!(
+        structured(&compact)["result"]["providers"],
+        structured(&verbose)["result"]["providers"]
+    );
     assert!(
-        structured(&verbose)["result"][0]
+        structured(&verbose)["result"]["agents"][0]
+            .get("session")
+            .is_some()
+    );
+    assert!(
+        structured(&verbose)["result"]["agents"][0]
             .get("machine_name")
             .is_some()
     );
@@ -1963,6 +2102,7 @@ async fn named_boards_keep_mcp_revisions_results_and_writes_isolated() {
         revisions.push(receipt["revision"].clone());
     }
     let native = Native::start(&_running, &root.path().join("native"), "named-owner");
+    _running.native_rows(&[&native]);
     for name in ["alpha", "beta"] {
         let subscribed = mcp
             .call(

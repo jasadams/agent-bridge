@@ -1,3 +1,6 @@
+#[path = "support/claude_directory.rs"]
+mod claude_directory;
+
 use agent_bridge::{
     broker::{BoundServer, Broker},
     network::{contact, identity::Identity},
@@ -8,7 +11,10 @@ use std::{path::Path, time::Duration};
 use tokio::time::timeout;
 
 fn broker(path: &Path) -> BoundServer {
-    Broker::bind(path.into(), "/missing/codex".into()).unwrap()
+    let mut bound = Broker::bind(path.into(), "/missing/codex".into()).unwrap();
+    let claude = claude_directory::write_cli(path, &json!([]));
+    bound.broker = bound.broker.clone().with_claude_binary(claude);
+    bound
 }
 fn enable(broker: &Broker) {
     broker

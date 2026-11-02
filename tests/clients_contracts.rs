@@ -8,6 +8,9 @@ use agent_bridge::{
 };
 use std::os::unix::fs::PermissionsExt;
 
+#[path = "support/claude_directory.rs"]
+mod native_claude;
+
 const SESSION: &str = "123e4567-e89b-12d3-a456-426614174000";
 fn agent(provider: Provider, session: &str, endpoint: &str) -> Agent {
     Agent {
@@ -92,7 +95,14 @@ async fn broker_enforces_native_endpoint_permissions_and_rejects_foreign_endpoin
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let state = root.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let mut bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    bound.broker = bound
+        .broker
+        .clone()
+        .with_claude_binary(native_claude::write_cli(
+            root.path(),
+            &serde_json::json!([]),
+        ));
     let server = tokio::spawn(broker::serve(bound));
     let endpoint = socket.to_str().unwrap();
     for provider in [Provider::Codex, Provider::Inbox] {

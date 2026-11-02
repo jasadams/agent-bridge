@@ -143,6 +143,12 @@ struct Agents {
     /// Include disabled or unreachable local registrations with stale_reason. Local only.
     #[serde(default)]
     include_stale: bool,
+    /// Native activity-age window where supported; Claude has no last-active time.
+    #[serde(default = "directory_age")]
+    max_age_days: u32,
+}
+fn directory_age() -> u32 {
+    7
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -372,19 +378,29 @@ impl Bridge {
         .await
     }
     async fn native_agent(&self, name: &str) -> Result<()> {
-        let agents = self.rpc(Request::List { all: false }).await?;
+        let directory = self
+            .rpc(Request::Directory {
+                all: false,
+                max_age_days: 7,
+            })
+            .await?;
+        let agents = &directory["agents"];
         ensure!(
-            agents
-                .as_array()
-                .is_some_and(|agents| agents.iter().any(|agent| agent["name"] == name
+            agents.as_array().is_some_and(|agents| agents.iter().any(
+                |agent| agent["name"] == name
                     && agent["enabled"] == true
+                    && agent["deliverable"] != false
+                    && agent["endpoint"].as_str().is_some_and(
+                        |endpoint| !endpoint.is_empty() || agent["provider"] != "claude"
+                    )
                     && agent["provider"]
                         .as_str()
                         .and_then(|provider| provider.parse::<crate::protocol::Provider>().ok())
                         .is_some_and(|provider| crate::clients::supports(
                             &provider,
                             crate::clients::Capability::PairingPrompts
-                        )))),
+                        ))
+            )),
             "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
         );
         Ok(())
@@ -882,8 +898,9 @@ impl Bridge {
                             );
                             Request::RemoteListPeer { peer }
                         }
-                        None => Request::List {
+                        None => Request::Directory {
                             all: args.include_stale,
+                            max_age_days: args.max_age_days,
                         },
                     })
                     .await?,

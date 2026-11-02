@@ -9,7 +9,7 @@ use agent_bridge::{
     },
     protocol::{Agent, Provider, Request},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
@@ -33,7 +33,9 @@ struct Running {
 
 impl Running {
     fn start(state: &Path) -> Self {
-        let bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let mut bound = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let claude = support::claude_directory::write_cli(state, &json!([]));
+        bound.broker = bound.broker.clone().with_claude_binary(claude);
         let broker = bound.broker.clone();
         Self {
             broker,
@@ -141,6 +143,10 @@ async fn authenticated_machine_names_survive_renaming_with_pinned_queued_deliver
     let socket = UnixListener::bind(&socket_path).unwrap();
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let session = uuid::Uuid::new_v4().to_string();
+    support::claude_directory::set_rows(
+        &root.path().join("b"),
+        &json!([{"sessionId":session,"name":"reviewer","cwd":"/fixture/reviewer","kind":"interactive","startedAt":1,"status":"idle"}]),
+    );
     bob.request(Request::Register {
         agent: Agent {
             name: "reviewer".into(),
@@ -207,13 +213,18 @@ async fn authenticated_machine_names_survive_renaming_with_pinned_queued_deliver
     assert_eq!(still_queued["recipient_session"], session);
     assert_eq!(still_queued["id"], id);
     bob.request(Request::Pause { paused: false });
-    let (stream, _) = timeout(Duration::from_secs(5), socket.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).await.unwrap();
-    let frame: Value = serde_json::from_str(&line).unwrap();
+    let frame: Value = timeout(Duration::from_secs(5), async {
+        loop {
+            let (stream, _) = socket.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).await.unwrap();
+            if !line.is_empty() {
+                break serde_json::from_str(&line).unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
     let text = frame["message"]["content"].as_str().unwrap();
     let local_id = frame["msg_id"].as_str().unwrap().to_owned();
     assert!(text.starts_with("<cross-session-message from-name=\"origin/user\">"));

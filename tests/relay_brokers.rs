@@ -1,10 +1,13 @@
 //! Production brokers use only registered circuit routes, with no LAN discovery.
+#[path = "support/claude_directory.rs"]
+mod claude_directory;
+
 use agent_bridge::{
     broker::{self, Broker},
     network::relay_node::{self, Limits, RunningNode},
     protocol::{Agent, Provider, Request},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::timeout;
 struct Running {
@@ -13,7 +16,9 @@ struct Running {
 }
 impl Running {
     fn start(path: &std::path::Path) -> Self {
-        let bound = Broker::bind(path.into(), "/missing/codex".into()).unwrap();
+        let mut bound = Broker::bind(path.into(), "/missing/codex".into()).unwrap();
+        let claude = claude_directory::write_cli(path, &json!([]));
+        bound.broker = bound.broker.clone().with_claude_binary(claude);
         Self {
             broker: bound.broker.clone(),
             task: tokio::spawn(broker::serve(bound)),

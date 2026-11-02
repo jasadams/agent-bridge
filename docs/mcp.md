@@ -294,9 +294,21 @@ usage](board.md) for controls and concurrency behavior.
 ### Discover and share your session
 
 Sessions remain private by default, including sessions created after pairing.
-For local discovery call `list_agents({})`. Unreachable Claude sockets are hidden.
-Use `list_agents({"include_stale":true})` for all local registrations with
-`stale_reason` on hidden rows. This option cannot be combined with `peer`. Remote discovery requires a specific
+For local discovery call `list_agents({})`. The local result is an envelope:
+`{agents:[...],providers:{claude:{state:"complete"}}}`. Provider states are
+`complete`, `unavailable`, or `incomplete`; failed native queries are not complete
+empty lists, and healthy providers remain visible. Claude membership, UUIDs and
+names come from `claude agents --json`, without a discovery hook or mod.
+Native rows without an inbox binding or with a failed delivery socket remain
+discoverable with `deliverable:false`. Discovery grants no permission and is not
+proof of model activity or message reading. Delivery hooks remain separate.
+Use `list_agents({"include_stale":true})` for retained binding diagnostics with
+`stale_reason`; these are not active native rows or peer export candidates.
+The optional `max_age_days` defaults to 7 (for example 30 for a wider window).
+Only supporting providers with native update timestamps apply it; Claude exposes
+start time, not last activity, and is not inactivity-filtered. Support is staged
+with each provider's native conversion.
+`include_stale` cannot be combined with `peer`. Remote discovery requires a specific
 paired peer alias or peer ID:
 
 ```json
@@ -366,7 +378,9 @@ recovery instructions and the exchange ID when one was created, without echoing
 invitation material.
 
 `list_agents` also defaults to compact routing and availability fields. Local
-results retain names, provider and enabled state; remote results retain peer ID,
+results retain the envelope/provider diagnostics, names, native status, working
+directory, owner-enabled state and delivery availability. Remote results remain an
+array and retain peer ID,
 alias, qualified routing name and online state. Pass `"verbose": true` for session,
 machine and transport metadata.
 

@@ -8,7 +8,7 @@ use super::{
     },
 };
 use crate::{broker::Broker, db::Db};
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use serde_json::json;
 use std::{
@@ -171,8 +171,43 @@ fn live_direct_routes(
     routes
 }
 
-fn respond(broker: &Broker, local_peer: &str, incoming: Incoming) {
+async fn respond(broker: &Broker, local_peer: &str, incoming: Incoming) {
     let peer = incoming.peer.to_string();
+    let directory_request = matches!(
+        &incoming.request.operation,
+        Operation::Directory | Operation::DirectorySupported { .. }
+    );
+    let snapshots = if matches!(
+        &incoming.request.operation,
+        Operation::Directory | Operation::DirectorySupported { .. }
+    ) {
+        let authorized = {
+            let db = broker.db.lock().unwrap();
+            db.network_config().is_ok_and(|config| config.enabled)
+                && db.peer(&peer).is_ok_and(|peer| !peer.revoked)
+        };
+        if authorized {
+            Some(
+                async {
+                    let requested = match &incoming.request.operation {
+                        Operation::DirectorySupported { providers } => providers.clone(),
+                        _ => vec!["claude".into(), "codex".into(), "inbox".into()],
+                    };
+                    validate_providers(&requested)?;
+                    let selected = requested
+                        .iter()
+                        .map(|provider| provider.parse())
+                        .collect::<Result<Vec<_>>>()?;
+                    broker.read_native_snapshots(selected).await
+                }
+                .await,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let response = (|| -> Result<WireResponse> {
         ensure!(
             incoming.request.version == VERSION,
@@ -186,6 +221,31 @@ fn respond(broker: &Broker, local_peer: &str, incoming: Incoming) {
             });
         }
         ensure!(!db.peer(&peer)?.revoked, "Peer is revoked");
+        let export = |providers: &[String]| -> Result<_> {
+            let snapshots = snapshots
+                .as_ref()
+                .context("Native directory unavailable")?
+                .as_ref()
+                .map_err(|_| anyhow!("Native directory unavailable"))?;
+            let mut directory = broker.project_directory(&db, snapshots, false)?;
+            // A peer with no Discover grant for a provider has a policy-empty
+            // view regardless of that provider's availability. Recheck current
+            // grants after native I/O; never let a new grant use a stale fallback.
+            let grants = db.peer(&peer)?.grants;
+            directory.providers.retain(|provider, _| {
+                providers.iter().any(|selected| selected == provider)
+                    && grants.iter().any(|grant| {
+                        grant.provider.label() == provider
+                            && grant.permission == super::trust::Permission::Discover
+                    })
+            });
+            let candidates = directory
+                .complete_agents()?
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<serde_json::Result<Vec<_>>>()?;
+            db.export_directory_candidates(&peer, providers, candidates)
+        };
         Ok(match incoming.request.operation {
             Operation::Hello { machine_name } => {
                 db.remember_peer_name(&peer, &machine_name)?;
@@ -194,13 +254,13 @@ fn respond(broker: &Broker, local_peer: &str, incoming: Incoming) {
                 }
             }
             Operation::Directory => WireResponse::Directory {
-                agents: db.export_agents(&peer)?,
+                agents: export(&["claude".into(), "codex".into(), "inbox".into()])?,
             },
             Operation::DirectorySupported { providers } => {
                 validate_providers(&providers)?;
                 WireResponse::SupportedDirectory {
                     providers: supported_providers(),
-                    agents: db.export_agents_supported(&peer, &providers)?,
+                    agents: export(&providers)?,
                 }
             }
             Operation::Send { envelope } => {
@@ -214,7 +274,7 @@ fn respond(broker: &Broker, local_peer: &str, incoming: Incoming) {
         })
     })();
     let response = response.unwrap_or_else(|error| WireResponse::Rejected {
-        retryable: super::store::retryable(&error),
+        retryable: directory_request || super::store::retryable(&error),
         reason: error.to_string(),
     });
     let _ = incoming.response.send(response);
@@ -341,6 +401,7 @@ pub async fn run(broker: Broker) {
     let mut local_peer = String::new();
     let mut allowed_cache = Vec::new();
     let mut tasks: FuturesUnordered<BoxFuture<'static, Completed>> = FuturesUnordered::new();
+    let mut responses: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
     let mut busy = HashSet::new();
     let mut schedules: HashMap<String, Schedule> = HashMap::new();
     let mut last_routes = BTreeMap::new();
@@ -715,7 +776,15 @@ pub async fn run(broker: Broker) {
                     None => std::future::pending().await,
                 }
             } => match incoming {
-                NetworkIncoming::Message(incoming) => respond(&broker, &local_peer, incoming),
+                NetworkIncoming::Message(incoming) => {
+                    if responses.len() >= 64 {
+                        let _ = incoming.response.send(WireResponse::Rejected { reason:"Directory/request capacity reached".into(), retryable:true });
+                    } else {
+                        let broker = broker.clone();
+                        let local = local_peer.clone();
+                        responses.push(Box::pin(async move { respond(&broker, &local, incoming).await }));
+                    }
+                },
                 NetworkIncoming::Pairing(incoming) => {
                     let result = (|| -> Result<serde_json::Value> {
                         let db = broker.db.lock().unwrap();
@@ -729,6 +798,7 @@ pub async fn run(broker: Broker) {
                 }
                 NetworkIncoming::Stopped => { schedules.clear(); active = None; *broker.network_handle.lock().unwrap() = None; broker.network_generation.fetch_add(1,std::sync::atomic::Ordering::SeqCst); start_after = Instant::now() + Duration::from_secs(2); }
             },
+            Some(()) = responses.next(), if !responses.is_empty() => {},
             Some(done) = pairing_tasks.next(), if !pairing_tasks.is_empty() => {
                 pairing_busy.remove(&done.id);
                 // Protocol progress is driven by authenticated packets, never by
@@ -1076,7 +1146,8 @@ mod tests {
                 request,
                 response,
             },
-        );
+        )
+        .await;
         assert!(matches!(
             received.await.unwrap(),
             WireResponse::Rejected {

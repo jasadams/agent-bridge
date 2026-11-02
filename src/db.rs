@@ -332,6 +332,15 @@ impl Db {
     }
 
     pub fn register(&mut self, agent: &Agent, replace: bool) -> Result<()> {
+        self.register_binding(agent, replace, true)
+    }
+
+    /// Native availability refreshes bindings, but cannot create owner intent.
+    pub(crate) fn bind_native(&mut self, agent: &Agent, replace: bool) -> Result<()> {
+        self.register_binding(agent, replace, false)
+    }
+
+    fn register_binding(&mut self, agent: &Agent, replace: bool, owner: bool) -> Result<()> {
         ensure!(
             valid_name(&agent.name),
             "Agent names use 1–100 letters, digits, dots, underscores or hyphens"
@@ -369,7 +378,19 @@ impl Db {
             tx.execute("UPDATE messages SET state='uncertain',detail='Recipient registration changed during attempted OpenCode reconciliation',updated=? WHERE recipient=? AND state='queued' AND id IN(SELECT id FROM opencode_deliveries WHERE phase<>'queued')",params![now(),agent.name])?;
             tx.execute("UPDATE messages SET state='failed',detail='Recipient registration was replaced',updated=? WHERE recipient=? AND state='queued'", params![now(), agent.name])?;
         }
-        tx.execute("INSERT INTO agents VALUES(?1,?2,?3,?4,?5) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider,session=excluded.session,endpoint=excluded.endpoint,enabled=excluded.enabled",params![agent.name, agent.provider.label(), agent.session, agent.endpoint, agent.enabled])?;
+        let enabled = agent.enabled
+            && (owner
+                || crate::directory_policy::owner_policy_enabled_on(
+                    &tx,
+                    &agent.provider,
+                    &agent.session,
+                    &agent.name,
+                )?);
+        tx.execute("INSERT INTO agents VALUES(?1,?2,?3,?4,?5) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider,session=excluded.session,endpoint=excluded.endpoint,enabled=excluded.enabled",params![agent.name, agent.provider.label(), agent.session, agent.endpoint, enabled])?;
+        if owner {
+            tx.execute("INSERT INTO agent_owner_policy(name,provider,session,enabled) VALUES(?1,?2,?3,?4) ON CONFLICT(name,provider,session) DO UPDATE SET enabled=excluded.enabled", params![agent.name, agent.provider.label(), agent.session, agent.enabled])?;
+            crate::directory_policy::clamp_bindings_on(&tx, &agent.provider, &agent.session)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -468,7 +489,7 @@ impl Db {
         enabled: bool,
     ) -> Result<()> {
         let routing_name = crate::clients::lifecycle::routing_name(&Provider::Codex, session);
-        self.register(
+        self.bind_native(
             &Agent {
                 name: routing_name,
                 provider: Provider::Codex,
@@ -512,10 +533,28 @@ impl Db {
 
     pub fn unregister(&self, name: &str, session: &str) -> Result<()> {
         ensure!(name != "user", "Cannot unregister the user inbox");
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        // Select from the unchanged exact binding so stale alias requests never
+        // create policy for a replacement UUID (or for an unknown route).
+        tx.execute(
+            "INSERT INTO agent_owner_policy(name,provider,session,enabled) SELECT name,provider,session,0 FROM agents WHERE name=?1 AND session=?2 ON CONFLICT(name,provider,session) DO UPDATE SET enabled=0",
+            params![name, session],
+        )?;
+        tx.execute(
             "UPDATE agents SET enabled=0 WHERE name=? AND session=?",
             params![name, session],
         )?;
+        let provider: Option<String> = tx
+            .query_row(
+                "SELECT provider FROM agents WHERE name=? AND session=?",
+                params![name, session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(provider) = provider {
+            crate::directory_policy::clamp_bindings_on(&tx, &provider.parse()?, session)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

@@ -117,7 +117,7 @@ fn message() -> Message {
 
 async fn broker_delivery(plugin: &PluginSocket) -> Message {
     let state = plugin.root.path().join("delivery-state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let server = tokio::spawn(broker::serve(bound));
     let agent = plugin.agent();
     broker::rpc(
@@ -212,7 +212,7 @@ async fn live_registration_titles_disposal_and_endpoint_conflicts_use_shared_reg
     let plugin = PluginSocket::start(4, receipt);
     let agent = plugin.agent();
     let state = plugin.root.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let server = tokio::spawn(broker::serve(bound));
     for title in ["First", "Renamed"] {
         broker::rpc(
@@ -363,7 +363,7 @@ fn opencode_endpoint_requires_private_socket_and_canonical_instance() {
 async fn paused_broker_expires_crashed_leases_and_queued_deadlines_without_native_events() {
     let plugin = PluginSocket::start(1, receipt);
     let state = plugin.root.path().join("expiry-state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
     let server = tokio::spawn(broker::serve(bound));
     let agent = plugin.agent();
     broker::rpc(
@@ -510,7 +510,7 @@ async fn topic_push_opencode_admission_fences_old_epoch_but_not_accepted_work() 
                 deferred
             }
         });
-        let bound = Broker::bind(state, "/missing/codex".into()).unwrap();
+        let bound = support::bind(state, "/missing/codex".into()).unwrap();
         let broker = bound.broker.clone();
         let server = tokio::spawn(broker::serve(bound));
         broker
@@ -666,7 +666,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
                 Some(missing)
             }
         });
-        let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+        let bound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
         let mut broker = bound.broker.clone();
         let mut server = tokio::spawn(broker::serve(bound));
         let observe = || Request::OpenCodeObserve {
@@ -828,7 +828,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
                 [SESSION],
             )
             .unwrap();
-        let rebound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+        let rebound = support::bind(state.clone(), "/missing/codex".into()).unwrap();
         broker = rebound.broker.clone();
         server = tokio::spawn(broker::serve(rebound));
         assert_eq!(

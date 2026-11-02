@@ -11,6 +11,20 @@ use tokio::{
     time::timeout,
 };
 
+#[path = "support/claude_directory.rs"]
+mod native_claude;
+
+fn bind(state: std::path::PathBuf, root: &std::path::Path) -> broker::BoundServer {
+    let mut bound = Broker::bind(state, "/missing/codex".into()).unwrap();
+    let root = root.join("fake-cli");
+    std::fs::create_dir_all(&root).unwrap();
+    bound.broker = bound
+        .broker
+        .clone()
+        .with_claude_binary(native_claude::write_cli(&root, &json!([])));
+    bound
+}
+
 fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -29,7 +43,7 @@ async fn claude_socket_only_history_allows_65_sends_without_receipts_or_status_p
     let sink = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let state = dir.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = bind(state.clone(), dir.path());
     let server = tokio::spawn(broker::serve(bound));
     broker::rpc(
         &state,
@@ -84,7 +98,13 @@ async fn claude_socket_only_history_allows_65_sends_without_receipts_or_status_p
     let bound = timeout(Duration::from_secs(3), async {
         loop {
             match Broker::bind(state.clone(), "/missing/codex".into()) {
-                Ok(bound) => break bound,
+                Ok(mut bound) => {
+                    bound.broker = bound
+                        .broker
+                        .clone()
+                        .with_claude_binary(dir.path().join("fake-cli/claude"));
+                    break bound;
+                }
                 Err(error) if error.to_string().contains("owns this state directory") => {
                     tokio::time::sleep(Duration::from_millis(20)).await
                 }
@@ -133,7 +153,7 @@ async fn real_broker_routes_native_claude_frame_and_accepts_correlated_reply() {
     let sink = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let state = dir.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = bind(state.clone(), dir.path());
     let server = tokio::spawn(broker::serve(bound));
     let session = id();
     let name = "claude-test";
@@ -264,7 +284,7 @@ async fn codex_adapter_never_spawns_an_argv_fallback_for_invalid_sessions() {
 async fn saturated_connections_do_not_reset_accepted_status_request() {
     let dir = temp();
     let state = dir.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = bind(state.clone(), dir.path());
     let server = tokio::spawn(broker::serve(bound));
     let mut idle = Vec::new();
     for _ in 0..64 {
@@ -304,7 +324,7 @@ async fn saturated_connections_do_not_reset_accepted_status_request() {
 async fn exclusive_service_lock_and_bad_frames_do_not_break_the_broker() {
     let dir = temp();
     let state = dir.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let bound = bind(state.clone(), dir.path());
     assert!(Broker::bind(state.clone(), "/missing/codex".into()).is_err());
     let server = tokio::spawn(broker::serve(bound));
     let mut stream = UnixStream::connect(state.join("bridge.sock"))

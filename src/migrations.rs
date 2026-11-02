@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -313,6 +313,21 @@ CREATE TRIGGER topic_push_failed_gap AFTER UPDATE OF state ON messages WHEN OLD.
 END;",
         )?;
         tx.pragma_update(None, "user_version", 19)?;
+    }
+    if version < 20 {
+        // Legacy enabled flags have ambiguous provenance. Preserve every value
+        // conservatively; subsequent native observations never write policy.
+        tx.execute_batch(
+            "CREATE TABLE agent_owner_policy(
+ name TEXT NOT NULL,
+ provider TEXT NOT NULL,
+ session TEXT NOT NULL,
+ enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+ PRIMARY KEY(name,provider,session)
+);
+INSERT INTO agent_owner_policy(name,provider,session,enabled) SELECT name,provider,session,enabled FROM agents;",
+        )?;
+        tx.pragma_update(None, "user_version", 20)?;
     }
     tx.commit()?;
     Ok(())

@@ -98,8 +98,12 @@ pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value
     fields(value, names)
 }
 
-pub(super) fn agents(value: Value, verbose: bool) -> Value {
+pub(super) fn agents(mut value: Value, verbose: bool) -> Value {
     if verbose {
+        return value;
+    }
+    if let Some(rows) = value.get_mut("agents") {
+        *rows = agents(rows.take(), false);
         return value;
     }
     let Value::Array(rows) = value else {
@@ -131,6 +135,12 @@ pub(super) fn agents(value: Value, verbose: bool) -> Value {
                             "qualified_name",
                             "enabled",
                             "stale_reason",
+                            "native_status",
+                            "native_available",
+                            "deliverable",
+                            "delivery_unavailable_reason",
+                            "cwd",
+                            "native_updated_at",
                         ],
                     )
                 }

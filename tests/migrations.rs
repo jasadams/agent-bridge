@@ -125,6 +125,8 @@ fn version_one_database_adds_trust_tables_without_reinitializing_settings() {
 // Reconstitute the previous numbered schema, including rows older binaries wrote.
 fn version_ten_fixture(conn: &mut Connection) {
     agent_bridge::migrations::migrate(conn).unwrap();
+    conn.execute_batch("DROP TABLE agent_owner_policy;")
+        .unwrap();
     conn.execute_batch(include_str!("fixtures/native-metadata-v10.sql"))
         .unwrap();
     conn.execute_batch("INSERT INTO native_claude VALUES('97e8d81e-073d-4cde-a017-4a8255b7b3b8','duplicate'),('empty',''),('null',NULL);
@@ -314,7 +316,7 @@ fn schema_thirteen_unknown_local_codex_queue_is_blocked_without_replay_and_is_id
     )
     .unwrap();
     conn.execute_batch(
-        "DROP TRIGGER topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; PRAGMA user_version=13;",
+        "DROP TABLE agent_owner_policy; DROP TRIGGER topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; PRAGMA user_version=13;",
     )
     .unwrap();
     drop(conn);

@@ -2,6 +2,7 @@ use agent_bridge::{
     broker::{self, Broker},
     protocol::Request,
 };
+mod support;
 use serde_json::Value;
 use std::{path::Path, time::Duration};
 use tokio::{
@@ -16,7 +17,7 @@ struct Running {
 }
 impl Running {
     fn start(path: &Path) -> Self {
-        let bound = Broker::bind(path.into(), "/missing/codex".into()).unwrap();
+        let bound = support::bind(path.into(), "/missing/codex".into()).unwrap();
         let broker = bound.broker.clone();
         let task = tokio::spawn(broker::serve(bound));
         Self { broker, task }

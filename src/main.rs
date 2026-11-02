@@ -145,6 +145,9 @@ enum Commands {
         /// Show the cached permitted directory of remote agents.
         #[arg(long, conflicts_with = "all")]
         remote: bool,
+        /// Native activity-age selection where supported (OpenCode only).
+        #[arg(long, default_value_t = 7, conflicts_with = "remote")]
+        max_age_days: u32,
     },
     Status,
     /// Check for releases or update a managed installation after confirmation.
@@ -964,11 +967,15 @@ async fn main() -> Result<()> {
             replace,
         },
         Commands::Unregister { name, session } => Request::Unregister { name, session },
-        Commands::List { all, remote } => {
+        Commands::List {
+            all,
+            remote,
+            max_age_days,
+        } => {
             if remote {
                 Request::RemoteList
             } else {
-                Request::List { all }
+                Request::Directory { all, max_age_days }
             }
         }
         Commands::Subscribe { agent, events } => {
@@ -1278,19 +1285,31 @@ async fn main() -> Result<()> {
     // Validate the selected local destination before opening admission or
     // creating an exchange. Failed selection must not leave a hidden window.
     if let Some((agent, _)) = &notify_agent {
-        let agents = broker::rpc(&state_dir, &Request::List { all: false }).await?;
+        let directory = broker::rpc(
+            &state_dir,
+            &Request::Directory {
+                all: false,
+                max_age_days: 7,
+            },
+        )
+        .await?;
+        let agents = &directory["agents"];
         anyhow::ensure!(
-            agents
-                .as_array()
-                .is_some_and(|agents| agents.iter().any(|entry| entry["name"] == *agent
+            agents.as_array().is_some_and(|agents| agents.iter().any(
+                |entry| entry["name"] == *agent
                     && entry["enabled"] == true
+                    && entry["deliverable"] != false
+                    && entry["endpoint"].as_str().is_some_and(
+                        |endpoint| !endpoint.is_empty() || entry["provider"] != "claude"
+                    )
                     && entry["provider"]
                         .as_str()
                         .and_then(|provider| provider.parse::<Provider>().ok())
                         .is_some_and(|provider| agent_bridge::clients::supports(
                             &provider,
                             agent_bridge::clients::Capability::PairingPrompts
-                        )))),
+                        ))
+            )),
             "Pairing owner input is unavailable for this session; omit --agent and use the explicit pairing CLI confirmation path"
         );
     }

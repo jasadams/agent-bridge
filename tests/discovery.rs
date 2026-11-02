@@ -1,4 +1,6 @@
 use agent_bridge::{broker::Broker, db::Db, discovery, protocol::Request};
+#[path = "support/claude_directory.rs"]
+mod claude_directory;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -9,6 +11,15 @@ use tokio::{
 
 fn id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+fn bind(state: std::path::PathBuf) -> agent_bridge::broker::BoundServer {
+    let mut bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let directory = state.join("native-directory");
+    std::fs::create_dir_all(&directory).unwrap();
+    let cli = claude_directory::write_cli(&directory, &json!([]));
+    bound.broker = bound.broker.clone().with_claude_binary(cli);
+    bound
 }
 
 #[test]
@@ -64,7 +75,7 @@ async fn observer_discovers_loaded_sessions_and_follows_native_events_without_re
     std::fs::create_dir(&home).unwrap();
     let socket = dir.path().join("native.sock");
     let native = UnixListener::bind(&socket).unwrap();
-    let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = bind(dir.path().join("state"));
     let broker = bound.broker.clone();
     let observer =
         tokio::spawn(async move { discovery::observe_connection(&broker, &socket, &home).await });
@@ -156,7 +167,7 @@ async fn default_list_hides_exited_sessions_and_all_preserves_history_and_restar
         .prefix("abl-")
         .tempdir_in("/tmp")
         .unwrap();
-    let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = bind(dir.path().join("state"));
     let session = id();
     let thread = json!({"id":session,"name":"returning-peer","status":{"type":"idle"}});
     bound.broker.observe_codex(&thread).unwrap();
@@ -245,7 +256,7 @@ async fn complete_paginated_baseline_preserves_live_events_and_ignores_reads_pre
     std::fs::create_dir(&home).unwrap();
     let path = dir.path().join("native.sock");
     let listener = UnixListener::bind(&path).unwrap();
-    let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+    let bound = bind(dir.path().join("state"));
     let keep = id();
     let absent = id();
     let joining = id();
@@ -350,7 +361,7 @@ async fn partial_failed_or_malformed_loaded_scans_never_retire_persisted_session
         std::fs::create_dir(&home).unwrap();
         let path = dir.path().join("native.sock");
         let listener = UnixListener::bind(&path).unwrap();
-        let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
+        let bound = bind(dir.path().join("state"));
         let persisted = id();
         bound
             .broker
