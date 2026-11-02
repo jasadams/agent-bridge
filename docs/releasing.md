@@ -25,10 +25,14 @@ builds use the manifest's fallback version.
 The `Release` workflow validates the strict `vMAJOR.MINOR.PATCH` tag and that its
 commit belongs to `main`. It runs tests and lint checks, builds Linux x86_64/ARM64
 and macOS Apple Silicon binaries, checks their reported versions, then
-publishes a GitHub release after all platforms succeed. Pull requests, ordinary
-main pushes and manual runs on branches run the same three-platform source,
+publishes a GitHub release after all platforms succeed. Pull requests and
+manual runs on branches run the same three-platform source,
 test, lint, installer and packaging checks. They skip optimized executable builds,
 macOS signing, release-binary version checks and release artifact uploads.
+
+Ordinary main pushes do not trigger the workflow, avoiding a redundant validation
+run when a reviewed PR is merged and tagged. Direct main changes can be validated
+with a manual run; release tags always validate the merged commit before publishing.
 
 Release preparation therefore requires no optimized PR or main build to finish
 before tagging a reviewed, validated commit. The tag workflow runs all required

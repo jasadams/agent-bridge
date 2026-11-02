@@ -57,7 +57,8 @@ Never modify the user's running service or private state for validation.
 
 ## CI and backlog-fast
 
-`.github/workflows/release.yml` already runs on pull requests and main pushes.
+`.github/workflows/release.yml` runs on pull requests, version-tag pushes, and
+manual dispatch, not plain main pushes (which would duplicate PR/tag validation).
 Its four-platform matrix validates formatting, package tests and Clippy, vendor
 relay tests/formatting/Clippy, installer and release Python checks, and release
 binary builds. Only semantic version tag pushes can publish. See

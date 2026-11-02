@@ -163,6 +163,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(matches), 1, block)
         return matches[0]
 
+    def test_triggers_validate_prs_and_release_tags_without_duplicate_main_push(self):
+        triggers = self.workflow.split('\non:\n', 1)[1].split('\npermissions:', 1)[0]
+        events = dict(re.findall(
+            r'^  ([a-z_]+):(.*?)(?=^  [a-z_]+:|\Z)',
+            triggers, re.MULTILINE | re.DOTALL))
+        self.assertEqual(set(events), {'push', 'pull_request', 'workflow_dispatch'})
+        # A tags-only push filter excludes every branch push. Removing the tag
+        # filter instead would accidentally enable pushes for all branches.
+        self.assertEqual(events['push'].strip(), "tags: ['v*']")
+        self.assertEqual(events['pull_request'].strip(), '')
+        self.assertEqual(events['workflow_dispatch'].strip(), '')
+
     def test_four_platform_source_validation_is_unconditional(self):
         build = self.jobs['build']
         self.assertRegex(build, r'(?m)^    needs: metadata$')
