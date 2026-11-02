@@ -1,5 +1,6 @@
+mod support;
+
 use agent_bridge::{
-    broker::Broker,
     db::Db,
     protocol::{Agent, Provider, Request},
 };
@@ -129,7 +130,7 @@ fn malformed_unsupported_missing_and_oversized_cursors_are_errors() {
 #[tokio::test]
 async fn broker_adds_metadata_and_keeps_legacy_history_unchanged() {
     let directory = tempfile::tempdir().unwrap();
-    let server = Broker::bind(directory.path().into(), "/missing/codex".into()).unwrap();
+    let server = support::bind(directory.path().into(), "/missing/codex".into()).unwrap();
     let broker = &server.broker;
     broker
         .request(Request::Register {
