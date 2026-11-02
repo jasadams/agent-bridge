@@ -189,6 +189,33 @@ reports diagnostics through `agent-bridge status`, and retries. Permanent deleti
 affects only broker-managed archives and their metadata, never user-managed
 external backups. See [retention and recovery details](board.md#archive-and-restore).
 
+## Local topics
+
+The Topics view shows local topics and their durable history. Select a topic by
+its displayed ID, create or rename one, and archive or restore it without changing
+its ID. Archived topics remain readable but reject new posts. The composer publishes
+as the local human inbox; the browser cannot select another author. Replies and
+mentions use exact IDs, with display names as labels only. Publication means durable
+acceptance, not that any agent received or completed a task.
+
+The timeline loads a bounded recent page and can load older posts. While Topics is
+visible, bounded incremental reads discover new posts; background polling pauses
+when the document is hidden. Drafts are kept in this tab's memory while switching
+topics or views, and are cleared on lock or reload. If a publication's response is
+lost, retry uses its original ID and exact payload; discarding an uncertain draft
+does not cancel a publication that may already have been accepted. Topic names and
+message bodies are rendered as text, not executable HTML.
+
+Authentication loss or rejection locks the monitor and clears topic drafts and
+pending retry IDs. If a publication was accepted just before access was revoked,
+its outcome may be uncertain and its exact retry payload cannot be recovered after
+locking. After regaining access, inspect the topic history before composing another
+message. No retry is automatic.
+
+Topic reads and writes use the same loopback monitor token, origin checks, request
+limits and revocation boundary described below. Topics do not add a web permission,
+membership, federation or native delivery subsystem.
+
 ## Browser access
 
 API requests carry a random access token in an Authorization header. The page

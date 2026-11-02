@@ -8,6 +8,7 @@
   <title>Agent Bridge · Boards</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/boards.js" defer></script>
+  <script src="/topics.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -30,7 +31,16 @@
       </form>
     </section>
     <section id="workspace" aria-label="Local monitor" hidden>
-      <nav class="view-navigation" aria-label="Monitor views"><button id="boards-tab" type="button" aria-pressed="true">Boards</button><button id="messages-tab" type="button" aria-pressed="false">Messages</button></nav>
+      <nav class="view-navigation" aria-label="Monitor views"><button id="boards-tab" type="button" aria-pressed="true">Boards</button><button id="messages-tab" type="button" aria-pressed="false">Messages</button><button id="topics-tab" type="button" aria-pressed="false">Topics</button></nav>
+      <section id="topics-view" aria-label="Topics" hidden>
+        <div class="topics-layout">
+          <aside aria-labelledby="topics-heading"><div class="panel-heading"><h1 id="topics-heading">Topics</h1><button id="topic-create" type="button">Create topic</button></div><p id="topic-list-status" role="status"></p><ul id="topic-list"></ul></aside>
+          <section aria-labelledby="topic-heading"><div class="panel-heading"><div><h2 id="topic-heading">Choose a topic</h2><p id="topic-id" class="help"></p></div><div><button id="topic-rename" type="button" disabled>Rename</button><button id="topic-archive" type="button" disabled>Archive</button></div></div>
+            <p id="topic-status" role="status" aria-live="polite"></p><button id="topic-older" type="button" hidden>Load older</button><ol id="topic-posts" aria-label="Topic messages"></ol>
+            <form id="topic-composer"><p id="topic-reply" class="help"></p><button id="topic-clear-reply" type="button" hidden>Cancel reply</button><label for="topic-mentions">Mention agents</label><select id="topic-mentions" multiple></select><label for="topic-body">Your message</label><textarea id="topic-body" rows="4" maxlength="65536"></textarea><button id="topic-send" type="submit" disabled>Publish</button><button id="topic-discard-uncertain" type="button" hidden>Discard uncertain draft</button><p id="topic-feedback" role="status" aria-live="polite"></p></form>
+          </section>
+        </div>
+      </section>
       <div id="messages-view" hidden>
       <div class="page-heading"><div><span class="eyebrow">Local observability</span><h1>Message activity<span class="live-tag">Live</span></h1><p>Every hop, with the context to follow it.</p></div><div class="machine-card"><span class="caption">This machine</span><strong id="local-machine">Local bridge</strong><span id="last-updated" class="help">Waiting for messages</span></div></div>
       <form id="filters" class="filters" aria-label="Filter messages">

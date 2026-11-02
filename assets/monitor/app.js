@@ -16,6 +16,7 @@
   const list = $("message-list");
   let token = null;
   let boards = null;
+  let topics = null;
   let messagesDirty = true;
   const rowNodes = new Map();
   let detailSignature = null;
@@ -23,8 +24,11 @@
     document.body.dataset.view = name;
     $("messages-view").hidden = name !== "messages";
     $("boards-view").hidden = name !== "boards";
+    $("topics-view").hidden = name !== "topics";
     $("messages-tab").setAttribute("aria-pressed", String(name === "messages"));
     $("boards-tab").setAttribute("aria-pressed", String(name === "boards"));
+    $("topics-tab").setAttribute("aria-pressed", String(name === "topics"));
+    if (name !== "topics") topics?.stop();
     if (name === "messages" && token && messagesDirty) scheduleRefresh();
   }
   let generation = 0;
@@ -59,6 +63,7 @@
     generation += 1;
     token = null;
     boards?.clear();
+    topics?.clear();
     view("locked");
     sessionAbort?.abort();
     streamAbort?.abort();
@@ -420,9 +425,14 @@
     authenticated: () => !!token,
     onViewChange: view,
   });
+  topics = window.createTopicMonitor({ request: (path, options) => api(path, generation, options) });
+  $("topics-tab").addEventListener("click", () => { void boards.leave(() => { view("topics"); topics.open(); }); });
   $("messages-tab").addEventListener("click", () => { void boards.leave(() => view("messages")); });
   $("boards-tab").addEventListener("click", () => { void boards.open(); });
-  $("lock-button").addEventListener("click", () => { void boards.leave(() => { lock(); $("access-token").focus(); }, true); });
+  $("lock-button").addEventListener("click", () => {
+    if (topics.hasDrafts() && !window.confirm("Locking discards topic drafts. An uncertain publication may already have been accepted. Discard drafts and lock?")) return;
+    void boards.leave(() => { lock(); $("access-token").focus(); }, true);
+  });
   $("filters").addEventListener("submit", (event) => {
     event.preventDefault();
     const next = new URLSearchParams();
@@ -456,6 +466,9 @@
     renderRows();
   });
   window.addEventListener("pagehide", () => lock());
+  window.addEventListener("beforeunload", event => {
+    if (topics.hasDrafts()) { event.preventDefault(); event.returnValue = ""; }
+  });
   function unlockFromLink(value) {
     // A link must not replace an active session or discard its response draft.
     if (!value || token) return;
