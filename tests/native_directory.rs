@@ -11,7 +11,7 @@ mod native_claude;
 async fn claude_native_membership_replaces_stored_discovery_without_registration() {
     let root = tempfile::Builder::new()
         .prefix("ab43-")
-        .tempdir_in("/tmp/opencode")
+        .tempdir()
         .unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let native = uuid::Uuid::new_v4().to_string();
@@ -68,7 +68,7 @@ async fn claude_native_membership_replaces_stored_discovery_without_registration
 async fn unavailable_native_directory_is_explicit_and_does_not_erase_other_results() {
     let root = tempfile::Builder::new()
         .prefix("ab43-")
-        .tempdir_in("/tmp/opencode")
+        .tempdir()
         .unwrap();
     let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = bound
@@ -374,7 +374,7 @@ fn legacy_ambiguity_is_not_discarded_when_a_fresh_claude_title_matches() {
 async fn sharing_and_sender_labels_follow_native_rename_not_cached_old_uuid() {
     let root = tempfile::Builder::new()
         .prefix("ab43-names-")
-        .tempdir_in("/tmp/opencode")
+        .tempdir()
         .unwrap();
     agent_bridge::broker::private_dir(root.path()).unwrap();
     let a = uuid::Uuid::new_v4().to_string();
