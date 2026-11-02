@@ -160,7 +160,7 @@ struct Running {
 }
 impl Running {
     fn start(path: &Path) -> Self {
-        let bound = Broker::bind(path.into(), "/missing/codex".into()).unwrap();
+        let bound = support::bind(path.into(), "/missing/codex".into()).unwrap();
         Self {
             broker: bound.broker.clone(),
             task: tokio::spawn(broker::serve(bound)),

@@ -125,8 +125,6 @@ fn version_one_database_adds_trust_tables_without_reinitializing_settings() {
 // Reconstitute the previous numbered schema, including rows older binaries wrote.
 fn version_ten_fixture(conn: &mut Connection) {
     agent_bridge::migrations::migrate(conn).unwrap();
-    conn.execute_batch("DROP TABLE agent_owner_policy;")
-        .unwrap();
     conn.execute_batch(include_str!("fixtures/native-metadata-v10.sql"))
         .unwrap();
     conn.execute_batch("INSERT INTO native_claude VALUES('97e8d81e-073d-4cde-a017-4a8255b7b3b8','duplicate'),('empty',''),('null',NULL);

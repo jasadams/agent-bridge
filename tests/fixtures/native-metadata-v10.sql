@@ -1,3 +1,5 @@
+-- Remove owner intent introduced after this historical fixture schema.
+DROP TABLE IF EXISTS agent_owner_policy;
 -- Remove local topics introduced after this fixture schema, children first.
 DROP TRIGGER IF EXISTS topic_push_failed_gap;
 DROP TABLE IF EXISTS topic_push_work;

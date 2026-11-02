@@ -14,7 +14,7 @@ struct Running {
 }
 impl Running {
     fn start(state: &std::path::Path) -> Self {
-        let server = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let server = support::bind(state.into(), "/missing/codex".into()).unwrap();
         Self {
             broker: server.broker.clone(),
             task: tokio::spawn(broker::serve(server)),

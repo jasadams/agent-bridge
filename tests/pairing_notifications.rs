@@ -1,5 +1,6 @@
 //! Exercise owner prompts through real loopback QUIC and the private native
 //! Claude socket transport. No model process or existing session is contacted.
+mod support;
 use agent_bridge::{
     broker::{self, Broker},
     protocol::{Agent, Provider, Request},
@@ -19,7 +20,7 @@ struct Running {
 }
 impl Running {
     fn start(state: &Path) -> Self {
-        let server = Broker::bind(state.into(), "/missing/codex".into()).unwrap();
+        let server = support::bind(state.into(), "/missing/codex".into()).unwrap();
         Self {
             broker: server.broker.clone(),
             task: tokio::spawn(broker::serve(server)),
@@ -413,6 +414,13 @@ async fn cli_selects_current_codex_or_explicit_agent_and_rejects_invalid_agent_b
         replace: false,
     });
     let native = Native::start(&broker, &root.path().join("native"), "explicit-owner");
+    support::claude_directory::set_rows(
+        &state.join("native-cli"),
+        &json!([{
+            "sessionId":native.agent.session,"name":native.agent.name,
+            "cwd":"/fixture","kind":"interactive","startedAt":0,"status":"idle"
+        }]),
+    );
     let executable = env!("CARGO_BIN_EXE_agent-bridge");
     let output = tokio::process::Command::new(executable)
         .arg("--state-dir")
