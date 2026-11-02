@@ -2,17 +2,17 @@ import { Plugin } from "@opencode/plugin";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { brokerRpc, MAX_FRAME } from "./rpc.ts";
+import { brokerRpc, MAX_FRAME, RpcNotSubmittedError } from "./rpc.ts";
 import { sameUser } from "./peer.ts";
 import { Journal, JournalCapacityError, nativeID, validateAcceptance, type Identity } from "./journal.ts";
 
 const SESSION = /^ses_[a-zA-Z0-9]{26}$/;
 const UUID = /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/;
-const LEASE_MS = 20000, HEARTBEAT_MS = 5000, RECEIPT_MS = 3000;
+const LEASE_MS = 20000, HEARTBEAT_MS = 5000, RECEIPT_MS = 3000, MAX_RECOVERABLE = 1024;
 type Delivery = Identity & { op: "deliver" | "reconcile"; generation: string; attempt: string };
 type Reply = { ok: boolean; instance: string; protocol: number; session: string; id?: string; namespace?: string; generation?: string; attempt?: string; native_message_id?: string; status?: "inserted" | "deferred" | "uncertain"; error?: string };
 type Frame = { op: "probe"; session: string } | Delivery;
-type Live = { generation: string; namespace: string; expires: number; revision: number };
+type Live = { generation: string; namespace: string; expires: number; revision: number; nextHeartbeat: number; metadataVersion: number; metadataApplied: number };
 type Data = { buffer: Buffer; handled: boolean; timer?: ReturnType<typeof setTimeout> };
 class InvalidNativeSession extends Error {}
 
@@ -58,9 +58,41 @@ const AgentBridge = Plugin.define({
     const heartbeats = new Set<Live>();
     const observing = new Set<string>();
     const recoverable = new Set<string>();
+    const conflictUntil = new Map<string, number>();
+    const recoverAfter = new Map<string, number>();
     let disposed = false, events = Promise.resolve();
+    let rescanNeeded = false, rescanQueued = false, nextRescan = 0;
+    let overloadLogAt = 0;
+    function reportFailure(category: string, error: unknown) {
+      if (error instanceof Error && /^Broker RPC (capacity exhausted|admission timed out) before submission \(active=\d+, queued=\d+\)$/.test(error.message)) {
+        if (Date.now() >= overloadLogAt) {
+          overloadLogAt = Date.now() + 10000;
+          console.error(`Agent Bridge: ${category}: ${error.message}`);
+        }
+      } else console.error(`Agent Bridge: ${category} is unavailable`);
+    }
+    function remember(session: string) {
+      if (recoverable.has(session)) return;
+      if (recoverable.size >= MAX_RECOVERABLE) {
+        rescanNeeded = true;
+        if (Date.now() >= overloadLogAt) {
+          overloadLogAt = Date.now() + 10000;
+          console.error(`Agent Bridge: native session recovery capacity reached (retained=${recoverable.size}); rescan scheduled`);
+        }
+        return;
+      }
+      recoverable.add(session);
+    }
+    function delayRecovery(session: string) {
+      if (recoverable.has(session)) recoverAfter.set(session, Date.now() + 4000);
+      else rescanNeeded = true;
+    }
     const sessionEvents = new Map<string, Promise<void>>();
+    const sessionDepth = new Map<string, number>();
     const lifecycle = new Map<string, number>();
+    const metadataVersions = new Map<string, number>();
+    const pendingActivity = new Map<string, number>();
+    let recoveryInFlight = 0;
     function guard(session: string, frame?: Delivery): Live {
       const entry = live.get(session);
       if (disposed || !entry || entry.expires <= Date.now() || frame && (entry.generation !== frame.generation || entry.namespace !== frame.namespace)) throw new Error("Stale session generation or lease");
@@ -80,27 +112,35 @@ const AgentBridge = Plugin.define({
       return info;
     }
     async function close(session: string, forget = true) {
-      if (forget) recoverable.delete(session);
+      if (forget) { recoverable.delete(session); conflictUntil.delete(session); recoverAfter.delete(session); metadataVersions.delete(session); }
+      else { remember(session); delayRecovery(session); }
       const entry = live.get(session);
       live.delete(session);
       if (entry?.generation) await brokerRpc(state as string, { op: "opencode_close", session, endpoint, generation: entry.generation });
     }
     async function observe(session: string) {
+      if ((conflictUntil.get(session) ?? 0) > Date.now()) return;
       observing.add(session);
       try {
       const epoch = lifecycle.get(session) ?? 0;
-      recoverable.add(session);
       const old = live.get(session);
+      if (!old) remember(session);
+      const metadataAtLookup = old?.metadataVersion ?? metadataVersions.get(session) ?? 0;
       if (old) old.revision++;
       let info: V2SessionInfo;
       try { info = await verified(session); } catch (error) {
-        if (error instanceof InvalidNativeSession) recoverable.delete(session);
+        // A lookup from an ended lifecycle cannot erase a newer lifecycle's
+        // queued recovery or change its retry timing.
+        if (disposed || (lifecycle.get(session) ?? 0) !== epoch || live.get(session) !== old) throw error;
+        if (error instanceof InvalidNativeSession) { recoverable.delete(session); recoverAfter.delete(session); conflictUntil.delete(session); if (!old) metadataVersions.delete(session); }
+        else { remember(session); delayRecovery(session); }
         if (old && live.get(session) === old) await close(session, error instanceof InvalidNativeSession);
         throw error;
       }
       if (disposed || live.get(session) !== old || (lifecycle.get(session) ?? 0) !== epoch) throw new Error("Observation belongs to an ended lifecycle");
-      recoverable.add(session);
-      const entry = old && old.expires > Date.now() ? old : { generation: "", namespace: "", expires: Date.now() + LEASE_MS, revision: 0 };
+      const entry = old && old.expires > Date.now() ? old : { generation: "", namespace: "", expires: Date.now() + LEASE_MS, revision: 0, nextHeartbeat: 0, metadataVersion: old?.metadataVersion ?? metadataVersions.get(session) ?? 0, metadataApplied: old?.metadataApplied ?? 0 };
+      entry.metadataVersion = Math.max(entry.metadataVersion, metadataVersions.get(session) ?? 0);
+      metadataVersions.delete(session);
       live.set(session, entry); // Probe can validate provisional membership, never delivery.
       const registrationRevision = entry.revision;
       try {
@@ -110,18 +150,46 @@ const AgentBridge = Plugin.define({
           await brokerRpc(state as string, { op: "opencode_close", session, endpoint, generation: result.generation });
           throw new Error("Registration completed after its lifecycle ended");
         }
-        entry.generation = result.generation; entry.namespace = result.namespace; entry.expires = Date.now() + LEASE_MS; entry.revision++; recoverable.add(session);
-      } catch (error) { if (live.get(session) === entry && entry.revision === registrationRevision) live.delete(session); throw error; }
+        conflictUntil.delete(session);
+        recoverAfter.delete(session);
+        entry.metadataApplied = Math.max(entry.metadataApplied, metadataAtLookup);
+        entry.generation = result.generation; entry.namespace = result.namespace; entry.expires = Date.now() + LEASE_MS; entry.nextHeartbeat = Date.now() + 1000 + Math.random() * (HEARTBEAT_MS - 2000); entry.revision++;
+        // Healthy leases are represented by live, not the bounded recovery backlog.
+        recoverable.delete(session);
+      } catch (error) {
+        if (disposed || (lifecycle.get(session) ?? 0) !== epoch || live.get(session) !== entry) throw error;
+        if (error instanceof RpcNotSubmittedError && old === entry && entry.generation && entry.expires > Date.now()) throw error;
+        remember(session);
+        const competingOwner = error instanceof Error && error.message.includes("OpenCode session has an unexpired owning instance");
+        if (competingOwner) {
+          if (recoverable.has(session)) conflictUntil.set(session, Date.now() + LEASE_MS + Math.random() * HEARTBEAT_MS);
+          else rescanNeeded = true;
+        }
+        if (live.get(session) === entry && entry.revision === registrationRevision) live.delete(session);
+        if (competingOwner) return;
+        delayRecovery(session);
+        throw error;
+      }
       } finally { observing.delete(session); }
     }
     async function heartbeat(session: string, entry: Live) {
+      if (heartbeats.has(entry)) return;
+      heartbeats.add(entry);
+      try {
       if (guard(session) !== entry) throw new Error("Heartbeat belongs to an ended lifecycle");
       const generation = entry.generation, revision = ++entry.revision;
       try {
         await brokerRpc(state as string, { op: "opencode_heartbeat", session, endpoint, generation, ready: true });
         if (disposed || live.get(session) !== entry || entry.generation !== generation) throw new Error("Replaced heartbeat generation");
-        entry.expires = Date.now() + LEASE_MS; entry.revision++;
-      } catch (error) { if (live.get(session) === entry && entry.revision === revision) live.delete(session); throw error; }
+        entry.expires = Date.now() + LEASE_MS; entry.nextHeartbeat = Date.now() + HEARTBEAT_MS + Math.random() * 1000; entry.revision++;
+      } catch (error) {
+        if (live.get(session) === entry && entry.revision === revision) {
+          if (error instanceof RpcNotSubmittedError && entry.expires > Date.now()) entry.nextHeartbeat = Date.now() + 1000 + Math.random() * 1000;
+          else { live.delete(session); remember(session); delayRecovery(session); }
+        }
+        throw error;
+      }
+      } finally { heartbeats.delete(entry); }
     }
     const contextMarker = "<agent-bridge-session-context>";
     const compactionMarker = "<agent-bridge-compaction-context>";
@@ -334,32 +402,76 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       return events.catch((error: unknown) => { console.error("Agent Bridge: native session registration is unavailable:", error instanceof Error ? error.message : error); });
     }
     function enqueueSession(session: string, work: () => Promise<void>, requireCurrent = true) {
+      const depth = sessionDepth.get(session) ?? 0;
+      if (requireCurrent && depth >= 8) {
+        if (SESSION.test(session) && !live.has(session)) remember(session);
+        return Promise.resolve();
+      }
+      sessionDepth.set(session, depth + 1);
       const previous = sessionEvents.get(session) ?? Promise.resolve();
       const epoch = lifecycle.get(session) ?? 0;
       const pending = previous.catch(() => {}).then(async () => {
         if (!requireCurrent || (lifecycle.get(session) ?? 0) === epoch) await work();
       });
       sessionEvents.set(session, pending);
-      void pending.catch(() => { console.error("Agent Bridge: native session registration is unavailable"); })
-        .finally(() => { if (sessionEvents.get(session) === pending) sessionEvents.delete(session); });
+      void pending.catch(error => { reportFailure("native session registration", error); })
+        .finally(() => {
+          if (sessionEvents.get(session) === pending) {
+            sessionEvents.delete(session);
+            if (!live.has(session)) metadataVersions.delete(session);
+          }
+          const remaining = (sessionDepth.get(session) ?? 1) - 1;
+          if (remaining) sessionDepth.set(session, remaining); else sessionDepth.delete(session);
+        });
+      return pending.catch(() => {});
+    }
+    function enqueueActivity(session: string, category: string, work: () => Promise<void>) {
+      const key = `${session}:${category}`, epoch = lifecycle.get(session) ?? 0;
+      if (pendingActivity.get(key) === epoch) return;
+      // The per-session chain must itself stay bounded when a stream of distinct
+      // sessions arrives faster than native verification or the broker responds.
+      // Retry activation through the bounded recovery workers instead.
+      if (pendingActivity.size >= 256 && !pendingActivity.has(key)) {
+        if (SESSION.test(session) && category !== "session.renamed" && !live.has(session)) remember(session);
+        return;
+      }
+      pendingActivity.set(key, epoch);
+      const scheduled = enqueueSession(session, work);
+      void scheduled.finally(() => { if (pendingActivity.get(key) === epoch) pendingActivity.delete(key); });
+    }
+    async function refreshTitle(session: string, entry: Live) {
+      const version = entry.metadataVersion;
+      await observe(session);
+      const current = live.get(session);
+      if (current) current.metadataApplied = Math.max(current.metadataApplied, version);
     }
     const timer = setInterval(() => {
       if (disposed) return;
       for (const [session, entry] of live) {
-        if (entry.expires <= Date.now()) { live.delete(session); continue; }
-        if (!entry.generation || heartbeats.has(entry) || observing.has(session)) continue;
-        heartbeats.add(entry);
+        if (entry.expires <= Date.now()) { live.delete(session); remember(session); continue; }
+        if (entry.metadataVersion > entry.metadataApplied && !sessionEvents.has(session)) enqueueActivity(session, "session.renamed", () => refreshTitle(session, entry));
+        if (!entry.generation || entry.nextHeartbeat > Date.now() || heartbeats.has(entry) || observing.has(session)) continue;
         void heartbeat(session, entry)
-          .catch(() => { console.error("Agent Bridge: native session heartbeat is unavailable"); })
-          .finally(() => heartbeats.delete(entry));
+          .catch(error => { reportFailure("native session heartbeat", error); });
       }
       // A previously verified, still-open session can lose its lease after a
       // transient broker failure. Re-verify before re-observing; deletion and
       // archive explicitly remove the session from this recovery set.
       for (const session of recoverable) {
-        if (!live.has(session) && !sessionEvents.has(session)) enqueueSession(session, () => observe(session));
+        if (recoveryInFlight >= 4) break;
+        if (!live.has(session) && !sessionEvents.has(session) && (recoverAfter.get(session) ?? 0) <= Date.now() && (conflictUntil.get(session) ?? 0) <= Date.now()) {
+          // Rotate scheduled work to the tail so persistent early failures
+          // cannot repeatedly occupy every worker ahead of later sessions.
+          recoverable.delete(session); recoverable.add(session);
+          recoveryInFlight++;
+          void enqueueSession(session, () => observe(session)).finally(() => { recoveryInFlight--; });
+        }
       }
-    }, HEARTBEAT_MS);
+      if (rescanNeeded && !rescanQueued && Date.now() >= nextRescan) {
+        nextRescan = Date.now() + LEASE_MS;
+        triggerScan();
+      }
+    }, 1000);
     timer.unref();
     // The activation gate means plugin setup can run after the triggering
     // session exists, and events queued before subscribe() are already gone.
@@ -376,22 +488,32 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
         ]);
       } finally { if (timeout) clearTimeout(timeout); }
       const sessions = (result as { data?: V2SessionInfo[] }).data ?? [];
-      for (const info of sessions) {
-        if (disposed) return;
-        if (!info.time.archived) enqueueSession(info.id, () => observe(info.id));
-      }
+      let cursor = 0;
+      // Bounded workers avoid one pending promise per historical session while
+      // a slow lookup cannot block every unrelated session in this instance.
+      await Promise.all(Array.from({ length: Math.min(4, sessions.length) }, async () => {
+        while (!disposed && cursor < sessions.length) {
+          const info = sessions[cursor++]!;
+          if (!info.time.archived && !live.has(info.id)) await enqueueSession(info.id, () => observe(info.id));
+        }
+      }));
     }
-    let scanTimer: ReturnType<typeof setTimeout> | undefined;
     async function initialScan() {
       try { await scanSessions(); }
       catch {
         if (!disposed) {
-          scanTimer = setTimeout(() => { void enqueue(initialScan); }, HEARTBEAT_MS);
-          scanTimer.unref();
+          rescanNeeded = true;
+          nextRescan = Date.now() + HEARTBEAT_MS;
         }
       }
     }
-    void enqueue(initialScan);
+    function triggerScan() {
+      if (disposed || rescanQueued) return;
+      rescanNeeded = false;
+      rescanQueued = true;
+      void enqueue(initialScan).finally(() => { rescanQueued = false; });
+    }
+    triggerScan();
     // Event payloads moved from V1 `properties` to a `data` field with a flat
     // sessionID. V2 also dropped session.updated and the permission.* revision
     // stream: the selection pin they guarded has no V2 equivalent, so leases
@@ -407,14 +529,20 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
           if (typeof data.sessionID !== "string") continue;
           if (value.type === "session.deleted" || value.type === "session.archived") {
             lifecycle.set(data.sessionID, (lifecycle.get(data.sessionID) ?? 0) + 1);
+            const hadEntry = live.has(data.sessionID);
             const closing = close(data.sessionID).catch(() => { console.error("Agent Bridge: native session close is unavailable"); });
             // Start invalidation immediately, but make later registrations wait
             // until the old generation's broker close has completed.
-            enqueueSession(data.sessionID, () => closing, false);
+            if (hadEntry) enqueueSession(data.sessionID, () => closing, false);
             continue;
           }
+          if (!["session.created", "tui.session.select", "session.status", "session.renamed"].includes(value.type)) continue;
       const sourceEntry = live.get(data.sessionID);
-          enqueueSession(data.sessionID, async () => {
+          if (value.type === "session.renamed" && (sourceEntry || sessionEvents.has(data.sessionID))) {
+            if (sourceEntry) sourceEntry.metadataVersion++;
+            else metadataVersions.set(data.sessionID, (metadataVersions.get(data.sessionID) ?? 0) + 1);
+          }
+          enqueueActivity(data.sessionID, value.type, async () => {
             if (disposed) return;
             const sourceSession = data.sessionID as string;
             if (value.type === "session.deleted") {
@@ -422,14 +550,15 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
             } else if (live.get(sourceSession) !== sourceEntry && value.type !== "session.archived" && value.type !== "session.created" && value.type !== "tui.session.select" && value.type !== "session.status") {
               return;
             } else if (value.type === "session.status" && sourceEntry) {
-              await heartbeat(sourceSession, sourceEntry as Live);
+              if ((sourceEntry as Live).nextHeartbeat <= Date.now()) await heartbeat(sourceSession, sourceEntry as Live);
             } else if (value.type === "session.created" || value.type === "tui.session.select" || value.type === "session.status") {
               await observe(sourceSession);
             } else if ((value.type === "session.renamed" || value.type === "session.archived" || value.type === "session.status") && live.has(sourceSession)) {
               // Renames and archives carry metadata for existing sessions only;
               // they must never activate dormant history. Status without a lease
               // is a live-execution signal and observes above.
-              await observe(sourceSession);
+              if (value.type === "session.renamed") await refreshTitle(sourceSession, live.get(sourceSession)!);
+              else await observe(sourceSession);
             }
           });
         }
@@ -455,11 +584,11 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
     // deliveries, and observing an already-live session is idempotent.
     disposeHooks(await ctx.session.hook("prompt", (event) => {
       const sessionID = (event as unknown as { sessionID: string }).sessionID;
-      return void enqueueSession(sessionID, () => observe(sessionID));
+      return void enqueueActivity(sessionID, "prompt", () => observe(sessionID));
     }));
     return async () => {
       if (disposed) return;
-      disposed = true; clearInterval(timer); if (scanTimer) clearTimeout(scanTimer); abort.abort(); listener.stop(true);
+      disposed = true; clearInterval(timer); abort.abort(); listener.stop(true);
       for (const socket of connections) socket.terminate();
       // Native calls may never resolve. Allow normal in-flight registrations to
       // compensate, but do not let one stalled location prevent shutdown.
@@ -470,11 +599,21 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       ]);
       if (drainTimer) clearTimeout(drainTimer);
       for (const registration of registrations) registration.dispose();
-      const results = await Promise.allSettled([...live.keys()].map(session => close(session)));
+      const closingSessions = [...live.keys()];
+      let cursor = 0, closeFailed = false, stopClosing = false;
+      const workers = Promise.all(Array.from({ length: Math.min(4, closingSessions.length) }, async () => {
+        while (!stopClosing && cursor < closingSessions.length) {
+          try { await close(closingSessions[cursor++]!); } catch { closeFailed = true; }
+        }
+      })).then(() => true);
+      let closeTimer: ReturnType<typeof setTimeout> | undefined;
+      const closed = await Promise.race([workers, new Promise<false>(resolve => { closeTimer = setTimeout(() => resolve(false), 6500); })]);
+      if (closeTimer) clearTimeout(closeTimer);
+      stopClosing = true;
       // Native calls may remain unresolved; their guards prevent journal access
       // after disposal. Do not wait indefinitely or keep a model process alive.
       journal.close(); await rm(socketDirectory, { recursive: true, force: true });
-      if (results.some(result => result.status === "rejected")) throw new Error("Some native leases could not be closed; expiry fences them");
+      if (!closed || closeFailed) throw new Error("Some native leases could not be closed; expiry fences them");
     };
   },
 });

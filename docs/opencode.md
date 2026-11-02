@@ -68,8 +68,12 @@ identities. Routes are `opencode-SESSION_ID`; use `opencode:TITLE` for title loo
 Duplicate titles remain ambiguous.
 
 Deleting/archiving a session or disposing the plugin unregisters its live routes.
-A crashed/closed instance expires through a 20-second lease, renewed every five
-seconds by the live plugin. Broker expiry also runs while paused and without
+A crashed/closed instance expires through a 20-second lease, renewed roughly every
+five to seven seconds by the live plugin, with staggered renewal scheduling. Startup
+observation and recovery use bounded workers and runtime-wide RPC limits, with
+separate slots for lease renewal and delivery admission. Repeated activity for
+the same session is coalesced. Competing instances back off after a
+live-owner conflict before trying again. Broker expiry also runs while paused and without
 native events. Stale generations cannot renew, close or update a replacement.
 A new verified live instance can reopen the same conversation after expiry;
 old queued work cannot silently follow its new generation. Explicit retry of
@@ -111,6 +115,27 @@ Pause is checked again at admission; queued work remains cancellable until then.
 The plugin has no hidden future-submission queue. Unattempted broker work waits
 while its exact owning session/generation remains live, and is dispatched when
 admission becomes available.
+
+The local broker bounds active socket handlers. At capacity it stops accepting
+until a handler finishes; excess connections remain subject to the operating
+system's bounded listen backlog and client timeouts. A client timeout after a
+request is written does not prove whether it was processed: inspect the existing
+message ID and do not automatically resubmit an Unknown outcome. Plugin RPCs
+that cannot obtain a local scheduling slot report that they were not submitted;
+they do not open a broker socket. Admission, renewal, close, observation and other
+RPCs have separate bounded capacity. Four stalled admissions can still delay or
+reject further admissions before submission; inspect the outcome rather than
+assuming a native attempt occurred. Recovery retains at most 1,024 session IDs
+per instance; overflow schedules periodic bounded rescans of native sessions.
+Capacity diagnostics contain counts, not message bodies.
+
+For isolated load verification after building the broker, run
+`bun tools/opencode-overload.ts /absolute/path/to/agent-bridge`. This exercises
+eight plugin instances against one disposable broker and 58 simulated native
+sessions, including renewal, restart and an Unknown outcome. Set
+`AGENT_BRIDGE_FIXTURE_DIR` to an owner-private temporary directory if `/tmp`
+cannot store the fixture database. It is not a substitute for OpenCode runtime
+compatibility testing.
 Waiting is bounded by the queue count and message byte limits, rather than a
 120-second age limit. Lease loss, close or generation replacement still fails
 queued work without native events; restart does not extend a lease. Historical
