@@ -261,6 +261,46 @@ async fn codex_adapter_never_spawns_an_argv_fallback_for_invalid_sessions() {
 }
 
 #[tokio::test]
+async fn saturated_connections_do_not_reset_accepted_status_request() {
+    let dir = temp();
+    let state = dir.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    let mut idle = Vec::new();
+    for _ in 0..64 {
+        idle.push(
+            UnixStream::connect(state.join("bridge.sock"))
+                .await
+                .unwrap(),
+        );
+    }
+    // Let the server accept and assign the idle connections before the probe.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut probe = UnixStream::connect(state.join("bridge.sock"))
+        .await
+        .unwrap();
+    probe.write_all(b"{\"op\":\"status\"}\n").await.unwrap();
+    // A request may wait for bounded admission; freeing a slot must let it
+    // complete rather than dropping its unread socket with ECONNRESET.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(idle.pop());
+    let mut response = String::new();
+    timeout(
+        Duration::from_secs(2),
+        BufReader::new(probe).read_line(&mut response),
+    )
+    .await
+    .expect("status should complete after a slot is freed")
+    .expect("status socket must not reset");
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["ok"],
+        true
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn exclusive_service_lock_and_bad_frames_do_not_break_the_broker() {
     let dir = temp();
     let state = dir.path().join("state");

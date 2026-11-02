@@ -7,6 +7,7 @@ import { Database } from "bun:sqlite";
 import { Journal, nativeID, MAX_JOURNAL_ROWS, MAX_JOURNAL_BYTES } from "./journal.ts";
 import AgentBridge from "./index.ts";
 import { sameUser } from "./peer.ts";
+import { brokerRpc } from "./rpc.ts";
 
 const A = "ses_0123456789abcdefghijklmnop";
 const B = "ses_ABCDEFGHIJKLMNOP0123456789";
@@ -40,12 +41,12 @@ async function frame(endpoint: string, value: unknown, raw = false, sent?: () =>
   });
 }
 
-async function setup(preexisting: string[] = [], tmpOverride?: string) {
+async function setup(preexisting: string[] = [], tmpOverride?: string, initialBrokerResponse?: (request: any) => Promise<void | false | string>, listHook?: () => Promise<void>) {
   const directory = await mkdtemp("/tmp/aboc-test-");
   await chmod(directory, 0o700);
   const registrations = new Map<string, any>();
   const requests: any[] = [];
-  let brokerResponse: ((request: any) => Promise<void | false>) | undefined;
+  let brokerResponse: ((request: any) => Promise<void | false | string>) | undefined = initialBrokerResponse;
   const brokerSockets = new Map<Bun.Socket<{ buffer: string }>, { closed: Promise<void>; resolve: () => void }>();
   let acceptedSockets = 0, closedSockets = 0, endedSockets = 0;
   let admissionDenied = false;
@@ -95,12 +96,15 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
         if (admissionGate) { const gate = admissionGate; admissionGate = undefined; gate.enter(); await gate.release; }
       }
       if (request.op === "opencode_admit" && (admissionDenied || registrations.get(request.session)?.generation !== request.generation)) { socket.end(JSON.stringify({ ok: false, error: "stale attempt" }) + "\n"); return; }
-      if (await brokerResponse?.(request) === false) return;
+      const override = await brokerResponse?.(request);
+      if (override === false) return;
+      if (typeof override === "string") { socket.end(JSON.stringify({ ok: false, error: override }) + "\n"); return; }
       socket.end(JSON.stringify({ ok: true, result }) + "\n");
     },
   }});
   await chmod(join(directory, "bridge.sock"), 0o600);
   const sessions = new Map<string, any>([A, B].map(id => [id, { id, projectID: "project", location: { directory }, title: id === A ? "Alpha" : "Beta", version: "2.2.5", time: { created: 1, updated: 1 } }]));
+  for (const id of preexisting) if (!sessions.has(id)) sessions.set(id, { id, projectID: "project", location: { directory }, title: "Test session", version: "2.2.5", time: { created: 1, updated: 1 } });
   // V2 transcripts are scanned by message id for receipts; user messages are
   // the flat {id, type, text} shape the context() readback returns.
   const transcripts = new Map<string, any[]>();
@@ -111,13 +115,13 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
   let promptReceipt: ((receipt: any) => unknown) | undefined;
   const writes: string[] = [];
   let wrongIdentity = false;
-  let blocked: { kind: "get" | "context" | "prompt"; skip: number; fail: boolean; enter: () => void; release: Promise<void>; returned: () => void } | undefined;
-  function blockNext(kind: "get" | "context" | "prompt", skip = 0, fail = false) {
+  let blocked: { kind: "get" | "context" | "prompt"; skip: number; fail: boolean; capture: boolean; enter: () => void; release: Promise<void>; returned: () => void } | undefined;
+  function blockNext(kind: "get" | "context" | "prompt", skip = 0, fail = false, capture = false) {
     let enter!: () => void, release!: () => void, returned!: () => void;
     const entered = new Promise<void>(resolve => { enter = resolve; });
     const blockedUntilRelease = new Promise<void>(resolve => { release = resolve; });
     const lookupReturned = new Promise<void>(resolve => { returned = resolve; });
-    blocked = { kind, skip, fail, enter, release: blockedUntilRelease, returned };
+    blocked = { kind, skip, fail, capture, enter, release: blockedUntilRelease, returned };
     return { entered, release, settled: async () => {
       await lookupReturned;
       // The plugin handler continuations run as microtasks. This event-loop
@@ -131,16 +135,18 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
   const session = {
     get: async ({ sessionID }: { sessionID: string }) => {
       writes.push(`/${sessionID}`);
+      let snapshot: any;
       if (blocked && blocked.kind === "get" && blocked.skip-- === 0) {
         const gate = blocked; blocked = undefined; gate.enter();
+        if (gate.capture) snapshot = structuredClone(sessions.get(sessionID));
         await gate.release; gate.returned();
         if (gate.fail) throw new Error("delayed lookup failure");
       }
-      const info = sessions.get(sessionID) as any;
-      if (!info || info.time.archived) throw new Error("Missing session");
+      const info = snapshot ?? sessions.get(sessionID) as any;
+      if (!info || info.time.archived && !snapshot) throw new Error("Missing session");
       return wrongIdentity ? { ...info, id: B } : info;
     },
-    list: async () => ({ data: ['', ...preexisting].filter(id => sessions.has(id as string)).map(id => sessions.get(id as string)) as any[] }),
+    list: async () => { await listHook?.(); return { data: ['', ...preexisting].filter(id => sessions.has(id as string)).map(id => sessions.get(id as string)) as any[] }; },
     // prompt() records the admission and inserts into the transcript exactly
     // like the durable wake->delivered path the real runtime applies.
     prompt: async ({ sessionID, id, text }: any) => {
@@ -267,6 +273,478 @@ async function setup(preexisting: string[] = [], tmpOverride?: string) {
   };
   return { directory, registrations, requests, close, socketState: () => ({ accepted: acceptedSockets, ended: endedSockets, closed: closedSockets, active: brokerSockets.size }), brokerResponse: (hook: typeof brokerResponse) => { brokerResponse = hook; }, denyAdmission: (denied: boolean, hook?: () => void) => { admissionDenied = denied; admissionHook = hook; }, sessions, transcripts, native, inbox, promptReceipt: (hook: typeof promptReceipt) => { promptReceipt = hook; }, admitInbox: () => { admitInbox = true; }, prompts, writes, get hooks() { return hooks; }, reload, journalState, event, pushEvent, created, endpoint, blockNext, blockAdmission, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; } };
 }
+
+test("startup observations are bounded across eight plugin instances", async () => {
+  const sessions = Array.from({ length: 58 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let inFlight = 0, peak = 0;
+  const fixtures: Awaited<ReturnType<typeof setup>>[] = [];
+  try {
+    for (let i = 0; i < 8; i++) fixtures.push(await setup(sessions, undefined, async request => {
+      if (request.op === "opencode_observe") {
+        peak = Math.max(peak, ++inFlight);
+        await gate;
+        inFlight--;
+      }
+    }));
+    await Bun.sleep(300);
+    expect(peak).toBeGreaterThan(0);
+    expect(peak).toBeLessThanOrEqual(32);
+  } finally { release(); }
+}, 30000);
+
+test("stalled observations leave capacity for admission traffic", async () => {
+  const sessions = Array.from({ length: 58 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let entered = 0;
+  const s = await setup(sessions, undefined, async request => {
+    if (request.op === "opencode_observe") { entered++; await gate; }
+  });
+  try {
+    await Bun.sleep(200);
+    expect(entered).toBeGreaterThan(0);
+    expect(await Promise.race([
+      brokerRpc(s.directory, { op: "status" }).then(() => true),
+      Bun.sleep(1000).then(() => false),
+    ])).toBe(true);
+  } finally { release(); }
+}, 30000);
+
+test("stalled heartbeats leave capacity for admission and status", async () => {
+  const s = await setup();
+  const sessions = Array.from({ length: 24 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  for (const session of sessions) await brokerRpc(s.directory, {op:"opencode_observe", session, endpoint:"/tmp/test.sock", ready:true});
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  s.brokerResponse(async request => { if (request.op === "opencode_heartbeat") await gate; });
+  const calls = sessions.map(session => brokerRpc(s.directory, {op:"opencode_heartbeat", session, generation:s.registrations.get(session).generation, ready:true}).catch(() => undefined));
+  try {
+    await Bun.sleep(200);
+    const outcome = await Promise.race([
+      Promise.all([brokerRpc(s.directory,{op:"status"}), brokerRpc(s.directory,{op:"opencode_admit",session:sessions[0],generation:s.registrations.get(sessions[0]).generation})]).then(() => true),
+      Bun.sleep(1000).then(() => false),
+    ]);
+    expect(outcome).toBe(true);
+  } finally { release(); await Promise.all(calls); }
+}, 30000);
+
+test("a heartbeat rejected before submission does not discard an unexpired lease", async () => {
+  const s = await setup(); await s.created(A);
+  const sessions = Array.from({length: 104}, (_, i) => `ses_${String(i).padStart(26,"0")}`);
+  for (const session of sessions) await brokerRpc(s.directory, {op:"opencode_observe",session,endpoint:"/tmp/test.sock",ready:true});
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  s.brokerResponse(async request => { if (request.op === "opencode_heartbeat" && request.session !== A) await gate; });
+  const calls = sessions.map(session => brokerRpc(s.directory, {op:"opencode_heartbeat",session,generation:s.registrations.get(session).generation,ready:true}).catch(() => undefined));
+  const now = Date.now;
+  try {
+    await Bun.sleep(150);
+    Date.now = () => now() + 6000;
+    await s.event("session.status", {sessionID:A});
+    expect((await frame(s.endpoint(), {op:"probe",session:A})).ok).toBe(true);
+  } finally { Date.now = now; release(); await Promise.all(calls); s.brokerResponse(undefined); }
+}, 30000);
+
+test("an observation rejected before submission preserves a live lease and retries metadata", async () => {
+  const s = await setup(); await s.created(A);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  s.brokerResponse(async request => { if (request.op === "opencode_observe" && request.session !== A) await gate; });
+  const calls = Array.from({length: 396}, (_, i) => brokerRpc(s.directory, {op:"opencode_observe",session:`ses_${String(i).padStart(26,"0")}`,endpoint:"/tmp/test.sock",ready:true}).catch(() => undefined));
+  try {
+    await Bun.sleep(150);
+    s.sessions.get(A).title = "latest under pressure";
+    await s.event("session.renamed", {sessionID:A});
+    expect((await frame(s.endpoint(), {op:"probe",session:A})).ok).toBe(true);
+    release(); await Promise.all(calls);
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && s.registrations.get(A)?.title !== "latest under pressure") await Bun.sleep(20);
+    expect(s.registrations.get(A)?.title).toBe("latest under pressure");
+  } finally { release(); await Promise.all(calls); s.brokerResponse(undefined); }
+}, 30000);
+
+test("stalled admission traffic leaves capacity for lease renewal", async () => {
+  const s = await setup(); await s.created(A);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  s.brokerResponse(async request => { if (request.op === "status") await gate; });
+  const calls = Array.from({length: 24}, () => brokerRpc(s.directory, {op:"status"}).catch(() => undefined));
+  try {
+    await Bun.sleep(200);
+    const generation = s.registrations.get(A).generation;
+    const result = await Promise.race([
+      brokerRpc(s.directory, {op:"opencode_heartbeat", session:A, generation, ready:true}).then(() => true),
+      Bun.sleep(1000).then(() => false),
+    ]);
+    expect(result).toBe(true);
+  } finally { release(); await Promise.all(calls); }
+}, 30000);
+
+test("stalled close traffic leaves capacity for delivery admission", async () => {
+  const s = await setup(); await s.created(A);
+  const sessions = Array.from({length: 8}, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  for (const session of sessions) await brokerRpc(s.directory, {op:"opencode_observe", session, endpoint:"/tmp/test.sock", ready:true});
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  s.brokerResponse(async request => { if (request.op === "opencode_close") await gate; });
+  const closes = sessions.map(session => brokerRpc(s.directory, {op:"opencode_close", session, generation:s.registrations.get(session).generation}).catch(() => undefined));
+  try {
+    await Bun.sleep(200);
+    const result = await Promise.race([
+      brokerRpc(s.directory, {op:"opencode_admit", session:A, generation:s.registrations.get(A).generation}).then(() => true),
+      Bun.sleep(1000).then(() => false),
+    ]);
+    expect(result).toBe(true);
+  } finally { release(); await Promise.all(closes); }
+}, 30000);
+
+test("stalled admissions leave capacity for status", async () => {
+  const s = await setup(); await s.created(A);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  s.brokerResponse(async request => { if (request.op === "opencode_admit") await gate; });
+  const calls = Array.from({length: 4}, () => brokerRpc(s.directory, {op:"opencode_admit", session:A, generation:s.registrations.get(A).generation}).catch(() => undefined));
+  try {
+    await Bun.sleep(200);
+    const result = await Promise.race([brokerRpc(s.directory,{op:"status"}).then(() => true), Bun.sleep(1000).then(() => false)]);
+    expect(result).toBe(true);
+  } finally { release(); await Promise.all(calls); }
+}, 30000);
+
+test("shared RPC socket limit holds across many stalled observations", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let entered = 0;
+  const s = await setup([], undefined, async request => {
+    if (request.op === "opencode_observe") { entered++; await gate; }
+  });
+  const calls = Array.from({ length: 60 }, (_, i) => brokerRpc(s.directory, {
+    op: "opencode_observe", session: `ses_${String(i).padStart(26, "0")}`, endpoint: "/tmp/test.sock", ready: true,
+  }).catch(() => undefined));
+  try {
+    await Bun.sleep(200);
+    expect(entered).toBeGreaterThan(0);
+    expect(entered).toBeLessThanOrEqual(16);
+    expect(s.socketState().active).toBeLessThanOrEqual(16);
+    expect(await brokerRpc(s.directory, { op: "status" })).toEqual({});
+  } finally { release(); await Promise.all(calls); }
+}, 30000);
+
+test("independent module loads share the process RPC limit", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let current = 0, peak = 0;
+  const s = await setup([], undefined, async request => {
+    if (request.op === "opencode_observe") { peak = Math.max(peak, ++current); await gate; current--; }
+  });
+  const a = await import("./rpc.ts" + "?agb41-copy-a");
+  const b = await import("./rpc.ts" + "?agb41-copy-b");
+  const calls = Array.from({length: 40}, (_, i) => (i % 2 ? a : b).brokerRpc(s.directory, {
+    op:"opencode_observe", session:`ses_${String(i).padStart(26,"0")}`, endpoint:"/tmp/test.sock", ready:true,
+  }).catch(() => undefined));
+  try {
+    await Bun.sleep(200);
+    expect(peak).toBeGreaterThan(0);
+    expect(peak).toBeLessThanOrEqual(12);
+  } finally { release(); await Promise.all(calls); }
+}, 30000);
+
+test("RPC observation backlog is bounded and leaves room for status", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const s = await setup([], undefined, async request => {
+    if (request.op === "opencode_observe") await gate;
+  });
+  const errors: string[] = [];
+  const calls = Array.from({ length: 480 }, (_, i) => brokerRpc(s.directory, {
+    op: "opencode_observe", session: `ses_${String(i).padStart(26, "0")}`, endpoint: "/tmp/test.sock", ready: true,
+  }).catch(error => { errors.push(error.message); }));
+  try {
+    await Bun.sleep(150);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.every(error => error.includes("before submission"))).toBe(true);
+    expect(await brokerRpc(s.directory, { op: "status" })).toEqual({});
+  } finally { release(); await Promise.all(calls); }
+}, 30000);
+
+test("many sessions renew across eight instances without starving status", async () => {
+  const sessions = Array.from({ length: 58 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  const fixtures: Awaited<ReturnType<typeof setup>>[] = [];
+  for (let i = 0; i < 8; i++) fixtures.push(await setup(sessions));
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline && fixtures.some(s => sessions.some(id => !s.requests.some(request => request.op === "opencode_heartbeat" && request.session === id)))) {
+    await Bun.sleep(100);
+  }
+  for (const s of fixtures) {
+    const renewed = new Set(s.requests.filter(request => request.op === "opencode_heartbeat").map(request => request.session));
+    expect(s.registrations.size).toBe(58);
+    expect(renewed.size).toBe(58);
+    expect(await brokerRpc(s.directory, { op: "status" })).toEqual({});
+  }
+}, 30000);
+
+test("competing owner observations back off despite repeated activity", async () => {
+  const s = await setup([], undefined, async request => request.op === "opencode_observe" ? "OpenCode session has an unexpired owning instance" : undefined);
+  await s.created();
+  await s.event("session.status", { sessionID: A });
+  await s.event("session.status", { sessionID: A });
+  expect(s.requests.filter(request => request.op === "opencode_observe" && request.session === A)).toHaveLength(1);
+});
+
+test("repeated status events coalesce while a session is busy", async () => {
+  const s = await setup(); await s.created(A);
+  const gate = s.blockNext("get");
+  try {
+    s.pushEvent({type: "session.renamed", data: {sessionID: A}});
+    await gate.entered;
+    for (let i = 0; i < 30; i++) s.pushEvent({type: "session.status", data: {sessionID: A}});
+    await Bun.sleep(50);
+    gate.release(); await gate.settled();
+    await Bun.sleep(100);
+    expect(s.requests.filter(request => request.op === "opencode_heartbeat" && request.session === A).length).toBeLessThanOrEqual(1);
+  } finally { gate.release(); }
+});
+
+test("sustained status activity does not accelerate lease renewal", async () => {
+  const s = await setup(); await s.created(A);
+  for (let i = 0; i < 8; i++) await s.event("session.status", { sessionID: A });
+  expect(s.requests.filter(request => request.op === "opencode_heartbeat" && request.session === A).length).toBeLessThanOrEqual(1);
+});
+
+test("rename and prompt bursts do not queue unbounded observations", async () => {
+  const s = await setup(); await s.created(A);
+  const gate = s.blockNext("get");
+  try {
+    s.pushEvent({type: "session.renamed", data: {sessionID: A}});
+    await gate.entered;
+    for (let i = 0; i < 40; i++) {
+      s.pushEvent({type: "session.renamed", data: {sessionID: A}});
+      s.hooks.prompt({sessionID: A});
+    }
+    await Bun.sleep(100);
+    gate.release(); await gate.settled();
+    await Bun.sleep(200);
+    expect(s.requests.filter(request => request.op === "opencode_observe" && request.session === A).length).toBeLessThanOrEqual(3);
+  } finally { gate.release(); }
+});
+
+test("rename during an in-flight registration eventually publishes the latest title", async () => {
+  const s = await setup(); await s.created(A);
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let held = false;
+  s.brokerResponse(async request => {
+    if (request.op === "opencode_observe" && !held) { held = true; enter(); await gate; }
+  });
+  try {
+    s.sessions.get(A).title = "first title";
+    s.pushEvent({type:"session.renamed",data:{sessionID:A}});
+    await entered;
+    s.sessions.get(A).title = "latest title";
+    await s.event("session.renamed", {sessionID:A});
+    release();
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && s.registrations.get(A)?.title !== "latest title") await Bun.sleep(20);
+    expect(s.registrations.get(A)?.title).toBe("latest title");
+  } finally { release(); s.brokerResponse(undefined); }
+}, 10000);
+
+test("rename during initial native lookup publishes the latest title", async () => {
+  const s = await setup();
+  const gate = s.blockNext("get", 0, false, true);
+  try {
+    s.pushEvent({type:"session.created",data:{sessionID:A}});
+    await gate.entered;
+    s.sessions.get(A).title = "latest title";
+    await s.event("session.renamed", {sessionID:A});
+    gate.release(); await gate.settled();
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && s.registrations.get(A)?.title !== "latest title") await Bun.sleep(20);
+    expect(s.registrations.get(A)?.title).toBe("latest title");
+  } finally { gate.release(); }
+}, 10000);
+
+test("failed initial observations with pending renames do not reactivate archived sessions", async () => {
+  const s = await setup();
+  const sessions = Array.from({ length: 30 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  for (const id of sessions) {
+    s.sessions.set(id, { id, title: "archived", location: {directory: s.directory}, time: {archived: 1} });
+    const gate = s.blockNext("get", 0, false, true);
+    try {
+      s.pushEvent({type:"session.created",data:{sessionID:id}});
+      await gate.entered;
+      await s.event("session.renamed", {sessionID:id});
+      gate.release(); await gate.settled();
+    } finally { gate.release(); }
+  }
+  await Bun.sleep(1100);
+  expect(sessions.every(id => !s.registrations.has(id))).toBe(true);
+  expect(s.requests.filter(request => request.op === "opencode_observe")).toHaveLength(0);
+}, 15000);
+
+test("repeated lifecycle epochs behind a stalled lookup recover only the latest session", async () => {
+  const s = await setup(); await s.created(A);
+  const gate = s.blockNext("get");
+  try {
+    s.pushEvent({type:"session.renamed",data:{sessionID:A}});
+    await gate.entered;
+    for (let i = 0; i < 100; i++) {
+      s.pushEvent({type:"session.archived",data:{sessionID:A}});
+      s.pushEvent({type:"session.created",data:{sessionID:A}});
+    }
+    await Bun.sleep(100);
+    gate.release(); await gate.settled();
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline && !s.registrations.has(A)) await Bun.sleep(50);
+    expect(s.registrations.has(A)).toBe(true);
+    expect((await frame(s.endpoint(), {op:"probe",session:A})).ok).toBe(true);
+  } finally { gate.release(); }
+}, 12000);
+
+test("stale archived lookup cannot erase recovery after recreation overflow", async () => {
+  const s = await setup();
+  s.sessions.get(A).time.archived = 1;
+  const gate = s.blockNext("get", 0, false, true);
+  try {
+    s.pushEvent({type:"session.created",data:{sessionID:A}});
+    await gate.entered;
+    delete s.sessions.get(A).time.archived;
+    for (let i = 0; i < 30; i++) {
+      s.pushEvent({type:"session.archived",data:{sessionID:A}});
+      s.pushEvent({type:"session.created",data:{sessionID:A}});
+    }
+    await Bun.sleep(100);
+    gate.release(); await gate.settled();
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline && !s.registrations.has(A)) await Bun.sleep(50);
+    expect(s.registrations.has(A)).toBe(true);
+  } finally { gate.release(); }
+}, 12000);
+
+test("recovery of many sessions keeps observation work bounded", async () => {
+  const sessions = Array.from({ length: 58 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  const attempts = new Map<string, number>();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let current = 0, peak = 0;
+  const s = await setup(sessions, undefined, async request => {
+    if (request.op !== "opencode_observe") return;
+    const count = (attempts.get(request.session) ?? 0) + 1;
+    attempts.set(request.session, count);
+    if (count === 1) return "temporary broker failure";
+    peak = Math.max(peak, ++current);
+    await gate;
+    current--;
+  });
+  try {
+    const deadline = Date.now() + 9000;
+    while (Date.now() < deadline && peak < 4) await Bun.sleep(50);
+    expect(attempts.size).toBe(58);
+    expect(peak).toBeGreaterThan(0);
+    expect(peak).toBeLessThanOrEqual(4);
+  } finally { release(); }
+}, 20000);
+
+test("persistent early recovery failures do not starve later sessions", async () => {
+  const sessions = Array.from({ length: 20 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  const attempts = new Map<string, number>();
+  await setup(sessions, undefined, async request => {
+    if (request.op === "opencode_observe") {
+      attempts.set(request.session, (attempts.get(request.session) ?? 0) + 1);
+      return "temporary broker failure";
+    }
+  });
+  const initialDeadline = Date.now() + 3000;
+  while (Date.now() < initialDeadline && attempts.size < sessions.length) await Bun.sleep(20);
+  expect(attempts.size).toBe(20);
+  const now = Date.now;
+  let offset = 0;
+  const clock = setInterval(() => { offset += 5000; }, 500);
+  try {
+    Date.now = () => now() + offset;
+    const deadline = now() + 8000;
+    while (now() < deadline && sessions.some(id => (attempts.get(id) ?? 0) < 2)) await Bun.sleep(50);
+    expect(sessions.every(id => (attempts.get(id) ?? 0) >= 2)).toBe(true);
+  } finally { Date.now = now; clearInterval(clock); }
+}, 15000);
+
+test("distinct-session overflow is bounded and recovered by rescan", async () => {
+  const sessions = Array.from({ length: 1100 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const originalError = console.error;
+  const messages: string[] = [];
+  console.error = (...args: unknown[]) => { messages.push(args.map(String).join(" ")); };
+  let s: Awaited<ReturnType<typeof setup>> | undefined;
+  try {
+    s = await setup(sessions, undefined, async request => { if (request.op === "opencode_observe") await gate; });
+    for (const sessionID of sessions) s.pushEvent({ type: "session.created", data: { sessionID } });
+    const overflowDeadline = Date.now() + 5000;
+    while (Date.now() < overflowDeadline && !messages.some(message => message.includes("recovery capacity reached"))) await Bun.sleep(20);
+    expect(messages.some(message => message.includes("retained=1024"))).toBe(true);
+    release();
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline && s.registrations.size < sessions.length) await Bun.sleep(50);
+    expect(s.registrations.has(sessions.at(-1)!)).toBe(true);
+    expect(s.registrations.size).toBe(sessions.length);
+    await Bun.sleep(1500);
+    const observations = s.requests.filter(request => request.op === "opencode_observe").length;
+    await Bun.sleep(21000);
+    // Under this oversized synthetic load individual renewals may fail and
+    // recover; a full repeated rescan would add at least 1,100 observations.
+    expect(s.requests.filter(request => request.op === "opencode_observe").length - observations).toBeLessThan(256);
+  } finally { release(); console.error = originalError; }
+}, 45000);
+
+test("overflow of healthy activity does not consume recovery capacity", async () => {
+  const sessions = Array.from({length: 1300}, (_, i) => `ses_${String(i).padStart(26,"0")}`);
+  const s = await setup(sessions);
+  const initial = Date.now() + 20000;
+  while (Date.now() < initial && s.registrations.size < sessions.length) await Bun.sleep(50);
+  expect(s.registrations.size).toBe(sessions.length);
+  let release!: () => void, failHeartbeat = false, failed = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const messages: string[] = [], originalError = console.error;
+  console.error = (...args: unknown[]) => { messages.push(args.map(String).join(" ")); };
+  s.brokerResponse(async request => {
+    if (request.op === "opencode_observe" && !failHeartbeat) await gate;
+    if (request.op === "opencode_heartbeat" && request.session === sessions[0] && failHeartbeat && !failed) { failed = true; return "stale generation"; }
+  });
+  try {
+    for (const sessionID of sessions) s.pushEvent({type:"session.renamed",data:{sessionID}});
+    for (const sessionID of sessions) s.pushEvent({type:"session.status",data:{sessionID}});
+    await Bun.sleep(500);
+    expect(messages.some(message => message.includes("recovery capacity reached"))).toBe(false);
+    release();
+    failHeartbeat = true;
+    const initialObservations = s.requests.filter(request => request.op === "opencode_observe" && request.session === sessions[0]).length;
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline && (!failed || s.requests.filter(request => request.op === "opencode_observe" && request.session === sessions[0]).length <= initialObservations)) await Bun.sleep(50);
+    expect(failed).toBe(true);
+    expect(s.requests.filter(request => request.op === "opencode_observe" && request.session === sessions[0]).length).toBeGreaterThan(initialObservations);
+  } finally { release(); s.brokerResponse(undefined); console.error = originalError; }
+}, 45000);
+
+test("repeated overflow with a failing native list has only one scan retry chain", async () => {
+  const sessions = Array.from({ length: 1100 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
+  let release!: () => void, listCalls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    const s = await setup([], undefined, async request => { if (request.op === "opencode_observe") await gate; }, async () => { listCalls++; throw new Error("native list unavailable"); });
+    for (const id of sessions) {
+      s.sessions.set(id, { id, title:"fixture", location:{directory:s.directory}, time:{created:1,updated:1} });
+      s.pushEvent({type:"session.created",data:{sessionID:id}});
+    }
+    await Bun.sleep(11500);
+    expect(listCalls).toBeGreaterThanOrEqual(2);
+    expect(listCalls).toBeLessThanOrEqual(3);
+  } finally { release(); console.error = originalError; }
+}, 20000);
 
 describe("V2 durable inbox proof", () => {
   const delivery = { op: "deliver", session: A, id: ID, content: "Exact held native input" };
@@ -645,8 +1123,10 @@ describe("V2 plugin with real private Unix sockets", () => {
     let entered!: () => void, release!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
     const blocked = new Promise<void>(resolve => { release = resolve; });
+    let heldHeartbeat = false;
     s.brokerResponse(async request => {
-      if (request.op === "opencode_heartbeat" && request.session === A) {
+      if (request.op === "opencode_heartbeat" && request.session === A && !heldHeartbeat) {
+        heldHeartbeat = true;
         entered();
         await blocked;
         return false;
@@ -1012,12 +1492,13 @@ describe("V2 plugin with real private Unix sockets", () => {
   test("readiness heartbeats use cached events and expired leases reject before native lookup", async () => {
     const s = await setup(); await s.created();
     const reads = s.writes.length;
-    await s.event("session.status", { sessionID: A, status: { type: "busy" } });
-    expect(s.writes).toHaveLength(reads);
-    expect(s.requests.filter(request => request.op === "opencode_heartbeat").at(-1).ready).toBe(true);
     const now = Date.now;
     try {
-      Date.now = () => now() + 20001;
+      Date.now = () => now() + 6000;
+      await s.event("session.status", { sessionID: A, status: { type: "busy" } });
+      expect(s.writes).toHaveLength(reads);
+      expect(s.requests.filter(request => request.op === "opencode_heartbeat").at(-1).ready).toBe(true);
+      Date.now = () => now() + 26001;
       expect((await frame(s.endpoint(), { op: "deliver", session: A, id: ID, content: "expired" })).ok).toBe(false);
     } finally { Date.now = now; }
     expect(s.writes).toHaveLength(reads); expect(s.prompts).toHaveLength(0);

@@ -2405,12 +2405,14 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     );
     let result = loop {
         tokio::select! {
-            res=bound.listener.accept()=>{
+            res=bound.listener.accept(), if permits.available_permits() > 0=>{
                 let (stream,_)=res?;
-                if let Ok(permit)=permits.clone().try_acquire_owned(){
-                    let broker=bound.broker.clone();
-                    connections.spawn(async move {let _permit=permit;if let Err(e)=broker.connection(stream).await{eprintln!("Connection: {e:#}");}});
-                }
+                // Only this loop acquires permits, so the guarded accept cannot
+                // race another acquirer. Leave excess peers in the bounded OS
+                // listen backlog rather than dropping an unread request.
+                let permit=permits.clone().try_acquire_owned().expect("accept requires a connection permit");
+                let broker=bound.broker.clone();
+                connections.spawn(async move {let _permit=permit;if let Err(e)=broker.connection(stream).await{eprintln!("Connection: {e:#}");}});
             },
             Some(_)=connections.join_next(),if !connections.is_empty()=>{},
             res=&mut dispatcher=>break res,
