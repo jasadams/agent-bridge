@@ -23,6 +23,43 @@ pub enum Capability {
     LifecycleRegistration,
 }
 
+/// Native observations, never a persisted agent catalog. Endpoint selection is
+/// request-local transport information, not evidence of native membership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeState {
+    pub session: String,
+    pub display_name: Option<String>,
+    pub status: Option<String>,
+    pub directory: Option<String>,
+    pub updated_ms: Option<i64>,
+    pub transport_endpoint: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StateError {
+    Unavailable(String),
+    Incomplete(String),
+}
+
+impl std::fmt::Display for StateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(detail) => write!(f, "native state unavailable: {detail}"),
+            Self::Incomplete(detail) => write!(f, "native state incomplete: {detail}"),
+        }
+    }
+}
+impl std::error::Error for StateError {}
+
+/// Synchronous reads run outside the DB lock on the existing blocking worker.
+/// Empty/None mean confirmed absence; errors must never become empty success.
+/// Only supporting providers age-filter lists; exact lookup is never filtered.
+pub trait ConnectorState {
+    fn provider(&self) -> Provider;
+    fn list(&self, max_age_days: u32) -> std::result::Result<Vec<NativeState>, StateError>;
+    fn get(&self, session: &str) -> std::result::Result<Option<NativeState>, StateError>;
+}
+
 /// Refresh authorization after asynchronous native preflight and before the first write.
 pub(crate) type NoticeGuard = std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
@@ -297,8 +334,7 @@ pub(crate) async fn deliver_notice(
     adapter.deliver(agent, msg, notice.text()).await
 }
 
-/// Observe only sessions already present in each native application. Dropping
-/// this future cancels both observers when the broker shuts down.
+/// Observe loaded Codex sessions. Dropping this future cancels the observer.
 pub(crate) async fn observe(broker: crate::broker::Broker, codex_home: Option<PathBuf>) {
     let codex_broker = broker.clone();
     let codex_observer = async move {
@@ -307,7 +343,7 @@ pub(crate) async fn observe(broker: crate::broker::Broker, codex_home: Option<Pa
         }
         std::future::pending::<()>().await;
     };
-    tokio::join!(claude_discovery::run(broker), codex_observer);
+    codex_observer.await;
 }
 
 #[cfg(test)]

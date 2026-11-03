@@ -1,148 +1,154 @@
 use agent_bridge::{
-    broker::Broker,
-    claude_discovery::{self, Titles},
-    db::Db,
-    protocol::{Agent, Provider, Request},
+    claude_discovery::State,
+    clients::{ConnectorState, StateError},
+    protocol::Provider,
 };
-use serde_json::{Value, json};
-use std::{io::Write, time::Duration};
+use serde_json::json;
+use std::{
+    fs, io,
+    os::unix::fs::PermissionsExt,
+    time::{Duration, Instant},
+};
 
-fn agent(session: &str) -> Agent {
-    Agent {
-        name: format!("claude-{session}"),
-        provider: Provider::Claude,
-        session: session.into(),
-        endpoint: String::new(),
-        enabled: true,
+const A: &str = "11111111-1111-4111-8111-111111111111";
+const B: &str = "22222222-2222-4222-8222-222222222222";
+
+fn fixture(script: &str) -> (tempfile::TempDir, State) {
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("claude");
+    fs::write(&executable, format!("#!/bin/sh\n[ \"$#\" = 2 ] && [ \"$1\" = agents ] && [ \"$2\" = --json ] || exit 90\n{script}\n")).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let state = State::new(executable);
+    (dir, state)
+}
+fn output(text: &str) -> (tempfile::TempDir, State) {
+    fixture(&format!("cat <<'NATIVE_JSON'\n{text}\nNATIVE_JSON"))
+}
+
+#[test]
+fn native_directory_needs_no_registration_and_names_are_only_metadata() {
+    let (_dir, state) = output(&json!([
+        {"sessionId":A,"name":"same","cwd":"/a","kind":"interactive","startedAt":1,"pid":1,"status":"idle","future":true},
+        {"sessionId":B,"name":"same","cwd":"/b","kind":"background","state":"blocked"}
+    ]).to_string());
+    let rows = state.list(7).unwrap();
+    assert_eq!(state.provider(), Provider::Claude);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].session, A);
+    assert_eq!(rows[1].session, B);
+    assert_eq!(rows[0].display_name.as_deref(), Some("same"));
+    assert_eq!(rows[1].directory.as_deref(), Some("/b"));
+    assert_eq!(rows[0].status.as_deref(), Some("idle"));
+    assert_eq!(rows[1].status.as_deref(), Some("blocked"));
+    assert!(
+        rows.iter()
+            .all(|s| s.updated_ms.is_none() && s.transport_endpoint.is_none())
+    );
+}
+
+#[test]
+fn exact_lookup_refreshes_rename_without_age_filtering_or_cached_state() {
+    let (dir, state) = output(&json!([{"sessionId":A,"name":"before","startedAt":1}]).to_string());
+    assert_eq!(
+        state.get(A).unwrap().unwrap().display_name.as_deref(),
+        Some("before")
+    );
+    fs::write(
+        dir.path().join("claude"),
+        format!("#!/bin/sh\nprintf '%s' '[{{\"sessionId\":\"{A}\",\"name\":\"after\"}}]'\n"),
+    )
+    .unwrap();
+    let row = state.get(A).unwrap().unwrap();
+    assert_eq!(row.display_name.as_deref(), Some("after"));
+    assert!(row.status.is_none());
+    assert_eq!(state.list(30).unwrap(), state.list(7).unwrap());
+    assert!(state.get(B).unwrap().is_none());
+}
+
+#[test]
+fn titles_short_and_noncanonical_ids_are_rejected_before_spawning() {
+    let (_dir, state) = fixture("exit 7");
+    for id in [
+        "before",
+        "claude:before",
+        "11111111",
+        "11111111111141118111111111111111",
+    ] {
+        assert!(matches!(state.get(id), Err(StateError::Incomplete(_))));
     }
 }
 
 #[test]
-fn provider_qualified_names_distinguish_cross_provider_collisions_and_manual_aliases() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = Db::open(&dir.path().join("db")).unwrap();
-    let cc = uuid::Uuid::new_v4().to_string();
-    let cx = uuid::Uuid::new_v4().to_string();
-    db.register(&agent(&cc), false).unwrap();
-    db.observe_claude_name(&cc, "same-name").unwrap();
-    db.observe_codex(&cx, Some("same-name"), true).unwrap();
-    assert!(db.resolve_agent("same-name").is_err());
-    assert_eq!(db.resolve_agent("claude:same-name").unwrap().session, cc);
-    assert_eq!(db.resolve_agent("codex:same-name").unwrap().session, cx);
-    let mut alias = db.resolve_agent(&format!("codex-{cx}")).unwrap();
-    alias.name = "same-name".into();
-    db.register(&alias, false).unwrap();
-    assert_eq!(db.resolve_agent("same-name").unwrap().session, cx);
-    assert_eq!(db.resolve_agent("claude:same-name").unwrap().session, cc);
-    db.observe_claude_name(&cc, "renamed").unwrap();
-    assert!(db.resolve_agent("claude:same-name").is_err());
-    assert_eq!(db.resolve_agent("claude:renamed").unwrap().session, cc);
-    let other = uuid::Uuid::new_v4().to_string();
-    db.register(&agent(&other), false).unwrap();
-    db.observe_claude_name(&other, "renamed").unwrap();
-    assert!(db.resolve_agent("claude:renamed").is_err());
+fn complete_empty_and_unknown_metadata_are_not_errors() {
+    let (_dir, empty) = output("[]");
+    assert!(empty.list(7).unwrap().is_empty());
+    assert!(empty.get(A).unwrap().is_none());
+    let (_dir, state) = output(&json!([{"sessionId":A}]).to_string());
+    assert!(state.list(7).unwrap()[0].status.is_none());
 }
 
-fn append(path: &std::path::Path, value: Value) {
-    writeln!(
-        std::fs::OpenOptions::new().append(true).open(path).unwrap(),
-        "{value}"
-    )
-    .unwrap();
-}
-async fn wait_title(broker: &Broker, title: &str) {
-    tokio::time::timeout(Duration::from_secs(6), async {
-        loop {
-            if broker
-                .request(Request::List { all: false })
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|a| {
-                    a["display_name"] == title && a["qualified_name"] == format!("claude:{title}")
-                })
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+#[test]
+fn malformed_partial_and_conflicting_rows_never_become_empty_success() {
+    for data in [
+        "not-json".to_string(),
+        "{}".into(),
+        "[null]".into(),
+        "[{}]".into(),
+        json!([{"id":"11111111"}]).to_string(),
+        json!([{"sessionId":"invalid"}]).to_string(),
+        json!([{"sessionId":A,"name":7}]).to_string(),
+        json!([{"sessionId":A,"startedAt":"bad"}]).to_string(),
+        json!([{"sessionId":A},{"id":"short"}]).to_string(),
+        json!([{"sessionId":A,"name":"a"},{"sessionId":A,"name":"b"}]).to_string(),
+    ] {
+        let (_dir, state) = output(&data);
+        assert!(
+            matches!(state.list(7), Err(StateError::Incomplete(_))),
+            "{data}"
+        );
+        assert!(matches!(state.get(B), Err(StateError::Incomplete(_))));
+    }
+    let (_dir, state) = output(&json!([{"sessionId":A},{"sessionId":A}]).to_string());
+    assert_eq!(state.list(7).unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn claude_titles_follow_filesystem_events_and_recover_partial_writes_and_replaced_files() {
-    let dir = tempfile::Builder::new()
-        .prefix("abc-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let projects = dir.path().join("projects");
-    let project = projects.join("project");
-    std::fs::create_dir_all(&project).unwrap();
-    let session = uuid::Uuid::new_v4().to_string();
-    let path = project.join(format!("{session}.jsonl"));
-    std::fs::write(&path, "").unwrap();
-    append(
-        &path,
-        json!({"type":"custom-title","sessionId":session,"customTitle":"before-start"}),
-    );
-    append(
-        &path,
-        json!({"type":"agent-name","sessionId":"wrong-session","agentName":"ignore-me"}),
-    );
-    let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
-    let socket = dir.path().join("cc.sock");
-    let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let mut cc = agent(&session);
-    cc.endpoint = socket.to_string_lossy().into();
-    bound
-        .broker
-        .request(Request::Register {
-            agent: cc,
-            replace: false,
-        })
-        .unwrap();
-    let broker = bound.broker.clone();
-    let root = projects.clone();
-    let task = tokio::spawn(async move { claude_discovery::observe(&broker, &root).await });
-    wait_title(&bound.broker, "before-start").await;
-    append(
-        &path,
-        json!({"type":"agent-name","sessionId":session,"agentName":"native-rename"}),
-    );
-    wait_title(&bound.broker, "native-rename").await;
-    task.abort();
-    let _ = task.await;
+#[test]
+fn bounds_are_incomplete_not_truncated_results() {
+    let (_dir, state) = output(&json!(vec![json!({"sessionId":A}); 4097]).to_string());
+    assert!(matches!(state.list(7), Err(StateError::Incomplete(_))));
+    let (_dir, state) = fixture("exec head -c 1048577 /dev/zero");
+    assert!(matches!(state.list(7), Err(StateError::Incomplete(_))));
+}
 
-    let mut titles = Titles::default();
-    titles.refresh(&bound.broker, &projects).unwrap();
-    let partial = json!({"type":"custom-title","sessionId":session,"customTitle":"partial-write"})
-        .to_string();
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+#[test]
+fn command_failures_are_unavailable_and_stderr_cannot_block_or_leak() {
+    let missing = State::new("/nonexistent/agent-bridge-test-claude");
+    assert!(matches!(missing.list(7), Err(StateError::Unavailable(_))));
+    let (_dir, state) =
+        fixture("head -c 131072 /dev/zero >&2; echo private-diagnostic >&2; exit 7");
+    let Err(StateError::Unavailable(error)) = state.list(7) else {
+        panic!("expected unavailable")
+    };
+    assert!(error.contains("exited"), "{error}");
+    assert!(!error.contains("private-diagnostic"));
+    let (_dir, state) = fixture("head -c 131072 /dev/zero >&2; printf '[]'");
+    assert!(state.list(7).unwrap().is_empty());
+}
+
+#[test]
+fn timeout_kills_and_reaps_only_the_query_child() {
+    let (dir, state) = fixture("echo $$ > \"$0.pid\"; exec sleep 30");
+    let start = Instant::now();
+    let Err(StateError::Unavailable(error)) = state.list(7) else {
+        panic!("expected timeout")
+    };
+    assert!(error.contains("timed out"));
+    assert!(start.elapsed() < Duration::from_secs(8));
+    let pid: i32 = fs::read_to_string(dir.path().join("claude.pid"))
+        .unwrap()
+        .trim()
+        .parse()
         .unwrap();
-    f.write_all(&partial.as_bytes()[..10]).unwrap();
-    titles.refresh(&bound.broker, &projects).unwrap();
-    wait_title(&bound.broker, "native-rename").await;
-    writeln!(f, "{}", &partial[10..]).unwrap();
-    titles.refresh(&bound.broker, &projects).unwrap();
-    wait_title(&bound.broker, "partial-write").await;
-    let replacement = project.join("replacement");
-    std::fs::write(
-        &replacement,
-        format!(
-            "{}\n",
-            json!({"type":"custom-title","sessionId":session,"customTitle":"replacement"})
-        ),
-    )
-    .unwrap();
-    std::fs::rename(replacement, &path).unwrap();
-    titles.refresh(&bound.broker, &projects).unwrap();
-    wait_title(&bound.broker, "replacement").await;
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
 }
