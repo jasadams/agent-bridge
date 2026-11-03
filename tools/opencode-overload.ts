@@ -30,7 +30,7 @@ try {
     const ctx = {
       options: { stateDir: root }, location: { directory: root },
       session: {
-        list: async () => ({ data: [...infos.values()] }),
+        list: async () => ({ data: [...infos.values()], cursor: { next: null } }),
         get: async ({ sessionID }: any) => infos.get(sessionID),
         context: async ({ sessionID }: any) => [...prompts.values()].filter(v => v.sessionID === sessionID && !v.text.includes("unknown-fixture")).map(v => ({ id: v.id, type: "user", text: v.text })),
         prompt: async ({ sessionID, id, text }: any) => {
@@ -42,7 +42,10 @@ try {
         },
         hook: async () => ({ dispose() {} }),
       },
-      event: { subscribe: ({ signal }: any) => ({ async *[Symbol.asyncIterator]() { await new Promise<void>(resolve => signal.addEventListener("abort", resolve, { once: true })); } }) },
+      event: { subscribe: ({ signal }: any) => ({ async *[Symbol.asyncIterator]() {
+        for (const sessionID of sessions) yield { type: "session.created", data: { sessionID }, location: { directory: root } };
+        await new Promise<void>(resolve => signal.addEventListener("abort", resolve, { once: true }));
+      } }) },
     };
     cleanups.push(await entry.setup(ctx));
   }

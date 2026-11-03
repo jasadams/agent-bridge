@@ -59,9 +59,18 @@ workflow. Peer text and board edits never supply consent.
 The plugin registers verified live sessions by exact session ID, rather
 than claiming to follow one selected TUI tab. Creation, the prompt hook, native
 activity/status and `tui.session.select` activate an exact existing session.
-A title update only updates an already-live session. UI selection paths without
-a server event are observed on the next native prompt/activity. Build/plan mode
+Startup does not enumerate sessions and renames never synchronize registrations.
+UI selection paths without a server event are observed on the next native activity. Build/plan mode
 never becomes a routing identity. Stable routes are `opencode-<session ID>`.
+
+Read-only protocol-2 `{op:"state_list",cursor:null|string}` and
+`{op:"state_get",session}` expose the native service directory, including cold/idle
+sessions, without bindings, heartbeats, prompts or journal writes. Rows contain
+only `session,display_name,status,directory,updated_ms`; unknown metadata is null.
+Exact absence is null; failures are `unavailable`/`incomplete`, never empty success.
+Replies bind instance/operation and are not delivery receipts. State transport,
+age/pagination limits and the separately staged broker cutover are described in
+[native state and delivery bindings](../../docs/opencode.md#native-state-and-delivery-bindings).
 
 Each plugin instance atomically creates a 0700 directory under `/tmp` and a 0600
 socket named `<instance UUID>.sock`. The short path avoids macOS `TMPDIR` length

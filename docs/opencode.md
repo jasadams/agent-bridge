@@ -53,24 +53,38 @@ OpenCode target before creating an exchange; use the explicit owner CLI pairing
 workflow instead. Board controls remain supported. Peer text, board content and
 native permission requests cannot supply pairing consent or change permissions.
 
-## Live session scope
+## Native state and delivery bindings
 
-The plugin belongs to one OpenCode server/plugin instance and may observe several
-live sessions. Startup verifies the runtime's native session listing. Session creation,
-chat submission, observed activity/status, and the runtime `tui.session.select`
-event activate an existing session only after verification through the supplied
-client. Title updates refresh metadata for sessions already observed as live;
-renaming archived history alone does not register it. A TUI's selected session is
-one source of activity, not a global single-session routing switch. Selection paths without a server event become
-visible on the next native prompt/activity. Session IDs
-use `ses_` plus 26 ASCII letters/digits; titles are display labels, never delivery
-identities. Routes are `opencode-SESSION_ID`; use `opencode:TITLE` for title lookup.
-Duplicate titles remain ambiguous.
+The connector reads global native `session.list` pages and exact `session.get`;
+it does not scan at startup or mirror title changes. Saved idle sessions and cold
+locations remain native candidates; archived sessions are omitted. IDs use `ses_`
+plus 26 ASCII letters/digits. Titles are display-only, never lookup or send routes.
+This provider boundary is staged: public broker listing/routing cutover belongs to AGB-46.
 
-Deleting/archiving a session or disposing the plugin unregisters its live routes.
+Private protocol-2 state requests are `{op:"state_list",cursor:null|string}` and
+`{op:"state_get",session:"ses_..."}`. Replies bind the operation and socket instance;
+list replies contain `sessions`/`next_cursor`, exact replies echo `session` and
+contain `state` (null only for confirmed absence). Rows require `session`,
+`display_name`, `status`, `directory`, `updated_ms`; unknown metadata is null and
+status is null because these native APIs expose no live status. The authenticated
+transport endpoint is attached locally, never accepted from row JSON.
+
+State reads never bind, renew, prompt or write the receipt journal. Expired lease
+endpoints are transport locators, not membership. At most 64 locators, 64 pages,
+4096 distinct sessions and a five-second total deadline are allowed. The first
+usable authenticated plugin selects scope; later pages never switch services.
+Native failures are unavailable/incomplete, not successful empty results.
+Completed lists filter only native `time.updated` with inclusive age boundaries;
+unknown update times remain included and exact lookup ignores age. The provider
+accepts any positive u32 age (including 7 and 30), not a maximum of 30 days.
+
+Creation, prompt/activity and `tui.session.select` events prepare delivery bindings.
+An explicit exact-session probe can prepare a cold candidate without prompting;
+the provisional binding terminates the broker's verification probe recursion.
+Deleting/archiving a session or disposing the plugin closes its delivery binding.
 A crashed/closed instance expires through a 20-second lease, renewed roughly every
-five to seven seconds by the live plugin, with staggered renewal scheduling. Startup
-observation and recovery use bounded workers and runtime-wide RPC limits, with
+five to seven seconds by the live plugin, with staggered renewal scheduling. Binding
+recovery uses bounded workers and runtime-wide RPC limits, with
 separate slots for lease renewal and delivery admission. Repeated activity for
 the same session is coalesced. Competing instances back off after a
 live-owner conflict before trying again. Broker expiry also runs while paused and without
@@ -125,8 +139,8 @@ that cannot obtain a local scheduling slot report that they were not submitted;
 they do not open a broker socket. Admission, renewal, close, observation and other
 RPCs have separate bounded capacity. Four stalled admissions can still delay or
 reject further admissions before submission; inspect the outcome rather than
-assuming a native attempt occurred. Recovery retains at most 1,024 session IDs
-per instance; overflow schedules periodic bounded rescans of native sessions.
+assuming a native attempt occurred. Recovery retains at most 1,024 previously bound
+delivery sessions per instance; unbound history and overflow never schedule rescans.
 Capacity diagnostics contain counts, not message bodies.
 
 For isolated load verification after building the broker, run

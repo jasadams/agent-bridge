@@ -41,7 +41,7 @@ async function frame(endpoint: string, value: unknown, raw = false, sent?: () =>
   });
 }
 
-async function setup(preexisting: string[] = [], tmpOverride?: string, initialBrokerResponse?: (request: any) => Promise<void | false | string>, listHook?: () => Promise<void>) {
+async function setup(preexisting: string[] = [], tmpOverride?: string, initialBrokerResponse?: (request: any) => Promise<void | false | string>, listHook?: (input: any) => Promise<unknown>) {
   const directory = await mkdtemp("/tmp/aboc-test-");
   await chmod(directory, 0o700);
   const registrations = new Map<string, any>();
@@ -115,6 +115,7 @@ async function setup(preexisting: string[] = [], tmpOverride?: string, initialBr
   let promptReceipt: ((receipt: any) => unknown) | undefined;
   const writes: string[] = [];
   let wrongIdentity = false;
+  let lookupError: unknown;
   let blocked: { kind: "get" | "context" | "prompt"; skip: number; fail: boolean; capture: boolean; enter: () => void; release: Promise<void>; returned: () => void } | undefined;
   function blockNext(kind: "get" | "context" | "prompt", skip = 0, fail = false, capture = false) {
     let enter!: () => void, release!: () => void, returned!: () => void;
@@ -135,6 +136,7 @@ async function setup(preexisting: string[] = [], tmpOverride?: string, initialBr
   const session = {
     get: async ({ sessionID }: { sessionID: string }) => {
       writes.push(`/${sessionID}`);
+      if (lookupError !== undefined) throw lookupError;
       let snapshot: any;
       if (blocked && blocked.kind === "get" && blocked.skip-- === 0) {
         const gate = blocked; blocked = undefined; gate.enter();
@@ -143,10 +145,10 @@ async function setup(preexisting: string[] = [], tmpOverride?: string, initialBr
         if (gate.fail) throw new Error("delayed lookup failure");
       }
       const info = snapshot ?? sessions.get(sessionID) as any;
-      if (!info || info.time.archived && !snapshot) throw new Error("Missing session");
+      if (!info) throw { _tag: "SessionNotFoundError", sessionID, message: "Missing session" };
       return wrongIdentity ? { ...info, id: B } : info;
     },
-    list: async () => { await listHook?.(); return { data: ['', ...preexisting].filter(id => sessions.has(id as string)).map(id => sessions.get(id as string)) as any[] }; },
+    list: async (input: unknown) => await listHook?.(input) ?? { data: [...sessions.values()], cursor: { next: null } },
     // prompt() records the admission and inserts into the transcript exactly
     // like the durable wake->delivered path the real runtime applies.
     prompt: async ({ sessionID, id, text }: any) => {
@@ -271,10 +273,99 @@ async function setup(preexisting: string[] = [], tmpOverride?: string, initialBr
     const db = new Database(join(directory, "opencode-receipts.sqlite3"), { readonly: true });
     try { return db.query("SELECT namespace,id,session,state FROM receipts ORDER BY id").all(); } finally { db.close(); }
   };
-  return { directory, registrations, requests, close, socketState: () => ({ accepted: acceptedSockets, ended: endedSockets, closed: closedSockets, active: brokerSockets.size }), brokerResponse: (hook: typeof brokerResponse) => { brokerResponse = hook; }, denyAdmission: (denied: boolean, hook?: () => void) => { admissionDenied = denied; admissionHook = hook; }, sessions, transcripts, native, inbox, promptReceipt: (hook: typeof promptReceipt) => { promptReceipt = hook; }, admitInbox: () => { admitInbox = true; }, prompts, writes, get hooks() { return hooks; }, reload, journalState, event, pushEvent, created, endpoint, blockNext, blockAdmission, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; } };
+  return { directory, registrations, requests, close, socketState: () => ({ accepted: acceptedSockets, ended: endedSockets, closed: closedSockets, active: brokerSockets.size }), brokerResponse: (hook: typeof brokerResponse) => { brokerResponse = hook; }, denyAdmission: (denied: boolean, hook?: () => void) => { admissionDenied = denied; admissionHook = hook; }, sessions, transcripts, native, inbox, promptReceipt: (hook: typeof promptReceipt) => { promptReceipt = hook; }, admitInbox: () => { admitInbox = true; }, prompts, writes, get hooks() { return hooks; }, reload, journalState, event, pushEvent, created, endpoint, blockNext, blockAdmission, lookupError: (error: unknown) => { lookupError = error; }, defer: (v: boolean) => { defer = v; }, wrongIdentity: () => { wrongIdentity = true; } };
 }
 
-test("startup observations are bounded across eight plugin instances", async () => {
+test("native state reads are passive, global and independent of delivery bindings", async () => {
+  const calls: any[] = [];
+  const s = await setup([A, B], undefined, undefined, async input => { calls.push(input); });
+  await Bun.sleep(30);
+  expect(calls).toHaveLength(0); expect(s.registrations.size).toBe(0);
+  await s.created(A);
+  const endpoint = s.endpoint(), requests = s.requests.length, journal = s.journalState(), reads = s.writes.length;
+  s.sessions.get(B).location.directory = "/cold/location";
+  s.sessions.get(B).time.updated = 1;
+  await s.event("session.renamed", { sessionID: B });
+  const page = await frame(endpoint, { op: "state_list", cursor: null });
+  expect(page).toMatchObject({ ok: true, protocol: 2, op: "state_list", next_cursor: null });
+  expect(page.sessions).toContainEqual({ session: B, display_name: "Beta", status: null, directory: "/cold/location", updated_ms: 1 });
+  expect(s.writes).toHaveLength(reads); // No per-row native lookup or probe.
+  expect(calls).toEqual([{ limit: 100, order: "desc", archived: false }]);
+  const exact = await frame(endpoint, { op: "state_get", session: B });
+  expect(exact).toEqual({ ok: true, protocol: 2, instance: page.instance, op: "state_get", session: B, state: page.sessions.find((row: any) => row.session === B) });
+  s.sessions.get(B).time.archived = 1;
+  expect((await frame(endpoint, { op: "state_get", session: B })).state).toBeNull();
+  expect((await frame(endpoint, { op: "state_list", cursor: null })).sessions.every((row: any) => row.session !== B)).toBe(true);
+  s.sessions.delete(B);
+  expect((await frame(endpoint, { op: "state_get", session: B })).state).toBeNull();
+  s.sessions.clear();
+  expect((await frame(endpoint, { op: "state_list", cursor: null })).sessions).toEqual([]);
+  expect(s.requests).toHaveLength(requests); expect(s.registrations.size).toBe(1);
+  expect(s.journalState()).toEqual(journal); expect(s.prompts).toHaveLength(0);
+  expect(s.writes.filter(path => path.includes("/prompt") || path.includes("/context"))).toEqual([]);
+});
+
+test("native state paging validates cursors, rows and bounded responses without fallback", async () => {
+  let page: any = { data: [], cursor: { next: "next" } };
+  const calls: any[] = [];
+  const s = await setup([], undefined, undefined, async input => { calls.push(input); return page; });
+  await s.created(); const endpoint = s.endpoint();
+  expect((await frame(endpoint, { op: "state_list", cursor: null })).next_cursor).toBe("next");
+  page = { data: [], cursor: { next: null } };
+  expect((await frame(endpoint, { op: "state_list", cursor: "next" })).ok).toBe(true);
+  expect(calls.at(-1)).toEqual({ limit: 100, order: "desc", archived: false, cursor: "next" });
+  for (const bad of [{}, { data: [], cursor: null }, { data: [], cursor: { next: 4 } }, { data: [{}], cursor: {} }, { data: [], cursor: { next: "next" } }]) {
+    page = bad;
+    expect(await frame(endpoint, { op: "state_list", cursor: "next" })).toMatchObject({ ok: false, op: "state_list", error: "incomplete" });
+  }
+  page = { data: [{ ...s.sessions.get(A), title: "x".repeat(256 * 1024) }], cursor: {} };
+  expect((await frame(endpoint, { op: "state_list", cursor: null })).error).toBe("incomplete");
+  for (const request of [{ op: "state_list" }, { op: "state_list", cursor: "" }, { op: "state_list", cursor: "x".repeat(4097) }, { op: "state_get", session: B, endpoint }, { op: "state_get", session: "title" }]) {
+    expect((await frame(endpoint, request)).ok).toBe(false);
+  }
+});
+
+test("native state lookup errors are not absence and cold delivery needs an explicit probe", async () => {
+  const s = await setup(); await s.created(); const endpoint = s.endpoint();
+  const gate = s.blockNext("get", 0, true);
+  const pending = frame(endpoint, { op: "state_get", session: B });
+  await gate.entered; gate.release(); await gate.settled();
+  expect(await pending).toMatchObject({ ok: false, op: "state_get", error: "unavailable" });
+  expect(s.registrations.has(B)).toBe(false);
+  for (const error of [new Error("SessionNotFoundError"), { _tag: "SessionNotFoundError", sessionID: A, message: "wrong session" }, { _tag: "SessionNotFoundError", sessionID: B }, { cause: { _tag: "SessionNotFoundError", sessionID: B, message: "wrapped" } }]) {
+    s.lookupError(error);
+    expect((await frame(endpoint, { op: "state_get", session: B })).error).toBe("unavailable");
+  }
+  s.lookupError(undefined);
+  expect((await frame(endpoint, { op: "state_get", session: B })).ok).toBe(true);
+  expect(s.registrations.has(B)).toBe(false);
+  expect((await frame(endpoint, { op: "probe", session: B })).ok).toBe(true);
+  expect(s.registrations.has(B)).toBe(true); expect(s.prompts).toHaveLength(0);
+  s.sessions.get(A).time.archived = 1; s.wrongIdentity();
+  expect((await frame(endpoint, { op: "state_get", session: A })).error).toBe("incomplete");
+});
+
+async function seed(s: Awaited<ReturnType<typeof setup>>, sessions: string[]) {
+  for (let i = 0; i < sessions.length; i += 8) await Promise.all(sessions.slice(i, i + 8).map(id => s.created(id)));
+}
+
+test("a cold probe's provisional binding cannot heartbeat before registration completes", async () => {
+  const s = await setup(); await s.created(A); const endpoint = s.endpoint();
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  s.brokerResponse(async request => { if (request.op === "opencode_observe" && request.session === B) { enter(); await held; } });
+  const pending = frame(endpoint, { op: "probe", session: B });
+  try {
+    await entered;
+    await s.event("session.status", { sessionID: B });
+    expect(s.requests.filter(request => request.op === "opencode_heartbeat" && request.session === B)).toHaveLength(0);
+    release();
+    expect((await pending).ok).toBe(true);
+  } finally { release(); await pending.catch(() => {}); s.brokerResponse(undefined); }
+});
+
+test("activity observations are bounded across eight plugin instances", async () => {
   const sessions = Array.from({ length: 58 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
@@ -288,7 +379,7 @@ test("startup observations are bounded across eight plugin instances", async () 
         inFlight--;
       }
     }));
-    await Bun.sleep(300);
+    await Promise.all(fixtures.map(s => seed(s, sessions)));
     expect(peak).toBeGreaterThan(0);
     expect(peak).toBeLessThanOrEqual(32);
   } finally { release(); }
@@ -303,6 +394,7 @@ test("stalled observations leave capacity for admission traffic", async () => {
     if (request.op === "opencode_observe") { entered++; await gate; }
   });
   try {
+    await seed(s, sessions);
     await Bun.sleep(200);
     expect(entered).toBeGreaterThan(0);
     expect(await Promise.race([
@@ -347,8 +439,9 @@ test("a heartbeat rejected before submission does not discard an unexpired lease
   } finally { Date.now = now; release(); await Promise.all(calls); s.brokerResponse(undefined); }
 }, 30000);
 
-test("an observation rejected before submission preserves a live lease and retries metadata", async () => {
+test("an observation rejected before submission preserves a live binding", async () => {
   const s = await setup(); await s.created(A);
+  const generation = s.registrations.get(A).generation;
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   s.brokerResponse(async request => { if (request.op === "opencode_observe" && request.session !== A) await gate; });
@@ -356,12 +449,10 @@ test("an observation rejected before submission preserves a live lease and retri
   try {
     await Bun.sleep(150);
     s.sessions.get(A).title = "latest under pressure";
-    await s.event("session.renamed", {sessionID:A});
+    await s.event("tui.session.select", {sessionID:A});
     expect((await frame(s.endpoint(), {op:"probe",session:A})).ok).toBe(true);
     release(); await Promise.all(calls);
-    const deadline = Date.now() + 4000;
-    while (Date.now() < deadline && s.registrations.get(A)?.title !== "latest under pressure") await Bun.sleep(20);
-    expect(s.registrations.get(A)?.title).toBe("latest under pressure");
+    expect(s.registrations.get(A)?.generation).toBe(generation);
   } finally { release(); await Promise.all(calls); s.brokerResponse(undefined); }
 }, 30000);
 
@@ -473,6 +564,7 @@ test("many sessions renew across eight instances without starving status", async
   const sessions = Array.from({ length: 58 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
   const fixtures: Awaited<ReturnType<typeof setup>>[] = [];
   for (let i = 0; i < 8; i++) fixtures.push(await setup(sessions));
+  await Promise.all(fixtures.map(s => seed(s, sessions)));
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline && fixtures.some(s => sessions.some(id => !s.requests.some(request => request.op === "opencode_heartbeat" && request.session === id)))) {
     await Bun.sleep(100);
@@ -497,7 +589,7 @@ test("repeated status events coalesce while a session is busy", async () => {
   const s = await setup(); await s.created(A);
   const gate = s.blockNext("get");
   try {
-    s.pushEvent({type: "session.renamed", data: {sessionID: A}});
+    s.pushEvent({type: "tui.session.select", data: {sessionID: A}});
     await gate.entered;
     for (let i = 0; i < 30; i++) s.pushEvent({type: "session.status", data: {sessionID: A}});
     await Bun.sleep(50);
@@ -517,7 +609,7 @@ test("rename and prompt bursts do not queue unbounded observations", async () =>
   const s = await setup(); await s.created(A);
   const gate = s.blockNext("get");
   try {
-    s.pushEvent({type: "session.renamed", data: {sessionID: A}});
+    s.pushEvent({type: "tui.session.select", data: {sessionID: A}});
     await gate.entered;
     for (let i = 0; i < 40; i++) {
       s.pushEvent({type: "session.renamed", data: {sessionID: A}});
@@ -529,43 +621,6 @@ test("rename and prompt bursts do not queue unbounded observations", async () =>
     expect(s.requests.filter(request => request.op === "opencode_observe" && request.session === A).length).toBeLessThanOrEqual(3);
   } finally { gate.release(); }
 });
-
-test("rename during an in-flight registration eventually publishes the latest title", async () => {
-  const s = await setup(); await s.created(A);
-  let enter!: () => void, release!: () => void;
-  const entered = new Promise<void>(resolve => { enter = resolve; });
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  let held = false;
-  s.brokerResponse(async request => {
-    if (request.op === "opencode_observe" && !held) { held = true; enter(); await gate; }
-  });
-  try {
-    s.sessions.get(A).title = "first title";
-    s.pushEvent({type:"session.renamed",data:{sessionID:A}});
-    await entered;
-    s.sessions.get(A).title = "latest title";
-    await s.event("session.renamed", {sessionID:A});
-    release();
-    const deadline = Date.now() + 4000;
-    while (Date.now() < deadline && s.registrations.get(A)?.title !== "latest title") await Bun.sleep(20);
-    expect(s.registrations.get(A)?.title).toBe("latest title");
-  } finally { release(); s.brokerResponse(undefined); }
-}, 10000);
-
-test("rename during initial native lookup publishes the latest title", async () => {
-  const s = await setup();
-  const gate = s.blockNext("get", 0, false, true);
-  try {
-    s.pushEvent({type:"session.created",data:{sessionID:A}});
-    await gate.entered;
-    s.sessions.get(A).title = "latest title";
-    await s.event("session.renamed", {sessionID:A});
-    gate.release(); await gate.settled();
-    const deadline = Date.now() + 4000;
-    while (Date.now() < deadline && s.registrations.get(A)?.title !== "latest title") await Bun.sleep(20);
-    expect(s.registrations.get(A)?.title).toBe("latest title");
-  } finally { gate.release(); }
-}, 10000);
 
 test("failed initial observations with pending renames do not reactivate archived sessions", async () => {
   const s = await setup();
@@ -585,11 +640,11 @@ test("failed initial observations with pending renames do not reactivate archive
   expect(s.requests.filter(request => request.op === "opencode_observe")).toHaveLength(0);
 }, 15000);
 
-test("repeated lifecycle epochs behind a stalled lookup recover only the latest session", async () => {
+test("repeated lifecycle epochs behind a stalled lookup retain only the latest explicit activity", async () => {
   const s = await setup(); await s.created(A);
   const gate = s.blockNext("get");
   try {
-    s.pushEvent({type:"session.renamed",data:{sessionID:A}});
+    s.pushEvent({type:"tui.session.select",data:{sessionID:A}});
     await gate.entered;
     for (let i = 0; i < 100; i++) {
       s.pushEvent({type:"session.archived",data:{sessionID:A}});
@@ -597,6 +652,7 @@ test("repeated lifecycle epochs behind a stalled lookup recover only the latest 
     }
     await Bun.sleep(100);
     gate.release(); await gate.settled();
+    await s.event("tui.session.select", { sessionID: A });
     const deadline = Date.now() + 7000;
     while (Date.now() < deadline && !s.registrations.has(A)) await Bun.sleep(50);
     expect(s.registrations.has(A)).toBe(true);
@@ -604,7 +660,7 @@ test("repeated lifecycle epochs behind a stalled lookup recover only the latest 
   } finally { gate.release(); }
 }, 12000);
 
-test("stale archived lookup cannot erase recovery after recreation overflow", async () => {
+test("stale archived lookup cannot erase explicit activity after recreation overflow", async () => {
   const s = await setup();
   s.sessions.get(A).time.archived = 1;
   const gate = s.blockNext("get", 0, false, true);
@@ -618,6 +674,7 @@ test("stale archived lookup cannot erase recovery after recreation overflow", as
     }
     await Bun.sleep(100);
     gate.release(); await gate.settled();
+    await s.event("tui.session.select", { sessionID: A });
     const deadline = Date.now() + 7000;
     while (Date.now() < deadline && !s.registrations.has(A)) await Bun.sleep(50);
     expect(s.registrations.has(A)).toBe(true);
@@ -630,7 +687,9 @@ test("recovery of many sessions keeps observation work bounded", async () => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   let current = 0, peak = 0;
-  const s = await setup(sessions, undefined, async request => {
+  const s = await setup(sessions);
+  await seed(s, sessions);
+  s.brokerResponse(async request => {
     if (request.op !== "opencode_observe") return;
     const count = (attempts.get(request.session) ?? 0) + 1;
     attempts.set(request.session, count);
@@ -639,6 +698,7 @@ test("recovery of many sessions keeps observation work bounded", async () => {
     await gate;
     current--;
   });
+  for (const sessionID of sessions) s.pushEvent({ type: "tui.session.select", data: { sessionID } });
   try {
     const deadline = Date.now() + 9000;
     while (Date.now() < deadline && peak < 4) await Bun.sleep(50);
@@ -651,12 +711,15 @@ test("recovery of many sessions keeps observation work bounded", async () => {
 test("persistent early recovery failures do not starve later sessions", async () => {
   const sessions = Array.from({ length: 20 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
   const attempts = new Map<string, number>();
-  await setup(sessions, undefined, async request => {
+  const s = await setup(sessions);
+  await seed(s, sessions);
+  s.brokerResponse(async request => {
     if (request.op === "opencode_observe") {
       attempts.set(request.session, (attempts.get(request.session) ?? 0) + 1);
       return "temporary broker failure";
     }
   });
+  for (const sessionID of sessions) s.pushEvent({ type: "tui.session.select", data: { sessionID } });
   const initialDeadline = Date.now() + 3000;
   while (Date.now() < initialDeadline && attempts.size < sessions.length) await Bun.sleep(20);
   expect(attempts.size).toBe(20);
@@ -671,37 +734,31 @@ test("persistent early recovery failures do not starve later sessions", async ()
   } finally { Date.now = now; clearInterval(clock); }
 }, 15000);
 
-test("distinct-session overflow is bounded and recovered by rescan", async () => {
+test("unbound activity overflow does not create a discovery rescan or recovery catalog", async () => {
   const sessions = Array.from({ length: 1100 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
-  let release!: () => void;
+  let release!: () => void, listCalls = 0;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const originalError = console.error;
   const messages: string[] = [];
   console.error = (...args: unknown[]) => { messages.push(args.map(String).join(" ")); };
   let s: Awaited<ReturnType<typeof setup>> | undefined;
   try {
-    s = await setup(sessions, undefined, async request => { if (request.op === "opencode_observe") await gate; });
+    s = await setup(sessions, undefined, async request => { if (request.op === "opencode_observe") await gate; }, async () => { listCalls++; });
     for (const sessionID of sessions) s.pushEvent({ type: "session.created", data: { sessionID } });
-    const overflowDeadline = Date.now() + 5000;
-    while (Date.now() < overflowDeadline && !messages.some(message => message.includes("recovery capacity reached"))) await Bun.sleep(20);
-    expect(messages.some(message => message.includes("retained=1024"))).toBe(true);
+    await Bun.sleep(300);
     release();
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline && s.registrations.size < sessions.length) await Bun.sleep(50);
-    expect(s.registrations.has(sessions.at(-1)!)).toBe(true);
-    expect(s.registrations.size).toBe(sessions.length);
     await Bun.sleep(1500);
-    const observations = s.requests.filter(request => request.op === "opencode_observe").length;
-    await Bun.sleep(21000);
-    // Under this oversized synthetic load individual renewals may fail and
-    // recover; a full repeated rescan would add at least 1,100 observations.
-    expect(s.requests.filter(request => request.op === "opencode_observe").length - observations).toBeLessThan(256);
+    expect(s.registrations.size).toBeGreaterThan(0);
+    expect(s.registrations.size).toBeLessThanOrEqual(256);
+    expect(listCalls).toBe(0);
+    expect(messages.some(message => message.includes("recovery capacity reached"))).toBe(false);
   } finally { release(); console.error = originalError; }
 }, 45000);
 
 test("overflow of healthy activity does not consume recovery capacity", async () => {
   const sessions = Array.from({length: 1300}, (_, i) => `ses_${String(i).padStart(26,"0")}`);
   const s = await setup(sessions);
+  await seed(s, sessions);
   const initial = Date.now() + 20000;
   while (Date.now() < initial && s.registrations.size < sessions.length) await Bun.sleep(50);
   expect(s.registrations.size).toBe(sessions.length);
@@ -728,23 +785,14 @@ test("overflow of healthy activity does not consume recovery capacity", async ()
   } finally { release(); s.brokerResponse(undefined); console.error = originalError; }
 }, 45000);
 
-test("repeated overflow with a failing native list has only one scan retry chain", async () => {
-  const sessions = Array.from({ length: 1100 }, (_, i) => `ses_${String(i).padStart(26, "0")}`);
-  let release!: () => void, listCalls = 0;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  const originalError = console.error;
-  console.error = () => {};
-  try {
-    const s = await setup([], undefined, async request => { if (request.op === "opencode_observe") await gate; }, async () => { listCalls++; throw new Error("native list unavailable"); });
-    for (const id of sessions) {
-      s.sessions.set(id, { id, title:"fixture", location:{directory:s.directory}, time:{created:1,updated:1} });
-      s.pushEvent({type:"session.created",data:{sessionID:id}});
-    }
-    await Bun.sleep(11500);
-    expect(listCalls).toBeGreaterThanOrEqual(2);
-    expect(listCalls).toBeLessThanOrEqual(3);
-  } finally { release(); console.error = originalError; }
-}, 20000);
+test("failed native list stays unavailable without startup or background scan retries", async () => {
+  let listCalls = 0;
+  const s = await setup([], undefined, undefined, async () => { listCalls++; throw new Error("PRIVATE native error"); });
+  await s.created();
+  const result = await frame(s.endpoint(), { op: "state_list", cursor: null });
+  expect(result).toMatchObject({ ok: false, op: "state_list", error: "unavailable" });
+  expect(JSON.stringify(result)).not.toContain("PRIVATE"); expect(listCalls).toBe(1);
+});
 
 describe("V2 durable inbox proof", () => {
   const delivery = { op: "deliver", session: A, id: ID, content: "Exact held native input" };
@@ -770,12 +818,16 @@ describe("V2 durable inbox proof", () => {
     expect(s.prompts).toHaveLength(1);
   });
 
-  test("P0: startup scan reopens a session after its location moved", async () => {
+  test("P0: explicit cold preparation reopens a session after its location moved", async () => {
     const s = await setup([A]);
     await s.created();
     s.sessions.get(A).location = { directory: join(s.directory, "new-worktree") };
     await s.reload();
-    for (let i = 0; i < 20 && !s.registrations.has(A); i++) await Bun.sleep(10);
+    await s.created(B);
+    expect(s.registrations.has(A)).toBe(false);
+    expect((await frame(s.endpoint(), { op: "state_get", session: A })).ok).toBe(true);
+    expect(s.registrations.has(A)).toBe(false);
+    expect((await frame(s.endpoint(), { op: "probe", session: A })).ok).toBe(true);
     expect(s.registrations.has(A)).toBe(true);
     s.admitInbox();
     expect((await frame(s.endpoint(), delivery)).status).toBe("inserted");
@@ -984,7 +1036,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created(A);
     const gate = s.blockNext("get", 0, true);
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered; gate.release(); await gate.settled();
       await Bun.sleep(5600);
       expect(s.registrations.has(A)).toBe(true);
@@ -1008,7 +1060,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created(A);
     const gate = s.blockNext("get", 0, true);
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered;
       gate.release(); await gate.settled();
       await Bun.sleep(50);
@@ -1021,7 +1073,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created(A);
     const gate = s.blockNext("get");
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.hooks.prompt({ sessionID: A });
       await gate.entered;
       s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await Bun.sleep(3400);
@@ -1032,7 +1084,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created(A);
     const gate = s.blockNext("get");
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered;
       await s.hooks.prompt?.({ sessionID: A, messageID: "msg_queued", delivery: "steer", prompt: { text: "hi" } });
       await s.event("session.deleted", { sessionID: A });
@@ -1046,8 +1098,9 @@ describe("V2 plugin with real private Unix sockets", () => {
     const endpoint = s.endpoint();
     const gate = s.blockNext("get");
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered;
+      s.sessions.delete(A);
       await s.event("session.deleted", { sessionID: A });
       expect((await frame(endpoint, { op: "probe", session: A })).ok).toBe(false);
       expect(s.registrations.has(A)).toBe(false);
@@ -1057,7 +1110,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created(A);
     const gate = s.blockNext("get");
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered;
       await Bun.sleep(3300);
       expect(s.registrations.has(A)).toBe(false);
@@ -1082,7 +1135,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created(A); await s.created(B);
     const gate = s.blockNext("get");
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered;
       await s.event("session.deleted", { sessionID: B });
       expect(s.registrations.has(B)).toBe(false);
@@ -1099,7 +1152,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const gate = s.blockNext("get");
     try {
       await started;
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered;
       await Bun.sleep(3300);
       expect(s.registrations.has(A)).toBe(false);
@@ -1110,7 +1163,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     const s = await setup(); await s.created(A);
     const gate = s.blockNext("get", 0, true);
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered;
       gate.release(); await gate.settled();
       await Bun.sleep(50);
@@ -1134,7 +1187,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     });
     try {
       await started;
-      await s.event("session.renamed", { sessionID: A });
+      await s.event("tui.session.select", { sessionID: A });
       await Bun.sleep(5200);
       expect((await frame(s.endpoint(), { op: "probe", session: A })).ok).toBe(true);
     } finally {
@@ -1148,7 +1201,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     await s.created(B);
     const gate = s.blockNext("get");
     try {
-      s.pushEvent({ type: "session.renamed", data: { sessionID: A }, location: { directory: s.directory } });
+      s.pushEvent({ type: "tui.session.select", data: { sessionID: A }, location: { directory: s.directory } });
       await gate.entered;
       await Bun.sleep(5600);
       expect(s.requests.some(request => request.op === "opencode_heartbeat" && request.session === B)).toBe(true);
@@ -1167,11 +1220,11 @@ describe("V2 plugin with real private Unix sockets", () => {
     expect(Buffer.byteLength(s.endpoint())).toBeLessThan(104);
     expect((await frame(s.endpoint(), { op: "probe", session: A })).ok).toBe(true);
   });
-  test("startup scan registers pre-existing sessions without any event", async () => {
+  test("startup leaves pre-existing native history unbound", async () => {
     const s = await setup([A, B]);
     await new Promise<void>(resolve => setImmediate(resolve));
     await Bun.sleep(20);
-    expect([...s.registrations.keys()].sort()).toEqual([A, B].sort());
+    expect(s.registrations.size).toBe(0); expect(s.writes).toHaveLength(0);
     await s.close();
     expect(s.registrations.size).toBe(0);
   });
@@ -1186,7 +1239,8 @@ describe("V2 plugin with real private Unix sockets", () => {
     expect((await stat(join(endpoint, ".."))).mode & 0o777).toBe(0o700);
     s.sessions.get(A).title = "Renamed";
     await s.event("session.renamed", { sessionID: A, title: "Renamed" });
-    expect(s.registrations.get(A).title).toBe("Renamed");
+    expect(s.registrations.get(A).title).toBe("Alpha");
+    expect((await frame(endpoint, { op: "state_get", session: A })).state.display_name).toBe("Renamed");
     expect(s.registrations.get(A).endpoint).toBe(endpoint);
     await s.close();
     expect(s.registrations.size).toBe(0);
@@ -1195,7 +1249,7 @@ describe("V2 plugin with real private Unix sockets", () => {
   test("unknown, deleted, wrong-client identity and archived sessions fail closed", async () => {
     const s = await setup();
     await s.created();
-    expect((await frame(s.endpoint(), { op: "probe", session: B })).ok).toBe(false);
+    expect((await frame(s.endpoint(), { op: "probe", session: "ses_" + "9".repeat(26) })).ok).toBe(false);
     s.sessions.delete(A);
     expect((await frame(s.endpoint(), { op: "probe", session: A })).ok).toBe(false);
     expect(s.prompts).toHaveLength(0);
