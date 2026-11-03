@@ -1,12 +1,14 @@
 //! A read-only observer of the *existing* native Codex daemon. Never starts or resumes a thread.
+use super::{ConnectorState, NativeState, StateError};
 use crate::broker::Broker;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 use tokio::{
@@ -18,6 +20,64 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 type Socket = WebSocketStream<UnixStream>;
 const MAX_LOADED_SESSIONS: usize = 4096;
 const MAX_LOADED_PAGES: usize = 64;
+
+/// Replaceable native observations owned by the existing, single connection.
+/// No database writes, previous lifecycle inventory, or owner policy live here.
+#[derive(Clone, Default)]
+pub struct State(Arc<Mutex<Observation>>);
+
+#[derive(Default)]
+struct Observation {
+    connected: bool,
+    complete: bool,
+    rows: BTreeMap<String, NativeState>,
+}
+
+impl State {
+    fn snapshot(&self) -> std::result::Result<MutexGuard<'_, Observation>, StateError> {
+        let observation = self
+            .0
+            .lock()
+            .map_err(|_| StateError::Unavailable("Codex observation lock poisoned".into()))?;
+        if !observation.connected {
+            return Err(StateError::Unavailable(
+                "Codex observer disconnected".into(),
+            ));
+        }
+        if !observation.complete {
+            return Err(StateError::Incomplete(
+                "Codex loaded-session read incomplete".into(),
+            ));
+        }
+        Ok(observation)
+    }
+}
+
+impl ConnectorState for State {
+    fn provider(&self) -> crate::protocol::Provider {
+        crate::protocol::Provider::Codex
+    }
+    fn list(&self, _max_age_days: u32) -> std::result::Result<Vec<NativeState>, StateError> {
+        Ok(self.snapshot()?.rows.values().cloned().collect())
+    }
+    fn get(&self, session: &str) -> std::result::Result<Option<NativeState>, StateError> {
+        if session.len() != 36 || uuid::Uuid::parse_str(session).is_err() {
+            return Err(StateError::Incomplete(
+                "Codex lookup requires a full session UUID".into(),
+            ));
+        }
+        Ok(self.snapshot()?.rows.get(session).cloned())
+    }
+}
+
+struct Connection<'a>(&'a State);
+impl Drop for Connection<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut observation) = self.0.0.lock() {
+            *observation = Observation::default();
+        }
+    }
+}
 
 /// Socket layout is isolated here because native daemon layout can change between Codex versions.
 pub fn socket_paths() -> Vec<PathBuf> {
@@ -78,7 +138,12 @@ async fn request_read(
     id: &str,
     next: &mut u64,
     pending: &mut HashMap<u64, Pending>,
+    state: &State,
 ) -> Result<()> {
+    ensure!(
+        id.len() == 36 && uuid::Uuid::parse_str(id).is_ok(),
+        "Invalid native Codex session UUID"
+    );
     if pending
         .values()
         .any(|p| matches!(p,Pending::Read(existing) if existing==id))
@@ -92,6 +157,7 @@ async fn request_read(
     let request = *next;
     *next += 1;
     pending.insert(request, Pending::Read(id.into()));
+    state.0.lock().unwrap().complete = false;
     send(
         socket,
         json!({"id":request,"method":"thread/read","params":{"threadId":id}}),
@@ -99,7 +165,14 @@ async fn request_read(
     .await
 }
 
-pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path) -> Result<()> {
+pub async fn observe_connection(
+    broker: &Broker,
+    path: &Path,
+    codex_home: &Path,
+    state: &State,
+) -> Result<()> {
+    *state.0.lock().unwrap() = Observation::default();
+    let _connection = Connection(state); // Also clears observations on cancellation.
     let stream = timeout(Duration::from_secs(3), UnixStream::connect(path)).await??;
     ensure!(
         stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
@@ -131,13 +204,14 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
         break;
     }
     send(&mut socket, json!({"method":"initialized"})).await?;
+    state.0.lock().unwrap().connected = true;
     let mut loaded = HashSet::new();
     let mut closed_during_scan = HashSet::new();
     let mut cursors = HashSet::new();
     let mut initial_scan = true;
     let mut pending = HashMap::from([(2, Pending::Loaded)]);
     let mut next = 3;
-    let mut observed = HashSet::new();
+    let mut failed_reads = HashSet::new();
     send(
         &mut socket,
         json!({"id":2,"method":"thread/loaded/list","params":{}}),
@@ -156,7 +230,9 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
                 match request {
                     Pending::Loaded => bail!("Native discovery rejected: {}", value["error"]),
                     Pending::Read(session) => {
-                        broker.codex_offline(Some(&session))?;
+                        state.0.lock().unwrap().rows.remove(&session);
+                        state.0.lock().unwrap().complete = false;
+                        failed_reads.insert(session);
                         continue;
                     }
                 }
@@ -178,7 +254,7 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
                                 loaded.len() <= MAX_LOADED_SESSIONS,
                                 "Native loaded-session scan exceeds 4096 identities"
                             );
-                            request_read(&mut socket, id, &mut next, &mut pending).await?;
+                            request_read(&mut socket, id, &mut next, &mut pending, state).await?;
                         }
                     }
                     let cursor = &value["result"]["nextCursor"];
@@ -196,7 +272,6 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
                         pending.insert(id, Pending::Loaded);
                         send(&mut socket,json!({"id":id,"method":"thread/loaded/list","params":{"cursor":cursor}})).await?;
                     } else {
-                        broker.reconcile_codex_loaded(&loaded)?;
                         initial_scan = false;
                         closed_during_scan.clear();
                     }
@@ -214,11 +289,32 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
                             "Native loaded-session scan exceeds 4096 identities"
                         );
                     }
-                    broker.observe_codex(thread)?;
-                    observed.insert(session);
-                    broker.discovery_status(json!({"state":"connected","socket":path,"observed_sessions":observed.len()}));
+                    failed_reads.remove(&session);
+                    let mut observation = state.0.lock().unwrap();
+                    if thread["status"]["type"] == "notLoaded" {
+                        observation.rows.remove(&session);
+                    } else {
+                        observation.rows.insert(
+                            session.clone(),
+                            NativeState {
+                                session,
+                                display_name: thread["name"].as_str().map(str::to_owned),
+                                directory: thread["cwd"].as_str().map(str::to_owned),
+                                status: thread["status"]["type"].as_str().map(str::to_owned),
+                                updated_ms: None,
+                                transport_endpoint: None,
+                            },
+                        );
+                        ensure!(
+                            observation.rows.len() <= MAX_LOADED_SESSIONS,
+                            "Native Codex observation exceeds 4096 sessions"
+                        );
+                    }
+                    broker.discovery_status(json!({"state":"connected","socket":path,"observed_sessions":observation.rows.len()}));
                 }
             }
+            state.0.lock().unwrap().complete =
+                !initial_scan && pending.is_empty() && failed_reads.is_empty();
             continue;
         }
         let method = value["method"].as_str().unwrap_or("");
@@ -234,7 +330,7 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
                             "Native loaded-session scan exceeds 4096 identities"
                         );
                     }
-                    request_read(&mut socket, id, &mut next, &mut pending).await?;
+                    request_read(&mut socket, id, &mut next, &mut pending, state).await?;
                 }
             }
             "thread/name/updated" | "thread/status/changed" | "thread/unarchived" => {
@@ -247,7 +343,8 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
                             loaded.remove(id);
                             closed_during_scan.insert(id.to_owned());
                         }
-                        broker.codex_offline(Some(id))?;
+                        state.0.lock().unwrap().rows.remove(id);
+                        failed_reads.remove(id);
                     } else {
                         if initial_scan {
                             loaded.insert(id.to_owned());
@@ -257,7 +354,7 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
                                 "Native loaded-session scan exceeds 4096 identities"
                             );
                         }
-                        request_read(&mut socket, id, &mut next, &mut pending).await?;
+                        request_read(&mut socket, id, &mut next, &mut pending, state).await?;
                     }
                 }
             }
@@ -270,26 +367,26 @@ pub async fn observe_connection(broker: &Broker, path: &Path, codex_home: &Path)
                         loaded.remove(id);
                         closed_during_scan.insert(id.to_owned());
                     }
-                    broker.codex_offline(Some(id))?;
-                    observed.remove(id);
+                    state.0.lock().unwrap().rows.remove(id);
+                    failed_reads.remove(id);
                 }
             }
             _ => {} // Do not collect transcript contents, tools, model deltas, or approval requests.
         }
+        state.0.lock().unwrap().complete =
+            !initial_scan && pending.is_empty() && failed_reads.is_empty();
     }
 }
 
 pub async fn run(broker: Broker, codex_home: PathBuf) {
+    let state = State::default();
     let mut delay = 1;
     loop {
         let mut last = "No native Codex daemon socket found".to_string();
         for socket in socket_paths() {
-            if let Err(error) = observe_connection(&broker, &socket, &codex_home).await {
+            if let Err(error) = observe_connection(&broker, &socket, &codex_home, &state).await {
                 last = format!("{error:#}");
             }
-        }
-        if let Err(e) = broker.codex_offline(None) {
-            eprintln!("Codex offline state: {e:#}");
         }
         broker
             .discovery_status(json!({"state":"disconnected","detail":last,"retry_seconds":delay}));
