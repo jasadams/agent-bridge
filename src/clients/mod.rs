@@ -334,8 +334,7 @@ pub(crate) async fn deliver_notice(
     adapter.deliver(agent, msg, notice.text()).await
 }
 
-/// Observe only sessions already present in each native application. Dropping
-/// this future cancels both observers when the broker shuts down.
+/// Observe loaded Codex sessions. Dropping this future cancels the observer.
 pub(crate) async fn observe(broker: crate::broker::Broker, codex_home: Option<PathBuf>) {
     let codex_broker = broker.clone();
     let codex_observer = async move {
@@ -344,7 +343,7 @@ pub(crate) async fn observe(broker: crate::broker::Broker, codex_home: Option<Pa
         }
         std::future::pending::<()>().await;
     };
-    tokio::join!(claude_discovery::run(broker), codex_observer);
+    codex_observer.await;
 }
 
 #[cfg(test)]
