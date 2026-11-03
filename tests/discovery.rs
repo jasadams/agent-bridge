@@ -56,7 +56,7 @@ struct Fixture {
 async fn fixture(wrong_home: bool) -> Fixture {
     let dir = tempfile::Builder::new()
         .prefix("abd-")
-        .tempdir_in("/tmp/opencode")
+        .tempdir_in(std::env::temp_dir())
         .unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir(&home).unwrap();
