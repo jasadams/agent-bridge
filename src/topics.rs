@@ -211,7 +211,39 @@ fn get_topic(conn: &Connection, local: &str, id: &str) -> Result<Topic> {
 
 fn known_agent(conn: &Connection, agent: &AgentRef, enabled: bool) -> Result<()> {
     let (provider, session) = identity(&agent.agent_id)?;
-    let known:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE provider=?1 AND session=?2 AND (?3=0 OR enabled=1) AND (?4=0 OR name='user'))",params![provider,session,enabled,agent.agent_id=="inbox-user"],|r|r.get(0))?;
+    let known: bool = if provider == "inbox" {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE provider='inbox' AND session=?1 AND (?2=0 OR enabled=1))",
+            params![session, enabled],
+            |r| r.get(0),
+        )?
+    } else {
+        let exact_alias: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM route_aliases WHERE provider=?1 AND session=?2)",
+            params![provider, session],
+            |r| r.get(0),
+        )?;
+        match provider {
+            // Codex has no local binding/catalog; exact presence is supplied by
+            // the request-local observer and a rowless canonical route is valid.
+            "codex" => true,
+            "claude" => {
+                exact_alias
+                    || conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM claude_bindings WHERE session=?)",
+                        [session],
+                        |r| r.get(0),
+                    )?
+            }
+            "opencode" => exact_alias
+                || conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM opencode_leases WHERE session=? AND expires>?)",
+                    params![session, crate::db::now()],
+                    |r| r.get(0),
+                )?,
+            _ => false,
+        }
+    };
     ensure!(
         known,
         "topic_agent_unknown: exact local registration required"
@@ -219,23 +251,7 @@ fn known_agent(conn: &Connection, agent: &AgentRef, enabled: bool) -> Result<()>
     Ok(())
 }
 
-fn current_display(conn: &Connection, provider: &str, session: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT display_name FROM session_metadata WHERE provider=? AND session=?",
-            params![provider, session],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten()
-        .filter(|name| !name.trim().is_empty()))
-}
-
 fn display_name(conn: &Connection, local: &str, agent: &AgentRef) -> Result<String> {
-    let (provider, session) = identity(&agent.agent_id)?;
-    if let Some(name) = current_display(conn, provider, session)? {
-        return Ok(name);
-    }
     let snapshot:Option<String>=conn.query_row("SELECT author_display_name FROM topic_posts WHERE bridge_id=? AND author_id=? ORDER BY created DESC,id DESC LIMIT 1",params![local,agent.agent_id],|r|r.get(0)).optional()?;
     Ok(snapshot.unwrap_or_else(|| agent.agent_id.clone()))
 }
@@ -326,10 +342,58 @@ fn schedule_topic_pushes(tx: &Transaction<'_>, post: &TopicPost) -> Result<()> {
             continue;
         }
         let (provider, session) = identity(&agent_id)?;
-        let target: Option<(String,String)> = tx.query_row("SELECT name,endpoint FROM agents WHERE provider=? AND session=? AND enabled=1 ORDER BY name LIMIT 1",params![provider,session],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
-        let mut gap = target.is_none() || provider == "inbox";
-        if let Some((name, _endpoint)) = target.filter(|_| !gap) {
-            let provider: Provider = provider.parse()?;
+        let provider: Provider = provider.parse()?;
+        let canonical = crate::clients::lifecycle::routing_name(&provider, session);
+        let target: Option<String> = if provider == Provider::Inbox {
+            tx.query_row(
+                "SELECT name FROM agents WHERE provider='inbox' AND session=? AND enabled=1 ORDER BY name LIMIT 1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?
+        } else {
+            let alias: Option<String> = tx
+                .query_row(
+                    "SELECT name FROM route_aliases WHERE provider=? AND session=? ORDER BY name LIMIT 1",
+                    params![provider.label(), session],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Some(alias.unwrap_or(canonical))
+        };
+        let mut gap = target.is_none();
+        if let Some(name) = target.filter(|_| !gap) {
+            let endpoint = match provider {
+                Provider::Claude => tx
+                    .query_row(
+                        "SELECT endpoint FROM claude_bindings WHERE session=?",
+                        [session],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default(),
+                Provider::OpenCode => tx
+                    .query_row(
+                        "SELECT endpoint FROM opencode_leases WHERE session=?1 AND expires>?2",
+                        params![session, crate::db::now()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let destination = crate::protocol::Agent {
+                name: name.clone(),
+                provider: provider.clone(),
+                session: session.to_owned(),
+                endpoint,
+            };
+            let source = crate::protocol::Agent {
+                name: "@topic".into(),
+                provider: Provider::Inbox,
+                session: "topic".into(),
+                endpoint: String::new(),
+            };
             let queued: i64 = tx.query_row(
                 "SELECT count(*) FROM messages WHERE state='queued'",
                 [],
@@ -358,9 +422,14 @@ fn schedule_topic_pushes(tx: &Transaction<'_>, post: &TopicPost) -> Result<()> {
                 );
                 let message_id = uuid::Uuid::new_v4().to_string();
                 tx.execute_batch("SAVEPOINT topic_push_enqueue")?;
-                let inserted = tx.execute(
-                    "INSERT INTO messages VALUES(?1,'@topic',?2,?3,?4,NULL,0,'queued',NULL,?5,?5)",
-                    params![message_id, name, session, text, now()],
+                let inserted = crate::db::insert_message_in(
+                    tx,
+                    &message_id,
+                    &source,
+                    &destination,
+                    &text,
+                    &None,
+                    0,
                 );
                 match inserted {
                     Ok(_) => {
@@ -394,7 +463,7 @@ fn schedule_topic_pushes(tx: &Transaction<'_>, post: &TopicPost) -> Result<()> {
                         {
                             gap = true;
                         } else {
-                            return Err(error.into());
+                            return Err(error);
                         }
                     }
                 }
@@ -414,7 +483,11 @@ impl Db {
     pub(crate) fn topic_push_revoke_obsolete(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("UPDATE messages SET state='failed',detail='Topic preference changed before native admission',updated=?1 WHERE state='queued' AND EXISTS (SELECT 1 FROM topic_push_work w WHERE w.message_id=messages.id AND NOT EXISTS(SELECT 1 FROM topic_push_preferences p WHERE p.bridge_id=w.bridge_id AND p.topic_id=w.topic_id AND p.agent_id=w.agent_id AND p.epoch=w.epoch AND p.mode<>'manual')) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')",[now()])?;
-        tx.execute("UPDATE messages SET state='failed',detail='Exact topic recipient became unavailable before admission; read history to catch up',updated=?1 WHERE state='queued' AND EXISTS (SELECT 1 FROM topic_push_work w JOIN message_context c ON c.id=w.message_id WHERE w.message_id=messages.id AND NOT EXISTS(SELECT 1 FROM agents a WHERE a.name=messages.recipient AND a.enabled=1 AND a.session=messages.recipient_session AND a.provider=json_extract(c.destination,'$.provider'))) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')",[now()])?;
+        tx.execute("UPDATE messages SET state='failed',detail='Exact topic recipient route changed before admission; read history to catch up',updated=?1 WHERE state='queued' AND EXISTS (SELECT 1 FROM topic_push_work w JOIN message_context c ON c.id=w.message_id WHERE w.message_id=messages.id AND (EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=messages.recipient AND (a.provider<>json_extract(c.destination,'$.provider') OR a.session<>messages.recipient_session)) OR (json_extract(c.destination,'$.provider')='inbox' AND NOT EXISTS(SELECT 1 FROM agents a WHERE a.name=messages.recipient AND a.enabled=1 AND a.session=messages.recipient_session)))) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')",[now()])?;
+        // A native topic subscriber without a live local binding/lease cannot be
+        // claimed. Record the existing one-gap outcome instead of stranding queued
+        // work forever; Codex presence is observer-owned and remains durable.
+        tx.execute("UPDATE messages SET state='failed',detail='Topic subscriber is not currently reachable; read history to catch up',updated=?1 WHERE state='queued' AND EXISTS (SELECT 1 FROM topic_push_work w JOIN message_context c ON c.id=w.message_id WHERE w.message_id=messages.id AND ((json_extract(c.destination,'$.provider')='claude' AND NOT EXISTS(SELECT 1 FROM claude_bindings b WHERE b.session=messages.recipient_session)) OR (json_extract(c.destination,'$.provider')='opencode' AND NOT EXISTS(SELECT 1 FROM opencode_leases l WHERE l.session=messages.recipient_session AND l.expires>?1)))) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')",[now()])?;
         tx.commit()?;
         Ok(())
     }
@@ -433,19 +506,27 @@ impl Db {
         };
         let (provider, session) = identity(&agent_id)?;
         ensure!(
-            recipient.enabled
-                && recipient.provider.label() == provider
-                && recipient.session == session,
+            recipient.provider.label() == provider && recipient.session == session,
             "topic_push_revoked: exact recipient changed"
         );
         let current = self.agent(&recipient.name)?;
+        let alias_fence: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM route_aliases WHERE name=? AND (provider<>? OR session<>?))",
+            params![recipient.name, recipient.provider.label(), recipient.session],
+            |row| row.get(0),
+        )?;
         ensure!(
-            current.enabled
+            !alias_fence
                 && current.provider == recipient.provider
-                && current.session == recipient.session
-                && current.endpoint == recipient.endpoint,
+                && current.session == recipient.session,
             "topic_push_revoked: recipient registration changed"
         );
+        if recipient.provider == Provider::Inbox {
+            ensure!(
+                self.inbox_enabled(&recipient.name, &recipient.session)?,
+                "topic_push_revoked: inbox is disabled"
+            );
+        }
         let active: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_push_preferences WHERE bridge_id=? AND topic_id=? AND agent_id=? AND epoch=? AND mode<>'manual')",params![bridge,topic,agent_id,epoch],|row|row.get(0))?;
         ensure!(
             active,
@@ -624,7 +705,10 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         let identities = {
             let mut stmt = tx.prepare(
-                "SELECT DISTINCT provider,session FROM agents ORDER BY provider,session LIMIT 1001",
+                "SELECT 'inbox',session FROM agents
+                 UNION
+                 SELECT provider,session FROM route_aliases
+                 ORDER BY 1,2 LIMIT 1001",
             )?;
             stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -944,7 +1028,6 @@ mod push_admission_tests {
             provider: Provider::Claude,
             session: uuid::Uuid::new_v4().to_string(),
             endpoint: "/tmp/fixture.sock".into(),
-            enabled: true,
         };
         db.register(&recipient, false).unwrap();
         let topic = db
@@ -1007,14 +1090,12 @@ mod push_admission_tests {
             provider: Provider::Claude,
             session: uuid::Uuid::new_v4().to_string(),
             endpoint: "/tmp/one.sock".into(),
-            enabled: true,
         };
         let second = Agent {
             name: "second".into(),
             provider: Provider::Claude,
             session: uuid::Uuid::new_v4().to_string(),
             endpoint: "/tmp/two.sock".into(),
-            enabled: true,
         };
         db.register(&first, false).unwrap();
         db.register(&second, false).unwrap();
@@ -1055,16 +1136,14 @@ mod push_admission_tests {
                 .pending,
             0
         );
-        db.conn
-            .execute("UPDATE agents SET enabled=0 WHERE name='first'", [])
-            .unwrap();
         publication.id = uuid::Uuid::new_v4().to_string();
         publication.author.agent_id = "inbox-user".into();
         db.topic_publish(&local, &publication, &TopicLimits::default())
             .unwrap();
+        // Connector unavailability is unknown, not a fabricated delivery gap.
         let gap = db.topic_push_get(&local, &topic.reference, &a).unwrap();
-        assert_eq!(gap.gap_count, 1);
-        assert_eq!(gap.last_gap_sequence, Some(2));
+        assert_eq!(gap.gap_count, 0);
+        assert_eq!(gap.last_gap_sequence, None);
         assert_eq!(
             db.topic_push_diagnostics(&local, &topic.reference, &b)
                 .unwrap()
@@ -1085,7 +1164,6 @@ mod push_admission_tests {
             provider: Provider::Claude,
             session: uuid::Uuid::new_v4().to_string(),
             endpoint: "/tmp/fixture.sock".into(),
-            enabled: true,
         };
         db.register(&recipient, false).unwrap();
         let topic = db
@@ -1143,7 +1221,6 @@ mod push_admission_tests {
             provider: Provider::Claude,
             session: uuid::Uuid::new_v4().to_string(),
             endpoint: "/tmp/fixture.sock".into(),
-            enabled: true,
         };
         db.register(&recipient, false).unwrap();
         let topic = db
@@ -1200,7 +1277,6 @@ mod push_admission_tests {
             provider: Provider::Claude,
             session: uuid::Uuid::new_v4().to_string(),
             endpoint: "/tmp/original.sock".into(),
-            enabled: true,
         };
         db.register(&original, false).unwrap();
         let topic = db
@@ -1263,7 +1339,6 @@ mod push_admission_tests {
             provider: Provider::OpenCode,
             session: session.into(),
             endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-            enabled: true,
         };
         db.opencode_observe(&recipient, true).unwrap();
         let topic = db
@@ -1321,7 +1396,6 @@ mod push_admission_tests {
             provider: Provider::OpenCode,
             session: session.into(),
             endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-            enabled: true,
         };
         db.opencode_observe(&recipient, true).unwrap();
         let topic = db

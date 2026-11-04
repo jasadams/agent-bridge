@@ -521,7 +521,15 @@ async fn occupied_port_reports_failure_without_disrupting_the_broker() {
             .await
             .is_err()
     );
-    assert!(running.broker.request(Request::List { all: false }).is_ok());
+    assert!(
+        running
+            .broker
+            .request(Request::List {
+                all: false,
+                max_age_days: 7
+            })
+            .is_ok()
+    );
     assert!(
         running
             .broker
@@ -886,10 +894,7 @@ async fn body_bounds_malformed_unknown_fields_and_revocation_never_change_board(
 
 #[tokio::test]
 async fn http_response_notifies_only_the_selected_boards_native_subscriber() {
-    use agent_bridge::{
-        board,
-        protocol::{Agent, Provider},
-    };
+    use agent_bridge::{board, protocol::Provider};
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::Builder::new()
         .prefix("ab-http-notice-")
@@ -921,17 +926,21 @@ async fn http_response_notifies_only_the_selected_boards_native_subscriber() {
         let path = root.path().join(format!("{name}.sock"));
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
         running
             .broker
             .request(Request::Register {
-                agent: Agent {
-                    name: name.into(),
-                    provider: Provider::Claude,
-                    session: uuid::Uuid::new_v4().to_string(),
-                    endpoint: path.to_str().unwrap().into(),
-                    enabled: true,
-                },
+                name: name.into(),
+                provider: Provider::Claude,
+                session: session.clone(),
                 replace: false,
+            })
+            .unwrap();
+        running
+            .broker
+            .request(Request::ClaudeBind {
+                session,
+                endpoint: path.to_string_lossy().into_owned(),
             })
             .unwrap();
         running

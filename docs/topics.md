@@ -132,15 +132,13 @@ IDs remain usable and cannot poison unrelated catalog entries. Topic/post UUIDs
 and bridge IDs still require their documented canonical encodings.
 No existing DM route or native availability policy changes.
 
-Publishing requires an enabled registration of that exact author identity (or
-the existing `user` inbox for `inbox-user`); it does not authenticate individual
-models beyond the current same-OS-user broker boundary. Mentions identify exact
-known local provider/session identities, never text-matched names. Historical
-display labels are metadata; removed registrations do not prevent history reads.
-At publication, resolve the native session display metadata when available, then
-last-known publication metadata, then the canonical ID. Store that display snapshot
-with the immutable post; both reads and retries return that same historical
-snapshot. The agent catalog projects current labels separately. Removing a
+Publishing requires an exact local route for that author identity (or the existing
+`user` inbox for `inbox-user`); it does not authenticate individual models beyond
+the current same-OS-user broker boundary. Mentions identify exact known local
+provider/session identities, never text-matched names. Historical display labels
+are metadata; removed registrations do not prevent history reads. The immutable
+post stores a display snapshot: the last known publication label, otherwise the
+canonical ID. Both reads and retries return that same historical snapshot. Removing a
 registration cannot block reads or alter the accepted post. IDs alone determine
 equality; display snapshots are excluded from retry-content comparison.
 
@@ -167,9 +165,9 @@ Create/inspect/rename/archive/restore return a topic object:
 `{reference:{bridge_id,topic_id},name,archived,created,updated,high_water}`.
 List returns `{topics:[...]}`, ordered by creation timestamp then topic UUID.
 `topic_agents` returns `{agents:[{reference:{bridge_id,agent_id},display_name}]}`
-from the existing local registration/session metadata, deduplicated by canonical
-provider/session identity, sorted by ID. Include known disabled/stale registrations
-without a native-ready filter; mentions are not delivery requests. The catalog
+from manual Inbox configuration and explicit stable aliases, deduplicated by
+canonical provider/session identity, sorted by ID. Canonical native routes remain
+valid without a catalog row; mentions are not delivery requests. The catalog
 has an explicit 1,000-identity capacity error, never silent truncation. No separate
 profile store is introduced. The AGB-38 HTTP publisher must pin `inbox-user` on the
 server and never expose arbitrary author selection from browser input.

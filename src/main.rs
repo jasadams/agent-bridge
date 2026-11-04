@@ -2,7 +2,7 @@ use agent_bridge::{
     board::Name,
     broker, hook,
     network::trust::Permission,
-    protocol::{Agent, EventSelector, Provider, Request},
+    protocol::{EventSelector, Provider, Request},
     service,
 };
 use anyhow::{Context, Result};
@@ -121,15 +121,13 @@ enum Commands {
         #[arg(long)]
         no_discovery: bool,
     },
-    /// Register a running native session under a stable routing name.
+    /// Add an explicit stable alias for a native session.
     Register {
         #[arg(value_enum)]
         provider: Provider,
         name: String,
         #[arg(long, alias = "thread")]
         session: String,
-        #[arg(long)]
-        socket: Option<PathBuf>,
         #[arg(long)]
         replace: bool,
     },
@@ -142,7 +140,10 @@ enum Commands {
     List {
         #[arg(long)]
         all: bool,
-        /// Show the cached permitted directory of remote agents.
+        /// OpenCode native-state age filter in days.
+        #[arg(long, default_value_t = 7)]
+        max_age_days: u32,
+        /// Request permitted remote peer directories on demand.
         #[arg(long, conflicts_with = "all")]
         remote: bool,
     },
@@ -949,26 +950,23 @@ async fn main() -> Result<()> {
             provider,
             name,
             session,
-            socket,
             replace,
         } => Request::Register {
-            agent: Agent {
-                name,
-                provider,
-                session,
-                endpoint: socket
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                enabled: true,
-            },
+            name,
+            provider,
+            session,
             replace,
         },
         Commands::Unregister { name, session } => Request::Unregister { name, session },
-        Commands::List { all, remote } => {
+        Commands::List {
+            all,
+            max_age_days,
+            remote,
+        } => {
             if remote {
                 Request::RemoteList
             } else {
-                Request::List { all }
+                Request::List { all, max_age_days }
             }
         }
         Commands::Subscribe { agent, events } => {
@@ -1278,19 +1276,21 @@ async fn main() -> Result<()> {
     // Validate the selected local destination before opening admission or
     // creating an exchange. Failed selection must not leave a hidden window.
     if let Some((agent, _)) = &notify_agent {
-        let agents = broker::rpc(&state_dir, &Request::List { all: false }).await?;
+        let resolved = broker::rpc(
+            &state_dir,
+            &Request::Resolve {
+                name: agent.clone(),
+            },
+        )
+        .await?;
         anyhow::ensure!(
-            agents
-                .as_array()
-                .is_some_and(|agents| agents.iter().any(|entry| entry["name"] == *agent
-                    && entry["enabled"] == true
-                    && entry["provider"]
-                        .as_str()
-                        .and_then(|provider| provider.parse::<Provider>().ok())
-                        .is_some_and(|provider| agent_bridge::clients::supports(
-                            &provider,
-                            agent_bridge::clients::Capability::PairingPrompts
-                        )))),
+            resolved["provider"]
+                .as_str()
+                .and_then(|provider| provider.parse::<Provider>().ok())
+                .is_some_and(|provider| agent_bridge::clients::supports(
+                    &provider,
+                    agent_bridge::clients::Capability::PairingPrompts
+                )),
             "Pairing owner input is unavailable for this session; omit --agent and use the explicit pairing CLI confirmation path"
         );
     }

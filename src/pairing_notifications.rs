@@ -25,8 +25,7 @@ impl Watch {
         now < self.expires_at && Instant::now() < self.deadline
     }
     fn matches(&self, current: &Agent) -> bool {
-        current.enabled
-            && current.name == self.agent.name
+        current.name == self.agent.name
             && current.provider == self.agent.provider
             && current.session == self.agent.session
     }
@@ -69,11 +68,7 @@ impl State {
         now: i64,
     ) -> Result<()> {
         ensure!(
-            agent.enabled
-                && crate::clients::supports(
-                    &agent.provider,
-                    crate::clients::Capability::PairingPrompts
-                ),
+            crate::clients::supports(&agent.provider, crate::clients::Capability::PairingPrompts),
             "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
         );
         ensure!(
@@ -278,9 +273,7 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
                 let state = broker.pairing_notifications.lock().unwrap();
                 let bound = state.transactions.get(&notice.id);
                 let pinned = db.agent(&notice.agent.name).ok().is_some_and(|a| {
-                    a.enabled
-                        && a.provider == notice.agent.provider
-                        && a.session == notice.agent.session
+                    a.provider == notice.agent.provider && a.session == notice.agent.session
                 });
                 let subscription_matches = state.owns_notice(&notice);
                 let current_phase = manager
@@ -359,7 +352,6 @@ mod tests {
             provider: Provider::Codex,
             session: "original-session".into(),
             endpoint: String::new(),
-            enabled: true,
         }
     }
     fn view(id: &str, phase: &'static str) -> View {
@@ -419,14 +411,10 @@ mod tests {
         );
     }
     #[test]
-    fn pinning_rejects_replacement_disabled_and_other_provider() {
+    fn pinning_rejects_replacement_and_other_provider() {
         for replacement in [
             Agent {
                 session: "replacement".into(),
-                ..agent()
-            },
-            Agent {
-                enabled: false,
                 ..agent()
             },
             Agent {

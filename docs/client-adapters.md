@@ -41,8 +41,8 @@ through a separate typed entry point and retain their existing text without a pe
 envelope. Board subscriptions require the control-notice capability. Pairing
 selectors additionally require `PairingPrompts`, supported by Claude and Codex;
 OpenCode retains board controls but rejects native pairing prompt selection with
-an explicit CLI fallback. Both require an enabled exact registration and their
-existing local opt-in checks. Capabilities
+an explicit CLI fallback. Both require an exact local route and their existing
+local opt-in checks. Capabilities
 do not grant peer permissions or owner approval.
 
 Durable queues, reply correlation, grants, network routing, retry decisions, board
@@ -57,20 +57,17 @@ mapping. Notification providers must use capabilities rather than new provider
 whitelists. Add adapter contracts alongside `tests/clients_contracts.rs` and the
 private `clients` tests; retain real socket and mock-daemon integration coverage.
 
-Native display metadata is stored in `session_metadata`, keyed by provider and
-native session ID. It is optional and independent of lifecycle registration:
-metadata alone never enables a destination. Exact registered aliases take
-precedence; otherwise display names resolve only to enabled automatic
-`provider-session` routes. Use `provider:title` to qualify a title; duplicate
-titles within that provider remain ambiguous. Renames update metadata without
-changing route identity, messages, delivery history, or session grants.
+Native state is read through the synchronous `ConnectorState` boundary. Each
+adapter reports exact provider/session rows with display labels, status, directory
+and an optional updated timestamp; nothing is persisted. Explicit `route_aliases`
+and `claude_bindings` store only owner configuration and Claude delivery
+coordinates. Display names and titles are never routing inputs, and canonical
+`provider-session` IDs are reserved and parse without a database row. Schema 20
+retires the old native catalog and session metadata tables; messages, immutable
+context, grants, receipts and Unknown outcomes are preserved. Reopening is
+idempotent. Older binaries reject the newer numbered schema; downgrading requires
+the matching pre-upgrade database backup and binary together.
 
-Schema version 11 transactionally copies Claude and Codex titles (including NULL
-and empty titles) into this shared table and removes their old tables. Reopening
-is idempotent. Older binaries reject this newer numbered schema; downgrading
-requires restoring the matching pre-upgrade database backup and binary together.
-There is no automatic down migration or compatibility with simultaneous older
-writers. Remote provider support is negotiated through an opt-in directory extension;
-legacy directory responses retain only Claude, Codex and Inbox so strict older
-provider enums remain readable. Capabilities never replace session grants.
-Adding an adapter needs no separate title table or title lookup UNION.
+Remote provider support is negotiated through the existing opt-in directory
+extension; legacy directory responses retain only Claude, Codex and Inbox so strict
+older provider enums remain readable. Capabilities never replace session grants.

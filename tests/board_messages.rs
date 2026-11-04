@@ -17,11 +17,12 @@ fn register(broker: &Broker, name: &str) -> Agent {
         provider: Provider::Inbox,
         session: id(),
         endpoint: String::new(),
-        enabled: true,
     };
     broker
         .request(Request::Register {
-            agent: agent.clone(),
+            name: agent.name.clone(),
+            provider: agent.provider.clone(),
+            session: agent.session.clone(),
             replace: false,
         })
         .unwrap();
@@ -150,10 +151,9 @@ async fn changed_removed_duplicate_malformed_and_replaced_owner_fail_closed() {
     let fresh = submission(&changed, "compose", "retain draft");
     broker
         .request(Request::Register {
-            agent: Agent {
-                session: id(),
-                ..owner
-            },
+            name: owner.name.clone(),
+            provider: owner.provider.clone(),
+            session: id(),
             replace: true,
         })
         .unwrap();
@@ -219,8 +219,11 @@ async fn full_queue_rejects_atomically_and_foreign_uuid_cannot_be_adopted() {
 }
 fn register_session(broker: &Broker) -> String {
     broker
-        .request(Request::List { all: true })
-        .unwrap()
+        .request(Request::List {
+            all: true,
+            max_age_days: 7,
+        })
+        .unwrap()["agents"]
         .as_array()
         .unwrap()
         .iter()
@@ -256,12 +259,19 @@ async fn composer_uses_actual_native_claude_delivery_and_closed_owner_is_unavail
         provider: Provider::Claude,
         session: id(),
         endpoint: socket.to_string_lossy().into_owned(),
-        enabled: true,
     };
     broker
         .request(Request::Register {
-            agent: owner.clone(),
+            name: owner.name.clone(),
+            provider: owner.provider.clone(),
+            session: owner.session.clone(),
             replace: false,
+        })
+        .unwrap();
+    broker
+        .request(Request::ClaudeBind {
+            session: owner.session.clone(),
+            endpoint: owner.endpoint.clone(),
         })
         .unwrap();
     let snapshot = add(&broker, &Name::default(), &owner.name, "compose");

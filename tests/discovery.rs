@@ -64,9 +64,10 @@ async fn fixture(wrong_home: bool) -> Fixture {
     let listener = UnixListener::bind(&path).unwrap();
     let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
     let state = State::default();
-    let (broker, reader, native_home) = (bound.broker.clone(), state.clone(), home.clone());
+    let (reader, native_home) = (state.clone(), home.clone());
+    let status = std::sync::Arc::new(std::sync::Mutex::new(json!({"state":"test"})));
     let observer = tokio::spawn(async move {
-        discovery::observe_connection(&broker, &path, &native_home, &reader).await
+        discovery::observe_connection(&path, &native_home, &reader, &status).await
     });
     let (stream, _) = listener.accept().await.unwrap();
     let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -104,7 +105,14 @@ fn disconnected_and_invalid_exact_ids_are_errors_not_empty_native_results() {
 #[tokio::test]
 async fn observer_provides_native_state_without_registration_or_database_writes() {
     let mut f = fixture(false).await;
-    let before = f.bound.broker.request(Request::List { all: true }).unwrap();
+    let before = f
+        .bound
+        .broker
+        .request(Request::List {
+            all: true,
+            max_age_days: 7,
+        })
+        .unwrap();
     let first = native_recv(&mut f.socket).await;
     assert_eq!(first["method"], "thread/loaded/list");
     assert!(matches!(f.state.list(7), Err(StateError::Incomplete(_))));
@@ -139,7 +147,13 @@ async fn observer_provides_native_state_without_registration_or_database_writes(
     .await;
     assert_eq!(f.state.list(7).unwrap(), f.state.list(30).unwrap());
     assert_eq!(
-        f.bound.broker.request(Request::List { all: true }).unwrap(),
+        f.bound
+            .broker
+            .request(Request::List {
+                all: true,
+                max_age_days: 7
+            })
+            .unwrap(),
         before
     );
     f.socket.close(None).await.unwrap();

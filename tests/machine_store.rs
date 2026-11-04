@@ -1,6 +1,6 @@
 use agent_bridge::{
     db::Db,
-    network::{identity::Identity, machine, trust::Permission, wire::RemoteAgent},
+    network::{identity::Identity, machine, trust::Permission},
     protocol::{Agent, Provider},
 };
 use rusqlite::Connection;
@@ -116,17 +116,18 @@ fn renames_preserve_identity_immutable_queued_envelopes_and_remote_routing() {
     db.grant_peer(&peer, "user", Permission::Send, true)
         .unwrap();
     db.remember_peer_name(&peer, "machine-b").unwrap();
-    db.replace_remote_agents(
-        &peer,
-        &[RemoteAgent {
+    db.register(
+        &Agent {
             name: "reviewer".into(),
             provider: Provider::Inbox,
             session: "pinned".into(),
-        }],
+            endpoint: String::new(),
+        },
+        false,
     )
     .unwrap();
     let mid = uuid::Uuid::new_v4().to_string();
-    db.send_remote(
+    db.send_remote_names(
         &identity.peer_id,
         &mid,
         "user",
@@ -159,10 +160,6 @@ fn renames_preserve_identity_immutable_queued_envelopes_and_remote_routing() {
     );
     assert_eq!(db.get(&mid).unwrap().recipient, format!("{peer}/reviewer"));
     assert_eq!(db.get(&mid).unwrap().recipient_session, "pinned");
-    let agents = db.remote_agents().unwrap();
-    assert_eq!(agents[0]["machine_name"], "renamed-remote");
-    assert_eq!(agents[0]["machine_display_name"], "workstation");
-    assert_eq!(agents[0]["qualified_name"], "workstation/reviewer");
 }
 
 #[test]
@@ -176,13 +173,12 @@ fn schema_four_upgrade_preserves_data_and_initializes_only_missing_name() {
             provider: Provider::Inbox,
             session: "same-session".into(),
             endpoint: String::new(),
-            enabled: true,
         },
         false,
     )
     .unwrap();
     let mid = uuid::Uuid::new_v4().to_string();
-    db.send(&mid, "user", "receiver", "preserved", &None)
+    db.send_names(&mid, "user", "receiver", "preserved", &None)
         .unwrap();
     let peer = id();
     db.pair_peer(&peer, &peer, Some("chosen-alias")).unwrap();
@@ -192,7 +188,7 @@ fn schema_four_upgrade_preserves_data_and_initializes_only_missing_name() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(include_str!("fixtures/native-metadata-v10.sql"))
         .unwrap();
-    conn.execute_batch("DROP TRIGGER inbound_usage_insert; DROP TRIGGER inbound_usage_delete; DROP TABLE inbound_usage; DROP TRIGGER message_context_insert; DROP TABLE message_context; DROP INDEX messages_monitor_order; DROP TABLE relay_nodes; DROP TABLE pairing_offers; DROP TABLE pairing_joined; ALTER TABLE peers DROP COLUMN machine_name; DELETE FROM settings WHERE key='machine_name'; PRAGMA user_version=4;").unwrap();
+    conn.execute_batch("DROP TRIGGER IF EXISTS inbound_usage_insert; DROP TRIGGER IF EXISTS inbound_usage_delete; DROP TABLE inbound_usage; DROP TRIGGER IF EXISTS message_context_insert; DROP TABLE message_context; DROP INDEX messages_monitor_order; DROP TABLE relay_nodes; DROP TABLE pairing_offers; DROP TABLE pairing_joined; ALTER TABLE peers DROP COLUMN machine_name; DELETE FROM settings WHERE key='machine_name'; PRAGMA user_version=4;").unwrap();
     drop(conn);
     let db = Db::open(&path).unwrap();
     assert_eq!(db.machine_name().unwrap(), machine::default_name());

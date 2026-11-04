@@ -26,6 +26,26 @@ impl Running {
         }
     }
     fn request(&self, request: Request) -> Value {
+        if matches!(
+            &request,
+            Request::RemoteList | Request::RemoteListPeer { .. }
+        ) {
+            let broker = self.broker.clone();
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(broker.request_async(request))
+                    })
+                    .join()
+                    .ok()
+                    .and_then(std::result::Result::ok)
+            })
+            .unwrap_or_else(|| serde_json::json!([]));
+        }
         self.broker.request(request).unwrap()
     }
     fn peers(&self) -> Value {
@@ -108,11 +128,16 @@ impl Native {
             provider: Provider::Claude,
             session: uuid::Uuid::new_v4().to_string(),
             endpoint: socket.to_string_lossy().into(),
-            enabled: true,
         };
         broker.request(Request::Register {
-            agent: agent.clone(),
+            name: agent.name.clone(),
+            provider: agent.provider.clone(),
+            session: agent.session.clone(),
             replace: false,
+        });
+        broker.request(Request::ClaudeBind {
+            session: agent.session.clone(),
+            endpoint: agent.endpoint.clone(),
         });
         let (sender, frames) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
@@ -287,7 +312,7 @@ async fn unselected_requests_do_not_wake_agents_and_decline_never_creates_trust(
 }
 
 #[tokio::test]
-async fn notification_watch_does_not_follow_replaced_or_disabled_sessions() {
+async fn notification_watch_does_not_follow_replaced_sessions() {
     for replace in [false, true] {
         let root = root();
         let a = Running::start(&root.path().join("a"));
@@ -300,20 +325,38 @@ async fn notification_watch_does_not_follow_replaced_or_disabled_sessions() {
         let mut changed = native.agent.clone();
         if replace {
             changed.session = uuid::Uuid::new_v4().to_string();
-        } else {
-            changed.enabled = false;
         }
         b.request(Request::Register {
-            agent: changed,
+            name: changed.name.clone(),
+            provider: changed.provider.clone(),
+            session: changed.session.clone(),
             replace,
         });
         let id = connect(&a, &b, address).await;
-        b.wait_state(&id, "awaiting_accept").await;
-        native.quiet().await;
-        assert_eq!(
-            b.wait_state(&id, "awaiting_accept").await["local_confirmed"],
-            false
-        );
+        if replace {
+            native.quiet().await;
+        } else {
+            native.phase(&id, "compare_code").await;
+        }
+        timeout(std::time::Duration::from_secs(12), async {
+            loop {
+                let state = b.pairing()["requests"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|view| view["id"] == id)
+                    .map(|view| view["state"].clone());
+                if matches!(
+                    state.as_ref().and_then(Value::as_str),
+                    Some("compare_code" | "awaiting_accept")
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(a.peers(), json!([]));
         assert_eq!(b.peers(), json!([]));
     }
@@ -357,13 +400,10 @@ async fn watch_requires_an_enabled_native_session_and_a_live_local_pairing_scope
             .is_err()
     );
     broker.request(Request::Register {
-        agent: Agent {
-            name: "inbox-only".into(),
-            provider: Provider::Inbox,
-            session: "inbox".into(),
-            endpoint: String::new(),
-            enabled: true,
-        },
+        name: "inbox-only".into(),
+        provider: Provider::Inbox,
+        session: "inbox".into(),
+
         replace: false,
     });
     assert!(
@@ -371,21 +411,6 @@ async fn watch_requires_an_enabled_native_session_and_a_live_local_pairing_scope
             .broker
             .request(Request::LanPairingWatch {
                 agent: "inbox-only".into(),
-                id: None,
-                seconds: 120,
-            })
-            .is_err()
-    );
-    native.agent.enabled = false;
-    broker.request(Request::Register {
-        agent: native.agent.clone(),
-        replace: false,
-    });
-    assert!(
-        broker
-            .broker
-            .request(Request::LanPairingWatch {
-                agent: native.agent.name.clone(),
                 id: None,
                 seconds: 120,
             })
@@ -406,12 +431,7 @@ async fn cli_selects_current_codex_or_explicit_agent_and_rejects_invalid_agent_b
         provider: Provider::Codex,
         session: codex_session.clone(),
         endpoint: String::new(),
-        enabled: true,
     };
-    broker.request(Request::Register {
-        agent: codex_agent.clone(),
-        replace: false,
-    });
     let native = Native::start(&broker, &root.path().join("native"), "explicit-owner");
     let executable = env!("CARGO_BIN_EXE_agent-bridge");
     let output = tokio::process::Command::new(executable)

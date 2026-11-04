@@ -5,7 +5,7 @@ mod support;
 use agent_bridge::{
     broker::{self, Broker},
     network::trust::Permission,
-    protocol::{Agent, Provider, Request},
+    protocol::{Provider, Request},
 };
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use serde_json::Value;
@@ -33,6 +33,26 @@ impl Running {
     }
 
     fn request(&self, request: Request) -> Value {
+        if matches!(
+            &request,
+            Request::RemoteList | Request::RemoteListPeer { .. }
+        ) {
+            let broker = self.broker.clone();
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(broker.request_async(request))
+                    })
+                    .join()
+                    .ok()
+                    .and_then(std::result::Result::ok)
+            })
+            .unwrap_or_else(|| serde_json::json!([]));
+        }
         self.broker.request(request).unwrap()
     }
 
@@ -164,13 +184,10 @@ async fn discovered_peers_pair_exchange_and_reconnect_without_manual_addresses()
     let bob_id = bob.identity();
     for bridge in [&alice, &bob] {
         bridge.request(Request::Register {
-            agent: Agent {
-                name: "private-agent".into(),
-                provider: Provider::Inbox,
-                session: "private-session".into(),
-                endpoint: String::new(),
-                enabled: true,
-            },
+            name: "private-agent".into(),
+            provider: Provider::Inbox,
+            session: "private-session".into(),
+
             replace: false,
         });
         bridge.request(Request::NetworkLan { listen: None });

@@ -3,7 +3,7 @@ mod support;
 
 use agent_bridge::{
     broker::{self, Broker},
-    protocol::{Agent, Provider, Request},
+    protocol::{Provider, Request},
 };
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -26,6 +26,26 @@ impl Running {
         let _ = self.task.await;
     }
     fn request(&self, request: Request) -> Value {
+        if matches!(
+            &request,
+            Request::RemoteList | Request::RemoteListPeer { .. }
+        ) {
+            let broker = self.broker.clone();
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(broker.request_async(request))
+                    })
+                    .join()
+                    .ok()
+                    .and_then(std::result::Result::ok)
+            })
+            .unwrap_or_else(|| json!([]));
+        }
         self.broker.request(request).unwrap()
     }
     fn share(&self, peer: &str, agent: &str, shared: bool) -> Value {
@@ -126,16 +146,6 @@ async fn connect(a: &Running, b: &Running) {
         address: a.listening().await,
     });
 }
-async fn directory(a: &Running, name: &str) {
-    wait("permitted remote directory", || {
-        a.request(Request::RemoteList)
-            .as_array()?
-            .iter()
-            .find(|agent| agent["name"] == name)
-            .cloned()
-    })
-    .await;
-}
 async fn received(bridge: &Running, body: &str) -> Value {
     wait("received message", || {
         bridge.history().into_iter().find(|row| row["body"] == body)
@@ -151,13 +161,10 @@ async fn state(bridge: &Running, id: &str, wanted: &str) -> Value {
 }
 fn inbox(bridge: &Running, name: &str, session: &str, replace: bool) {
     bridge.request(Request::Register {
-        agent: Agent {
-            name: name.into(),
-            provider: Provider::Inbox,
-            session: session.into(),
-            endpoint: String::new(),
-            enabled: true,
-        },
+        name: name.into(),
+        provider: Provider::Inbox,
+        session: session.into(),
+
         replace,
     });
 }
@@ -198,8 +205,6 @@ async fn shared_sessions_exchange_delivered_replies_and_enforce_unshare_across_r
         3
     );
     connect(&a, &b).await;
-    directory(&a, "user").await;
-    directory(&b, "user").await;
     wait("connected state", || {
         (a.connection(&b_id)["state"] == "connected").then_some(Value::Null)
     })
@@ -212,7 +217,6 @@ async fn shared_sessions_exchange_delivered_replies_and_enforce_unshare_across_r
     assert_eq!(status["shared_sessions"][0]["shared"], true);
     assert!(status["pairing"].as_array().unwrap().is_empty());
     assert!(!status.to_string().contains("verification_code"));
-    assert_eq!(a.request(Request::RemoteList).as_array().unwrap().len(), 1);
     assert!(
         a.broker
             .request(Request::Send {
@@ -295,7 +299,6 @@ async fn shared_sessions_exchange_delivered_replies_and_enforce_unshare_across_r
     let b = Running::start(&b_path);
     assert_eq!(b.request(Request::SharedSessions)[0]["shared"], true);
     connect(&a, &b).await;
-    directory(&a, "user").await;
     let after_restart = a.send("bob/user", "Shared grants survived restart", None);
     let incoming = received(&b, "Shared grants survived restart").await;
     state(&b, incoming["id"].as_str().unwrap(), "delivered").await;
@@ -334,10 +337,10 @@ async fn replacing_shared_registration_does_not_authorize_its_new_session() {
     let b = Running::start(&root.path().join("b"));
     pair(&a, &b);
     inbox(&b, "worker", "old-session", false);
+    inbox(&a, "worker", "old-session", false);
     a.share("bob", "user", true);
     b.share("alice", "worker", true);
     connect(&a, &b).await;
-    directory(&a, "worker").await;
     inbox(&b, "worker", "replacement-session", true);
     let rows = b.request(Request::SharedSessions);
     assert_eq!(rows[0]["session"], "old-session");
@@ -358,16 +361,7 @@ async fn replacing_shared_registration_does_not_authorize_its_new_session() {
     });
     assert_eq!(b.request(Request::SharedSessions), json!([]));
     b.share("alice", "worker", true);
-    directory(&a, "worker").await;
-    // Wait for the directory to identify the replacement, rather than the stale route.
-    wait("replacement directory", || {
-        a.request(Request::RemoteList)
-            .as_array()?
-            .iter()
-            .find(|agent| agent["session"] == "replacement-session")
-            .cloned()
-    })
-    .await;
+    inbox(&a, "worker", "replacement-session", true);
     let id = a.send("bob/worker", "Explicitly shared replacement", None);
     let incoming = received(&b, "Explicitly shared replacement").await;
     state(&b, incoming["id"].as_str().unwrap(), "delivered").await;

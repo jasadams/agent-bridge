@@ -146,7 +146,7 @@ fn schema_three_upgrade_preserves_existing_network_configuration_and_data() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(include_str!("fixtures/native-metadata-v10.sql"))
         .unwrap();
-    conn.execute_batch("DROP TRIGGER inbound_usage_insert; DROP TRIGGER inbound_usage_delete; DROP TABLE inbound_usage; DROP TRIGGER message_context_insert; DROP TABLE message_context; DROP INDEX messages_monitor_order; DROP TABLE relay_nodes; DROP TABLE pairing_offers; DROP TABLE pairing_joined; DROP TABLE consumed_invitations; DELETE FROM settings WHERE key IN ('network_lan','machine_name'); ALTER TABLE peers DROP COLUMN machine_name; PRAGMA user_version=3;").unwrap();
+    conn.execute_batch("DROP TRIGGER IF EXISTS inbound_usage_insert; DROP TRIGGER IF EXISTS inbound_usage_delete; DROP TABLE inbound_usage; DROP TRIGGER IF EXISTS message_context_insert; DROP TABLE message_context; DROP INDEX messages_monitor_order; DROP TABLE relay_nodes; DROP TABLE pairing_offers; DROP TABLE pairing_joined; DROP TABLE consumed_invitations; DELETE FROM settings WHERE key IN ('network_lan','machine_name'); ALTER TABLE peers DROP COLUMN machine_name; PRAGMA user_version=3;").unwrap();
     conn.execute("INSERT INTO messages VALUES('preserved','user','user','user','body',NULL,0,'submitted',NULL,1,1)", []).unwrap();
     drop(conn);
     let db = Db::open(&path).unwrap();

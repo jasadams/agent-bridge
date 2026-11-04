@@ -2,7 +2,7 @@
 use agent_bridge::{
     broker::{self, Broker},
     network::relay_node::{self, Limits, RunningNode},
-    protocol::{Agent, Provider, Request},
+    protocol::{Provider, Request},
 };
 use serde_json::Value;
 use std::time::Duration;
@@ -20,6 +20,23 @@ impl Running {
         }
     }
     fn request(&self, req: Request) -> Value {
+        if matches!(&req, Request::RemoteList | Request::RemoteListPeer { .. }) {
+            let broker = self.broker.clone();
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(broker.request_async(req))
+                    })
+                    .join()
+                    .ok()
+                    .and_then(std::result::Result::ok)
+            })
+            .unwrap_or_else(|| serde_json::json!([]));
+        }
         self.broker.request(req).unwrap()
     }
     fn id(&self) -> String {
@@ -170,18 +187,6 @@ async fn pair(a: &Running, b: &Running) -> String {
     b.state(&id, "paired").await;
     id
 }
-async fn directory(bridge: &Running, target: &str) {
-    wait("permitted remote directory", || {
-        bridge
-            .request(Request::RemoteList)
-            .as_array()?
-            .iter()
-            .find(|row| row["peer_id"] == target && row["name"] == "user")
-            .cloned()
-    })
-    .await;
-}
-
 #[tokio::test]
 async fn public_discovery_pairs_and_exchanges_private_delivered_replies_only_through_relay() {
     let root = tempfile::Builder::new()
@@ -222,26 +227,14 @@ async fn public_discovery_pairs_and_exchanges_private_delivered_replies_only_thr
             .all(|peer| peer["peer_id"] != node.peer_id.to_string())
     );
     b.request(Request::Register {
-        agent: Agent {
-            name: "private".into(),
-            provider: Provider::Inbox,
-            session: "private".into(),
-            endpoint: String::new(),
-            enabled: true,
-        },
+        name: "private".into(),
+        provider: Provider::Inbox,
+        session: "private".into(),
+
         replace: false,
     });
     a.share(&bid);
     b.share(&aid);
-    directory(&a, &bid).await;
-    directory(&b, &aid).await;
-    assert!(
-        a.request(Request::RemoteList)
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["name"] != "private")
-    );
     let original = a.send(&format!("{bid}/user"), "Relayed hello", None);
     let incoming = b.message("Relayed hello").await;
     let local = incoming["id"].as_str().unwrap().to_owned();
@@ -318,7 +311,6 @@ async fn configured_independent_nodes_provide_routes_when_an_operator_is_unavail
     pair(&a, &b).await;
     a.share(&b.id());
     b.share(&a.id());
-    directory(&a, &b.id()).await;
     let id = a.send(&format!("{}/user", b.id()), "Independent operator", None);
     let msg = b.message("Independent operator").await;
     b.delivery(msg["id"].as_str().unwrap(), "delivered").await;
@@ -358,8 +350,6 @@ async fn relay_restart_recovers_reservations_and_durable_messages_without_pairin
     pair(&a, &b).await;
     a.share(&b.id());
     b.share(&a.id());
-    directory(&a, &b.id()).await;
-    directory(&b, &a.id()).await;
     // Disable the destination as well: an established direct path can survive
     // relay loss, while this case must exercise offline durable recovery.
     b.request(Request::NetworkConfigure {

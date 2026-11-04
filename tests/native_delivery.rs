@@ -31,17 +31,23 @@ async fn claude_socket_only_history_allows_65_sends_without_receipts_or_status_p
     let state = dir.path().join("state");
     let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
     let server = tokio::spawn(broker::serve(bound));
+    let session = id();
     broker::rpc(
         &state,
         &Request::Register {
-            agent: Agent {
-                name: "claude-flow".into(),
-                provider: Provider::Claude,
-                session: id(),
-                endpoint: socket.to_string_lossy().into_owned(),
-                enabled: true,
-            },
+            name: "claude-flow".into(),
+            provider: Provider::Claude,
+            session: session.clone(),
             replace: false,
+        },
+    )
+    .await
+    .unwrap();
+    broker::rpc(
+        &state,
+        &Request::ClaudeBind {
+            session,
+            endpoint: socket.to_string_lossy().into_owned(),
         },
     )
     .await
@@ -140,14 +146,19 @@ async fn real_broker_routes_native_claude_frame_and_accepts_correlated_reply() {
     broker::rpc(
         &state,
         &Request::Register {
-            agent: Agent {
-                name: name.into(),
-                provider: Provider::Claude,
-                session: session.clone(),
-                endpoint: socket.to_string_lossy().into_owned(),
-                enabled: true,
-            },
+            name: name.into(),
+            provider: Provider::Claude,
+            session: session.clone(),
             replace: false,
+        },
+    )
+    .await
+    .unwrap();
+    broker::rpc(
+        &state,
+        &Request::ClaudeBind {
+            session: session.clone(),
+            endpoint: socket.to_string_lossy().into_owned(),
         },
     )
     .await
@@ -236,7 +247,6 @@ async fn codex_adapter_never_spawns_an_argv_fallback_for_invalid_sessions() {
         provider: Provider::Codex,
         session: "invalid-session".into(),
         endpoint: String::new(),
-        enabled: true,
     };
     let msg = Message {
         id: id(),

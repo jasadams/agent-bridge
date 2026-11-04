@@ -365,7 +365,6 @@ mod tests {
             provider: crate::protocol::Provider::Claude,
             session: "123e4567-e89b-12d3-a456-426614174000".into(),
             endpoint: path.to_string_lossy().into_owned(),
-            enabled: true,
         };
         let guard: super::super::NoticeGuard =
             std::sync::Arc::new(|| anyhow::bail!("subscription revoked"));
@@ -393,7 +392,6 @@ mod tests {
                 provider: crate::protocol::Provider::Claude,
                 session: uuid::Uuid::new_v4().to_string(),
                 endpoint: path.to_string_lossy().into_owned(),
-                enabled: true,
             };
             let fixture =
                 super::super::topic_race_fixture::Fixture::new(&root.path().join("state"), agent);

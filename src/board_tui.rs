@@ -4578,7 +4578,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_response_save_delivers_generic_named_board_event() {
-        use crate::protocol::{Agent, EventSelector, Provider};
+        use crate::protocol::{EventSelector, Provider};
         use std::os::unix::fs::PermissionsExt;
         use tokio::{io::AsyncReadExt, net::UnixListener, time::timeout};
 
@@ -4612,16 +4612,19 @@ mod tests {
         let socket_path = root.path().join("native.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
         broker
             .request(Request::Register {
-                agent: Agent {
-                    name: "terminal-watcher".into(),
-                    provider: Provider::Claude,
-                    session: uuid::Uuid::new_v4().to_string(),
-                    endpoint: socket_path.to_string_lossy().into(),
-                    enabled: true,
-                },
+                name: "terminal-watcher".into(),
+                provider: Provider::Claude,
+                session: session.clone(),
                 replace: false,
+            })
+            .unwrap();
+        broker
+            .request(Request::ClaudeBind {
+                session,
+                endpoint: socket_path.to_string_lossy().into_owned(),
             })
             .unwrap();
         let (captured, mut received) = mpsc::channel(8);

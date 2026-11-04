@@ -417,7 +417,8 @@ class Qualification:
         native.stdin.flush()
         wait_for("Claude inbox", endpoint.exists)
         # --bare intentionally skips owner hooks; registration is explicit.
-        rpc(state, {"op": "register", "agent": {"name": name, "provider": "claude", "session": session, "endpoint": str(endpoint), "enabled": True}, "replace": False})
+        rpc(state, {"op": "register", "name": name, "provider": "claude", "session": session, "replace": False})
+        rpc(state, {"op": "claude_bind", "session": session, "endpoint": str(endpoint)})
         return self.route("claude", session, state)
 
     async def codex(self):

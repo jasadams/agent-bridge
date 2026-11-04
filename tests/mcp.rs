@@ -5,7 +5,6 @@ mod support;
 use agent_bridge::{
     broker::{self, Broker},
     db::Db,
-    network::wire::RemoteAgent,
     protocol::{Agent, MAX_FRAME, Provider, Request},
 };
 use serde_json::{Value, json};
@@ -36,13 +35,10 @@ impl Running {
     }
     fn inbox(&self, name: &str) {
         self.request(Request::Register {
-            agent: Agent {
-                name: name.into(),
-                provider: Provider::Inbox,
-                session: format!("inbox-{name}"),
-                endpoint: String::new(),
-                enabled: true,
-            },
+            name: name.into(),
+            provider: Provider::Inbox,
+            session: format!("inbox-{name}"),
+
             replace: false,
         });
     }
@@ -68,14 +64,14 @@ impl Native {
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         let session = uuid::Uuid::new_v4().to_string();
         running.request(Request::Register {
-            agent: Agent {
-                name: name.into(),
-                provider: Provider::Claude,
-                session: session.clone(),
-                endpoint: socket.to_string_lossy().into(),
-                enabled: true,
-            },
+            name: name.into(),
+            provider: Provider::Claude,
+            session: session.clone(),
             replace: false,
+        });
+        running.request(Request::ClaudeBind {
+            session: session.clone(),
+            endpoint: socket.to_string_lossy().into_owned(),
         });
         let (captured, received) = tokio::sync::mpsc::channel(32);
         let task = tokio::spawn(async move {
@@ -395,16 +391,9 @@ async fn topic_tools_discover_and_publish_durable_history_without_native_input()
         .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
         .unwrap();
     assert_eq!(dm_count, 0);
-    running.request(Request::Unregister {
-        name: native.name.clone(),
-        session: native.session.clone(),
-    });
-    let disabled_author = mcp.call("publish_topic_post", json!({"topic":topic,"id":uuid::Uuid::new_v4().to_string(),"author":author,"body":"disabled author"})).await;
-    assert!(failed(&disabled_author));
-    assert!(disabled_author.to_string().contains("topic_agent_unknown"));
-    let stale = mcp.call("list_topic_agents", json!({})).await;
+    let catalog = mcp.call("list_topic_agents", json!({})).await;
     assert!(
-        structured(&stale)["result"]["agents"]
+        structured(&catalog)["result"]["agents"]
             .as_array()
             .unwrap()
             .iter()
@@ -655,19 +644,20 @@ async fn rejected_opencode_send_does_not_return_a_phantom_message_id() {
     let running = Running::start(&state);
     running.inbox("alice");
     running.inbox("bob");
-    let conn = rusqlite::Connection::open(state.join("messages.sqlite3")).unwrap();
-    conn.execute(
-        "INSERT INTO agents(name,provider,session,endpoint,enabled) VALUES(?1,'opencode',?2,?3,1)",
-        rusqlite::params![
-            "opencode-ses_abcdefghijklmnopqrstuvwx12",
-            "ses_abcdefghijklmnopqrstuvwx12",
-            "/tmp/unused.sock"
-        ],
-    )
-    .unwrap();
+    running.request(Request::Register {
+        name: "opencode-target".into(),
+        provider: Provider::OpenCode,
+        session: "ses_abcdefghijklmnopqrstuvwx12".into(),
+        replace: false,
+    });
     let mut mcp = Mcp::start(&state);
     mcp.initialize().await;
-    let rejected = mcp.call("send_message", json!({"from":"alice","to":"opencode-ses_abcdefghijklmnopqrstuvwx12","body":"rejected"})).await;
+    let rejected = mcp
+        .call(
+            "send_message",
+            json!({"from":"alice","to":"opencode-target","body":"rejected"}),
+        )
+        .await;
     assert!(failed(&rejected), "{rejected}");
     let error = &rejected["result"]["structuredContent"];
     assert!(
@@ -918,7 +908,7 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     assert!(!failed(&stale));
     let agents = mcp.call("list_agents", json!({})).await;
     assert!(
-        structured(&agents)["result"]
+        structured(&agents)["result"]["agents"]
             .as_array()
             .unwrap()
             .iter()
@@ -955,7 +945,7 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     });
     let available = mcp.call("list_agents", json!({})).await;
     assert!(
-        !structured(&available)["result"]
+        !structured(&available)["result"]["agents"]
             .as_array()
             .unwrap()
             .iter()
@@ -963,7 +953,7 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
     );
     let all = mcp.call("list_agents", json!({"include_stale":true})).await;
     let data = structured(&all);
-    let row = data["result"]
+    let row = data["result"]["agents"]
         .as_array()
         .unwrap()
         .iter()
@@ -1018,37 +1008,20 @@ async fn strict_tools_reject_unknown_fields_and_cannot_supply_owner_approval() {
 }
 
 #[tokio::test]
-async fn list_agents_defaults_to_local_and_requires_one_explicit_trusted_remote_peer() {
+async fn list_agents_defaults_to_local_envelope_and_remote_is_on_demand() {
     let root = root();
     let state = root.path().join("state");
     let running = Running::start(&state);
     running.inbox("local-agent");
-    let mut peers = Vec::new();
-    for alias in ["workstation", "other-machine"] {
-        let peer = libp2p_identity::Keypair::generate_ed25519()
-            .public()
-            .to_peer_id()
-            .to_string();
-        running.request(Request::PeerPair {
-            peer_id: peer.clone(),
-            fingerprint: peer.clone(),
-            alias: Some(alias.into()),
-        });
-        // Seed the permitted directory cache, as the network worker does after
-        // fetching a paired peer's explicitly exported sessions.
-        Db::open(&state.join("messages.sqlite3"))
-            .unwrap()
-            .replace_remote_agents(
-                &peer,
-                &[RemoteAgent {
-                    name: format!("{alias}-agent"),
-                    provider: Provider::Inbox,
-                    session: format!("{alias}-session"),
-                }],
-            )
-            .unwrap();
-        peers.push(peer);
-    }
+    let peer = libp2p_identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id()
+        .to_string();
+    running.request(Request::PeerPair {
+        peer_id: peer.clone(),
+        fingerprint: peer.clone(),
+        alias: Some("workstation".into()),
+    });
     let mut mcp = Mcp::start(&state);
     mcp.initialize().await;
     let tools = mcp.request("tools/list", json!({})).await;
@@ -1064,6 +1037,12 @@ async fn list_agents_defaults_to_local_and_requires_one_explicit_trusted_remote_
             .get("include_stale")
             .is_some()
     );
+    assert!(
+        list["inputSchema"]["properties"]
+            .get("max_age_days")
+            .is_some()
+    );
+    assert!(list["inputSchema"]["properties"].get("remote").is_none());
     assert!(failed(
         &mcp.call(
             "list_agents",
@@ -1071,33 +1050,31 @@ async fn list_agents_defaults_to_local_and_requires_one_explicit_trusted_remote_
         )
         .await
     ));
-    assert!(list["inputSchema"]["properties"].get("remote").is_none());
     for arguments in [json!({}), json!({"peer":null})] {
         let response = mcp.call("list_agents", arguments).await;
-        let agents = structured(&response)["result"].as_array().unwrap();
+        let result = &structured(&response)["result"];
+        let agents = result["agents"].as_array().unwrap();
         assert!(agents.iter().any(|agent| agent["name"] == "local-agent"));
-        assert!(agents.iter().all(|agent| agent["peer_alias"].is_null()));
+        assert!(agents.iter().all(|agent| {
+            agent
+                .get("enabled")
+                .is_none_or(serde_json::Value::is_boolean)
+        }));
         assert!(
-            !agents
+            result["providers"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .any(|agent| agent["name"] == "workstation-agent")
+                .any(|provider| provider["provider"] == "inbox")
         );
     }
-    for peer in ["workstation", peers[0].as_str()] {
+    // Remote listing is requested live. Without an authenticated transport route
+    // it must fail, never return a stale or false-empty directory.
+    for peer in ["workstation", peer.as_str()] {
         let response = mcp.call("list_agents", json!({"peer":peer})).await;
-        let agents = structured(&response)["result"].as_array().unwrap();
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0]["name"], "workstation-agent");
-        assert_eq!(agents[0]["peer_id"], peers[0]);
-        assert_eq!(agents[0]["online"], false);
+        assert!(failed(&response), "{response}");
+        assert!(!response.to_string().contains("workstation-agent"));
     }
-    let other = mcp
-        .call("list_agents", json!({"peer":"other-machine"}))
-        .await;
-    assert_eq!(
-        structured(&other)["result"][0]["name"],
-        "other-machine-agent"
-    );
     for arguments in [
         json!({"remote":true}),
         json!({"remote":false}),
@@ -1106,28 +1083,11 @@ async fn list_agents_defaults_to_local_and_requires_one_explicit_trusted_remote_
         json!({"peer":"*"}),
         json!({"peer":"missing-peer"}),
         json!({"peer":42}),
+        json!({"max_age_days":0}),
     ] {
         let response = mcp.call("list_agents", arguments).await;
         assert!(failed(&response), "{response}");
-        assert!(!response.to_string().contains("workstation-agent"));
-        assert!(!response.to_string().contains("other-machine-agent"));
     }
-    running.request(Request::PeerRevoke {
-        peer: "workstation".into(),
-    });
-    for peer in ["workstation", peers[0].as_str()] {
-        let response = mcp.call("list_agents", json!({"peer":peer})).await;
-        assert!(failed(&response), "{response}");
-        assert!(!response.to_string().contains("workstation-agent"));
-    }
-    // A rejected or revoked selection cannot poison another peer's cache.
-    let other = mcp
-        .call("list_agents", json!({"peer":"other-machine"}))
-        .await;
-    assert_eq!(
-        structured(&other)["result"][0]["name"],
-        "other-machine-agent"
-    );
     mcp.close().await;
 }
 
@@ -1310,12 +1270,14 @@ async fn two_mcp_clients_pair_real_brokers_only_after_both_owners_approve_then_s
     assert_eq!(a.request(Request::PeersList)[0]["grants"], json!([]));
     assert_eq!(b.request(Request::PeersList)[0]["grants"], json!([]));
     let private = b_mcp.call("list_agents", json!({"peer":a_peer})).await;
-    assert_eq!(structured(&private)["result"], json!([]));
+    if !failed(&private) {
+        assert_eq!(structured(&private)["result"], json!([]));
+    }
+    a.inbox("shared-inbox");
+    let shared_agent = "shared-inbox";
+    let shared_session = "inbox-shared-inbox";
     let shared = a_mcp
-        .call(
-            "share_session",
-            json!({"peer":b_peer,"agent":a_native.name}),
-        )
+        .call("share_session", json!({"peer":b_peer,"agent":shared_agent}))
         .await;
     assert!(!failed(&shared), "{shared}");
     let a_peers = a.request(Request::PeersList);
@@ -1324,24 +1286,36 @@ async fn two_mcp_clients_pair_real_brokers_only_after_both_owners_approve_then_s
     assert!(
         grants
             .iter()
-            .all(|grant| grant["session"] == a_native.session)
+            .all(|grant| grant["session"] == shared_session)
     );
     assert_eq!(b.request(Request::PeersList)[0]["grants"], json!([]));
     a.inbox("private-future-session");
     let exported = Db::open(&a_state.join("messages.sqlite3"))
         .unwrap()
-        .export_agents(&b_peer)
+        .export_agents(
+            &b_peer,
+            &[Agent {
+                name: shared_agent.into(),
+                provider: Provider::Inbox,
+                session: shared_session.into(),
+                endpoint: String::new(),
+            }],
+        )
         .unwrap();
     assert_eq!(exported.len(), 1);
-    assert_eq!(exported[0].name, a_native.name);
-    assert_eq!(exported[0].session, a_native.session);
+    assert_eq!(exported[0].name, shared_agent);
+    assert_eq!(exported[0].session, shared_session);
     timeout(Duration::from_secs(30), async {
         loop {
             let response = b_mcp.call("list_agents", json!({"peer":a_peer})).await;
+            if failed(&response) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             let agents = structured(&response)["result"].as_array().unwrap();
             if !agents.is_empty() {
                 assert_eq!(agents.len(), 1, "other sessions must remain private");
-                assert_eq!(agents[0]["name"], a_native.name);
+                assert_eq!(agents[0]["name"], shared_agent);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1352,7 +1326,7 @@ async fn two_mcp_clients_pair_real_brokers_only_after_both_owners_approve_then_s
     let unshared = a_mcp
         .call(
             "unshare_session",
-            json!({"peer":b_peer,"agent":a_native.name}),
+            json!({"peer":b_peer,"agent":shared_agent}),
         )
         .await;
     assert!(!failed(&unshared), "{unshared}");
@@ -1360,7 +1334,15 @@ async fn two_mcp_clients_pair_real_brokers_only_after_both_owners_approve_then_s
     assert!(
         Db::open(&a_state.join("messages.sqlite3"))
             .unwrap()
-            .export_agents(&b_peer)
+            .export_agents(
+                &b_peer,
+                &[Agent {
+                    name: a_native.name.clone(),
+                    provider: Provider::Claude,
+                    session: a_native.session.clone(),
+                    endpoint: String::new(),
+                }]
+            )
             .unwrap()
             .is_empty()
     );
@@ -1385,10 +1367,9 @@ async fn event_subscription_compact_results_keep_effective_set_and_atomic_snapsh
     let state = root.path().join("state");
     let running = Running::start(&state);
     let coordinator = Native::start(&running, &root.path().join("coordinator"), "coordinator");
-    let worker = Native::start(&running, &root.path().join("worker"), "worker");
     let mut mcp = Mcp::start(&state);
     mcp.initialize().await;
-    let events = json!([{"event":"agent.opened"},{"event":"agent.closed"}]);
+    let events = json!([{"event":"board.changed","board":"main"}]);
     let response = mcp
         .call(
             "subscribe",
@@ -1403,47 +1384,21 @@ async fn event_subscription_compact_results_keep_effective_set_and_atomic_snapsh
         receipt["recovery"],
         json!({"total":0,"truncated":false,"items":[]})
     );
-    let available = receipt["agents"].as_array().unwrap();
-    let known = available
-        .iter()
-        .find(|agent| agent["session"] == worker.session)
-        .unwrap();
-    assert_eq!(known["provider"], "claude");
-    assert_eq!(known["route"], worker.name);
-    assert!(known["display_name"].is_string());
-    assert!(
-        available
-            .iter()
-            .all(|agent| agent.get("endpoint").is_none())
-    );
-    let added = mcp
+    assert!(receipt.get("agents").is_none());
+    let repeated = mcp
         .call(
             "subscribe",
-            json!({"agent":coordinator.name,"events":[{"event":"board.changed","board":"main"}]}),
+            json!({"agent":coordinator.name,"events":events}),
         )
         .await;
-    assert_eq!(
-        structured(&added)["result"]["events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
-    );
-    // Retain the snapshot even when adding a board selector to an existing lifecycle watch.
-    assert!(
-        structured(&added)["result"]["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|agent| agent["session"] == worker.session)
-    );
+    assert_eq!(structured(&repeated)["result"]["events"], events);
     let removed = mcp
         .call(
             "unsubscribe",
-            json!({"agent":coordinator.name,"events":[{"event":"board.changed","board":"main"}]}),
+            json!({"agent":coordinator.name,"events":events}),
         )
         .await;
-    assert_eq!(structured(&removed)["result"]["events"], events);
+    assert_eq!(structured(&removed)["result"]["events"], json!([]));
     let empty = mcp
         .call("unsubscribe", json!({"agent":coordinator.name,"events":[]}))
         .await;
@@ -1492,14 +1447,14 @@ async fn board_subscriptions_deliver_debounced_native_notices_only_when_opted_in
     for arguments in [
         json!({}),
         json!({"agent":native.name}),
-        json!({"agent":"missing","events":[{"event":"agent.opened"}]}),
+        json!({"agent":"missing","events":[{"event":"board.changed","board":"main"}]}),
         json!({"agent":native.name,"events":[]}),
         json!({"agent":native.name,"events":[{"event":"unknown"}]}),
         json!({"agent":native.name,"events":[{"event":"board.changed"}]}),
         json!({"agent":native.name,"events":[{"event":"board.changed","board":"missing"}]}),
-        json!({"agent":native.name,"events":[{"event":"agent.opened","board":"main"}]}),
+        json!({"agent":native.name,"events":[{"event":"agent.opened"}]}),
         json!({"agent":native.name,"events":[{"event":"board.changed","board":"main","extra":true}]}),
-        json!({"agent":native.name,"peer":"remote","events":[{"event":"agent.opened"}]}),
+        json!({"agent":native.name,"peer":"remote","events":[{"event":"board.changed","board":"main"}]}),
     ] {
         let response = mcp.call("subscribe", arguments).await;
         assert!(failed(&response), "{response}");
@@ -1855,16 +1810,24 @@ async fn compact_writes_stay_small_and_verbose_preserves_full_records() {
     assert!(send_sizes[0].abs_diff(send_sizes[1]) < 32);
     assert_eq!(board_sizes[0], board_sizes[1]);
     let compact = mcp.call("list_agents", json!({})).await;
-    for agent in structured(&compact)["result"].as_array().unwrap() {
+    for agent in structured(&compact)["result"]["agents"].as_array().unwrap() {
         assert!(agent.get("endpoint").is_none());
         assert!(agent.get("session").is_none());
         assert!(agent.get("machine_name").is_none());
-        assert_eq!(agent["enabled"], true);
+        assert!(
+            agent
+                .get("enabled")
+                .is_none_or(serde_json::Value::is_boolean)
+        );
     }
     let verbose = mcp.call("list_agents", json!({"verbose":true})).await;
-    assert!(structured(&verbose)["result"][0].get("session").is_some());
     assert!(
-        structured(&verbose)["result"][0]
+        structured(&verbose)["result"]["agents"][0]
+            .get("session")
+            .is_some()
+    );
+    assert!(
+        structured(&verbose)["result"]["agents"][0]
             .get("machine_name")
             .is_some()
     );

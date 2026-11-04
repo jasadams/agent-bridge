@@ -17,7 +17,6 @@ fn agent(name: &str, session: &str) -> Agent {
         provider: Provider::Inbox,
         session: session.into(),
         endpoint: String::new(),
-        enabled: true,
     }
 }
 
@@ -78,7 +77,7 @@ fn grants_are_directional_pinned_and_revoked_without_cache() {
             .unwrap()
     );
     assert!(
-        !db.peer_allowed(&peer, &Provider::Inbox, "original", Permission::Receive)
+        db.peer_allowed(&peer, &Provider::Inbox, "original", Permission::Receive)
             .unwrap()
     );
     db.grant_peer(&peer, "reviewer", Permission::Send, true)
@@ -129,7 +128,7 @@ fn pairing_rejects_fingerprint_mismatch_and_alias_replacement() {
 }
 
 #[test]
-fn disabling_a_session_blocks_an_existing_grant() {
+fn unregistering_a_route_keeps_saved_grants_until_explicit_policy_change() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Db::open(&dir.path().join("db")).unwrap();
     db.register(&agent("reviewer", "session"), false).unwrap();
@@ -139,13 +138,11 @@ fn disabling_a_session_blocks_an_existing_grant() {
         .unwrap();
     db.unregister("reviewer", "session").unwrap();
     assert!(
-        !db.peer_allowed(&peer, &Provider::Inbox, "session", Permission::Receive)
+        db.peer_allowed(&peer, &Provider::Inbox, "session", Permission::Receive)
             .unwrap()
     );
-    assert!(
-        db.grant_peer(&peer, "reviewer", Permission::Send, true)
-            .is_err()
-    );
+    db.grant_peer(&peer, "reviewer", Permission::Send, true)
+        .unwrap();
     db.grant_peer(&peer, "reviewer", Permission::Receive, false)
         .unwrap();
 }

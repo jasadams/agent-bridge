@@ -48,10 +48,6 @@ impl Provider {
 pub enum EventSelector {
     #[serde(rename = "board.changed")]
     BoardChanged { board: crate::board::Name },
-    #[serde(rename = "agent.opened")]
-    AgentOpened {},
-    #[serde(rename = "agent.closed")]
-    AgentClosed {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +56,6 @@ pub struct Agent {
     pub provider: Provider,
     pub session: String,
     pub endpoint: String,
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,15 +152,26 @@ pub enum Request {
         limit: usize,
     },
     Register {
-        agent: Agent,
+        name: String,
+        provider: Provider,
+        session: String,
         #[serde(default)]
         replace: bool,
+    },
+    /// Start a Claude SessionStart binding without creating route membership.
+    ClaudeBind {
+        session: String,
+        endpoint: String,
+    },
+    /// End only the matching normalized Claude endpoint, never its replacement.
+    ClaudeUnbind {
+        session: String,
+        endpoint: String,
     },
     #[serde(rename = "opencode_observe")]
     OpenCodeObserve {
         session: String,
         endpoint: String,
-        title: Option<String>,
         #[serde(default)]
         ready: bool,
     },
@@ -210,15 +216,15 @@ pub enum Request {
         name: String,
         session: String,
     },
-    /// A native SessionEnd retires every alias of the verified exact session.
-    SessionClose {
-        name: String,
-        session: String,
-        endpoint: String,
-    },
     List {
         #[serde(default)]
         all: bool,
+        #[serde(default = "max_age_days")]
+        max_age_days: u32,
+    },
+    /// Read-only local routing configuration lookup. Never native presence.
+    Resolve {
+        name: String,
     },
     Send {
         id: String,
@@ -492,6 +498,10 @@ fn topic_limit() -> usize {
 
 fn history_limit() -> usize {
     30
+}
+
+fn max_age_days() -> u32 {
+    7
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -170,21 +170,23 @@ See [board retention and recovery](board.md#archive-and-restore).
 
 ### Event subscriptions
 
-Subscriptions are off by default. Use your exact registered local route:
+Subscriptions are off by default. Use your exact registered local route and an
+explicit `board.changed` selector:
 
 ```json
-{"agent":"coordinator-route","events":[{"event":"agent.opened"},{"event":"agent.closed"},{"event":"board.changed","board":"main"}]}
+{"agent":"coordinator-route","events":[{"event":"board.changed","board":"main"}]}
 ```
 
 `subscribe` adds selectors idempotently; `unsubscribe` removes specified selectors
 idempotently, or removes all when `events` is omitted. Removing a selector that
-is not subscribed changes nothing. Removing one selector preserves the other
-selectors and their pending notices. Both return the effective
-`events`, `agent`, `agents` snapshot, `persistent:false` and `recovery`, including in compact
-mode. No compatibility aliases for the removed board-specific tools remain.
-Board selectors require explicit existing local names; unknown events, mixed or
-unknown fields, empty explicit lists, invalid boards and excessive selectors fail.
-There is no wildcard or automatic opt-in.
+is not subscribed changes nothing. Both return the effective `events`, `agent`,
+`persistent:false` and `recovery`, including in compact mode. No compatibility
+aliases for removed board-specific tools remain. Removed `agent.opened` and
+`agent.closed` selectors are rejected by strict decoding; there is no replacement
+lifecycle subscription or availability snapshot. Board selectors require explicit
+existing local names; unknown events, mixed or unknown fields, empty explicit
+lists, invalid boards and excessive selectors fail. There is no wildcard or
+automatic opt-in.
 
 For each named `board.changed` selector, read the active board and supply its
 current revision in `board_revisions` on both `subscribe` and selector-specific
@@ -203,101 +205,28 @@ commands obtain the current named-board fence automatically.
 Equivalent CLI commands accept a JSON selector array:
 
 ```sh
-agent-bridge subscribe --agent coordinator-route --events '[{"event":"agent.opened"},{"event":"agent.closed"},{"event":"board.changed","board":"main"}]'
+agent-bridge subscribe --agent coordinator-route --events '[{"event":"board.changed","board":"main"}]'
 agent-bridge unsubscribe --agent coordinator-route --events '[{"event":"board.changed","board":"main"}]'
 agent-bridge unsubscribe --agent coordinator-route
 ```
 
-With lifecycle selectors, `subscribe` atomically establishes the watch and returns
-currently available local agents in `agents`, identified by provider/session,
-exact `route` and `display_name`. Subsequent transitions arrive as typed native
-control notices with event, observation time and reason where known. Existing
-agents appear in the snapshot, without replaying historical transitions. Repeating
-subscriptions is idempotent. Notices concern availability, not transcript creation
-or deletion, and exclude the receiving agent itself and the permanent user inbox.
-Heartbeat, title and alias changes alone produce no lifecycle event. Remote peer
-presence and private endpoints are excluded. Snapshot display labels are limited
-to 4,096 UTF-8 bytes, with safe truncation and `...`; exact routing identities
-remain unchanged. Ordinary agent listings retain their full display metadata.
+Board notifications are debounced, capped and delivered as typed local control
+notices. They grant no permission and do not enter peer-message history. Closing
+or replacing the receiving route invalidates pending work; reconnect/reopen requires
+explicit opt-in. Subscriptions and pending notices do not survive broker restart.
 
-`subscribe` rejects a local available-agent snapshot exceeding 256 canonical
-identities or 65,536 encoded JSON bytes before changing any selectors. It never
-silently truncates the snapshot. Reduce local registrations before retrying.
-
-Closure removes subscriptions and pending notices; reconnect/reopen requires
-explicit opt-in. Subscriptions and event history do not survive broker restart:
-resubscribe and use the returned snapshot.
-
-An overflow, definite failure or genuinely ambiguous native lifecycle write makes
-the event stream incomplete. Overflow/definite failure permits at most one
-`resync.required` notice. An ambiguous attempted write instead records a local
-Unknown diagnostic and suppresses transitions **without submitting any resync or
-replay**. Further lifecycle transitions wait until you explicitly call
-`subscribe` with a lifecycle selector to obtain a fresh atomic snapshot. Adding
-only a board selector does not recover the lifecycle stream. A failed resync
-attempt is not replayed automatically; after a transport interruption, explicitly
-resubscribe even if no resync notice arrived. Recovery invalidates older pending
-lifecycle notices. Preserve per-identity transition order when interpreting
-notices. Native hooks/events, confirmed socket cleanup and OpenCode lease expiry
-have observation delays; `/exit` is not a universally synchronous callback.
-
-A fully completed Claude socket submission remains transport-submitted internally
-and keeps the event stream functioning. Its public diagnostic is still Unknown:
-the socket interface does not confirm native acceptance or model reading. This
-differs from an interrupted/partial write, whose stream may contain a genuine gap.
-
-Unsubscribe, closure, recipient replacement and broker restart prevent pending
-notices from starting native delivery for an invalid subscription or recipient.
-Native I/O already admitted before that boundary may complete; these operations
-do not cancel it. Unsubscribing one selector does not cancel retained selectors'
-work. Failed or Unknown native attempts are not automatically replayed.
-
-Subscribe/unsubscribe receipts always include
-`recovery:{"total":0,"truncated":false,"items":[]}` when no attempted OpenCode
-control needs inspection, including for other providers. For OpenCode, a nonzero
-`total` identifies hidden attempted controls that can still block native delivery
-even though the returned availability snapshot is current. Up to 16 items expose
-only `id`, `state`, `reconciliation_pending`, `route_matches` and
-`lease_available`; `truncated:true` means more items exist. An `instruction` is
-included when `total` is nonzero. These diagnostics do not expose control text
-or add controls to peer-message history. Reading them performs no native work.
-
-Inspect the reported ID and use the existing CLI against the **same broker state
-directory** for explicit recovery:
-
-```sh
-agent-bridge --state-dir "/same/private/state" retry CONTROL_ID
-```
-
-For an attempted OpenCode control, this queues **read-only reconciliation** of
-existing native proof, without reinserting a prompt. Do not request duplicate
-insertion. A matching live route/lease is needed to perform native readback;
-`lease_available` reports current availability, not proof that insertion succeeded.
-A queued or pending reconciliation has not necessarily run. After a lease/generation
-change or broker restart, explicitly retry that same ID again if readback remains
-queued; this still reads proof and cannot insert another prompt.
-Missing or mismatched proof remains Unknown but does not block later eligible
-messages. Queue capacity and exact route/lease restrictions still apply.
-There is no automatic retry, automatic promotion to Delivered, or cancel escape
-that proves an Unknown attempt never happened. After reconciliation, explicitly
-subscribe to lifecycle events again if a fresh snapshot is needed.
-
-These notices are control data, require no acknowledgement or peer reply, do not
-enter peer-message history, and grant no owner approval or permission. See
-[native session setup](native-sessions.md) for availability evidence and delays.
-Board notices retain 3 quiet seconds / 10 maximum debounce thresholds, named-board
-context, fair polling, pause and exact-recipient fences. Supply your own registered
-`agent` on `update_board` to suppress own-write notices. Terminal and web responses
-both notify watchers through the same board update path. See [interactive board
 usage](board.md) for controls and concurrency behavior.
 
 ### Discover and share your session
 
 Sessions remain private by default, including sessions created after pairing.
-For local discovery call `list_agents({})`. Unreachable Claude sockets are hidden.
-Use `list_agents({"include_stale":true})` for all local registrations with
-`stale_reason` on hidden rows. This option cannot be combined with `peer`. Remote discovery requires a specific
-paired peer alias or peer ID:
+For local discovery call `list_agents({})`. Results are current native connector
+state plus manual Inbox configuration:
+`{"agents":[...],"providers":[{"provider":"claude","state":"complete|incomplete|unavailable"}]}`.
+Use `list_agents({"include_stale":true})` for disabled manual Inbox configuration;
+`max_age_days` defaults to 7 and applies only to OpenCode. Neither option can be
+combined with `peer`. Remote discovery is on demand and requires a specific paired
+peer alias or peer ID; an unavailable route is an error, not an empty directory:
 
 ```json
 {"peer":"workstation"}
@@ -307,8 +236,8 @@ This returns only that peer's permitted remote directory. There is no MCP option
 to list every remote machine at once; the former `remote` boolean is no longer
 accepted. Unknown or revoked peers return an error. A known peer with no shared
 sessions returns an empty list, which does not prove that its local registration
-failed. Results are cached and can briefly lag changes on the other machine;
-their `online` field reports whether the peer is currently connected.
+failed. Results are requested from the peer on demand and are not persisted; an
+unreachable route is an error rather than a stale cached directory.
 
 You can tell an agent **“Share this session with workstation.”** It should call
 `share_session` using its own exact local registration name from its native
@@ -366,9 +295,10 @@ recovery instructions and the exchange ID when one was created, without echoing
 invitation material.
 
 `list_agents` also defaults to compact routing and availability fields. Local
-results retain names, provider and enabled state; remote results retain peer ID,
-alias, qualified routing name and online state. Pass `"verbose": true` for session,
-machine and transport metadata.
+results retain names, provider, display labels and status; manual Inbox rows may
+show `enabled`. Native transport endpoints and enabled flags are omitted. Remote
+results retain peer ID, alias, qualified routing name and online state. Pass
+`"verbose": true` for session, machine and transport metadata.
 
 To avoid receiving the same board text again, pass the last revision to `read_board`:
 

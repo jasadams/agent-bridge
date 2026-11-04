@@ -1,6 +1,5 @@
 //! A read-only observer of the *existing* native Codex daemon. Never starts or resumes a thread.
 use super::{ConnectorState, NativeState, StateError};
-use crate::broker::Broker;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -165,11 +164,17 @@ async fn request_read(
     .await
 }
 
+type Status = std::sync::Arc<std::sync::Mutex<serde_json::Value>>;
+
+fn report(status: &Status, value: serde_json::Value) {
+    *status.lock().unwrap() = value;
+}
+
 pub async fn observe_connection(
-    broker: &Broker,
     path: &Path,
     codex_home: &Path,
     state: &State,
+    status: &Status,
 ) -> Result<()> {
     *state.0.lock().unwrap() = Observation::default();
     let _connection = Connection(state); // Also clears observations on cancellation.
@@ -217,7 +222,10 @@ pub async fn observe_connection(
         json!({"id":2,"method":"thread/loaded/list","params":{}}),
     )
     .await?;
-    broker.discovery_status(json!({"state":"connected","socket":path,"observed_sessions":0}));
+    report(
+        status,
+        json!({"state":"connected","socket":path,"observed_sessions":0}),
+    );
     loop {
         let value = receive(&mut socket).await?;
         if value.get("method").is_none()
@@ -310,7 +318,10 @@ pub async fn observe_connection(
                             "Native Codex observation exceeds 4096 sessions"
                         );
                     }
-                    broker.discovery_status(json!({"state":"connected","socket":path,"observed_sessions":observation.rows.len()}));
+                    report(
+                        status,
+                        json!({"state":"connected","socket":path,"observed_sessions":observation.rows.len()}),
+                    );
                 }
             }
             state.0.lock().unwrap().complete =
@@ -378,18 +389,19 @@ pub async fn observe_connection(
     }
 }
 
-pub async fn run(broker: Broker, codex_home: PathBuf) {
-    let state = State::default();
+pub async fn run(state: State, codex_home: PathBuf, status: Status) {
     let mut delay = 1;
     loop {
         let mut last = "No native Codex daemon socket found".to_string();
         for socket in socket_paths() {
-            if let Err(error) = observe_connection(&broker, &socket, &codex_home, &state).await {
+            if let Err(error) = observe_connection(&socket, &codex_home, &state, &status).await {
                 last = format!("{error:#}");
             }
         }
-        broker
-            .discovery_status(json!({"state":"disconnected","detail":last,"retry_seconds":delay}));
+        report(
+            &status,
+            json!({"state":"disconnected","detail":last,"retry_seconds":delay}),
+        );
         // Reconnect backoff only. Connected discovery waits on socket notifications, not a timer.
         sleep(Duration::from_secs(delay)).await;
         delay = (delay * 2).min(15);

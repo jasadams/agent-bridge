@@ -154,8 +154,8 @@ async fn bounded_older_pages_and_catalog_use_ids_not_names() {
     ] {
         request(
             broker,
-            json!({"op":"register","agent":{"name":name,
-            "provider":"inbox","session":session,"endpoint":"","enabled":name != "other"}}),
+            json!({"op":"register","name":name,
+            "provider":"inbox","session":session}),
         )
         .unwrap();
     }
@@ -263,9 +263,14 @@ async fn topic_mentions_do_not_submit_native_input_or_inherit_alias_replacement(
     let register = |session: &str, replace| {
         request(
             broker,
-            json!({"op":"register",
-        "agent":{"name":"reviewer","provider":"claude","session":session,
-            "endpoint":endpoint.to_str().unwrap(),"enabled":true},"replace":replace}),
+            json!({"op":"register","name":"reviewer","provider":"claude",
+            "session":session,"replace":replace}),
+        )
+        .unwrap();
+        request(
+            broker,
+            json!({"op":"claude_bind","session":session,
+                "endpoint":endpoint.to_str().unwrap()}),
         )
         .unwrap()
     };
@@ -286,6 +291,12 @@ async fn topic_mentions_do_not_submit_native_input_or_inherit_alias_replacement(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
     );
     register(&uuid::Uuid::new_v4().to_string(), true);
+    request(
+        broker,
+        json!({"op":"claude_unbind","session":session,
+            "endpoint":endpoint.to_str().unwrap()}),
+    )
+    .unwrap();
     assert!(
         request(
             broker,

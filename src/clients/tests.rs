@@ -12,7 +12,6 @@ fn agent(provider: Provider) -> Agent {
         provider,
         session: "123e4567-e89b-12d3-a456-426614174000".into(),
         endpoint: String::new(),
-        enabled: true,
     }
 }
 fn message(agent: &Agent) -> Message {
@@ -33,11 +32,7 @@ fn message(agent: &Agent) -> Message {
 
 #[test]
 fn native_capabilities_are_explicit_and_inbox_has_none() {
-    for capability in [
-        Capability::Messages,
-        Capability::ControlNotices,
-        Capability::LifecycleRegistration,
-    ] {
+    for capability in [Capability::Messages, Capability::ControlNotices] {
         assert!(!supports(&Provider::Inbox, capability));
         assert!(supports(&Provider::Claude, capability));
         assert!(supports(&Provider::Codex, capability));

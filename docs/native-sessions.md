@@ -52,14 +52,12 @@ Install lifecycle hooks, then start a new session or restart the relevant sessio
 agent-bridge hooks install
 ```
 
-The startup hook registers the session's native inbox socket and the end hook
-disables its automatic registration. Default local listings also check that the
-private native socket still accepts connections, hiding missing or refused sockets
-immediately. The broker checks enabled Claude registrations every minute and disables
-them after two consecutive failures; a successful check or registration clears the
-first failure. This repairs missed end hooks after crashes or disconnects. Hooks run through Claude Code's normal
-workspace trust flow. Check the client session's status if it does not expose an
-inbox socket.
+The startup hook records the session's private inbox socket as a delivery binding.
+The end hook removes only the matching normalized endpoint, so a late end event
+cannot close a replacement. No native membership or enabling flag is stored; sends
+verify native state through the connector boundary when they need it. Hooks run
+through Claude Code's normal workspace trust flow. Check the client session's status
+if it does not expose an inbox socket.
 
 When incoming messages are held, review the client's cross-session message
 settings. Agent Bridge leaves those choices and tool approvals under the owner's
@@ -109,35 +107,28 @@ shared sessions.
 
 ## Session names
 
-`agent-bridge list` shows available registrations, native display names and stable
-routing names. Automatically registered names use `codex-<thread-UUID>`,
-`claude-<session-UUID>` or `opencode-<ses_ID>`. Qualified display names such as `codex:reviewer` are also
-accepted for messaging. If a display name is ambiguous, use the stable name.
+`agent-bridge list` reads Claude, Codex and OpenCode native state for the current
+request and returns `{"agents":[...],"providers":[...]}`. Native rows use exact
+`codex-<thread-UUID>`, `claude-<session-UUID>` or `opencode-<ses_ID>` routes. An
+explicit registration alias may replace a route name; display names and titles are
+labels only and never resolve a destination. Canonical provider session IDs are
+reserved and cannot be registered as aliases.
 
 ```sh
-agent-bridge list --all
-agent-bridge send --to 'codex:reviewer' --message 'Ready for review.'
+agent-bridge list
+agent-bridge list --max-age-days 30
+agent-bridge send --to 'codex-<thread-UUID>' --message 'Ready for review.'
 ```
 
-Use `list --all` or MCP `list_agents({"include_stale":true})` to inspect hidden local
-registrations. Stale rows include `stale_reason`: `disabled`, `socket_missing`,
-`socket_refused`, or `socket_invalid`. Socket checks send no message; inconclusive
-errors such as a full accept backlog do not retire a session. A disabled session
-needs native registration again to become enabled.
+The age filter applies only to OpenCode, whose native API supplies an activity
+timestamp; Claude and Codex ignore it. Default is 7 days, explicit 30 is useful for
+cold sessions. `list --all` and MCP `include_stale: true` include disabled manual
+Inbox configuration only; they do not retain saved native rows.
 
-Socket availability cannot distinguish a live background spare from an interactive
-session, or prove that a session behind a shared process socket is still open.
-Process kinds, stable restart aliases, activity timestamps and result pagination
-are not currently recorded by this check. Display names remain labels; use stable
-routing names when names collide.
-
-An available session indicates transport availability. It does not establish that
-the model is currently working or that a message has been read. Manual Claude
-aliases share the same socket checks. A verified native session end disables all
-aliases of that exact session; Codex close/unload or daemon disconnect does the
-same. Removing one registration with ordinary `unregister` affects only that
-alias. Alias removal alone is not a lifecycle transition while the native
-identity remains available through another registration.
+Native availability means the provider answered this request. It does not establish
+that the model is working, that a message has been read, or that a session is
+permitted. Use exact provider/session identities for routing. Removing an explicit
+alias affects only that alias; queued messages keep their immutable identity.
 
 ## Permissions and troubleshooting
 
@@ -166,34 +157,12 @@ Native delivery depends on the capabilities exposed by the installed client and
 its running session. [Trust and recovery](peer-trust.md) covers grants, revocation
 and safe upgrade/rollback; [MCP setup](mcp.md) covers the structured command path.
 
-## Optional local lifecycle events
+## Board notifications
 
-A coordinator can opt into `agent.opened` and `agent.closed` through generic
-[`subscribe` selectors](mcp.md#event-subscriptions), alongside explicit
-`board.changed` selectors. Use the exact receiving route in native context.
-The atomic subscribe-time snapshot lists currently available local identities;
-subsequent control notices describe genuine availability changes, not new or
-deleted transcripts. Repeated discovery, heartbeats and renames do not open agents.
-
-Claude SessionEnd and confirmed socket failure, Codex native discovery/close/
-archive/unload and daemon disconnect, and OpenCode disposal/deletion/archive or
-lease expiry supply availability evidence. Fallback observation may be delayed;
-`/exit` is not guaranteed to synchronously notify all clients. Notices are local
-control data, require no acknowledgement, grant no permission and do not enter
-peer-message history. Closing the recipient prunes its subscriptions; reopen or
-broker restart requires explicit resubscription and a fresh returned snapshot.
-Snapshots reject more than 256 canonical identities or 65,536 encoded JSON bytes
-before subscription changes; they never silently truncate identities. Display
-labels are bounded to 4,096 UTF-8 bytes with safe truncation and `...`, without
-changing exact routes or ordinary listing metadata.
-
-Overflow or a Failed or Unknown lifecycle delivery marks the stream incomplete.
-The broker attempts one `resync.required` notice and suppresses further lifecycle
-transitions until explicit lifecycle subscription obtains a fresh snapshot.
-Resync attempts are not automatically replayed. Unsubscribe, closure, replacement
-and restart block pending delivery for invalid recipients or selectors; native
-I/O admitted earlier may still finish. See the [event subscription recovery
-contract](mcp.md#event-subscriptions).
+Explicit `board.changed` subscriptions remain available; the removed
+`agent.opened`/`agent.closed` selectors have no replacement. Native lookup is not
+permission and does not create a durable availability catalog. See the
+[event subscription contract](mcp.md#event-subscriptions).
 
 For OpenCode, subscribe/unsubscribe receipts include bounded `recovery`
 diagnostics for hidden attempted controls: total count, truncation, and at most

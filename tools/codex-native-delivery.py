@@ -261,7 +261,7 @@ class Probe:
             thread = (await self.rpc(ws, "thread/start", {"cwd": str(self.root), "model": "fixture", "approvalPolicy": "never", "sandbox": "read-only"}))["thread"]
             case["thread"] = thread["id"]
             self.event("case_start", case=name, thread=thread)
-            self.broker({"op": "register", "agent": {"name": case["alias"], "provider": "codex", "session": case["thread"], "endpoint": "", "enabled": True}, "replace": False})
+            self.broker({"op": "register", "name": case["alias"], "provider": "codex", "session": case["thread"], "replace": False})
             if name != "idle":
                 started = await self.rpc(ws, "turn/start", {"threadId": case["thread"], "input": [{"type": "text", "text": "DISPOSABLE_ACTIVE_TURN", "text_elements": []}]})
                 case["active_turn"] = started["turn"]["id"]

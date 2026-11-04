@@ -35,7 +35,7 @@ async fn value(state: &Path, args: &[&str], input: Option<&str>) -> Value {
     let output = cli(state, args, input).await;
     assert!(
         output.status.success(),
-        "{}",
+        "{args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
@@ -126,7 +126,12 @@ async fn mutual_pairing_cli_uses_stdin_persists_offer_and_grants_no_access() {
             value(state, &["status"], None).await["network"]["enabled"],
             false
         );
-        assert_eq!(value(state, &["list", "--remote"], None).await, json!([]));
+        assert!(
+            !cli(state, &["list", "--remote"], None)
+                .await
+                .status
+                .success()
+        );
         assert!(
             value(state, &["peers", "list"], None).await[0]["grants"]
                 .as_array()

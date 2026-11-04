@@ -1,29 +1,11 @@
 use agent_bridge::{
     broker::{Broker, private_dir},
-    protocol::{Agent, Provider, Request},
+    protocol::{Provider, Request},
 };
 use std::{
     os::unix::{fs::PermissionsExt, net::UnixListener},
     path::Path,
 };
-
-fn register(broker: &Broker, socket: &Path) -> String {
-    let session = uuid::Uuid::new_v4().to_string();
-    let name = format!("claude-{session}");
-    broker
-        .request(Request::Register {
-            agent: Agent {
-                name: name.clone(),
-                provider: Provider::Claude,
-                session,
-                endpoint: socket.to_string_lossy().into_owned(),
-                enabled: true,
-            },
-            replace: false,
-        })
-        .unwrap();
-    name
-}
 
 fn listener(socket: &Path) -> UnixListener {
     let listener = UnixListener::bind(socket).unwrap();
@@ -32,90 +14,112 @@ fn listener(socket: &Path) -> UnixListener {
 }
 
 #[tokio::test]
-async fn listing_hides_dead_claude_sockets_and_all_explains_them() {
+async fn claude_binding_start_end_and_replacement_are_exact_endpoint_fenced() {
     let dir = tempfile::tempdir().unwrap();
     private_dir(dir.path()).unwrap();
     let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
-    let socket = dir.path().join("native.sock");
-    let live = listener(&socket);
-    let name = register(&bound.broker, &socket);
-    let rows = bound.broker.request(Request::List { all: false }).unwrap();
-    assert!(rows.as_array().unwrap().iter().any(|r| r["name"] == name));
-    drop(live);
-    let rows = bound.broker.request(Request::List { all: false }).unwrap();
-    assert!(!rows.as_array().unwrap().iter().any(|r| r["name"] == name));
-    let rows = bound.broker.request(Request::List { all: true }).unwrap();
-    let row = rows
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["name"] == name)
+    let first = dir.path().join("first.sock");
+    let replacement = dir.path().join("replacement.sock");
+    let _first = listener(&first);
+    let _replacement = listener(&replacement);
+    let session = uuid::Uuid::new_v4().to_string();
+    bound
+        .broker
+        .request(Request::ClaudeBind {
+            session: session.clone(),
+            endpoint: first.to_string_lossy().into_owned(),
+        })
         .unwrap();
-    assert_eq!(row["stale_reason"], "socket_refused");
-    assert_eq!(row["enabled"], true); // Listing never changes durable state.
-    std::fs::remove_file(&socket).unwrap();
-    let rows = bound.broker.request(Request::List { all: true }).unwrap();
-    assert_eq!(
-        rows.as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["name"] == name)
-            .unwrap()["stale_reason"],
-        "socket_missing"
+    bound
+        .broker
+        .request(Request::ClaudeBind {
+            session: session.clone(),
+            endpoint: replacement.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+    // A delayed SessionEnd for the old socket cannot remove the replacement.
+    assert!(
+        bound
+            .broker
+            .request(Request::ClaudeUnbind {
+                session: session.clone(),
+                endpoint: first.to_string_lossy().into_owned(),
+            })
+            .is_err()
+    );
+    bound
+        .broker
+        .request(Request::ClaudeUnbind {
+            session: session.clone(),
+            endpoint: replacement.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+    assert!(
+        bound
+            .broker
+            .request(Request::ClaudeUnbind {
+                session,
+                endpoint: replacement.to_string_lossy().into_owned(),
+            })
+            .is_err()
     );
 }
 
 #[tokio::test]
-async fn reaper_requires_two_failures_and_resets_after_recovery_or_registration() {
+async fn listing_reports_connector_state_and_never_a_stored_native_catalog() {
     let dir = tempfile::tempdir().unwrap();
     private_dir(dir.path()).unwrap();
     let bound = Broker::bind(dir.path().join("state"), "/missing/codex".into()).unwrap();
-    let socket = dir.path().join("native.sock");
-    let live = listener(&socket);
-    let name = register(&bound.broker, &socket);
-    let enabled = || {
-        let rows = bound.broker.request(Request::List { all: true }).unwrap();
-        rows.as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["name"] == name)
-            .unwrap()["enabled"]
-            .as_bool()
-            .unwrap()
-    };
-    drop(live);
-    bound.broker.reap_claude_sessions().unwrap();
-    assert!(enabled());
-    std::fs::remove_file(&socket).unwrap();
-    let live = listener(&socket);
-    bound.broker.reap_claude_sessions().unwrap(); // Recovery clears first failure.
-    drop(live);
-    bound.broker.reap_claude_sessions().unwrap();
-    assert!(enabled());
-    std::fs::remove_file(&socket).unwrap();
-    let live = listener(&socket);
-    let rows = bound.broker.request(Request::List { all: true }).unwrap();
-    let row = rows
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["name"] == name)
-        .unwrap();
-    let agent: Agent = serde_json::from_value(row.clone()).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
     bound
         .broker
         .request(Request::Register {
-            agent,
+            name: "alias".into(),
+            provider: Provider::Claude,
+            session: session.clone(),
             replace: false,
         })
         .unwrap();
-    drop(live);
-    bound.broker.reap_claude_sessions().unwrap();
-    assert!(enabled());
-    bound.broker.reap_claude_sessions().unwrap();
-    assert!(!enabled());
-    std::fs::remove_file(&socket).unwrap();
-    let _live = listener(&socket);
-    bound.broker.reap_claude_sessions().unwrap();
-    assert!(!enabled()); // A new listener cannot revive an explicitly disabled route.
+    let listed = bound
+        .broker
+        .request(Request::List {
+            all: true,
+            max_age_days: 7,
+        })
+        .unwrap();
+    // The alias is configuration, not a native row. It appears only if the
+    // connector reports that exact session in this request.
+    assert!(
+        !listed["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "alias")
+    );
+    assert!(
+        listed["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|provider| provider["provider"] == "claude")
+    );
+    assert_eq!(
+        bound
+            .broker
+            .request(Request::Unregister {
+                name: "alias".into(),
+                session: session.clone(),
+            })
+            .unwrap()["unregistered"],
+        "alias"
+    );
+    assert!(
+        bound
+            .broker
+            .request(Request::Unregister {
+                name: format!("claude-{session}"),
+                session,
+            })
+            .is_err()
+    );
 }

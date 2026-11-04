@@ -3,7 +3,7 @@ use agent_bridge::{
     clients::{self, Capability},
     db::Db,
     hook,
-    network::{trust::Permission, wire::RemoteAgent},
+    network::trust::Permission,
     protocol::{Agent, Provider, Request},
 };
 use std::os::unix::fs::PermissionsExt;
@@ -15,7 +15,6 @@ fn agent(provider: Provider, session: &str, endpoint: &str) -> Agent {
         provider,
         session: session.into(),
         endpoint: endpoint.into(),
-        enabled: true,
     }
 }
 
@@ -32,12 +31,6 @@ fn database_and_remote_directory_enforce_the_selected_native_identity_contract()
         for invalid in ["", "mutable-title", "../escape", "session\n", "not-a-uuid"] {
             let local = agent(provider.clone(), invalid, "");
             assert!(db.register(&local, false).is_err());
-            let remote = RemoteAgent {
-                name: local.name.clone(),
-                provider: provider.clone(),
-                session: invalid.into(),
-            };
-            assert!(db.replace_remote_agents(&peer, &[remote]).is_err());
         }
         // Accept every UUID syntax previously accepted by uuid::Uuid::parse_str.
         // Canonicalization/storage changes are deliberately outside this refactor.
@@ -48,15 +41,6 @@ fn database_and_remote_directory_enforce_the_selected_native_identity_contract()
         ] {
             let local = agent(provider.clone(), &valid, "");
             db.register(&local, true).unwrap();
-            db.replace_remote_agents(
-                &peer,
-                &[RemoteAgent {
-                    name: local.name.clone(),
-                    provider: provider.clone(),
-                    session: valid.clone(),
-                }],
-            )
-            .unwrap();
             assert_eq!(db.agent(&local.name).unwrap().session, valid);
         }
         assert!(clients::supports(&provider, Capability::ControlNotices));
@@ -82,7 +66,7 @@ fn database_and_remote_directory_enforce_the_selected_native_identity_contract()
 }
 
 #[tokio::test]
-async fn broker_enforces_native_endpoint_permissions_and_rejects_foreign_endpoints() {
+async fn claude_binding_accepts_only_private_owned_sockets_and_unbinds_exact_endpoint() {
     let root = tempfile::Builder::new()
         .prefix("ab-client-")
         .tempdir_in("/tmp")
@@ -95,28 +79,15 @@ async fn broker_enforces_native_endpoint_permissions_and_rejects_foreign_endpoin
     let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
     let server = tokio::spawn(broker::serve(bound));
     let endpoint = socket.to_str().unwrap();
-    for provider in [Provider::Codex, Provider::Inbox] {
-        assert!(
-            broker::rpc(
-                &state,
-                &Request::Register {
-                    agent: agent(provider, SESSION, endpoint),
-                    replace: true
-                }
-            )
-            .await
-            .is_err()
-        );
-    }
     let link = root.path().join("link.sock");
     std::os::unix::fs::symlink(&socket, &link).unwrap();
     for bad in ["relative.sock", link.to_str().unwrap()] {
         assert!(
             broker::rpc(
                 &state,
-                &Request::Register {
-                    agent: agent(Provider::Claude, SESSION, bad),
-                    replace: true
+                &Request::ClaudeBind {
+                    session: SESSION.into(),
+                    endpoint: bad.into(),
                 }
             )
             .await
@@ -127,9 +98,9 @@ async fn broker_enforces_native_endpoint_permissions_and_rejects_foreign_endpoin
     assert!(
         broker::rpc(
             &state,
-            &Request::Register {
-                agent: agent(Provider::Claude, SESSION, endpoint),
-                replace: true
+            &Request::ClaudeBind {
+                session: SESSION.into(),
+                endpoint: endpoint.into(),
             }
         )
         .await
@@ -140,43 +111,57 @@ async fn broker_enforces_native_endpoint_permissions_and_rejects_foreign_endpoin
     assert!(
         broker::rpc(
             &state,
-            &Request::Register {
-                agent: agent(Provider::Claude, SESSION, endpoint),
-                replace: true
+            &Request::ClaudeBind {
+                session: "bad-session".into(),
+                endpoint: endpoint.into(),
             }
         )
         .await
         .is_err()
     );
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    for provider in [Provider::Claude, Provider::Codex] {
-        let endpoint = if provider == Provider::Claude {
-            endpoint
-        } else {
-            ""
-        };
-        assert!(
-            broker::rpc(
-                &state,
-                &Request::Register {
-                    agent: agent(provider.clone(), "bad-session", endpoint),
-                    replace: true
-                }
-            )
-            .await
-            .is_err()
-        );
-        let result = broker::rpc(
+    broker::rpc(
+        &state,
+        &Request::ClaudeBind {
+            session: SESSION.into(),
+            endpoint: endpoint.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let replacement = root.path().join("replacement.sock");
+    let _replacement_listener = std::os::unix::net::UnixListener::bind(&replacement).unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+    broker::rpc(
+        &state,
+        &Request::ClaudeBind {
+            session: SESSION.into(),
+            endpoint: replacement.to_str().unwrap().into(),
+        },
+    )
+    .await
+    .unwrap();
+    // An old SessionEnd cannot remove the replacement binding.
+    assert!(
+        broker::rpc(
             &state,
-            &Request::Register {
-                agent: agent(provider, SESSION, endpoint),
-                replace: true,
-            },
+            &Request::ClaudeUnbind {
+                session: SESSION.into(),
+                endpoint: endpoint.into(),
+            }
         )
         .await
-        .unwrap();
-        assert_eq!(result["session"], SESSION);
-    }
+        .is_err()
+    );
+    broker::rpc(
+        &state,
+        &Request::ClaudeUnbind {
+            session: SESSION.into(),
+            endpoint: replacement.to_str().unwrap().into(),
+        },
+    )
+    .await
+    .unwrap();
     server.abort();
     let _ = server.await;
 }

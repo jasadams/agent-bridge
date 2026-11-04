@@ -699,21 +699,20 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn main_label_metadata_refreshes_without_changing_board_identity() {
+    async fn main_cosmetic_labels_do_not_change_board_identity() {
         let (root, bound, old) = setup();
         let broker = &bound.broker;
         let session = "885b5a56-af8d-4a72-9b43-8ad930e945b6";
-        let name = format!("claude-{session}");
         let owner = crate::board_messages::Owner {
-            name: name.clone(),
+            name: "coordinator".into(),
             provider: crate::protocol::Provider::Claude,
             session: session.into(),
-            endpoint: "/tmp/display-fixture.sock".into(),
+            endpoint: "/tmp/coordinator.sock".into(),
         };
         let marker = crate::board_messages::Marker {
             id: "main-title".into(),
             instance: uuid::Uuid::new_v4().to_string(),
-            label: format!("Message {name}"),
+            label: "Message coordinator".into(),
             owner: owner.clone(),
         };
         let before = board::update_named(
@@ -734,17 +733,13 @@ mod tests {
             .unwrap()
             .register(
                 &crate::protocol::Agent {
-                    name,
-                    provider: owner.provider,
-                    session: session.into(),
-                    endpoint: owner.endpoint,
-                    enabled: true,
+                    name: owner.name.clone(),
+                    provider: owner.provider.clone(),
+                    session: owner.session.clone(),
+                    endpoint: String::new(),
                 },
                 false,
             )
-            .unwrap();
-        broker
-            .observe_claude_name(session, "Main coordinator")
             .unwrap();
         broker.monitor_control.lock().unwrap().enable(0);
         let first = broker.monitor_board(1, &Name::default(), None);
@@ -754,7 +749,7 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .values()
-                .any(|value| value == "Main coordinator")
+                .any(|value| value == "coordinator")
         );
         let identity = broker
             .monitor_board_revision(1, &Name::default())
@@ -764,16 +759,6 @@ mod tests {
                     reply.status, reply.body
                 )
             });
-        broker.observe_claude_name(session, "Main planner").unwrap();
-        let renamed = broker.monitor_board(1, &Name::default(), Some(&before.revision));
-        assert_eq!(renamed.body["unchanged"], true);
-        assert!(
-            renamed.body["message_labels"]
-                .as_object()
-                .unwrap()
-                .values()
-                .any(|value| value == "Main planner")
-        );
         let updated = broker
             .monitor_board_revision(1, &Name::default())
             .unwrap_or_else(|reply| {
@@ -782,7 +767,7 @@ mod tests {
                     reply.status, reply.body
                 )
             });
-        assert_ne!(identity.message_labels, updated.message_labels);
+        assert_eq!(identity.message_labels, updated.message_labels);
         assert_eq!(identity.revision, updated.revision);
         let after = board::read(root.path()).unwrap();
         assert_eq!(
@@ -838,11 +823,12 @@ mod tests {
             provider: Provider::Inbox,
             session: uuid::Uuid::new_v4().to_string(),
             endpoint: String::new(),
-            enabled: true,
         };
         broker
             .request(Request::Register {
-                agent: owner.clone(),
+                name: owner.name.clone(),
+                provider: owner.provider.clone(),
+                session: owner.session.clone(),
                 replace: false,
             })
             .unwrap();
