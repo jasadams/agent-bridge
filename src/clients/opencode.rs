@@ -10,10 +10,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
     io::{Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    },
+    os::{fd::FromRawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -370,6 +367,7 @@ fn exchange_sync(path: &Path, frame: &Value, deadline: Instant) -> Result<Vec<u8
     }
     #[cfg(target_os = "linux")]
     {
+        use std::os::fd::AsRawFd;
         let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
         let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         let result = unsafe {
