@@ -342,7 +342,7 @@ authenticated approval: agents can also edit this shared document.
 
 ## Subscribe to changes
 
-Notifications are off by default. An enabled local Codex, Claude or OpenCode session can
+Notifications are off by default. A supported local Codex, Claude or OpenCode session can
 opt in with the generic `subscribe` MCP tool, selecting its exact registration
 and an explicit board selector:
 
@@ -368,9 +368,6 @@ reopening requires explicit opt-in again. They do not enable networking or share
 boards with other machines. Both terminal responses and web-board responses use
 the same selected-board revision updates and event delivery. Neither view needs
 a subscription control: the receiving agent opts in through CLI or MCP.
-
-The same API supports local `agent.opened` and `agent.closed` selectors. See
-[event subscriptions](mcp.md#event-subscriptions) for snapshots and recovery.
 
 The broker permits at most 64 watches globally and 8 concurrent delivery workers.
 It polls at most one watched board every 250 ms in fair round-robin order;
@@ -516,7 +513,7 @@ Also check clipboard selection, refresh/reconnect and the selected-name display.
 ## Reusable message composers
 
 Use MCP `add_board_message_input(agent, board, expected_revision, id, label)` after
-`read_board`. `agent` must be an exact enabled local registration, not a native
+`read_board`. `agent` must resolve to an exact local route, not a native
 display name. The tool pins its name, provider, session and endpoint and appends a
 composer using the same revision checks and own-write notice suppression as
 `update_board`. IDs are 1–80 ASCII letters, digits, dots, underscores or hyphens
@@ -565,13 +562,11 @@ a UUID already used by an ordinary message cannot be adopted. A new deliberate
 send uses a new UUID. Queue rejection and errors retain the draft.
 
 Both interfaces keep compact message boxes stacked at the bottom, below the
-independently scrollable board. Each box shows the pinned agent's friendly name,
-an editable input and Send. Explicit registration aliases remain names; canonical
-session registrations use their native session display title. Without a title, a
-meaningful authored composer label is shown, then a concise provider fallback.
-Generated session IDs are kept out of the compact label. Titles refresh as
-presentation metadata without changing board text, revision, timestamp or draft
-identity; a replacement session cannot supply its title to an old pinned target.
+independently scrollable board. Each box shows a cosmetic label, an editable input
+and Send. Labels use an explicit alias or a concise provider fallback; native
+titles never route or authorize a destination. A replacement session cannot supply
+metadata to an old pinned target. Labels do not change board text, revision,
+timestamp or draft identity.
 Click an input or Tab/Shift-Tab into it to type directly;
 there is no activation step. A bounded stack scrolls when many inputs are present,
 and keyboard focus brings the selected input into view. Errors and pending or stale

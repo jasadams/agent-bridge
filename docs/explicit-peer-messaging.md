@@ -48,7 +48,7 @@ agent-bridge list --remote
 
 Discovery lets the peer see this session. Receive lets it deliver here. Send lets this local session originate messages to that peer, whose destination also needs receiving permission. The default sender `user` needs its own explicit grants when used. Permissions are independent and pinned to provider and session IDs.
 
-Remote directories refresh automatically while networking is enabled, normally within five seconds of a change. Only permitted sessions appear. Cached entries remain available offline and show `online: false`, allowing enqueueing to a previously known session. Each peer can export up to 100 agents; narrow discovery grants if that limit is reported.
+Remote directories are requested on demand while networking is enabled. Only permitted sessions appear; nothing is persisted. An unreachable peer is an error, not a stale offline directory. Once a destination is resolved, durable outbound work remains queued across restarts. Each peer can export up to 100 agents; narrow discovery grants if that limit is reported.
 
 ## Send and reply
 
@@ -105,7 +105,7 @@ agent-bridge peers revoke workstation
 
 Disable closes the listener and connections and stops new attempts while retaining queues, caches and history. Re-enabling resumes pending and ambiguous transfers. Queued network requests recheck the persisted setting before acceptance. Already in-flight transfers may have committed elsewhere and cannot be recalled; previously accepted native queue entries continue under local delivery rules.
 
-Revocation disconnects the peer, clears grants and cached exports, and blocks queued inbound and pending outbound work. Receiving permissions are checked again before native dispatch. Submitted work cannot be recalled. Restoring trust requires explicit pairing and fresh grants. Blocked messages require an explicit retry; they do not silently resume. A blocked inbound message can be retried safely at its destination after permissions are restored.
+Revocation disconnects the peer, clears grants and any stored remote directory, and blocks queued inbound and pending outbound work. Receiving permissions are checked again before native dispatch. Submitted work cannot be recalled. Restoring trust requires explicit pairing and fresh grants. Blocked messages require an explicit retry; they do not silently resume. A blocked inbound message can be retried safely at its destination after permissions are restored.
 
 ## Resource bounds and trust
 

@@ -99,9 +99,9 @@ to refresh the extracted plugin. See [OpenCode setup options](docs/install.md#op
 for custom configuration/state paths and removal, and the
 [OpenCode guide](docs/opencode.md) for supported versions and behavior.
 
-Loaded Codex sessions are discovered automatically. To register Claude Code
-sessions for native message delivery, install the lifecycle hooks and approve
-them through the client's normal trust flow:
+Loaded Codex sessions are discovered automatically. To bind Claude Code inbox
+sockets for native message delivery, install the session hooks and approve them
+through the client's normal trust flow:
 
 ```sh
 agent-bridge hooks install

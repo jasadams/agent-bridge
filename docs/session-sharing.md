@@ -44,9 +44,11 @@ its ID must be `ses_` followed by exactly 26 ASCII letters/digits. Claude/Codex
 retain UUID session validation. Titles are display metadata, never grants.
 
 This form needs no current registration and never broadens access. `shared` lists
-partial grants too, along with provider/session, current routing names, enabled
-state and a `stale` flag when no registration remains. `shared: true` means all
-three grant records exist, not that the session is currently enabled or online.
+partial grants too, along with provider/session and current explicit routing names.
+Manual Inbox rows report `enabled` and `stale`; native rows retain saved grants even
+when the session is absent, and unavailable state is not fabricated as stale.
+`shared: true` means all three grant records exist, not that the session is
+currently present or online.
 
 Renaming retains the provider/session binding; replacing a name or creating another
 native session does not inherit permissions. Aliases for the same provider/session
@@ -77,9 +79,9 @@ network connectivity, pairing progress and granted sessions. States are:
 
 [NAT traversal](nat-traversal.md) adds live direct/relayed `path` and `transport`
 fields for connected trusted identities. Other rows have null path information.
-A connection does not prove that an individual session is enabled, permitted or
-currently thinking. These are local snapshots; remote directories may take up to
-five seconds to refresh. Discovery labels are unverified; the full peer ID and
+A connection does not prove that an individual session is permitted or currently
+thinking. Remote directories are requested on demand; an unauthenticated route is
+an error, never a stale cached snapshot. Discovery labels are unverified; the full peer ID and
 trust state distinguish them. `pairing list` displays verification codes and name
 context for owners; `connections` omits codes.
 
