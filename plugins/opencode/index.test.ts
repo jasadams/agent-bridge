@@ -1239,7 +1239,7 @@ describe("V2 plugin with real private Unix sockets", () => {
     expect((await stat(join(endpoint, ".."))).mode & 0o777).toBe(0o700);
     s.sessions.get(A).title = "Renamed";
     await s.event("session.renamed", { sessionID: A, title: "Renamed" });
-    expect(s.registrations.get(A).title).toBe("Alpha");
+    expect(s.registrations.get(A).title).toBeUndefined();
     expect((await frame(endpoint, { op: "state_get", session: A })).state.display_name).toBe("Renamed");
     expect(s.registrations.get(A).endpoint).toBe(endpoint);
     await s.close();
