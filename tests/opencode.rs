@@ -2,7 +2,8 @@ mod support;
 
 use agent_bridge::{
     broker::{self, Broker},
-    clients, delivery,
+    clients::{self, ConnectorState, StateError},
+    delivery,
     protocol::{Agent, Message, Provider, Request},
 };
 use serde_json::{Value, json};
@@ -295,6 +296,232 @@ async fn live_registration_titles_disposal_and_endpoint_conflicts_use_shared_reg
     .await
     .unwrap();
     server.abort();
+    plugin.finish();
+}
+
+#[test]
+fn native_state_pages_use_only_updated_age_and_exact_lookup_ignores_age() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let plugin = PluginSocket::start(5, move |frame, instance| {
+        let old = state_row(SESSION, json!(now - 15 * 86_400_000));
+        if frame["op"] == "state_get" {
+            state_reply(&frame, instance, old)
+        } else if frame["cursor"].is_null() {
+            let mut reply = state_reply(&frame, instance, json!([old]));
+            reply["next_cursor"] = json!("second");
+            reply
+        } else {
+            assert_eq!(frame["cursor"], "second");
+            state_reply(&frame, instance, json!([state_row(OTHER, Value::Null)]))
+        }
+    });
+    let state = clients::opencode::State::new(vec![plugin.agent().endpoint.clone()], None);
+    assert_eq!(state.provider(), Provider::OpenCode);
+    let recent = state.list(7).unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].session, OTHER);
+    assert_eq!(state.list(30).unwrap().len(), 2);
+    let exact = state.get(SESSION).unwrap().unwrap();
+    assert_eq!(exact.session, SESSION);
+    let endpoint = std::fs::canonicalize(plugin.agent().endpoint)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(exact.transport_endpoint, Some(endpoint));
+    plugin.finish();
+}
+fn state_row(session: &str, updated: Value) -> Value {
+    json!({"session":session,"display_name":"same title","status":null,"directory":"/cold/location","updated_ms":updated})
+}
+fn state_reply(frame: &Value, instance: &str, rows: Value) -> Value {
+    let mut reply = json!({"ok":true,"protocol":2,"instance":instance,"op":frame["op"]});
+    if frame["op"] == "state_get" {
+        reply["session"] = frame["session"].clone();
+        reply["state"] = rows;
+    } else {
+        reply["sessions"] = rows;
+        reply["next_cursor"] = Value::Null;
+    }
+    reply
+}
+
+#[test]
+fn native_state_strict_identity_and_required_metadata_reject_receipts_and_cross_scope_rows() {
+    for variant in 0..9 {
+        let plugin = PluginSocket::start(1, move |frame, instance| {
+            let mut value = state_reply(&frame, instance, state_row(SESSION, Value::Null));
+            match variant {
+                0 => value["instance"] = json!(uuid::Uuid::new_v4().to_string()),
+                1 => value["protocol"] = json!(1),
+                2 => value["op"] = json!("state_list"),
+                3 => value["session"] = json!(OTHER),
+                4 => value["state"]["session"] = json!(OTHER),
+                5 => {
+                    value["state"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("display_name");
+                }
+                6 => value["state"]["transport_endpoint"] = json!("/forged.sock"),
+                7 => value["status"] = json!("inserted"),
+                _ => return receipt(frame, instance),
+            }
+            value
+        });
+        let state = clients::opencode::State::new(vec![plugin.agent().endpoint], None);
+        assert!(
+            matches!(state.get(SESSION), Err(StateError::Incomplete(_))),
+            "variant {variant}"
+        );
+        plugin.finish();
+    }
+}
+
+#[test]
+fn native_state_locators_are_not_membership_and_preferred_service_can_confirm_absence() {
+    let unused = PluginSocket::start(0, receipt);
+    let selected = PluginSocket::start(1, |frame, instance| {
+        state_reply(&frame, instance, Value::Null)
+    });
+    let endpoint = selected.agent().endpoint;
+    let state = clients::opencode::State::new(
+        vec![
+            unused.agent().endpoint,
+            endpoint.clone(),
+            "/missing/native.sock".into(),
+        ],
+        Some(endpoint),
+    );
+    assert!(state.get(SESSION).unwrap().is_none());
+    selected.finish();
+    unused.finish();
+    assert!(matches!(
+        clients::opencode::State::new(vec![], None).list(7),
+        Err(StateError::Unavailable(_))
+    ));
+    let excessive = clients::opencode::State::new(
+        (0..65).map(|n| format!("/missing/{n}.sock")).collect(),
+        None,
+    );
+    assert!(matches!(excessive.list(7), Err(StateError::Incomplete(_))));
+    assert!(matches!(
+        excessive.get("same title"),
+        Err(StateError::Incomplete(_))
+    ));
+    assert!(matches!(excessive.list(0), Err(StateError::Incomplete(_))));
+}
+
+#[test]
+fn native_state_partial_pages_cycles_overflow_and_native_errors_are_not_empty_success() {
+    for variant in 0..4 {
+        let plugin = PluginSocket::start(
+            if variant < 2 { 2 } else { 1 },
+            move |frame, instance| {
+                if variant == 3 {
+                    return json!({"ok":false,"protocol":2,"instance":instance,"op":frame["op"],"error":"unavailable"});
+                }
+                let mut reply = state_reply(&frame, instance, json!([]));
+                if variant == 2 {
+                    reply["sessions"] = json!([state_row(SESSION, Value::Null)]);
+                    reply["sessions"][0]["display_name"] =
+                        json!("x".repeat(agent_bridge::protocol::MAX_FRAME));
+                } else if frame["cursor"].is_null() || variant == 0 {
+                    reply["next_cursor"] = json!("same");
+                } else {
+                    reply = json!({"ok":false,"protocol":2,"instance":instance,"op":frame["op"],"error":"unavailable"});
+                }
+                reply
+            },
+        );
+        let state = clients::opencode::State::new(vec![plugin.agent().endpoint], None);
+        let result = state.list(7);
+        assert!(if variant == 3 {
+            matches!(result, Err(StateError::Unavailable(_)))
+        } else {
+            matches!(result, Err(StateError::Incomplete(_)))
+        });
+        plugin.finish();
+    }
+}
+
+#[tokio::test]
+async fn native_state_reply_cannot_satisfy_a_registration_probe() {
+    let plugin = PluginSocket::start(1, |_, instance| {
+        state_reply(&json!({"op":"state_list"}), instance, json!([]))
+    });
+    let bound = Broker::bind(plugin.root.path().join("state"), "/missing/codex".into()).unwrap();
+    assert!(
+        bound
+            .broker
+            .request(Request::OpenCodeObserve {
+                session: SESSION.into(),
+                endpoint: plugin.agent().endpoint,
+                title: None,
+                ready: true
+            })
+            .is_err()
+    );
+    plugin.finish();
+}
+
+#[test]
+fn native_state_session_and_page_limits_never_return_partial_directories() {
+    for count in [4096, 4097] {
+        let plugin = PluginSocket::start(41, move |frame, instance| {
+            let start: usize = frame["cursor"]
+                .as_str()
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(0);
+            let end = (start + 100).min(count);
+            let rows: Vec<_> = (start..end)
+                .map(|n| state_row(&format!("ses_{n:026}"), Value::Null))
+                .collect();
+            let mut reply = state_reply(&frame, instance, json!(rows));
+            if end < count {
+                reply["next_cursor"] = json!(end.to_string());
+            }
+            reply
+        });
+        let result = clients::opencode::State::new(vec![plugin.agent().endpoint], None).list(7);
+        if count == 4096 {
+            assert_eq!(result.unwrap().len(), count);
+        } else {
+            assert!(matches!(result, Err(StateError::Incomplete(_))));
+        }
+        plugin.finish();
+    }
+    let plugin = PluginSocket::start(64, |frame, instance| {
+        let next = frame["cursor"]
+            .as_str()
+            .map(|s| s.parse::<usize>().unwrap())
+            .unwrap_or(0)
+            + 1;
+        let mut reply = state_reply(&frame, instance, json!([]));
+        reply["next_cursor"] = json!(next.to_string());
+        reply
+    });
+    assert!(matches!(
+        clients::opencode::State::new(vec![plugin.agent().endpoint], None).list(7),
+        Err(StateError::Incomplete(_))
+    ));
+    plugin.finish();
+}
+
+#[test]
+fn native_state_total_deadline_bounds_a_stalled_native_reply() {
+    let plugin = PluginSocket::start_optional(1, |_, _| {
+        std::thread::sleep(std::time::Duration::from_millis(5100));
+        None
+    });
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        clients::opencode::State::new(vec![plugin.agent().endpoint], None).list(7),
+        Err(StateError::Unavailable(_))
+    ));
+    assert!(start.elapsed() < std::time::Duration::from_secs(6));
     plugin.finish();
 }
 

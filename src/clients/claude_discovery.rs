@@ -26,15 +26,28 @@ impl State {
     }
 
     fn read(&self) -> Result<Vec<u8>, StateError> {
-        let mut child = Command::new(&self.executable)
-            .args(["agents", "--json"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            // Discard stderr without a pipe: bursts cannot deadlock the child,
-            // allocate unbounded diagnostics, or leak native private content.
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(unavailable)?;
+        let deadline = Instant::now() + DEADLINE;
+        let mut child = loop {
+            match Command::new(&self.executable)
+                .args(["agents", "--json"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                // Discard stderr without a pipe: bursts cannot deadlock the child,
+                // allocate unbounded diagnostics, or leak native private content.
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => break child,
+                // A native upgrade can briefly replace the executable. Retry only
+                // that transient case, within the existing query deadline.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(unavailable(error)),
+            }
+        };
         let result = (|| {
             let mut stdout = child.stdout.take().expect("piped stdout");
             let fd = stdout.as_raw_fd();
@@ -43,7 +56,6 @@ impl State {
             {
                 return Err(unavailable(io::Error::last_os_error()));
             }
-            let deadline = Instant::now() + DEADLINE;
             let mut output = Vec::new();
             let mut eof = false;
             loop {

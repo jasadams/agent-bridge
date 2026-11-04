@@ -12,13 +12,25 @@ const LEASE_MS = 20000, HEARTBEAT_MS = 5000, RECEIPT_MS = 3000, MAX_RECOVERABLE 
 type Delivery = Identity & { op: "deliver" | "reconcile"; generation: string; attempt: string };
 type Reply = { ok: boolean; instance: string; protocol: number; session: string; id?: string; namespace?: string; generation?: string; attempt?: string; native_message_id?: string; status?: "inserted" | "deferred" | "uncertain"; error?: string };
 type Frame = { op: "probe"; session: string } | Delivery;
-type Live = { generation: string; namespace: string; expires: number; revision: number; nextHeartbeat: number; metadataVersion: number; metadataApplied: number };
+type StateFrame = { op: "state_list"; cursor: string | null } | { op: "state_get"; session: string };
+type Live = { generation: string; namespace: string; expires: number; revision: number; nextHeartbeat: number };
 type Data = { buffer: Buffer; handled: boolean; timer?: ReturnType<typeof setTimeout> };
 class InvalidNativeSession extends Error {}
+class IncompleteState extends Error {}
+const isState = (frame: Frame | StateFrame): frame is StateFrame => frame.op === "state_list" || frame.op === "state_get";
+const validCursor = (cursor: unknown): cursor is string | null => cursor === null || typeof cursor === "string" && Buffer.byteLength(cursor) > 0 && Buffer.byteLength(cursor) <= 4096;
 
-function parseFrame(input: unknown): Frame {
+function parseFrame(input: unknown): Frame | StateFrame {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid frame");
   const f = input as Record<string, unknown>;
+  if (f.op === "state_list") {
+    if (Object.keys(f).length !== 2 || !validCursor(f.cursor)) throw new Error("Invalid state cursor");
+    return f as StateFrame;
+  }
+  if (f.op === "state_get") {
+    if (Object.keys(f).length !== 2 || typeof f.session !== "string" || !SESSION.test(f.session)) throw new Error("Invalid state session");
+    return f as StateFrame;
+  }
   const fields = f.op === "probe" ? ["op", "session"] : f.op === "deliver" || f.op === "reconcile" ? ["op", "session", "id", "content", "namespace", "generation", "attempt", "native_message_id"] : [];
   if (!fields.length || Object.keys(f).length !== fields.length || Object.keys(f).some(k => !fields.includes(k)) || typeof f.session !== "string" || !SESSION.test(f.session)) throw new Error("Invalid frame identity");
   if (f.op !== "probe") {
@@ -40,6 +52,21 @@ function matches(message: NativeMessage, frame: Delivery) {
 type V2SessionInfo = { id: string; title?: string; time: { archived?: number }; location: { directory: string } };
 type V2Context = { session: Plugin.Context["session"]; event: Plugin.Context["event"]; options: Plugin.Context["options"]; location: { directory: string } };
 
+async function nativeRead<T>(read: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([read, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Native read unavailable")), RECEIPT_MS); })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+function stateRow(input: unknown) {
+  const info = input as { id?: unknown; title?: unknown; time?: { updated?: unknown; archived?: unknown }; location?: { directory?: unknown } } | null;
+  if (!info || typeof info.id !== "string" || !SESSION.test(info.id) || !info.time || typeof info.time !== "object" || Array.isArray(info.time) || info.location != null && (typeof info.location !== "object" || Array.isArray(info.location))) throw new IncompleteState();
+  const name = info.title ?? null, directory = info.location?.directory ?? null, updated = info.time.updated ?? null;
+  if (name !== null && typeof name !== "string" || directory !== null && typeof directory !== "string" || updated !== null && !Number.isSafeInteger(updated) || info.time.archived != null && !Number.isSafeInteger(info.time.archived)) throw new IncompleteState();
+  if (info.time.archived) return null;
+  return { session: info.id, display_name: name as string | null, status: null, directory: directory as string | null, updated_ms: updated as number | null };
+}
+
 const AgentBridge = Plugin.define({
   id: "agent-bridge",
   async setup(raw) {
@@ -60,8 +87,7 @@ const AgentBridge = Plugin.define({
     const recoverable = new Set<string>();
     const conflictUntil = new Map<string, number>();
     const recoverAfter = new Map<string, number>();
-    let disposed = false, events = Promise.resolve();
-    let rescanNeeded = false, rescanQueued = false, nextRescan = 0;
+    let disposed = false;
     let overloadLogAt = 0;
     function reportFailure(category: string, error: unknown) {
       if (error instanceof Error && /^Broker RPC (capacity exhausted|admission timed out) before submission \(active=\d+, queued=\d+\)$/.test(error.message)) {
@@ -74,10 +100,9 @@ const AgentBridge = Plugin.define({
     function remember(session: string) {
       if (recoverable.has(session)) return;
       if (recoverable.size >= MAX_RECOVERABLE) {
-        rescanNeeded = true;
         if (Date.now() >= overloadLogAt) {
           overloadLogAt = Date.now() + 10000;
-          console.error(`Agent Bridge: native session recovery capacity reached (retained=${recoverable.size}); rescan scheduled`);
+          console.error(`Agent Bridge: delivery binding recovery capacity reached (retained=${recoverable.size})`);
         }
         return;
       }
@@ -85,12 +110,10 @@ const AgentBridge = Plugin.define({
     }
     function delayRecovery(session: string) {
       if (recoverable.has(session)) recoverAfter.set(session, Date.now() + 4000);
-      else rescanNeeded = true;
     }
     const sessionEvents = new Map<string, Promise<void>>();
     const sessionDepth = new Map<string, number>();
     const lifecycle = new Map<string, number>();
-    const metadataVersions = new Map<string, number>();
     const pendingActivity = new Map<string, number>();
     let recoveryInFlight = 0;
     function guard(session: string, frame?: Delivery): Live {
@@ -100,21 +123,14 @@ const AgentBridge = Plugin.define({
     }
     async function verified(session: string): Promise<V2SessionInfo> {
       if (disposed || !SESSION.test(session)) throw new Error("Invalid or disposed session");
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      let info: V2SessionInfo;
-      try {
-        info = await Promise.race([
-          ctx.session.get({ sessionID: session }) as Promise<V2SessionInfo>,
-          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Native session lookup timed out")), RECEIPT_MS); }),
-        ]);
-      } finally { if (timeout) clearTimeout(timeout); }
+      const info = await nativeRead(ctx.session.get({ sessionID: session }) as Promise<V2SessionInfo>);
       if (disposed || !info || info.id !== session || info.time.archived) throw new InvalidNativeSession("Native session is unavailable");
       return info;
     }
     async function close(session: string, forget = true) {
-      if (forget) { recoverable.delete(session); conflictUntil.delete(session); recoverAfter.delete(session); metadataVersions.delete(session); }
-      else { remember(session); delayRecovery(session); }
       const entry = live.get(session);
+      if (forget) { recoverable.delete(session); conflictUntil.delete(session); recoverAfter.delete(session); }
+      else if (entry?.generation || recoverable.has(session)) { remember(session); delayRecovery(session); }
       live.delete(session);
       if (entry?.generation) await brokerRpc(state as string, { op: "opencode_close", session, endpoint, generation: entry.generation });
     }
@@ -124,23 +140,20 @@ const AgentBridge = Plugin.define({
       try {
       const epoch = lifecycle.get(session) ?? 0;
       const old = live.get(session);
-      if (!old) remember(session);
-      const metadataAtLookup = old?.metadataVersion ?? metadataVersions.get(session) ?? 0;
+      const bound = !!old?.generation || recoverable.has(session);
       if (old) old.revision++;
       let info: V2SessionInfo;
       try { info = await verified(session); } catch (error) {
         // A lookup from an ended lifecycle cannot erase a newer lifecycle's
         // queued recovery or change its retry timing.
         if (disposed || (lifecycle.get(session) ?? 0) !== epoch || live.get(session) !== old) throw error;
-        if (error instanceof InvalidNativeSession) { recoverable.delete(session); recoverAfter.delete(session); conflictUntil.delete(session); if (!old) metadataVersions.delete(session); }
-        else { remember(session); delayRecovery(session); }
+        if (error instanceof InvalidNativeSession) { recoverable.delete(session); recoverAfter.delete(session); conflictUntil.delete(session); }
+        else if (bound) { remember(session); delayRecovery(session); }
         if (old && live.get(session) === old) await close(session, error instanceof InvalidNativeSession);
         throw error;
       }
       if (disposed || live.get(session) !== old || (lifecycle.get(session) ?? 0) !== epoch) throw new Error("Observation belongs to an ended lifecycle");
-      const entry = old && old.expires > Date.now() ? old : { generation: "", namespace: "", expires: Date.now() + LEASE_MS, revision: 0, nextHeartbeat: 0, metadataVersion: old?.metadataVersion ?? metadataVersions.get(session) ?? 0, metadataApplied: old?.metadataApplied ?? 0 };
-      entry.metadataVersion = Math.max(entry.metadataVersion, metadataVersions.get(session) ?? 0);
-      metadataVersions.delete(session);
+      const entry = old && old.expires > Date.now() ? old : { generation: "", namespace: "", expires: Date.now() + LEASE_MS, revision: 0, nextHeartbeat: 0 };
       live.set(session, entry); // Probe can validate provisional membership, never delivery.
       const registrationRevision = entry.revision;
       try {
@@ -152,18 +165,16 @@ const AgentBridge = Plugin.define({
         }
         conflictUntil.delete(session);
         recoverAfter.delete(session);
-        entry.metadataApplied = Math.max(entry.metadataApplied, metadataAtLookup);
         entry.generation = result.generation; entry.namespace = result.namespace; entry.expires = Date.now() + LEASE_MS; entry.nextHeartbeat = Date.now() + 1000 + Math.random() * (HEARTBEAT_MS - 2000); entry.revision++;
         // Healthy leases are represented by live, not the bounded recovery backlog.
         recoverable.delete(session);
       } catch (error) {
         if (disposed || (lifecycle.get(session) ?? 0) !== epoch || live.get(session) !== entry) throw error;
         if (error instanceof RpcNotSubmittedError && old === entry && entry.generation && entry.expires > Date.now()) throw error;
-        remember(session);
+        if (bound) remember(session);
         const competingOwner = error instanceof Error && error.message.includes("OpenCode session has an unexpired owning instance");
         if (competingOwner) {
-          if (recoverable.has(session)) conflictUntil.set(session, Date.now() + LEASE_MS + Math.random() * HEARTBEAT_MS);
-          else rescanNeeded = true;
+          if (conflictUntil.has(session) || conflictUntil.size < MAX_RECOVERABLE) conflictUntil.set(session, Date.now() + LEASE_MS + Math.random() * HEARTBEAT_MS);
         }
         if (live.get(session) === entry && entry.revision === registrationRevision) live.delete(session);
         if (competingOwner) return;
@@ -173,7 +184,7 @@ const AgentBridge = Plugin.define({
       } finally { observing.delete(session); }
     }
     async function heartbeat(session: string, entry: Live) {
-      if (heartbeats.has(entry)) return;
+      if (!entry.generation || heartbeats.has(entry)) return;
       heartbeats.add(entry);
       try {
       if (guard(session) !== entry) throw new Error("Heartbeat belongs to an ended lifecycle");
@@ -270,6 +281,9 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       return response(frame, "uncertain");
     }
     async function handle(frame: Frame) {
+      // Explicit send preparation only. The provisional entry makes the broker's
+      // recursive exact-session verification probe terminate without re-observing.
+      if (frame.op === "probe" && (live.get(frame.session)?.expires ?? 0) <= Date.now()) await observe(frame.session);
       const initial = guard(frame.session, frame.op === "probe" ? undefined : frame);
       try { await verified(frame.session); }
       catch (error) {
@@ -345,7 +359,29 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       catch { return response(frame, "uncertain"); }
     }
 
-    function dispatch(frame: Frame): ReturnType<typeof handle> {
+    async function stateRead(frame: StateFrame) {
+      const header = { ok: true, protocol: 2, instance, op: frame.op };
+      if (frame.op === "state_get") {
+        let info: unknown;
+        try { info = await nativeRead(ctx.session.get({ sessionID: frame.session })); }
+        catch (error) {
+          const missing = error as { _tag?: unknown; sessionID?: unknown; message?: unknown } | null;
+          if (missing?._tag !== "SessionNotFoundError" || missing.sessionID !== frame.session || typeof missing.message !== "string") throw error;
+          return { ...header, session: frame.session, state: null };
+        }
+        const row = stateRow(info);
+        if ((info as V2SessionInfo).id !== frame.session) throw new IncompleteState();
+        return { ...header, session: frame.session, state: row };
+      }
+      const page = await nativeRead(ctx.session.list({ limit: 100, order: "desc", archived: false, ...(frame.cursor === null ? {} : { cursor: frame.cursor }) }));
+      if (!page || !Array.isArray(page.data) || page.data.length > 100 || !page.cursor || typeof page.cursor !== "object" || !validCursor(page.cursor.next ?? null) || page.cursor.previous != null && !validCursor(page.cursor.previous) || frame.cursor !== null && page.cursor.next === frame.cursor) throw new IncompleteState();
+      return { ...header, sessions: page.data.map(stateRow).filter(row => row !== null), next_cursor: page.cursor.next ?? null };
+    }
+    function stateFailure(frame: StateFrame, error: unknown) {
+      return { ok: false, protocol: 2, instance, op: frame.op, error: error instanceof IncompleteState ? "incomplete" : "unavailable" };
+    }
+    function dispatch(frame: Frame | StateFrame) {
+      if (isState(frame)) return stateRead(frame);
       if (frame.op !== "deliver") return handle(frame); // Reconciliation never joins submission work.
       const key = frame.namespace + "\0" + frame.id.toLowerCase();
       const fingerprint = JSON.stringify([frame.op, frame.session, frame.id.toLowerCase(), frame.namespace, frame.content, frame.native_message_id, frame.generation, frame.attempt]);
@@ -381,14 +417,17 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
           const newline = data.buffer.indexOf(10);
           if (newline < 0) return;
           data.handled = true;
-          let frame: Frame;
+          let frame: Frame | StateFrame;
           try {
             if (newline !== data.buffer.length - 1) throw new Error("Expected exactly one frame");
             frame = parseFrame(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data.buffer.subarray(0, newline))));
           } catch { socket.end(JSON.stringify({ ok: false, instance, protocol: 2, error: "Invalid frame" }) + "\n"); return; }
           const pending = dispatch(frame).then(
-            result => socket.end(JSON.stringify(result) + "\n"),
-            error => socket.end(JSON.stringify({ ...response(frame, "uncertain"), ok: false, error: error instanceof JournalCapacityError ? "Receipt journal capacity reached; existing native insertion requires reconciliation" : "Native session, lease or insertion unconfirmed" }) + "\n"),
+            result => {
+              const bytes = JSON.stringify(result) + "\n";
+              socket.end(isState(frame) && Buffer.byteLength(bytes) > MAX_FRAME ? JSON.stringify(stateFailure(frame, new IncompleteState())) + "\n" : bytes);
+            },
+            error => socket.end(JSON.stringify(isState(frame) ? stateFailure(frame, error) : { ...response(frame, "uncertain"), ok: false, error: error instanceof JournalCapacityError ? "Receipt journal capacity reached; existing native insertion requires reconciliation" : "Native session, lease or insertion unconfirmed" }) + "\n"),
           );
           active.add(pending); void pending.finally(() => active.delete(pending));
         },
@@ -397,14 +436,9 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       }});
       await chmod(endpoint, 0o600);
     } catch (error) { journal.close(); await rm(socketDirectory, { recursive: true, force: true }); throw error; }
-    function enqueue(work: () => Promise<void>) {
-      events = events.catch(() => {}).then(work);
-      return events.catch((error: unknown) => { console.error("Agent Bridge: native session registration is unavailable:", error instanceof Error ? error.message : error); });
-    }
     function enqueueSession(session: string, work: () => Promise<void>, requireCurrent = true) {
       const depth = sessionDepth.get(session) ?? 0;
       if (requireCurrent && depth >= 8) {
-        if (SESSION.test(session) && !live.has(session)) remember(session);
         return Promise.resolve();
       }
       sessionDepth.set(session, depth + 1);
@@ -418,7 +452,6 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
         .finally(() => {
           if (sessionEvents.get(session) === pending) {
             sessionEvents.delete(session);
-            if (!live.has(session)) metadataVersions.delete(session);
           }
           const remaining = (sessionDepth.get(session) ?? 1) - 1;
           if (remaining) sessionDepth.set(session, remaining); else sessionDepth.delete(session);
@@ -430,26 +463,18 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       if (pendingActivity.get(key) === epoch) return;
       // The per-session chain must itself stay bounded when a stream of distinct
       // sessions arrives faster than native verification or the broker responds.
-      // Retry activation through the bounded recovery workers instead.
+      // Excess unbound activity is dropped, not saved as discovery inventory.
       if (pendingActivity.size >= 256 && !pendingActivity.has(key)) {
-        if (SESSION.test(session) && category !== "session.renamed" && !live.has(session)) remember(session);
         return;
       }
       pendingActivity.set(key, epoch);
       const scheduled = enqueueSession(session, work);
       void scheduled.finally(() => { if (pendingActivity.get(key) === epoch) pendingActivity.delete(key); });
     }
-    async function refreshTitle(session: string, entry: Live) {
-      const version = entry.metadataVersion;
-      await observe(session);
-      const current = live.get(session);
-      if (current) current.metadataApplied = Math.max(current.metadataApplied, version);
-    }
     const timer = setInterval(() => {
       if (disposed) return;
       for (const [session, entry] of live) {
-        if (entry.expires <= Date.now()) { live.delete(session); remember(session); continue; }
-        if (entry.metadataVersion > entry.metadataApplied && !sessionEvents.has(session)) enqueueActivity(session, "session.renamed", () => refreshTitle(session, entry));
+        if (entry.expires <= Date.now()) { live.delete(session); if (entry.generation) remember(session); continue; }
         if (!entry.generation || entry.nextHeartbeat > Date.now() || heartbeats.has(entry) || observing.has(session)) continue;
         void heartbeat(session, entry)
           .catch(error => { reportFailure("native session heartbeat", error); });
@@ -467,53 +492,8 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
           void enqueueSession(session, () => observe(session)).finally(() => { recoveryInFlight--; });
         }
       }
-      if (rescanNeeded && !rescanQueued && Date.now() >= nextRescan) {
-        nextRescan = Date.now() + LEASE_MS;
-        triggerScan();
-      }
     }, 1000);
     timer.unref();
-    // The activation gate means plugin setup can run after the triggering
-    // session exists, and events queued before subscribe() are already gone.
-    // Register verified live sessions once, then rely on events. The broker's
-    // session lease selects one owner even when several instances observe them.
-    async function scanSessions() {
-      if (disposed) return;
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      let result: Awaited<ReturnType<typeof ctx.session.list>>;
-      try {
-        result = await Promise.race([
-          ctx.session.list({}),
-          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Native session list timed out")), RECEIPT_MS); }),
-        ]);
-      } finally { if (timeout) clearTimeout(timeout); }
-      const sessions = (result as { data?: V2SessionInfo[] }).data ?? [];
-      let cursor = 0;
-      // Bounded workers avoid one pending promise per historical session while
-      // a slow lookup cannot block every unrelated session in this instance.
-      await Promise.all(Array.from({ length: Math.min(4, sessions.length) }, async () => {
-        while (!disposed && cursor < sessions.length) {
-          const info = sessions[cursor++]!;
-          if (!info.time.archived && !live.has(info.id)) await enqueueSession(info.id, () => observe(info.id));
-        }
-      }));
-    }
-    async function initialScan() {
-      try { await scanSessions(); }
-      catch {
-        if (!disposed) {
-          rescanNeeded = true;
-          nextRescan = Date.now() + HEARTBEAT_MS;
-        }
-      }
-    }
-    function triggerScan() {
-      if (disposed || rescanQueued) return;
-      rescanNeeded = false;
-      rescanQueued = true;
-      void enqueue(initialScan).finally(() => { rescanQueued = false; });
-    }
-    triggerScan();
     // Event payloads moved from V1 `properties` to a `data` field with a flat
     // sessionID. V2 also dropped session.updated and the permission.* revision
     // stream: the selection pin they guarded has no V2 equivalent, so leases
@@ -536,29 +516,15 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
             if (hadEntry) enqueueSession(data.sessionID, () => closing, false);
             continue;
           }
-          if (!["session.created", "tui.session.select", "session.status", "session.renamed"].includes(value.type)) continue;
-      const sourceEntry = live.get(data.sessionID);
-          if (value.type === "session.renamed" && (sourceEntry || sessionEvents.has(data.sessionID))) {
-            if (sourceEntry) sourceEntry.metadataVersion++;
-            else metadataVersions.set(data.sessionID, (metadataVersions.get(data.sessionID) ?? 0) + 1);
-          }
+          if (!["session.created", "tui.session.select", "session.status"].includes(value.type)) continue;
+          const sourceEntry = live.get(data.sessionID);
           enqueueActivity(data.sessionID, value.type, async () => {
             if (disposed) return;
             const sourceSession = data.sessionID as string;
-            if (value.type === "session.deleted") {
-              if (live.has(sourceSession)) await close(sourceSession);
-            } else if (live.get(sourceSession) !== sourceEntry && value.type !== "session.archived" && value.type !== "session.created" && value.type !== "tui.session.select" && value.type !== "session.status") {
-              return;
-            } else if (value.type === "session.status" && sourceEntry) {
-              if ((sourceEntry as Live).nextHeartbeat <= Date.now()) await heartbeat(sourceSession, sourceEntry as Live);
-            } else if (value.type === "session.created" || value.type === "tui.session.select" || value.type === "session.status") {
+            if (value.type === "session.status" && sourceEntry) {
+              if (live.get(sourceSession) === sourceEntry && sourceEntry.nextHeartbeat <= Date.now()) await heartbeat(sourceSession, sourceEntry);
+            } else {
               await observe(sourceSession);
-            } else if ((value.type === "session.renamed" || value.type === "session.archived" || value.type === "session.status") && live.has(sourceSession)) {
-              // Renames and archives carry metadata for existing sessions only;
-              // they must never activate dormant history. Status without a lease
-              // is a live-execution signal and observes above.
-              if (value.type === "session.renamed") await refreshTitle(sourceSession, live.get(sourceSession)!);
-              else await observe(sourceSession);
             }
           });
         }
@@ -594,7 +560,7 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
       // compensate, but do not let one stalled location prevent shutdown.
       let drainTimer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
-        Promise.allSettled([events, ...sessionEvents.values()]),
+        Promise.allSettled([...sessionEvents.values()]),
         new Promise<void>(resolve => { drainTimer = setTimeout(resolve, 6500); }),
       ]);
       if (drainTimer) clearTimeout(drainTimer);
