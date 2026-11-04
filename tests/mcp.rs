@@ -866,7 +866,9 @@ async fn one_stdio_process_discovers_tools_and_routes_messages_with_safe_retries
         .find(|tool| tool["name"] == "send_message")
         .unwrap();
     let description = tool["description"].as_str().unwrap();
-    assert!(description.contains("connection_status"));
+    assert!(!description.contains("connection_status"));
+    assert!(description.contains("Send under existing grants"));
+    assert!(description.contains("Use your exact registered from identity"));
     assert!(description.contains("then continue your work"));
     assert!(!description.to_lowercase().contains("acknowledg"));
     assert!(!description.to_lowercase().contains("poll"));

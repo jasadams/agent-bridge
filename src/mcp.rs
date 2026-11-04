@@ -946,7 +946,7 @@ impl Bridge {
             .await
     }
     #[tool(
-        description = "Send under existing grants, then continue your work. Use your exact registered from identity; check connection_status matches your broker. To reply, use received to / Delivered to as from, exact received from / Reply to as to, and received id / Message reference as parent. After a timeout or uncertain error, retry the same request using its id or returned request_id as id. verbose includes the full record."
+        description = "Send under existing grants, then continue your work. Use your exact registered from identity. To reply, use received to / Delivered to as from, exact received from / Reply to as to, and received id / Message reference as parent. After a timeout or uncertain error, retry the same request using its id or returned request_id as id. verbose includes the full record."
     )]
     async fn send_message(&self, Parameters(args): Parameters<SendArgs>) -> CallToolResult {
         let id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());

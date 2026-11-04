@@ -55,8 +55,7 @@ Use `agent-bridge opencode install` to opt into the bundled V2 plugin and the
 existing `agent-bridge` stdio MCP connection. See [installation](install.md) for
 config selection, preservation, updates and removal. V2 reloads changed
 configuration. The exact session route and broker state directory are supplied through
-its verified native system context; check `connection_status` before using a
-connection shared by several conversations. No new transport or per-message
+its verified native system context. No new transport or per-message
 setup prompt is required.
 
 OpenCode supports the same message and shared-board tools, including correlated
@@ -112,8 +111,7 @@ how to reply: use the incoming `to` as your local
 `from`, its `id` as the reply `parent`, and its `from` as
 the reply `to`. Claude uses the equivalent `Delivered to`, `Message reference`,
 and `Reply to` fields. Preserve these exact routes rather than display names.
-Session startup supplies the broker state directory and CLI fallback once; check
-`connection_status` identifies that broker before using a configured MCP server.
+Session startup supplies the broker state directory and CLI fallback once.
 Send and continue working. For delivery failures or missing responses, see
 [diagnostic outcomes and adapter proof](delivery-outcomes.md).
 
