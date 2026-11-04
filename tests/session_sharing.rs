@@ -11,14 +11,13 @@ fn identity() -> String {
         .to_peer_id()
         .to_string()
 }
-fn register(db: &mut Db, name: &str, session: &str, enabled: bool, replace: bool) {
+fn register(db: &mut Db, name: &str, session: &str, replace: bool) {
     db.register(
         &Agent {
             name: name.into(),
             provider: Provider::Inbox,
             session: session.into(),
             endpoint: String::new(),
-            enabled,
         },
         replace,
     )
@@ -32,8 +31,8 @@ fn bundle_is_explicit_idempotent_and_does_not_change_other_session_grants() {
     let mut db = Db::open(&path).unwrap();
     let peer = identity();
     db.pair_peer(&peer, &peer, Some("machine-b")).unwrap();
-    register(&mut db, "selected", "original", true, false);
-    register(&mut db, "private", "other", true, false);
+    register(&mut db, "selected", "original", false);
+    register(&mut db, "private", "other", false);
     db.grant_peer("machine-b", "private", Permission::Send, true)
         .unwrap();
     assert!(
@@ -106,9 +105,9 @@ fn session_replacement_cannot_inherit_sharing_and_stale_grants_remain_visible() 
     let mut db = Db::open(&root.path().join("db")).unwrap();
     let peer = identity();
     db.pair_peer(&peer, &peer, Some("machine-b")).unwrap();
-    register(&mut db, "worker", "old", true, false);
+    register(&mut db, "worker", "old", false);
     db.share_peer_session("machine-b", "worker", true).unwrap();
-    register(&mut db, "worker", "new", true, true);
+    register(&mut db, "worker", "new", true);
     assert!(
         !db.peer_allowed(&peer, &Provider::Inbox, "new", Permission::Receive)
             .unwrap()
@@ -121,7 +120,8 @@ fn session_replacement_cannot_inherit_sharing_and_stale_grants_remain_visible() 
     // Unsharing the replacement cannot accidentally remove an old session grant.
     db.share_peer_session("machine-b", "worker", false).unwrap();
     assert_eq!(db.peer(&peer).unwrap().grants.len(), 3);
-    register(&mut db, "old-session", "old", false, false);
+    register(&mut db, "old-session", "old", false);
+    db.unregister("old-session", "old").unwrap();
     db.share_peer_session("machine-b", "old-session", false)
         .unwrap();
     assert!(db.shared_sessions().unwrap().as_array().unwrap().is_empty());
@@ -133,14 +133,14 @@ fn disabled_session_can_be_unshared_but_not_shared_and_revocation_clears_everyth
     let mut db = Db::open(&root.path().join("db")).unwrap();
     let peer = identity();
     db.pair_peer(&peer, &peer, None).unwrap();
-    register(&mut db, "worker", "original", true, false);
-    register(&mut db, "alias", "original", true, false);
+    register(&mut db, "worker", "original", false);
+    register(&mut db, "alias", "original", false);
     db.share_peer_session(&peer, "worker", true).unwrap();
     assert_eq!(
         db.shared_sessions().unwrap()[0]["local_names"],
         serde_json::json!(["alias", "worker"])
     );
-    register(&mut db, "worker", "original", false, false);
+    db.unregister("worker", "original").unwrap();
     assert!(db.share_peer_session(&peer, "worker", true).is_err());
     db.share_peer_session(&peer, "worker", false).unwrap();
     assert!(db.peer(&peer).unwrap().grants.is_empty());
@@ -157,9 +157,9 @@ fn stale_session_identity_removal_does_not_touch_replacement_grants() {
     let mut db = Db::open(&root.path().join("db")).unwrap();
     let peer = identity();
     db.pair_peer(&peer, &peer, Some("machine-b")).unwrap();
-    register(&mut db, "worker", "old", true, false);
+    register(&mut db, "worker", "old", false);
     db.share_peer_session("machine-b", "worker", true).unwrap();
-    register(&mut db, "worker", "replacement", true, true);
+    register(&mut db, "worker", "replacement", true);
     db.share_peer_session("machine-b", "worker", true).unwrap();
     assert_eq!(db.peer("machine-b").unwrap().grants.len(), 6);
     db.unshare_peer_session("machine-b", &Provider::Inbox, "old")

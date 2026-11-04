@@ -25,7 +25,6 @@ fn duplicate_publish_and_restart_do_not_duplicate_opted_in_work() {
             provider: Provider::Claude,
             session: recipient_session.clone(),
             endpoint: "/tmp/test.sock".into(),
-            enabled: true,
         },
         false,
     )
@@ -89,7 +88,6 @@ fn manual_default_and_mode_switch_do_not_schedule_historical_posts() {
             provider: Provider::Claude,
             session: session.clone(),
             endpoint: "/tmp/test.sock".into(),
-            enabled: true,
         },
         false,
     )
@@ -161,7 +159,6 @@ fn restart_after_claim_preserves_uncertainty_without_automatic_replay() {
             provider: Provider::Claude,
             session: session.clone(),
             endpoint: "/tmp/test.sock".into(),
-            enabled: true,
         },
         false,
     )

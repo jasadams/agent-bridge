@@ -167,7 +167,6 @@ mod tests {
             session: session.into(),
             provider: Provider::Inbox,
             endpoint: String::new(),
-            enabled: true,
         }
     }
     #[test]
@@ -179,11 +178,10 @@ mod tests {
             provider: Provider::Codex,
             session: "123e4567-e89b-12d3-a456-426614174000".into(),
             endpoint: String::new(),
-            enabled: true,
         };
         db.register(&native, false).unwrap();
         let peer = db
-            .send(
+            .send_names(
                 &uuid::Uuid::new_v4().to_string(),
                 "user",
                 &native.name,
@@ -218,7 +216,7 @@ mod tests {
             .unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let body = format!("<script>alert('x')</script>{}", "x".repeat(1024));
-        db.send(&id, "alice", "bob", &body, &None).unwrap();
+        db.send_names(&id, "alice", "bob", &body, &None).unwrap();
         db.conn
             .execute(
                 "UPDATE agents SET session='replacement-source' WHERE name='alice'",
@@ -267,7 +265,7 @@ mod tests {
                 .is_empty()
         );
         for _ in 0..3 {
-            db.send(
+            db.send_names(
                 &uuid::Uuid::new_v4().to_string(),
                 "alice",
                 "bob",
@@ -334,7 +332,7 @@ mod tests {
             ("uncertain", Some("inbox"), "unknown"),
         ] {
             let id = uuid::Uuid::new_v4().to_string();
-            db.send(&id, "user", "bob", "historical message", &None)
+            db.send_names(&id, "user", "bob", "historical message", &None)
                 .unwrap();
             db.conn
                 .execute("UPDATE messages SET state=? WHERE id=?", [raw, &id])
@@ -348,7 +346,7 @@ mod tests {
             expected.entry(outcome).or_default().push(id);
         }
         let id = uuid::Uuid::new_v4().to_string();
-        db.send(&id, "user", "bob", "reconciliation", &None)
+        db.send_names(&id, "user", "bob", "reconciliation", &None)
             .unwrap();
         db.conn.execute("INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,phase,deadline) VALUES(?,'original-destination','legacy','legacy','pending','reconcile',0)", [&id]).unwrap();
         expected.entry("unknown").or_default().push(id);
@@ -395,7 +393,7 @@ mod tests {
             ("dispatched", "pending"),
         ] {
             let id = uuid::Uuid::new_v4().to_string();
-            db.send(&id, "user", "bob", "native attempt", &None)
+            db.send_names(&id, "user", "bob", "native attempt", &None)
                 .unwrap();
             db.conn
                 .execute("UPDATE messages SET state='sending' WHERE id=?", [&id])
@@ -440,11 +438,11 @@ mod tests {
         db.register(&agent("bob", "saved-destination"), false)
             .unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        db.send(&id, "alice", "bob", "old", &None).unwrap();
+        db.send_names(&id, "alice", "bob", "old", &None).unwrap();
         db.conn
             .execute_batch(include_str!("../tests/fixtures/native-metadata-v10.sql"))
             .unwrap();
-        db.conn.execute_batch("DROP TRIGGER inbound_usage_insert; DROP TRIGGER inbound_usage_delete; DROP TABLE inbound_usage; DROP TRIGGER message_context_insert; DROP TABLE message_context; DROP INDEX messages_monitor_order; PRAGMA user_version=8;").unwrap();
+        db.conn.execute_batch("DROP TRIGGER IF EXISTS inbound_usage_insert; DROP TRIGGER IF EXISTS inbound_usage_delete; DROP TABLE IF EXISTS inbound_usage; DROP TRIGGER IF EXISTS message_context_insert; DROP TABLE IF EXISTS message_context; DROP INDEX IF EXISTS messages_monitor_order; DROP TABLE IF EXISTS route_aliases; DROP TABLE IF EXISTS claude_bindings; CREATE TABLE IF NOT EXISTS remote_agents(peer_id TEXT NOT NULL,name TEXT NOT NULL,agent TEXT NOT NULL,PRIMARY KEY(peer_id,name)); PRAGMA user_version=8;").unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let message = db

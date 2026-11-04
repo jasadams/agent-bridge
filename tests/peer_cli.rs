@@ -21,7 +21,7 @@ async fn json(state: &Path, args: &[&str]) -> Value {
     let output = cli(state, args).await;
     assert!(
         output.status.success(),
-        "{}",
+        "{args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
@@ -89,10 +89,7 @@ async fn local_cli_manages_peer_trust_and_explicit_network_lifecycle() {
         ],
     )
     .await;
-    assert_eq!(
-        json(&state, &["list", "--remote"]).await,
-        serde_json::json!([])
-    );
+    assert!(!cli(&state, &["list", "--remote"]).await.status.success());
     json(
         &state,
         &[

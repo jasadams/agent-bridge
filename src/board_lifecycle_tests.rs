@@ -63,11 +63,12 @@ async fn stale_writes_and_subscription_requests_do_not_cross_restore_generation(
         provider: Provider::Codex,
         session: uuid::Uuid::new_v4().to_string(),
         endpoint: String::new(),
-        enabled: true,
     };
     broker
         .request(Request::Register {
-            agent: agent.clone(),
+            name: agent.name.clone(),
+            provider: agent.provider.clone(),
+            session: agent.session.clone(),
             replace: false,
         })
         .unwrap();
@@ -524,11 +525,12 @@ async fn archived_message_receipt_readback_never_enqueues_an_unknown_old_control
         provider: Provider::Inbox,
         session: uuid::Uuid::new_v4().to_string(),
         endpoint: String::new(),
-        enabled: true,
     };
     broker
         .request(Request::Register {
-            agent: owner.clone(),
+            name: owner.name.clone(),
+            provider: owner.provider.clone(),
+            session: owner.session.clone(),
             replace: false,
         })
         .unwrap();

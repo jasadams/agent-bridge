@@ -1,8 +1,9 @@
 use crate::{
+    clients::{ConnectorState, NativeState},
     db::Db,
-    delivery, hook,
+    delivery,
     network::identity::Identity,
-    protocol::{MAX_FRAME, Provider, Request, Response},
+    protocol::{Agent, MAX_FRAME, Provider, Request, Response},
 };
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
@@ -50,6 +51,12 @@ impl CodexWorkers {
     }
 }
 
+enum PreparedSend {
+    Duplicate(crate::protocol::Message),
+    Local(Agent, Agent),
+    Remote(Agent, Option<crate::network::wire::RemoteAgent>),
+}
+
 #[derive(Clone)]
 pub(crate) struct NetworkSnapshot {
     pub generation: u64,
@@ -75,11 +82,11 @@ pub struct Broker {
     pub(crate) network_generation: Arc<AtomicU64>,
     pub(crate) pairing_generation: Arc<AtomicU64>,
     pub(crate) contact_routes: Arc<Mutex<std::collections::BTreeMap<String, (String, String)>>>,
-    pub claude_wake: Arc<Notify>,
-    claude_failures: Arc<Mutex<std::collections::HashMap<String, (String, String)>>>,
     pub state_dir: PathBuf,
     codex_bin: PathBuf,
     discovery_status: Arc<Mutex<Value>>,
+    claude_state: Arc<dyn ConnectorState>,
+    codex_state: Arc<crate::clients::codex_discovery::State>,
 }
 
 pub fn private_dir(path: &Path) -> Result<()> {
@@ -160,14 +167,6 @@ impl Broker {
                 .unwrap_or(peer_id);
             return format!("{qualifier}/{name}");
         }
-        // An explicit registration alias is already the agent's chosen name.
-        if let Ok(agent) = db.agent(sender)
-            && sender == hook::routing_name(&agent.provider, &agent.session)
-            && let Ok(Some(name)) = db.display_name(&agent.provider, &agent.session)
-            && !name.trim().is_empty()
-        {
-            return name;
-        }
         sender.to_owned()
     }
 
@@ -236,11 +235,7 @@ impl Broker {
         for error in crate::board_lifecycle::cleanup(&db, &state_dir, crate::db::now())? {
             eprintln!("Board archive recovery: {error}");
         }
-        let mut event_state = crate::board_notifications::State::default();
-        event_state.reconcile(
-            crate::board_notifications::available(&db)?,
-            "broker startup",
-        );
+        let event_state = crate::board_notifications::State::default();
         let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         let broker = Self {
@@ -260,11 +255,11 @@ impl Broker {
             network_generation: Arc::new(AtomicU64::new(0)),
             pairing_generation: Arc::new(AtomicU64::new(0)),
             contact_routes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
-            claude_wake: Arc::new(Notify::new()),
-            claude_failures: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_dir,
             codex_bin,
             discovery_status: Arc::new(Mutex::new(json!({"state":"disabled"}))),
+            claude_state: Arc::new(crate::clients::claude_discovery::State::new("claude")),
+            codex_state: Arc::new(crate::clients::codex_discovery::State::default()),
         };
         Ok(BoundServer {
             listener,
@@ -272,6 +267,534 @@ impl Broker {
             _lock: lock,
             socket,
         })
+    }
+
+    /// One connector implementation per provider for this request. OpenCode's
+    /// transport locators are snapshotted from leases; no DB lock is held while
+    /// the native read runs.
+    fn connector(
+        &self,
+        provider: &Provider,
+        preferred_session: Option<&str>,
+    ) -> Result<Option<Arc<dyn ConnectorState>>> {
+        Ok(match provider {
+            Provider::Claude => Some(self.claude_state.clone()),
+            Provider::Codex => Some(self.codex_state.clone()),
+            Provider::OpenCode => {
+                let (endpoints, preferred) = {
+                    let db = self.db.lock().unwrap();
+                    db.opencode_locators(preferred_session)?
+                };
+                Some(Arc::new(crate::clients::opencode::State::new(
+                    endpoints, preferred,
+                )))
+            }
+            Provider::Inbox => None,
+        })
+    }
+
+    pub(crate) fn native_get(
+        &self,
+        provider: &Provider,
+        session: &str,
+    ) -> Result<Option<NativeState>> {
+        let Some(connector) = self.connector(provider, Some(session))? else {
+            return Ok(None);
+        };
+        connector
+            .get(session)
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
+    fn native_list(
+        &self,
+        provider: &Provider,
+        max_age_days: u32,
+    ) -> std::result::Result<Vec<NativeState>, crate::clients::StateError> {
+        match self.connector(provider, None) {
+            Ok(Some(connector)) => connector.list(max_age_days),
+            Ok(None) => Ok(Vec::new()),
+            Err(error) => Err(crate::clients::StateError::Unavailable(error.to_string())),
+        }
+    }
+
+    /// Resolve configured routing identity and enrich transport details from the
+    /// connector boundary when available. Native errors never become a false
+    /// empty directory; durable work still keeps its immutable identity.
+    fn prepare_agent(&self, name: &str, require_present: bool) -> Result<Agent> {
+        let agent = {
+            let db = self.db.lock().unwrap();
+            db.agent(name)?
+        };
+        if agent.provider == Provider::Inbox {
+            if require_present {
+                let enabled = self
+                    .db
+                    .lock()
+                    .unwrap()
+                    .inbox_enabled(&agent.name, &agent.session)?;
+                ensure!(
+                    enabled,
+                    "Inbox registration is disabled; enable it explicitly before new work"
+                );
+            }
+            return Ok(agent);
+        }
+        if agent.provider == Provider::OpenCode && !agent.endpoint.is_empty() {
+            // A live lease already provides the exact request-local transport
+            // locator. Cold explicit sends without a lease still perform GET.
+            return Ok(agent);
+        }
+        if require_present && let Ok(Some(state)) = self.native_get(&agent.provider, &agent.session)
+        {
+            // Enrich only this request from the connector observation. Absence
+            // never fabricates a catalog row; durable work remains queued for
+            // the immutable identity and is delivered only when it is present.
+            return Ok(Agent {
+                name: agent.name,
+                endpoint: state
+                    .transport_endpoint
+                    .unwrap_or_else(|| agent.endpoint.clone()),
+                provider: agent.provider,
+                session: agent.session,
+            });
+        }
+        Ok(agent)
+    }
+
+    /// Duplicate readback first, then request-local native verification for a
+    /// new local send. The final locked arm repeats the duplicate and route
+    /// fences immediately before the durable insert.
+    fn prepare_send(
+        &self,
+        id: &str,
+        sender: &str,
+        recipient: &str,
+        body: &str,
+        parent: &Option<String>,
+    ) -> Result<PreparedSend> {
+        if let Some(message) = self
+            .db
+            .lock()
+            .unwrap()
+            .send_duplicate(id, sender, recipient, body, parent)?
+        {
+            return Ok(PreparedSend::Duplicate(message));
+        }
+        if recipient.contains('/') {
+            let source = self.prepare_agent(sender, true)?;
+            let (peer, name) = recipient
+                .split_once('/')
+                .context("Remote destination must be peer/agent")?;
+            let destination = {
+                let db = self.db.lock().unwrap();
+                db.agent(name)
+                    .ok()
+                    .map(|agent| crate::network::wire::RemoteAgent {
+                        name: name.into(),
+                        provider: agent.provider,
+                        session: agent.session,
+                    })
+            };
+            let destination = match destination {
+                Some(destination) => Some(destination),
+                None => self
+                    .sync_remote_directory(peer)?
+                    .into_iter()
+                    .find(|row| row["name"] == name)
+                    .and_then(|row| {
+                        Some(crate::network::wire::RemoteAgent {
+                            name: name.into(),
+                            provider: row["provider"].as_str()?.parse().ok()?,
+                            session: row["session"].as_str()?.into(),
+                        })
+                    }),
+            };
+            return Ok(PreparedSend::Remote(source, destination));
+        }
+        let source = self.prepare_agent(sender, true)?;
+        let destination = self.prepare_agent(recipient, true)?;
+        Ok(PreparedSend::Local(source, destination))
+    }
+
+    fn prepare_list(&self, all: bool, max_age_days: u32) -> Result<Value> {
+        ensure!(max_age_days >= 1, "max_age_days must be at least 1");
+        let (configured, machine, opencode_multi) = {
+            let db = self.db.lock().unwrap();
+            (
+                db.listed_agents(all)?,
+                self.local_machine(&db)?,
+                db.opencode_live_instances().unwrap_or(0) > 1,
+            )
+        };
+        let mut providers = Vec::new();
+        let mut rows: std::collections::BTreeMap<(String, String, String), Value> =
+            std::collections::BTreeMap::new();
+        let mut native_sessions = std::collections::BTreeSet::new();
+        for provider in [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::OpenCode,
+            Provider::Inbox,
+        ] {
+            if provider == Provider::Inbox {
+                providers.push(json!({"provider":"inbox","state":"complete"}));
+                continue;
+            }
+            match self.native_list(&provider, max_age_days) {
+                Ok(states) => {
+                    if provider == Provider::OpenCode && opencode_multi {
+                        providers.push(json!({
+                            "provider":provider,
+                            "state":"incomplete",
+                            "detail":"Multiple OpenCode instances are live; this request uses one service scope",
+                        }));
+                    } else {
+                        providers.push(json!({"provider":provider,"state":"complete"}));
+                    }
+                    for state in states {
+                        native_sessions
+                            .insert((provider.label().to_string(), state.session.clone()));
+                        let name =
+                            crate::clients::lifecycle::routing_name(&provider, &state.session);
+                        rows.entry((name.clone(), provider.label().into(), state.session.clone()))
+                            .or_insert_with(|| {
+                                json!({
+                                    "name":name,
+                                    "provider":provider,
+                                    "session":state.session,
+                                    "display_name":state.display_name,
+                                    "status":state.status,
+                                    "directory":state.directory,
+                                    "updated_ms":state.updated_ms,
+                                    "machine_name":machine["machine_name"],
+                                    "peer_id":machine["peer_id"],
+                                    "machine_display_name":machine["display_name"],
+                                })
+                            });
+                    }
+                }
+                Err(error) => {
+                    let (state, detail) = match error {
+                        crate::clients::StateError::Unavailable(detail) => ("unavailable", detail),
+                        crate::clients::StateError::Incomplete(detail) => ("incomplete", detail),
+                    };
+                    providers.push(json!({
+                        "provider":provider,
+                        "state":state,
+                        "detail":detail.chars().take(512).collect::<String>(),
+                    }));
+                }
+            }
+        }
+        // Explicit aliases appear only when their exact target is present in
+        // this request. Manual Inbox rows remain visible configuration.
+        for agent in configured {
+            if agent.provider == Provider::Inbox {
+                let enabled = self
+                    .db
+                    .lock()
+                    .unwrap()
+                    .inbox_enabled(&agent.name, &agent.session)?;
+                let mut row = json!({
+                    "name":agent.name,
+                    "provider":"inbox",
+                    "session":agent.session,
+                    "display_name":Value::Null,
+                    "status":Value::Null,
+                    "directory":Value::Null,
+                    "updated_ms":Value::Null,
+                    "machine_name":machine["machine_name"],
+                    "peer_id":machine["peer_id"],
+                    "machine_display_name":machine["display_name"],
+                    "enabled":enabled,
+                });
+                if !enabled {
+                    row["stale_reason"] = json!("disabled");
+                }
+                rows.insert(
+                    (agent.name.clone(), "inbox".into(), agent.session.clone()),
+                    row,
+                );
+                continue;
+            }
+            if native_sessions.contains(&(agent.provider.label().into(), agent.session.clone())) {
+                rows.entry((
+                    agent.name.clone(),
+                    agent.provider.label().into(),
+                    agent.session.clone(),
+                ))
+                .or_insert_with(|| {
+                    json!({
+                        "name":agent.name,
+                        "provider":agent.provider,
+                        "session":agent.session,
+                        "display_name":Value::Null,
+                        "status":Value::Null,
+                        "directory":Value::Null,
+                        "updated_ms":Value::Null,
+                        "machine_name":machine["machine_name"],
+                        "peer_id":machine["peer_id"],
+                        "machine_display_name":machine["display_name"],
+                    })
+                });
+            }
+        }
+        Ok(json!({
+            "agents": rows.into_values().collect::<Vec<_>>(),
+            "providers": providers,
+        }))
+    }
+
+    /// Request-local directory for peer export and on-demand listing.
+    /// Request-local native presence snapshot for claiming durable work. Native
+    /// absence leaves queued work untouched; it never becomes a false delivery.
+    fn native_readiness(&self) -> std::collections::HashSet<(String, String)> {
+        let (bindings, leases) = {
+            let db = self.db.lock().unwrap();
+            (
+                db.claude_binding_sessions()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|session| {
+                        db.agent(&crate::clients::lifecycle::routing_name(
+                            &Provider::Claude,
+                            &session,
+                        ))
+                        .ok()
+                        .map(|agent| (session, agent.endpoint))
+                    })
+                    .collect::<Vec<_>>(),
+                db.opencode_lease_sessions().unwrap_or_default(),
+            )
+        };
+        let mut ready = std::collections::HashSet::new();
+        for binding in bindings.into_iter().flatten() {
+            // Bindings are delivery coordinates. Claiming does not probe the
+            // socket (that would create payload-free native connections); a dead
+            // socket fails the delivery attempt with its existing diagnostic.
+            if !binding.1.is_empty() {
+                ready.insert(("claude".into(), binding.0));
+            }
+        }
+        for session in leases {
+            ready.insert(("opencode".into(), session));
+        }
+        if let Ok(rows) = self.codex_state.list(7) {
+            for row in rows {
+                ready.insert(("codex".into(), row.session));
+            }
+        }
+        ready
+    }
+
+    pub(crate) fn prepare_directory(&self) -> Result<Vec<Agent>> {
+        let (configured, opencode_sessions) = {
+            let db = self.db.lock().unwrap();
+            (db.listed_agents(true)?, db.opencode_lease_sessions()?)
+        };
+        let mut directory = Vec::new();
+        for session in opencode_sessions {
+            directory.push(Agent {
+                name: crate::clients::lifecycle::routing_name(&Provider::OpenCode, &session),
+                provider: Provider::OpenCode,
+                session,
+                endpoint: String::new(),
+            });
+        }
+        for provider in [Provider::Claude, Provider::Codex] {
+            let Ok(rows) = self.native_list(&provider, 7) else {
+                continue;
+            };
+            for row in rows {
+                directory.push(Agent {
+                    name: crate::clients::lifecycle::routing_name(&provider, &row.session),
+                    provider: provider.clone(),
+                    session: row.session,
+                    endpoint: String::new(),
+                });
+            }
+        }
+        for agent in configured {
+            if agent.provider == Provider::Inbox {
+                let enabled = self
+                    .db
+                    .lock()
+                    .unwrap()
+                    .inbox_enabled(&agent.name, &agent.session)?;
+                if enabled {
+                    directory.push(agent);
+                }
+                continue;
+            }
+            // Explicit aliases are owner configuration. Connector-present
+            // canonical Claude/Codex rows were added above; Claude bindings are
+            // delivery coordinates, not directory membership.
+            directory.push(agent);
+        }
+        directory.sort_by(|left, right| left.name.cmp(&right.name));
+        directory.dedup_by(|left, right| left.name == right.name);
+        Ok(directory)
+    }
+
+    /// On-demand peer directory. Nothing is persisted; a failed lookup is not a
+    /// false empty directory.
+    async fn remote_directory(&self, only: Option<&str>) -> Result<Value> {
+        let peers = {
+            let db = self.db.lock().unwrap();
+            ensure!(db.network_config()?.enabled, "Networking is disabled");
+            let mut peers = db.peers()?;
+            if let Some(only) = only {
+                let peer = db.peer(only)?;
+                ensure!(!peer.revoked, "Peer is revoked");
+                peers.retain(|candidate| candidate.peer_id == peer.peer_id);
+            }
+            let peers = peers
+                .into_iter()
+                .filter(|peer| !peer.revoked)
+                .collect::<Vec<_>>();
+            ensure!(
+                !peers.is_empty(),
+                "No active paired peers are available for a remote directory"
+            );
+            peers
+        };
+        let handle = self
+            .network_handle
+            .lock()
+            .unwrap()
+            .clone()
+            .context("Network transport is not ready; retry after status shows a connection")?
+            .handle;
+        let status = self.network_status.lock().unwrap().clone();
+        let stored = {
+            let db = self.db.lock().unwrap();
+            db.network_peers()?
+        };
+        let mut rows = Vec::new();
+        for peer in peers {
+            let peer_id: libp2p::PeerId = peer.peer_id.parse()?;
+            let mut addresses: Vec<libp2p::Multiaddr> = Vec::new();
+            for (id, address) in &stored {
+                if id == &peer.peer_id
+                    && let Ok(address) = address.parse()
+                {
+                    addresses.push(address);
+                }
+            }
+            for path in status["paths"].as_array().into_iter().flatten() {
+                if path["peer_id"] != peer.peer_id {
+                    continue;
+                }
+                for address in path["addresses"].as_array().into_iter().flatten().take(8) {
+                    if let Some(address) = address
+                        .as_str()
+                        .and_then(|value| value.parse::<libp2p::Multiaddr>().ok())
+                    {
+                        addresses.push(address);
+                    }
+                }
+            }
+            for discovered in status["discovered"].as_array().into_iter().flatten() {
+                if discovered["peer_id"] != peer.peer_id {
+                    continue;
+                }
+                for address in discovered["addresses"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(8)
+                {
+                    if let Some(address) = address
+                        .as_str()
+                        .and_then(|value| value.parse::<libp2p::Multiaddr>().ok())
+                    {
+                        addresses.push(address);
+                    }
+                }
+            }
+            addresses.truncate(8);
+            for address in &mut addresses {
+                if !address
+                    .iter()
+                    .any(|part| matches!(part, libp2p::multiaddr::Protocol::P2p(_)))
+                {
+                    address.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                }
+            }
+            ensure!(
+                !addresses.is_empty(),
+                "No authenticated route is available for peer {}; reconnect before listing its directory",
+                peer.display_name
+            );
+            let response = match handle
+                .request_addresses(
+                    peer_id,
+                    addresses.clone(),
+                    crate::network::wire::WireRequest::new(
+                        crate::network::wire::Operation::DirectorySupported {
+                            providers: crate::network::wire::supported_providers(),
+                        },
+                    ),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(error);
+                }
+            };
+            let crate::network::wire::WireResponse::SupportedDirectory { providers, agents } =
+                response
+            else {
+                anyhow::bail!("Peer did not return a supported directory");
+            };
+            crate::network::wire::validate_providers(&providers)?;
+            ensure!(
+                agents
+                    .iter()
+                    .all(|agent| providers.iter().any(|p| p == agent.provider.label())),
+                "Directory contains an unadvertised provider"
+            );
+            for agent in agents {
+                rows.push(json!({
+                    "peer_id":peer.peer_id,
+                    "peer_alias":peer.alias,
+                    "machine_name":peer.machine_name,
+                    "machine_display_name":peer.display_name,
+                    "name":agent.name,
+                    "provider":agent.provider,
+                    "session":agent.session,
+                    "qualified_name":format!("{}/{}",peer.alias.as_deref().unwrap_or(&peer.peer_id),agent.name),
+                    "online":true,
+                }));
+            }
+        }
+        Ok(json!(rows))
+    }
+
+    /// Blocking request paths may ask the active transport for one fresh peer
+    /// directory. This is request-local and never persisted.
+    fn sync_remote_directory(&self, peer: &str) -> Result<Vec<Value>> {
+        let broker = self.clone();
+        let peer = peer.to_owned();
+        let run = move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(broker.remote_directory(Some(&peer)))
+        };
+        let value = if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(run)
+                .join()
+                .map_err(|_| anyhow::anyhow!("Remote directory worker stopped"))??
+        } else {
+            run()?
+        };
+        value
+            .as_array()
+            .cloned()
+            .context("Peer directory response is not an array")
     }
 
     async fn ready_network(&self, cancel: u64) -> Result<NetworkSnapshot> {
@@ -375,11 +898,7 @@ impl Broker {
                 self.blocking(move |broker| broker.request(req)).await
             }
             req @ Request::Register {
-                agent:
-                    crate::protocol::Agent {
-                        provider: Provider::OpenCode,
-                        ..
-                    },
+                provider: Provider::OpenCode,
                 ..
             } => self.blocking(move |broker| broker.request(req)).await,
             Request::MonitorEnable { port } => {
@@ -407,6 +926,8 @@ impl Broker {
                 .await
                 .context("Monitor did not start in time; inspect monitor status")?
             }
+            Request::RemoteList => self.remote_directory(None).await,
+            Request::RemoteListPeer { peer } => self.remote_directory(Some(&peer)).await,
             Request::ContactLocation { location, seconds } => {
                 ensure!(
                     (30..=600).contains(&seconds),
@@ -479,23 +1000,43 @@ impl Broker {
     }
 
     pub fn request(&self, req: Request) -> Result<Value> {
-        // A native probe may trigger lifecycle cleanup through this same broker.
-        // Complete transport I/O before holding the database administration lock.
+        // Complete all native/provider I/O before taking the DB administration
+        // lock. These snapshots are request-local and discarded on return.
+        let prepared_send = match &req {
+            Request::Send {
+                id,
+                sender,
+                recipient,
+                body,
+                parent,
+            } => Some(self.prepare_send(id, sender, recipient, body, parent)?),
+            _ => None,
+        };
+        let prepared_list = match &req {
+            Request::List { all, max_age_days } => Some(self.prepare_list(*all, *max_age_days)?),
+            _ => None,
+        };
+        let board_preflight = match &req {
+            Request::BoardMessageSend { request } => Some(self.board_send_preflight(request)?),
+            _ => None,
+        };
+        let prepared_subscribe = match &req {
+            Request::Subscribe { agent, .. } => Some(self.prepare_agent(agent, true)?),
+            _ => None,
+        };
+        // Register stores explicit routing configuration only. Native presence
+        // is checked request-locally for routing and listing, never stored.
         let candidate = match &req {
-            Request::Register { agent, .. } if agent.provider == Provider::OpenCode => {
-                Some(agent.clone())
-            }
             Request::OpenCodeObserve {
                 session, endpoint, ..
             }
             | Request::OpenCodeHeartbeat {
                 session, endpoint, ..
-            } => Some(crate::protocol::Agent {
+            } => Some(Agent {
                 name: crate::clients::lifecycle::routing_name(&Provider::OpenCode, session),
                 provider: Provider::OpenCode,
                 session: session.clone(),
                 endpoint: endpoint.clone(),
-                enabled: true,
             }),
             _ => None,
         };
@@ -510,16 +1051,8 @@ impl Broker {
         db.opencode_tick(crate::db::now())?;
         {
             let mut state = self.board_notifications.lock().unwrap();
-            state.reconcile(
-                crate::board_notifications::available(&db)?,
-                "OpenCode lease expired",
-            );
             state.prune(|name| db.agent(name).ok());
         }
-        let registration = matches!(
-            &req,
-            Request::Register { .. } | Request::OpenCodeObserve { .. }
-        );
         let req = match req {
             Request::BoardRead => Request::NamedBoardRead {
                 board: Default::default(),
@@ -616,7 +1149,11 @@ impl Broker {
                 // Board edits share the broker's local administration mutex. No
                 // network request can invoke this API or select a filesystem path.
                 Request::BoardMessageSend { request } => {
-                    self.board_message_submit_locked(&db, &request).body
+                    if let Some(detail) = board_preflight.flatten() {
+                        crate::board_messages::Reply::error(503, "unavailable", detail).body
+                    } else {
+                        self.board_message_submit_locked(&db, &request).body
+                    }
                 }
                 Request::AddBoardMessageInput {
                     agent,
@@ -626,7 +1163,12 @@ impl Broker {
                     label,
                 } => {
                     let actor = db.agent(&agent)?;
-                    ensure!(actor.enabled, "Message input owner must be enabled");
+                    if actor.provider == Provider::Inbox {
+                        ensure!(
+                            db.inbox_enabled(&actor.name, &actor.session)?,
+                            "Message input owner must be enabled"
+                        );
+                    }
                     let marker = crate::board_messages::Marker {
                         id,
                         instance: uuid::Uuid::new_v4().to_string(),
@@ -732,10 +1274,14 @@ impl Broker {
                     actor,
                 } => {
                     let actor = actor.map(|name| db.agent(&name)).transpose()?;
-                    ensure!(
-                        actor.as_ref().is_none_or(|agent| agent.enabled),
-                        "Board writer must be an enabled local registration"
-                    );
+                    if let Some(agent) = &actor
+                        && agent.provider == Provider::Inbox
+                    {
+                        ensure!(
+                            db.inbox_enabled(&agent.name, &agent.session)?,
+                            "Board writer must be an enabled local registration"
+                        );
+                    }
                     match self.update_board_locked(
                         &db,
                         &name,
@@ -756,44 +1302,33 @@ impl Broker {
                     }
                 }
                 Request::Subscribe {
-                    agent,
+                    agent: _,
                     events,
                     board_revisions,
                 } => {
                     self.validate_board_fences_locked(&db, &events, &board_revisions)?;
-                    let agent = db.agent(&agent)?;
+                    let prepared =
+                        prepared_subscribe.context("Subscribe preparation is missing")?;
                     let mut boards = std::collections::BTreeMap::new();
                     ensure!(
                         !events.is_empty() && events.len() <= 64,
                         "Provide between 1 and 64 event selectors"
                     );
                     for event in &events {
-                        if let crate::protocol::EventSelector::BoardChanged { board } = event {
-                            boards.insert(
-                                board.clone(),
-                                self.read_board_locked(&db, board)?.revision,
-                            );
-                        }
+                        let crate::protocol::EventSelector::BoardChanged { board } = event;
+                        boards.insert(board.clone(), self.read_board_locked(&db, board)?.revision);
                     }
-                    let agents = crate::board_notifications::available(&db)?;
-                    ensure!(
-                        agents.len() <= 256,
-                        "Available-agent snapshot exceeds 256 identities; reduce local registrations before subscribing"
-                    );
-                    ensure!(
-                        serde_json::to_vec(&agents)?.len() <= crate::protocol::MAX_BODY,
-                        "Available-agent snapshot exceeds 65536 bytes; reduce local registrations before subscribing"
-                    );
-                    let recovery = db.event_recovery(Some(&agent))?;
+                    let recovery = db.event_recovery(Some(&prepared))?;
                     let mut state = self.board_notifications.lock().unwrap();
-                    state.reconcile(agents.clone(), "local registration changed");
                     state.prune(|name| db.agent(name).ok());
-                    state.subscribe(agent.clone(), &events, &boards, std::time::Instant::now())?;
-                    let effective = state.events(&agent.name);
-                    let lifecycle = effective.iter().any(|event| {
-                        !matches!(event, crate::protocol::EventSelector::BoardChanged { .. })
-                    });
-                    json!({"agent":agent.name,"events":effective,"agents":if lifecycle {agents} else {Vec::new()},"persistent":false,"recovery":recovery})
+                    state.subscribe(
+                        prepared.clone(),
+                        &events,
+                        &boards,
+                        std::time::Instant::now(),
+                    )?;
+                    let effective = state.events(&prepared.name);
+                    json!({"agent":prepared.name,"events":effective,"persistent":false,"recovery":recovery})
                 }
                 Request::Unsubscribe {
                     agent,
@@ -811,49 +1346,50 @@ impl Broker {
                             "Provide between 1 and 64 event selectors"
                         );
                         for event in events {
-                            if let crate::protocol::EventSelector::BoardChanged { board } = event {
-                                self.read_board_locked(&db, board)?;
-                            }
+                            let crate::protocol::EventSelector::BoardChanged { board } = event;
+                            self.read_board_locked(&db, board)?;
                         }
                     }
-                    let registered: bool = db.conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM agents WHERE name=?)",
-                        [&agent],
-                        |row| row.get(0),
-                    )?;
-                    let receiver = registered.then(|| db.agent(&agent)).transpose()?;
+                    let receiver = db.agent(&agent).ok();
                     let recovery = db.event_recovery(receiver.as_ref())?;
                     let mut state = self.board_notifications.lock().unwrap();
                     state.unsubscribe(&agent, events.as_deref());
                     json!({"agent":agent,"events":state.events(&agent),"agents":[],"persistent":false,"recovery":recovery})
                 }
-                Request::Register { mut agent, replace } => {
-                    crate::clients::validate_registration(&mut agent)?;
-                    if agent.provider == Provider::OpenCode {
-                        db.opencode_alias_admission(&agent)?;
+                Request::Register {
+                    name,
+                    provider,
+                    session,
+                    replace,
+                } => {
+                    let mut agent = Agent {
+                        name,
+                        provider,
+                        session,
+                        endpoint: String::new(),
+                    };
+                    if agent.provider == Provider::Inbox {
+                        crate::clients::validate_registration(&mut agent)?;
+                    } else {
+                        crate::clients::validate_session(&agent.provider, &agent.session)?;
                     }
                     db.register(&agent, replace)?;
-                    if agent.provider == Provider::Claude {
-                        self.claude_failures
-                            .lock()
-                            .unwrap()
-                            .retain(|_, (session, _)| session != &agent.session);
-                    }
                     json!(agent)
+                }
+                Request::ClaudeBind { session, endpoint } => {
+                    db.claude_bind(&session, &endpoint)?;
+                    json!({"bound":true,"session":session})
+                }
+                Request::ClaudeUnbind { session, endpoint } => {
+                    db.claude_unbind(&session, &endpoint)?;
+                    json!({"unbound":true,"session":session})
                 }
                 Request::OpenCodeObserve {
                     session,
                     endpoint,
-                    title,
                     ready,
                 } => {
-                    ensure!(
-                        title
-                            .as_ref()
-                            .is_none_or(|s| s.len() <= 4096 && !s.chars().any(char::is_control)),
-                        "Invalid OpenCode title"
-                    );
-                    let mut agent = crate::protocol::Agent {
+                    let mut agent = Agent {
                         name: crate::clients::lifecycle::routing_name(
                             &Provider::OpenCode,
                             &session,
@@ -861,22 +1397,11 @@ impl Broker {
                         provider: Provider::OpenCode,
                         session,
                         endpoint,
-                        enabled: true,
                     };
                     crate::clients::validate_registration(&mut agent)?;
                     let observed_at = crate::db::now();
                     db.opencode_tick(observed_at)?;
-                    {
-                        let mut state = self.board_notifications.lock().unwrap();
-                        state.reconcile(
-                            crate::board_notifications::available(&db)?,
-                            "OpenCode lease expired",
-                        );
-                        state.prune(|name| db.agent(name).ok());
-                    }
-                    let result = db.opencode_observe_at(&agent, ready, observed_at)?;
-                    db.observe_session_name(&agent.provider, &agent.session, title.as_deref())?;
-                    result
+                    db.opencode_observe_at(&agent, ready, observed_at)?
                 }
                 Request::OpenCodeHeartbeat {
                     session,
@@ -915,11 +1440,9 @@ impl Broker {
                     attempt,
                 } => {
                     let message = db.get(&id)?;
-                    let agent = db.agent(&message.recipient)?;
+                    let agent = db.stored_destination(&message)?;
                     db.topic_push_authorize(&id, &agent)?;
                     if let Some(token) = db.event_control_token(&id)? {
-                        let message = db.get(&id)?;
-                        let agent = db.agent(&message.recipient)?;
                         self.authorize_event_locked(&db, &agent, &token)?;
                     }
                     db.opencode_admit(&id, &session, &generation, &instance, &attempt)?
@@ -932,14 +1455,20 @@ impl Broker {
                 } => {
                     let agent = db.agent(&recipient)?;
                     ensure!(
-                        agent.provider == Provider::OpenCode && agent.enabled,
-                        "Typed OpenCode notice requires an enabled exact local session"
+                        agent.provider == Provider::OpenCode,
+                        "Typed OpenCode notice requires an exact local session"
                     );
                     if let Some(token) = &event_token {
                         self.authorize_event_locked(&db, &agent, token)?;
                     }
                     let transaction = db.conn.unchecked_transaction()?;
-                    let message = db.send(&id, "user", &agent.name, &content, &None)?;
+                    let source = Agent {
+                        name: "user".into(),
+                        provider: Provider::Inbox,
+                        session: "user".into(),
+                        endpoint: String::new(),
+                    };
+                    let message = db.send(&id, &source, &agent, &content, &None)?;
                     db.opencode_notice_content(&id, &content)?;
                     if let Some(token) = &event_token {
                         db.event_control_record(&id, token)?;
@@ -967,66 +1496,12 @@ impl Broker {
                     )?;
                     json!({"queued":true,"message":self.message_value(&db, &message)?})
                 }
-                Request::SessionClose {
-                    name,
-                    session,
-                    endpoint,
-                } => {
-                    // Normalize the parent only: SessionEnd may run after the
-                    // old socket was removed, but must never close its replacement.
-                    let endpoint = if endpoint.is_empty() {
-                        endpoint
-                    } else {
-                        let path = Path::new(&endpoint);
-                        path.parent()
-                            .context("Missing native endpoint directory")?
-                            .canonicalize()?
-                            .join(
-                                path.file_name()
-                                    .context("Missing native endpoint filename")?,
-                            )
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    db.close_native(&name, &session, &endpoint)?;
-                    json!({"closed":name})
-                }
                 Request::Unregister { name, session } => {
-                    // SessionEnd can race a disconnect, so exact names remain usable while disabled.
-                    db.unregister(&db.resolve_agent(&name)?.name, &session)?;
+                    db.unregister(&name, &session)?;
                     json!({"unregistered":name})
                 }
-                Request::List { all } => {
-                    let mut agents = Vec::new();
-                    let machine = self.local_machine(&db)?;
-                    for agent in db.listed_agents(all)? {
-                        let stale_reason = if !agent.enabled {
-                            Some("disabled".to_owned())
-                        } else if agent.provider == Provider::Claude {
-                            crate::clients::claude::stale_reason(Path::new(&agent.endpoint))
-                        } else {
-                            None
-                        };
-                        if !all && stale_reason.is_some() {
-                            continue;
-                        }
-                        let display = db.display_name(&agent.provider, &agent.session)?;
-                        let mut value = json!(agent);
-                        if let Some(reason) = stale_reason {
-                            value["stale_reason"] = json!(reason);
-                        }
-                        value["machine_name"] = machine["machine_name"].clone();
-                        value["peer_id"] = machine["peer_id"].clone();
-                        value["machine_display_name"] = machine["display_name"].clone();
-                        if let Some(display) = display {
-                            value["display_name"] = json!(display);
-                            value["qualified_name"] =
-                                json!(format!("{}:{display}", agent.provider.label()));
-                        }
-                        agents.push(value);
-                    }
-                    json!(agents)
-                }
+                Request::List { .. } => prepared_list.context("List preparation is missing")?,
+                Request::Resolve { name } => json!(db.agent(&name)?),
                 Request::Send {
                     id,
                     sender,
@@ -1034,11 +1509,40 @@ impl Broker {
                     body,
                     parent,
                 } => {
-                    let sent = if recipient.contains('/') {
-                        let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                        db.send_remote(&local, &id, &sender, &recipient, &body, &parent)
-                    } else {
-                        db.send(&id, &sender, &recipient, &body, &parent)
+                    let sent = match prepared_send.context("Send preparation is missing")? {
+                        PreparedSend::Duplicate(message) => Ok(message),
+                        PreparedSend::Remote(source, destination) => {
+                            let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
+                            db.send_remote(
+                                &local,
+                                &id,
+                                &source,
+                                &recipient,
+                                &body,
+                                &parent,
+                                destination.as_ref(),
+                            )
+                        }
+                        PreparedSend::Local(source, destination) => {
+                            // Repeat the duplicate readback and route fences under
+                            // the final administration lock.
+                            if let Some(message) =
+                                db.send_duplicate(&id, &sender, &recipient, &body, &parent)?
+                            {
+                                Ok(message)
+                            } else {
+                                let current_source = db.agent(&sender)?;
+                                let current_target = db.agent(&recipient)?;
+                                ensure!(
+                                    current_source.provider == source.provider
+                                        && current_source.session == source.session
+                                        && current_target.provider == destination.provider
+                                        && current_target.session == destination.session,
+                                    "Route changed while preparing the send; retry with the current identity"
+                                );
+                                db.send(&id, &source, &destination, &body, &parent)
+                            }
+                        }
                     };
                     let message = match sent {
                         Ok(message) => message,
@@ -1059,7 +1563,7 @@ impl Broker {
                 }
                 Request::History { agent, limit } => {
                     let agent = agent
-                        .map(|name| db.resolve_agent(&name).map(|a| a.name))
+                        .map(|name| db.agent(&name).map(|a| a.name))
                         .transpose()?;
                     json!(
                         db.history(&agent, limit)?
@@ -1075,7 +1579,7 @@ impl Broker {
                     limit,
                 } => {
                     let agent = agent
-                        .map(|name| db.resolve_agent(&name).map(|a| a.name))
+                        .map(|name| db.agent(&name).map(|a| a.name))
                         .transpose()?;
                     let page = db.history_since(&agent, cursor.as_deref(), limit)?;
                     json!({
@@ -1109,20 +1613,7 @@ impl Broker {
                     json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.monitor_control.lock().unwrap().status(),"machine":self.local_machine(&db)?,"updates":updates,"board_archives":crate::board_lifecycle::diagnostics(&db)?})
                 }
                 Request::RemoteList | Request::RemoteListPeer { .. } => {
-                    let mut agents = match &req {
-                        Request::RemoteListPeer { peer } => db.remote_agents_for(peer)?,
-                        _ => db.remote_agents()?,
-                    };
-                    let status = self.network_status.lock().unwrap().clone();
-                    if let Some(agents) = agents.as_array_mut() {
-                        for agent in agents {
-                            agent["online"] =
-                                json!(status["connected"].as_array().is_some_and(|ids| {
-                                    ids.iter().any(|id| id == &agent["peer_id"])
-                                }));
-                        }
-                    }
-                    agents
+                    anyhow::bail!("Use the asynchronous on-demand peer directory RPC")
                 }
                 Request::RelayList => json!(db.relay_nodes()?),
                 Request::RelayAdd { address } => {
@@ -1293,11 +1784,10 @@ impl Broker {
                 Request::LanPairingWatch { agent, id, seconds } => {
                     let agent = db.agent(&agent)?;
                     ensure!(
-                        agent.enabled
-                            && crate::clients::supports(
-                                &agent.provider,
-                                crate::clients::Capability::PairingPrompts
-                            ),
+                        crate::clients::supports(
+                            &agent.provider,
+                            crate::clients::Capability::PairingPrompts
+                        ),
                         "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
                     );
                     let now = crate::db::now();
@@ -1720,21 +2210,13 @@ impl Broker {
         })();
         {
             let mut state = self.board_notifications.lock().unwrap();
-            state.reconcile(
-                crate::board_notifications::available(&db)?,
-                "local registration changed",
-            );
             state.prune(|name| db.agent(name).ok());
         }
         self.revoke_event_controls_locked(&db)?;
         drop(db);
         self.wake.notify_one();
         self.network_wake.notify_one();
-        let result = result?;
-        if registration {
-            self.claude_wake.notify_one();
-        }
-        Ok(result)
+        result
     }
 
     pub(crate) fn event_guard(
@@ -1778,8 +2260,7 @@ impl Broker {
         ensure!(token.len() <= 1024, "Event authorization exceeds limit");
         let current = db.agent(&agent.name)?;
         ensure!(
-            current.enabled
-                && current.provider == agent.provider
+            current.provider == agent.provider
                 && current.session == agent.session
                 && current.endpoint == agent.endpoint,
             "Event recipient registration changed"
@@ -1805,6 +2286,62 @@ impl Broker {
             }
         }
         Ok(())
+    }
+
+    /// Expensive native checks for a board submission happen before the DB
+    /// administration lock. Receipt duplicates and identity conflicts skip
+    /// all native I/O. Returning Some(detail) is a definite 503.
+    fn board_send_preflight(
+        &self,
+        request: &crate::board_messages::Submission,
+    ) -> Result<Option<String>> {
+        let owner = {
+            let db = self.db.lock().unwrap();
+            match db.board_message_receipt(request) {
+                Ok(Some(_)) | Err(_) => return Ok(None),
+                Ok(None) => {}
+            }
+            if !request.valid() {
+                return Ok(None);
+            }
+            let snapshot = match self.read_board_locked(&db, &request.board) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return Ok(None),
+            };
+            if snapshot.revision != request.expected_revision {
+                return Ok(None);
+            }
+            crate::board_interaction::controls(&snapshot.markdown)
+                .iter()
+                .find(|control| {
+                    crate::board_interaction::control_id(&snapshot, control) == request.control_id
+                })
+                .and_then(|control| match &control.kind {
+                    crate::board_interaction::Kind::Message { owner, .. } => Some(owner.clone()),
+                    _ => None,
+                })
+        };
+        let Some(owner) = owner else {
+            return Ok(None);
+        };
+        if owner.provider == Provider::Claude {
+            return Ok(crate::clients::claude::stale_reason(Path::new(
+                &owner.endpoint,
+            )));
+        }
+        if owner.provider == Provider::OpenCode {
+            let live = self
+                .db
+                .lock()
+                .unwrap()
+                .opencode_locators(Some(&owner.session))
+                .map(|(_, preferred)| preferred.is_some())
+                .unwrap_or(false);
+            if !live {
+                return Ok(Some("OpenCode live lease required".into()));
+            }
+        }
+        Ok(None)
     }
 
     /// Shared explicit user submission path. The caller holds the DB mutex.
@@ -1890,16 +2427,24 @@ impl Broker {
                 );
             }
         };
-        if agent.provider == Provider::Claude
-            && let Some(reason) = crate::clients::claude::stale_reason(Path::new(&agent.endpoint))
+        if agent.provider == Provider::Inbox
+            && !db
+                .inbox_enabled(&agent.name, &agent.session)
+                .unwrap_or(false)
         {
-            return Reply::error(503, "unavailable", reason);
+            return Reply::error(503, "unavailable", "Message input inbox is disabled");
         }
-        // The native admission checks and OpenCode durable lease/queue triggers in
-        // Db::send remain authoritative. No native conversation is started here.
+        // The native admission checks and OpenCode durable lease/queue guards in
+        // Db::insert_message remain authoritative. No native conversation starts here.
         let result = (|| -> Result<Value> {
             let tx = db.conn.unchecked_transaction()?;
-            let message = db.send(&request.id, "user", &owner.name, &request.text, &None)?;
+            let source = Agent {
+                name: "user".into(),
+                provider: Provider::Inbox,
+                session: "user".into(),
+                endpoint: String::new(),
+            };
+            let message = db.send(&request.id, &source, &agent, &request.text, &None)?;
             let receipt = json!({"accepted":true,"id":request.id,"message":self.message_value(db, &message)?,"state":db.delivery_state(&message)?,"duplicate":false});
             tx.execute("INSERT INTO board_message_receipts(id,submission,owner,receipt) VALUES(?1,?2,?3,?4)", rusqlite::params![request.id, serde_json::to_string(request)?, serde_json::to_string(owner)?, serde_json::to_string(&receipt)?])?;
             tx.commit()?;
@@ -1954,9 +2499,9 @@ impl Broker {
     ) -> Result<()> {
         let names = events
             .iter()
-            .filter_map(|event| match event {
-                crate::protocol::EventSelector::BoardChanged { board } => Some(board.clone()),
-                _ => None,
+            .map(|event| {
+                let crate::protocol::EventSelector::BoardChanged { board } = event;
+                board.clone()
             })
             .collect::<std::collections::BTreeSet<_>>();
         ensure!(
@@ -2065,140 +2610,6 @@ impl Broker {
         Ok(board)
     }
 
-    /// Retire missed Claude SessionEnd registrations only after two consecutive
-    /// sweeps fail. A successful probe or a fresh registration resets suspicion.
-    pub fn reap_claude_sessions(&self) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        let mut previous = self.claude_failures.lock().unwrap();
-        let mut failed = std::collections::HashMap::new();
-        let agents = db.listed_agents(false)?;
-        let mut live = std::collections::HashSet::new();
-        let mut stale = Vec::new();
-        for agent in agents
-            .into_iter()
-            .filter(|agent| agent.provider == Provider::Claude)
-        {
-            if crate::clients::claude::stale_reason(Path::new(&agent.endpoint)).is_none() {
-                live.insert(agent.session.clone());
-            } else {
-                stale.push(agent);
-            }
-        }
-        for agent in stale {
-            // An old alias socket cannot retire a native session that remains
-            // reachable through another exact registration of that identity.
-            if live.contains(&agent.session) {
-                continue;
-            }
-            let identity = (agent.session.clone(), agent.endpoint.clone());
-            if previous.get(&agent.name) == Some(&identity) {
-                db.close_native(&agent.name, &agent.session, &agent.endpoint)?;
-            } else {
-                failed.insert(agent.name, identity);
-            }
-        }
-        *previous = failed;
-        {
-            let mut state = self.board_notifications.lock().unwrap();
-            state.reconcile(
-                crate::board_notifications::available(&db)?,
-                "local registration changed",
-            );
-            state.prune(|name| db.agent(name).ok());
-        }
-        self.revoke_event_controls_locked(&db)?;
-        drop(db);
-        self.network_wake.notify_one();
-        Ok(())
-    }
-
-    async fn reap_claude_loop(&self) -> Result<()> {
-        let period = Duration::from_secs(60);
-        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            self.reap_claude_sessions()?;
-        }
-    }
-
-    pub fn claude_sessions(&self) -> Result<Vec<String>> {
-        Ok(self
-            .db
-            .lock()
-            .unwrap()
-            .agents()?
-            .into_iter()
-            .filter(|a| a.provider == Provider::Claude && a.enabled)
-            .map(|a| a.session)
-            .collect())
-    }
-
-    pub fn observe_claude_name(&self, session: &str, name: &str) -> Result<()> {
-        self.db.lock().unwrap().observe_claude_name(session, name)
-    }
-
-    pub fn observe_codex(&self, thread: &Value) -> Result<()> {
-        let session = thread["id"]
-            .as_str()
-            .context("Native thread is missing its ID")?;
-        let enabled = thread["status"]["type"] != "notLoaded";
-        let mut db = self.db.lock().unwrap();
-        db.observe_codex(session, thread["name"].as_str(), enabled)?;
-        if !enabled {
-            db.codex_offline(Some(session))?;
-        }
-        {
-            let mut state = self.board_notifications.lock().unwrap();
-            state.reconcile(
-                crate::board_notifications::available(&db)?,
-                "local registration changed",
-            );
-            state.prune(|name| db.agent(name).ok());
-        }
-        self.revoke_event_controls_locked(&db)?;
-        drop(db);
-        self.wake.notify_one();
-        self.network_wake.notify_one();
-        Ok(())
-    }
-
-    /// Reconcile the complete initial loaded scan without closing unchanged
-    /// sessions merely because the read-only observer connected after startup.
-    pub fn reconcile_codex_loaded(&self, loaded: &std::collections::HashSet<String>) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        for agent in db.listed_agents(false)? {
-            if agent.provider == Provider::Codex && !loaded.contains(&agent.session) {
-                db.codex_offline(Some(&agent.session))?;
-            }
-        }
-        {
-            let mut state = self.board_notifications.lock().unwrap();
-            state.reconcile(
-                crate::board_notifications::available(&db)?,
-                "Codex session absent from complete loaded scan",
-            );
-            state.prune(|name| db.agent(name).ok());
-        }
-        self.revoke_event_controls_locked(&db)?;
-        Ok(())
-    }
-
-    pub fn codex_offline(&self, session: Option<&str>) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        db.codex_offline(session)?;
-        {
-            let mut state = self.board_notifications.lock().unwrap();
-            state.reconcile(
-                crate::board_notifications::available(&db)?,
-                "local registration changed",
-            );
-            state.prune(|name| db.agent(name).ok());
-        }
-        self.revoke_event_controls_locked(&db)?;
-        Ok(())
-    }
-
     pub fn discovery_status(&self, status: Value) {
         *self.discovery_status.lock().unwrap() = status;
     }
@@ -2217,10 +2628,6 @@ impl Broker {
                     eprintln!("OpenCode reconciliation sweep failed: {error:#}");
                 }
                 let mut state = broker.board_notifications.lock().unwrap();
-                state.reconcile(
-                    crate::board_notifications::available(&db)?,
-                    "OpenCode lease expired",
-                );
                 state.prune(|name| db.agent(name).ok());
                 Ok(())
             })
@@ -2232,10 +2639,11 @@ impl Broker {
             while workers.len() < 16 {
                 let busy_codex = codex_workers.sessions();
                 let next = self.blocking(move |broker| -> Result<_> {
-                    let mut db = broker.db.lock().unwrap();
+                    let readiness = broker.native_readiness();
+                let mut db = broker.db.lock().unwrap();
                     broker.revoke_event_controls_locked(&db)?;
                     db.topic_push_revoke_obsolete()?;
-                    Ok(db.claim_excluding_codex(&busy_codex)?.map(|(msg, agent)| {
+                    Ok(db.claim_excluding_codex(&busy_codex, Some(&readiness))?.map(|(msg, agent)| {
                         let machines = json!({"source_machine":broker.message_machine(&db, &msg.sender)?,"destination_machine":broker.message_machine(&db, &msg.recipient)?,"sender_name":broker.message_sender_name(&db, &msg.sender)});
                         let dispatch = if agent.provider==Provider::OpenCode {
                             let content = crate::clients::Adapter::OpenCode.message_content(&msg,&broker.state_dir,&machines);
@@ -2299,15 +2707,13 @@ impl Broker {
                     if raw_codex_notice && outcome.state == "submitted" {
                         outcome.detail = "Native accepted typed control".into();
                     }
-                    if outcome.state == "failed"
-                        && let Some(token) = &event_token
-                    {
-                        this.board_notifications.lock().unwrap().lost(token, &agent);
-                    } else if outcome.state == "uncertain"
-                        && let Some(token) = &event_token
-                    {
-                        this.board_notifications.lock().unwrap().uncertain(token, &agent);
-                        eprintln!("Control {} has Unknown delivery after an ambiguous native attempt; lifecycle transitions require explicit snapshot recovery, without native resubmission: {}", msg.id, outcome.detail);
+                    if outcome.state == "failed" {
+                        eprintln!("Control {} failed: {}", msg.id, outcome.detail);
+                    } else if outcome.state == "uncertain" {
+                        eprintln!(
+                            "Control {} has Unknown delivery after an ambiguous native attempt; inspect the native conversation, without resubmission: {}",
+                            msg.id, outcome.detail
+                        );
                     }
                     let finish_id = msg.id.clone();
                     let result = this
@@ -2381,8 +2787,6 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     let broker = bound.broker.clone();
     let dispatcher = broker.dispatch();
     tokio::pin!(dispatcher);
-    let claude_reaper = broker.reap_claude_loop();
-    tokio::pin!(claude_reaper);
     let monitoring = crate::monitor::run(broker.clone());
     tokio::pin!(monitoring);
     let pairing_notifications = crate::pairing_notifications::run(broker.clone());
@@ -2393,7 +2797,11 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     tokio::pin!(board_cleanup);
     let networking = crate::network::worker::run(broker.clone());
     tokio::pin!(networking);
-    let observer = crate::clients::observe(bound.broker.clone(), codex_home);
+    let observer = crate::clients::observe(
+        bound.broker.codex_state.clone(),
+        codex_home,
+        bound.broker.discovery_status.clone(),
+    );
     tokio::pin!(observer);
     let update_checks = crate::update::run_checks(broker.state_dir.clone());
     tokio::pin!(update_checks);
@@ -2416,7 +2824,6 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
             },
             Some(_)=connections.join_next(),if !connections.is_empty()=>{},
             res=&mut dispatcher=>break res,
-            res=&mut claude_reaper=>break res,
             _=&mut monitoring=>unreachable!("Monitor worker runs until shutdown"),
             res=&mut pairing_notifications=>break res,
             res=&mut board_notifications=>break res,
@@ -2539,8 +2946,14 @@ mod request_scheduling_tests {
             let _ = wait.recv_timeout(Duration::from_secs(2));
         });
         barrier.wait();
-        let request =
-            tokio::spawn(async move { broker.request_async(Request::List { all: false }).await });
+        let request = tokio::spawn(async move {
+            broker
+                .request_async(Request::List {
+                    all: false,
+                    max_age_days: 7,
+                })
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(20)).await;
         request.abort();
         let _ = request.await;
@@ -2577,8 +2990,14 @@ mod request_scheduling_tests {
         });
         barrier.wait();
         let started = std::time::Instant::now();
-        let request =
-            tokio::spawn(async move { broker.request_async(Request::List { all: false }).await });
+        let request = tokio::spawn(async move {
+            broker
+                .request_async(Request::List {
+                    all: false,
+                    max_age_days: 7,
+                })
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(20)).await;
         let elapsed = started.elapsed();
         request.await.unwrap().unwrap();
@@ -2622,47 +3041,30 @@ mod machine_tests {
     use super::*;
 
     #[tokio::test]
-    async fn message_sender_labels_prefer_native_names_but_preserve_manual_aliases() {
+    async fn message_sender_labels_preserve_explicit_aliases_without_native_catalog() {
         let directory = tempfile::tempdir().unwrap();
         let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
         let broker = &bound.broker;
         let mut db = broker.db.lock().unwrap();
-        db.observe_codex(
-            "97e8d81e-073d-4cde-a017-4a8255b7b3b8",
-            Some("researcher"),
-            true,
-        )
-        .unwrap();
         db.register(
             &crate::protocol::Agent {
                 name: "reviewer".into(),
                 provider: Provider::Codex,
                 session: "97e8d81e-073d-4cde-a017-4a8255b7b3b8".into(),
                 endpoint: String::new(),
-                enabled: true,
             },
             false,
         )
         .unwrap();
         assert_eq!(
             broker.message_sender_name(&db, "codex-97e8d81e-073d-4cde-a017-4a8255b7b3b8"),
-            "researcher"
+            "codex-97e8d81e-073d-4cde-a017-4a8255b7b3b8"
         );
         assert_eq!(broker.message_sender_name(&db, "reviewer"), "reviewer");
         assert_eq!(broker.message_sender_name(&db, "missing"), "missing");
         assert_eq!(
             broker.message_sender_name(&db, "unknown-peer/reviewer"),
             "unknown-peer/reviewer"
-        );
-        db.observe_codex(
-            "97e8d81e-073d-4cde-a017-4a8255b7b3b8",
-            Some("renamed"),
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            broker.message_sender_name(&db, "codex-97e8d81e-073d-4cde-a017-4a8255b7b3b8"),
-            "renamed"
         );
     }
 
@@ -2750,11 +3152,10 @@ mod opencode_admission_tests {
         let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
         let broker = &bound.broker;
         let agent = Agent {
-            name: "opencode-owner-test".into(),
+            name: "opencode-ses_0123456789abcdefghijklmnop".into(),
             provider: Provider::OpenCode,
             session: "ses_0123456789abcdefghijklmnop".into(),
             endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-            enabled: true,
         };
         // A verified-live registration fixture isolates the capability selector;
         // native endpoint/probe checks have separate real-socket coverage.
@@ -2814,11 +3215,10 @@ mod opencode_admission_tests {
                 .unwrap()
                 .to_owned();
             let agent = Agent {
-                name: "native".into(),
+                name: "opencode-ses_0123456789abcdefghijklmnop".into(),
                 provider: Provider::OpenCode,
                 session: "ses_0123456789abcdefghijklmnop".into(),
                 endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-                enabled: true,
             };
             let (message, dispatch) = {
                 let mut db = broker.db.lock().unwrap();
@@ -2845,7 +3245,7 @@ mod opencode_admission_tests {
                     parent: None,
                     hops: 0,
                 };
-                db.accept_remote(&local, &origin, &envelope).unwrap();
+                db.accept_remote_names(&local, &origin, &envelope).unwrap();
                 let (msg, target) = db.claim().unwrap().unwrap();
                 let frame = db
                     .opencode_dispatch(&msg, &target, "durable peer content")
@@ -2920,7 +3320,6 @@ mod codex_worker_tests {
             provider: Provider::Codex,
             session: "123e4567-e89b-12d3-a456-426614174000".into(),
             endpoint: String::new(),
-            enabled: true,
         };
         let mut alias = one.clone();
         alias.name = "alias".into();
@@ -2931,7 +3330,7 @@ mod codex_worker_tests {
             db.register(agent, false).unwrap();
         }
         let send = |db: &Db, agent: &Agent| {
-            db.send(
+            db.send_names(
                 &uuid::Uuid::new_v4().to_string(),
                 "user",
                 &agent.name,
@@ -2953,13 +3352,13 @@ mod codex_worker_tests {
         db.finish(&first.id, "submitted", "native accepted")
             .unwrap();
         assert!(
-            db.claim_excluding_codex(&busy.sessions())
+            db.claim_excluding_codex(&busy.sessions(), None)
                 .unwrap()
                 .is_none()
         );
         let unrelated = send(&db, &other);
         assert_eq!(
-            db.claim_excluding_codex(&busy.sessions())
+            db.claim_excluding_codex(&busy.sessions(), None)
                 .unwrap()
                 .unwrap()
                 .0
@@ -2972,7 +3371,7 @@ mod codex_worker_tests {
         busy.completed(&result);
         result.unwrap();
         assert_eq!(
-            db.claim_excluding_codex(&busy.sessions())
+            db.claim_excluding_codex(&busy.sessions(), None)
                 .unwrap()
                 .unwrap()
                 .0
@@ -2991,7 +3390,7 @@ mod codex_worker_tests {
             });
             busy.track(worker.id(), &one);
             assert!(
-                db.claim_excluding_codex(&busy.sessions())
+                db.claim_excluding_codex(&busy.sessions(), None)
                     .unwrap()
                     .is_none()
             );
@@ -3003,7 +3402,7 @@ mod codex_worker_tests {
             busy.completed(&result);
             assert!(busy.sessions().is_empty());
             assert_eq!(
-                db.claim_excluding_codex(&busy.sessions())
+                db.claim_excluding_codex(&busy.sessions(), None)
                     .unwrap()
                     .unwrap()
                     .0
@@ -3013,111 +3412,6 @@ mod codex_worker_tests {
             db.finish(&queued.id, "failed", "test worker cleanup")
                 .unwrap();
         }
-    }
-}
-
-#[cfg(test)]
-mod board_timestamp_integration_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn timestamp_persistence_error_still_prunes_lifecycle_subscriptions() {
-        let root = tempfile::tempdir().unwrap();
-        let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
-        let broker = &bound.broker;
-        let agent = crate::protocol::Agent {
-            name: "timestamp-watcher".into(),
-            provider: Provider::Codex,
-            session: uuid::Uuid::new_v4().to_string(),
-            endpoint: String::new(),
-            enabled: true,
-        };
-        broker
-            .request(Request::Register {
-                agent: agent.clone(),
-                replace: false,
-            })
-            .unwrap();
-        broker
-            .request(Request::Subscribe {
-                board_revisions: Default::default(),
-                agent: agent.name.clone(),
-                events: vec![
-                    crate::protocol::EventSelector::AgentOpened {},
-                    crate::protocol::EventSelector::BoardChanged {
-                        board: Default::default(),
-                    },
-                ],
-            })
-            .unwrap();
-        let before = broker.request(Request::BoardRead).unwrap();
-        assert_eq!(
-            broker
-                .board_notifications
-                .lock()
-                .unwrap()
-                .events(&agent.name)
-                .len(),
-            2
-        );
-        // SQLite FAIL retains earlier trigger statements, modeling a failed
-        // metadata write that changes registration availability before returning.
-        broker
-            .db
-            .lock()
-            .unwrap()
-            .conn
-            .execute_batch(
-                "CREATE TEMP TRIGGER fail_board_timestamp BEFORE INSERT ON settings
-             WHEN NEW.key='board_timestamps' BEGIN
-               UPDATE agents SET enabled=0 WHERE name='timestamp-watcher';
-               SELECT RAISE(FAIL, 'timestamp persistence fixture failure');
-             END;",
-            )
-            .unwrap();
-        let error = broker
-            .request(Request::board_update(
-                Default::default(),
-                before["revision"].as_str().unwrap().into(),
-                vec![crate::board::Edit::Set {
-                    markdown: "applied before metadata failure".into(),
-                }],
-                None,
-            ))
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("timestamp persistence fixture failure"));
-        assert!(
-            !broker
-                .db
-                .lock()
-                .unwrap()
-                .agent(&agent.name)
-                .unwrap()
-                .enabled
-        );
-        assert!(
-            broker
-                .board_notifications
-                .lock()
-                .unwrap()
-                .events(&agent.name)
-                .is_empty()
-        );
-        // This is the documented post-rename ambiguity, not an unapplied write.
-        assert_eq!(
-            crate::board::read(&broker.state_dir).unwrap().markdown,
-            "applied before metadata failure"
-        );
-        broker
-            .db
-            .lock()
-            .unwrap()
-            .conn
-            .execute_batch("DROP TRIGGER fail_board_timestamp")
-            .unwrap();
-        let after = broker.request(Request::BoardRead).unwrap();
-        assert_ne!(after["revision"], before["revision"]);
-        assert!(after["last_updated"].is_i64());
     }
 }
 

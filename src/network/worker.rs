@@ -171,48 +171,86 @@ fn live_direct_routes(
     routes
 }
 
-fn respond(broker: &Broker, local_peer: &str, incoming: Incoming) {
+async fn respond(broker: &Broker, local_peer: &str, incoming: Incoming) {
     let peer = incoming.peer.to_string();
-    let response = (|| -> Result<WireResponse> {
+    let response: Result<WireResponse> = async {
         ensure!(
             incoming.request.version == VERSION,
             "Unsupported protocol version"
         );
-        let db = broker.db.lock().unwrap();
-        if !db.network_config()?.enabled {
-            return Ok(WireResponse::Rejected {
-                reason: "Networking is disabled".into(),
-                retryable: true,
-            });
-        }
-        ensure!(!db.peer(&peer)?.revoked, "Peer is revoked");
-        Ok(match incoming.request.operation {
-            Operation::Hello { machine_name } => {
-                db.remember_peer_name(&peer, &machine_name)?;
-                WireResponse::Hello {
-                    machine_name: db.machine_name()?,
-                }
+        {
+            let db = broker.db.lock().unwrap();
+            if !db.network_config()?.enabled {
+                return Ok(WireResponse::Rejected {
+                    reason: "Networking is disabled".into(),
+                    retryable: true,
+                });
             }
-            Operation::Directory => WireResponse::Directory {
-                agents: db.export_agents(&peer)?,
-            },
+            ensure!(!db.peer(&peer)?.revoked, "Peer is revoked");
+        }
+        match incoming.request.operation {
+            Operation::Hello { machine_name } => {
+                let db = broker.db.lock().unwrap();
+                db.remember_peer_name(&peer, &machine_name)?;
+                Ok(WireResponse::Hello {
+                    machine_name: db.machine_name()?,
+                })
+            }
+            Operation::Directory => {
+                let directory_broker = broker.clone();
+                let directory =
+                    tokio::task::spawn_blocking(move || directory_broker.prepare_directory())
+                        .await??;
+                let db = broker.db.lock().unwrap();
+                Ok(WireResponse::Directory {
+                    agents: db.export_agents(&peer, &directory)?,
+                })
+            }
             Operation::DirectorySupported { providers } => {
                 validate_providers(&providers)?;
-                WireResponse::SupportedDirectory {
+                let directory_broker = broker.clone();
+                let directory =
+                    tokio::task::spawn_blocking(move || directory_broker.prepare_directory())
+                        .await??;
+                let db = broker.db.lock().unwrap();
+                let agents = db.export_agents_supported(&peer, &providers, &directory)?;
+                Ok(WireResponse::SupportedDirectory {
                     providers: supported_providers(),
-                    agents: db.export_agents_supported(&peer, &providers)?,
-                }
+                    agents,
+                })
             }
             Operation::Send { envelope } => {
-                db.accept_remote(local_peer, &peer, &envelope)?;
+                let duplicate = {
+                    let db = broker.db.lock().unwrap();
+                    db.inbound_duplicate(&peer, &envelope)?
+                };
+                if duplicate {
+                    broker.wake.notify_one();
+                    return Ok(WireResponse::Accepted { id: envelope.id });
+                }
+                // Envelope identity and Receive grants are checked in the final
+                // locked acceptance. Native presence is verified when the
+                // durable work is claimed, not by fabricating a catalog here.
+                let destination = {
+                    let db = broker.db.lock().unwrap();
+                    db.agent(&envelope.destination.name)?
+                };
+                {
+                    let db = broker.db.lock().unwrap();
+                    db.accept_remote(local_peer, &peer, &envelope, &destination)?;
+                }
                 broker.wake.notify_one();
-                WireResponse::Accepted { id: envelope.id }
+                Ok(WireResponse::Accepted { id: envelope.id })
             }
-            Operation::Sync { after } => WireResponse::Status {
-                events: db.sync_events(&peer, after)?,
-            },
-        })
-    })();
+            Operation::Sync { after } => {
+                let db = broker.db.lock().unwrap();
+                Ok(WireResponse::Status {
+                    events: db.sync_events(&peer, after)?,
+                })
+            }
+        }
+    }
+    .await;
     let response = response.unwrap_or_else(|error| WireResponse::Rejected {
         retryable: super::store::retryable(&error),
         reason: error.to_string(),
@@ -235,7 +273,7 @@ fn apply(broker: &Broker, done: Completed) -> Result<()> {
                     .all(|agent| agent.provider != crate::protocol::Provider::OpenCode),
                 "Legacy directory contains an unsupported provider"
             );
-            db.replace_remote_agents(&done.peer, &agents)
+            Ok(())
         }
         (Kind::DirectorySupported(_), WireResponse::SupportedDirectory { providers, agents }) => {
             validate_providers(&providers)?;
@@ -245,7 +283,7 @@ fn apply(broker: &Broker, done: Completed) -> Result<()> {
                     .all(|agent| providers.iter().any(|p| p == agent.provider.label())),
                 "Directory contains an unadvertised provider"
             );
-            db.replace_remote_agents(&done.peer, &agents)
+            Ok(())
         }
         (Kind::Sync, WireResponse::Status { events }) => db.apply_events(&done.peer, &events),
         (Kind::Send(id), response) => {
@@ -643,6 +681,17 @@ pub async fn run(broker: Broker) {
                         )));
                     }
                     if schedule.fallback {
+                        // A startup trust race or one transient probe failure must
+                        // not pin a capable peer to the legacy directory forever.
+                        if now >= schedule.probe {
+                            schedule.probe = now + Duration::from_secs(5);
+                            return Ok(Some((
+                                Kind::DirectorySupported(None),
+                                Operation::DirectorySupported {
+                                    providers: supported_providers(),
+                                },
+                            )));
+                        }
                         return Ok(Some((Kind::Directory, Operation::Directory)));
                     }
                     if now >= schedule.probe {
@@ -715,7 +764,7 @@ pub async fn run(broker: Broker) {
                     None => std::future::pending().await,
                 }
             } => match incoming {
-                NetworkIncoming::Message(incoming) => respond(&broker, &local_peer, incoming),
+                NetworkIncoming::Message(incoming) => respond(&broker, &local_peer, incoming).await,
                 NetworkIncoming::Pairing(incoming) => {
                     let result = (|| -> Result<serde_json::Value> {
                         let db = broker.db.lock().unwrap();
@@ -865,19 +914,18 @@ mod tests {
         db.pair_peer(&peer, &peer, None).unwrap();
         db.grant_peer(&peer, "user", Permission::Send, true)
             .unwrap();
-        let native = RemoteAgent {
-            name: "native".into(),
-            provider: Provider::OpenCode,
-            session: "ses_0123456789abcdefghijklmnop".into(),
-        };
-        let inbox = RemoteAgent {
-            name: "user".into(),
-            provider: Provider::Inbox,
-            session: "user".into(),
-        };
-        db.replace_remote_agents(&peer, &[native, inbox]).unwrap();
+        db.register(
+            &crate::protocol::Agent {
+                name: "native".into(),
+                provider: Provider::OpenCode,
+                session: "ses_0123456789abcdefghijklmnop".into(),
+                endpoint: String::new(),
+            },
+            false,
+        )
+        .unwrap();
         let native_id = uuid::Uuid::new_v4().to_string();
-        db.send_remote(
+        db.send_remote_names(
             &local,
             &native_id,
             "user",
@@ -887,7 +935,7 @@ mod tests {
         )
         .unwrap();
         let inbox_id = uuid::Uuid::new_v4().to_string();
-        db.send_remote(
+        db.send_remote_names(
             &local,
             &inbox_id,
             "user",
@@ -1076,7 +1124,8 @@ mod tests {
                 request,
                 response,
             },
-        );
+        )
+        .await;
         assert!(matches!(
             received.await.unwrap(),
             WireResponse::Rejected {

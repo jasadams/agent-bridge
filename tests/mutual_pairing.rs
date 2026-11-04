@@ -346,7 +346,7 @@ fn schema_five_upgrade_preserves_identity_policy_and_installs_empty_pairing_stat
     conn.execute_batch(include_str!("fixtures/native-metadata-v10.sql"))
         .unwrap();
     conn.execute_batch(
-        "DROP TRIGGER inbound_usage_insert; DROP TRIGGER inbound_usage_delete; DROP TABLE inbound_usage; DROP TRIGGER message_context_insert; DROP TABLE message_context; DROP INDEX messages_monitor_order; DROP TABLE relay_nodes; DROP TABLE pairing_offers; DROP TABLE pairing_joined; PRAGMA user_version=5;",
+        "DROP TRIGGER IF EXISTS inbound_usage_insert; DROP TRIGGER IF EXISTS inbound_usage_delete; DROP TABLE inbound_usage; DROP TRIGGER IF EXISTS message_context_insert; DROP TABLE message_context; DROP INDEX messages_monitor_order; DROP TABLE relay_nodes; DROP TABLE pairing_offers; DROP TABLE pairing_joined; PRAGMA user_version=5;",
     )
     .unwrap();
     drop(conn);

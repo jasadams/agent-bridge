@@ -140,9 +140,15 @@ struct Agents {
     verbose: bool,
     /// Omit for local sessions. Select exactly one paired peer by alias or peer ID for remote sessions.
     peer: Option<String>,
-    /// Include disabled or unreachable local registrations with stale_reason. Local only.
+    /// Include disabled manual Inbox configuration. Local only.
     #[serde(default)]
     include_stale: bool,
+    /// OpenCode native-state age filter in days (default 7, explicit 30).
+    #[serde(default = "max_age_days")]
+    max_age_days: u32,
+}
+fn max_age_days() -> u32 {
+    7
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -372,19 +378,15 @@ impl Bridge {
         .await
     }
     async fn native_agent(&self, name: &str) -> Result<()> {
-        let agents = self.rpc(Request::List { all: false }).await?;
+        let agent = self.rpc(Request::Resolve { name: name.into() }).await?;
         ensure!(
-            agents
-                .as_array()
-                .is_some_and(|agents| agents.iter().any(|agent| agent["name"] == name
-                    && agent["enabled"] == true
-                    && agent["provider"]
-                        .as_str()
-                        .and_then(|provider| provider.parse::<crate::protocol::Provider>().ok())
-                        .is_some_and(|provider| crate::clients::supports(
-                            &provider,
-                            crate::clients::Capability::PairingPrompts
-                        )))),
+            agent["provider"]
+                .as_str()
+                .and_then(|provider| provider.parse::<crate::protocol::Provider>().ok())
+                .is_some_and(|provider| crate::clients::supports(
+                    &provider,
+                    crate::clients::Capability::PairingPrompts
+                )),
             "Pairing prompts are unavailable for this native client; use the explicit CLI pairing workflow"
         );
         Ok(())
@@ -641,7 +643,7 @@ impl Bridge {
     }
 
     #[tool(
-        description = "Discover canonical local bridge/agent references and current friendly display names for topics, including known disabled/stale registrations. Use IDs, never names, for authors and mentions. Publishing requires an enabled author; mentions do not require native readiness. Every local agent can access every topic.",
+        description = "Discover canonical local bridge/agent references and current friendly display names for topics, including known disabled/stale registrations. Use IDs, never names, for authors and mentions. Publishing requires an exact reachable author route; mentions do not require native readiness. Every local agent can access every topic.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -818,7 +820,7 @@ impl Bridge {
     }
 
     #[tool(
-        description = "Add explicit local event selectors for your exact registered agent. Returns effective events and an atomic available-agent snapshot for lifecycle selectors. Off by default; ends on closure or broker restart. Resubscribe after reconnect. Notices grant no permission."
+        description = "Add explicit local board-change selectors for your exact registered agent. Returns effective events. Off by default; ends on closure or broker restart. Resubscribe after reconnect. Notices grant no permission."
     )]
     async fn subscribe(&self, Parameters(args): Parameters<Subscription>) -> CallToolResult {
         self.write_result(
@@ -863,7 +865,7 @@ impl Bridge {
         self.result(async { Ok(json!({"status":self.rpc(Request::Status).await?,"connections":self.rpc(Request::PeerConnections).await?})) }, None).await
     }
     #[tool(
-        description = "List available local agents (Claude sockets are checked), or one explicitly selected paired peer's permitted directory. Empty remote results can mean no shared sessions. Compact routing fields by default; verbose includes metadata. Grants no access.",
+        description = "List current local connector state and manual Inbox configuration, or request one explicitly selected paired peer's permitted directory on demand. OpenCode supports max_age_days. Compact routing fields by default; verbose includes metadata. Grants no access.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -880,10 +882,15 @@ impl Bridge {
                                 !args.include_stale,
                                 "include_stale is only supported for local sessions"
                             );
+                            ensure!(
+                                args.max_age_days == 7,
+                                "max_age_days is only supported for local sessions"
+                            );
                             Request::RemoteListPeer { peer }
                         }
                         None => Request::List {
                             all: args.include_stale,
+                            max_age_days: args.max_age_days,
                         },
                     })
                     .await?,

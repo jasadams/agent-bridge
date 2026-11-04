@@ -62,11 +62,12 @@ fn fixture() -> Fixture {
         provider: Provider::Inbox,
         session: uuid::Uuid::new_v4().to_string(),
         endpoint: String::new(),
-        enabled: true,
     };
     broker
         .request(Request::Register {
-            agent: owner.clone(),
+            name: owner.name.clone(),
+            provider: owner.provider.clone(),
+            session: owner.session.clone(),
             replace: false,
         })
         .unwrap();
@@ -356,11 +357,12 @@ async fn old_subscription_fences_cannot_attach_to_or_remove_watches_for_a_recrea
         provider: Provider::Codex,
         session: uuid::Uuid::new_v4().to_string(),
         endpoint: String::new(),
-        enabled: true,
     };
     broker
         .request(Request::Register {
-            agent: watcher.clone(),
+            name: watcher.name.clone(),
+            provider: watcher.provider.clone(),
+            session: watcher.session.clone(),
             replace: false,
         })
         .unwrap();

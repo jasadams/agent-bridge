@@ -574,7 +574,6 @@ mod tests {
                 provider: crate::protocol::Provider::Codex,
                 session: "123e4567-e89b-12d3-a456-426614174000".into(),
                 endpoint: String::new(),
-                enabled: true,
             };
             let topic =
                 super::super::topic_race_fixture::Fixture::new(&root.path().join("state"), agent);

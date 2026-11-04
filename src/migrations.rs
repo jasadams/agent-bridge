@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -313,6 +313,49 @@ CREATE TRIGGER topic_push_failed_gap AFTER UPDATE OF state ON messages WHEN OLD.
 END;",
         )?;
         tx.pragma_update(None, "user_version", 19)?;
+    }
+    if version < 20 {
+        // One connector-state boundary replaces the stored native catalog.
+        // Route aliases are explicit stable configuration; canonical provider
+        // IDs remain parseable without a row. Claude bindings are delivery
+        // coordinates only, not membership or liveness.
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS message_context_insert;
+DROP TRIGGER IF EXISTS opencode_enqueue_bound;
+DROP TRIGGER IF EXISTS opencode_enqueue_binding;
+DROP TABLE IF EXISTS route_aliases;
+DROP TABLE IF EXISTS claude_bindings;
+CREATE TABLE route_aliases(
+ name TEXT PRIMARY KEY,
+ provider TEXT NOT NULL CHECK(provider IN ('claude','codex','opencode')),
+ session TEXT NOT NULL
+);
+INSERT INTO route_aliases(name,provider,session)
+ SELECT name,provider,session FROM agents
+ WHERE provider IN ('claude','codex','opencode') AND name<>provider||'-'||session;
+CREATE TABLE claude_bindings(session TEXT PRIMARY KEY, endpoint TEXT NOT NULL);
+INSERT INTO claude_bindings(session,endpoint)
+ SELECT a.session,a.endpoint FROM agents a
+ WHERE a.provider='claude' AND a.endpoint<>'' AND a.name=(
+  SELECT b.name FROM agents b
+  WHERE b.provider='claude' AND b.session=a.session AND b.endpoint<>''
+  ORDER BY (b.name='claude-'||b.session) DESC,b.name LIMIT 1
+ );
+DROP TABLE IF EXISTS agents_v20;
+CREATE TABLE agents_v20(
+ name TEXT PRIMARY KEY,
+ provider TEXT NOT NULL CHECK(provider='inbox'),
+ session TEXT NOT NULL,
+ endpoint TEXT NOT NULL CHECK(endpoint=''),
+ enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+);
+INSERT INTO agents_v20 SELECT name,provider,session,endpoint,enabled FROM agents WHERE provider='inbox';
+DROP TABLE agents;
+ALTER TABLE agents_v20 RENAME TO agents;
+DROP TABLE IF EXISTS session_metadata;
+DROP TABLE IF EXISTS remote_agents;",
+        )?;
+        tx.pragma_update(None, "user_version", 20)?;
     }
     tx.commit()?;
     Ok(())

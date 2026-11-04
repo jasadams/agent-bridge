@@ -12,7 +12,6 @@ fn agent(name: &str) -> Agent {
         provider: Provider::Inbox,
         session: id(),
         endpoint: String::new(),
-        enabled: true,
     }
 }
 
@@ -23,12 +22,18 @@ fn duplicate_send_is_idempotent_but_conflicting_reuse_is_rejected() {
     let mut db = Db::open(&dbpath).unwrap();
     db.register(&agent("worker"), false).unwrap();
     let mid = id();
-    db.send(&mid, "user", "worker", "first", &None).unwrap();
+    db.send_names(&mid, "user", "worker", "first", &None)
+        .unwrap();
     assert_eq!(
-        db.send(&mid, "user", "worker", "first", &None).unwrap().id,
+        db.send_names(&mid, "user", "worker", "first", &None)
+            .unwrap()
+            .id,
         mid
     );
-    assert!(db.send(&mid, "user", "worker", "different", &None).is_err());
+    assert!(
+        db.send_names(&mid, "user", "worker", "different", &None)
+            .is_err()
+    );
     assert_eq!(db.history(&None, 50).unwrap().len(), 1);
 }
 
@@ -40,8 +45,10 @@ fn crash_preserves_queued_and_quarantines_in_flight() {
     db.register(&agent("worker"), false).unwrap();
     let first = id();
     let second = id();
-    db.send(&first, "user", "worker", "first", &None).unwrap();
-    db.send(&second, "user", "worker", "second", &None).unwrap();
+    db.send_names(&first, "user", "worker", "first", &None)
+        .unwrap();
+    db.send_names(&second, "user", "worker", "second", &None)
+        .unwrap();
     assert_eq!(db.claim().unwrap().unwrap().0.id, first);
     drop(db);
     let db = Db::open(&path).unwrap();
@@ -58,7 +65,7 @@ fn recipient_replacement_never_redirects_pending_work() {
     let old = agent("worker");
     db.register(&old, false).unwrap();
     let mid = id();
-    db.send(&mid, "user", "worker", "for old session", &None)
+    db.send_names(&mid, "user", "worker", "for old session", &None)
         .unwrap();
     let new = agent("worker");
     assert!(db.register(&new, false).is_err());
@@ -67,8 +74,8 @@ fn recipient_replacement_never_redirects_pending_work() {
     assert!(db.retry(&mid, false).is_err());
     assert!(db.claim().unwrap().is_none());
     // A delayed SessionEnd from the previous session cannot unregister its replacement.
-    db.unregister("worker", &old.session).unwrap();
-    assert!(db.agent("worker").unwrap().enabled);
+    assert!(db.unregister("worker", &old.session).is_err());
+    assert_eq!(db.agent("worker").unwrap().session, new.session);
 }
 
 #[test]
@@ -80,9 +87,9 @@ fn one_in_flight_per_recipient_preserves_fifo_without_blocking_other_agents() {
     let a1 = id();
     let a2 = id();
     let b1 = id();
-    db.send(&a1, "user", "a", "a1", &None).unwrap();
-    db.send(&a2, "user", "a", "a2", &None).unwrap();
-    db.send(&b1, "user", "b", "b1", &None).unwrap();
+    db.send_names(&a1, "user", "a", "a1", &None).unwrap();
+    db.send_names(&a2, "user", "a", "a2", &None).unwrap();
+    db.send_names(&b1, "user", "b", "b1", &None).unwrap();
     assert_eq!(db.claim().unwrap().unwrap().0.id, a1);
     assert_eq!(db.claim().unwrap().unwrap().0.id, b1);
     assert!(db.claim().unwrap().is_none());
@@ -96,7 +103,8 @@ fn native_completion_prevents_normal_retries_but_allows_explicit_duplicate_overr
     let mut db = Db::open(&temp.path().join("db")).unwrap();
     db.register(&agent("worker"), false).unwrap();
     let mid = id();
-    db.send(&mid, "user", "worker", "message", &None).unwrap();
+    db.send_names(&mid, "user", "worker", "message", &None)
+        .unwrap();
     db.claim().unwrap();
     db.finish(&mid, "submitted", "transport finished later")
         .unwrap();
@@ -113,7 +121,8 @@ fn pause_and_offline_registration_hold_work_until_resume() {
     let mut db = Db::open(&temp.path().join("db")).unwrap();
     let worker = agent("worker");
     db.register(&worker, false).unwrap();
-    db.send(&id(), "user", "worker", "wait", &None).unwrap();
+    db.send_names(&id(), "user", "worker", "wait", &None)
+        .unwrap();
     db.pause(true).unwrap();
     assert!(db.claim().unwrap().is_none());
     db.pause(false).unwrap();
@@ -130,16 +139,16 @@ fn replies_are_correlated_and_bounded() {
     db.register(&agent("a"), false).unwrap();
     db.register(&agent("b"), false).unwrap();
     let mut parent = id();
-    db.send(&parent, "a", "b", "start", &None).unwrap();
+    db.send_names(&parent, "a", "b", "start", &None).unwrap();
     assert!(
-        db.send(&id(), "a", "b", "forged parent", &Some(parent.clone()))
+        db.send_names(&id(), "a", "b", "forged parent", &Some(parent.clone()))
             .is_err()
     );
     let (mut sender, mut recipient) = ("b", "a");
     for hop in 1..=100 {
         let next = id();
         assert_eq!(
-            db.send(&next, sender, recipient, "reply", &Some(parent))
+            db.send_names(&next, sender, recipient, "reply", &Some(parent))
                 .unwrap()
                 .hops,
             hop
@@ -148,7 +157,7 @@ fn replies_are_correlated_and_bounded() {
         std::mem::swap(&mut sender, &mut recipient);
     }
     let error = db
-        .send(&id(), sender, recipient, "too far", &Some(parent))
+        .send_names(&id(), sender, recipient, "too far", &Some(parent))
         .unwrap_err();
     assert!(error.to_string().contains("100-hop limit"));
 }
@@ -159,7 +168,8 @@ fn submitted_requires_explicit_duplicate_override_and_queued_can_cancel() {
     let mut db = Db::open(&temp.path().join("db")).unwrap();
     db.register(&agent("worker"), false).unwrap();
     let mid = id();
-    db.send(&mid, "user", "worker", "message", &None).unwrap();
+    db.send_names(&mid, "user", "worker", "message", &None)
+        .unwrap();
     db.claim().unwrap();
     db.finish(&mid, "submitted", "sent").unwrap();
     assert!(db.retry(&mid, false).is_err());

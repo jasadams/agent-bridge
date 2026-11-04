@@ -54,13 +54,12 @@ fn historical_acknowledged_messages_remain_terminal_without_an_ack_api() {
             provider: Provider::Inbox,
             session: "worker-session".into(),
             endpoint: String::new(),
-            enabled: true,
         },
         false,
     )
     .unwrap();
     let id = uuid::Uuid::new_v4().to_string();
-    db.send(&id, "user", "worker", "historical receipt", &None)
+    db.send_names(&id, "user", "worker", "historical receipt", &None)
         .unwrap();
     // Only historical compatibility fixtures may create the retired disk state.
     rusqlite::Connection::open(&path)

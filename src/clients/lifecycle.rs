@@ -1,6 +1,6 @@
 use crate::{
     broker::rpc,
-    protocol::{Agent, Provider, Request},
+    protocol::{Provider, Request},
     service,
 };
 use anyhow::{Context, Result, ensure};
@@ -20,12 +20,12 @@ pub async fn run(state: &Path, provider: Provider) -> Result<()> {
 }
 
 async fn run_inner(state: &Path, provider: Provider) -> Result<()> {
+    ensure!(
+        matches!(provider, Provider::Claude | Provider::Codex),
+        "Client does not support native hooks"
+    );
     let adapter =
         super::Adapter::for_provider(&provider).context("Inbox is not a native hook provider")?;
-    ensure!(
-        adapter.supports(super::Capability::LifecycleRegistration),
-        "Client does not support lifecycle registration"
-    );
     let mut input = String::new();
     std::io::stdin()
         .take(1024 * 1024)
@@ -38,32 +38,31 @@ async fn run_inner(state: &Path, provider: Provider) -> Result<()> {
     let event = data["hook_event_name"].as_str().unwrap_or("SessionStart");
     let endpoint = adapter.hook_endpoint()?;
     if event == "SessionEnd" {
+        // Only Claude has a delivery binding to retire. Codex membership is
+        // observed from native state and never stored here.
+        if provider == Provider::Claude {
+            rpc(
+                state,
+                &Request::ClaudeUnbind {
+                    session: session.into(),
+                    endpoint,
+                },
+            )
+            .await?;
+        }
+        println!("{{}}");
+        return Ok(());
+    }
+    if provider == Provider::Claude {
         rpc(
             state,
-            &Request::SessionClose {
-                name,
+            &Request::ClaudeBind {
                 session: session.into(),
                 endpoint,
             },
         )
         .await?;
-        println!("{{}}");
-        return Ok(());
     }
-    rpc(
-        state,
-        &Request::Register {
-            agent: Agent {
-                name: name.clone(),
-                provider: provider.clone(),
-                session: session.into(),
-                endpoint,
-                enabled: true,
-            },
-            replace: false,
-        },
-    )
-    .await?;
     let machine_context = rpc(state, &Request::MachineShow)
         .await
         .ok()
@@ -82,8 +81,8 @@ async fn run_inner(state: &Path, provider: Provider) -> Result<()> {
 /// metadata. Client support is checked before any native context is generated.
 pub fn registration_context(provider: &Provider, name: &str, state: &Path) -> Result<String> {
     ensure!(
-        super::supports(provider, super::Capability::LifecycleRegistration),
-        "Client does not support lifecycle registration"
+        super::Adapter::for_provider(provider).is_some(),
+        "Client does not support native session context"
     );
     let exe = service::shell_quote(&service::installed_binary()?.to_string_lossy());
     let state_arg = service::shell_quote(&state.to_string_lossy());

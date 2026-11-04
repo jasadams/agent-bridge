@@ -21,6 +21,23 @@ impl Running {
         }
     }
     fn request(&self, req: Request) -> Value {
+        if matches!(&req, Request::RemoteList | Request::RemoteListPeer { .. }) {
+            let broker = self.broker.clone();
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(broker.request_async(req))
+                    })
+                    .join()
+                    .ok()
+                    .and_then(std::result::Result::ok)
+            })
+            .unwrap_or_else(|| serde_json::json!([]));
+        }
         self.broker.request(req).unwrap()
     }
     fn peers(&self) -> Value {

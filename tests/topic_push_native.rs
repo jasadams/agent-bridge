@@ -2,7 +2,7 @@
 //! This is a fixture socket, not qualification of an installed native client.
 use agent_bridge::{
     broker::{self, Broker},
-    protocol::{Agent, Provider, Request},
+    protocol::{Provider, Request},
     topics::{AgentRef, TopicRef},
 };
 use std::{os::unix::fs::PermissionsExt, time::Duration};
@@ -34,27 +34,26 @@ async fn opt_in_topic_push_uses_guarded_native_adapter_and_untrusted_context() {
     let broker = bound.broker.clone();
     broker
         .request(Request::Register {
-            agent: Agent {
-                name: "topic".into(),
-                provider: Provider::Inbox,
-                session: "unrelated".into(),
-                endpoint: String::new(),
-                enabled: true,
-            },
+            name: "topic".into(),
+            provider: Provider::Inbox,
+            session: "unrelated".into(),
+
             replace: false,
         })
         .unwrap();
     let session = uuid::Uuid::new_v4().to_string();
     broker
         .request(Request::Register {
-            agent: Agent {
-                name: "receiver".into(),
-                provider: Provider::Claude,
-                session: session.clone(),
-                endpoint: socket.to_string_lossy().into_owned(),
-                enabled: true,
-            },
+            name: "receiver".into(),
+            provider: Provider::Claude,
+            session: session.clone(),
             replace: false,
+        })
+        .unwrap();
+    broker
+        .request(Request::ClaudeBind {
+            session: session.clone(),
+            endpoint: socket.to_string_lossy().into_owned(),
         })
         .unwrap();
     let server = tokio::spawn(broker::serve(bound));
@@ -151,14 +150,16 @@ async fn stale_enabled_socket_failure_records_one_durable_gap() {
     let session = uuid::Uuid::new_v4().to_string();
     broker
         .request(Request::Register {
-            agent: Agent {
-                name: "stale".into(),
-                provider: Provider::Claude,
-                session: session.clone(),
-                endpoint: socket.to_string_lossy().into_owned(),
-                enabled: true,
-            },
+            name: "stale".into(),
+            provider: Provider::Claude,
+            session: session.clone(),
             replace: false,
+        })
+        .unwrap();
+    broker
+        .request(Request::ClaudeBind {
+            session: session.clone(),
+            endpoint: socket.to_string_lossy().into_owned(),
         })
         .unwrap();
     drop(listener); // Registration stays enabled; the socket now refuses connections.

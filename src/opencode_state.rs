@@ -51,14 +51,7 @@ impl Db {
             None => json!({"status":"unavailable","message_id":id,"session":row.session}),
         }))
     }
-    pub(crate) fn opencode_alias_admission(&self, agent: &Agent) -> Result<()> {
-        let valid: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_leases WHERE session=?1 AND endpoint=?2 AND expires>?3)",params![agent.session,agent.endpoint,now()],|r|r.get(0))?;
-        ensure!(
-            valid,
-            "OpenCode alias requires the current owning live plugin lease"
-        );
-        Ok(())
-    }
+
     /// Hidden typed controls retain ordinary native uncertainty barriers. Expose
     /// bounded recovery handles without turning them into peer-message history.
     pub(crate) fn event_recovery(&self, agent: Option<&Agent>) -> Result<Value> {
@@ -72,7 +65,7 @@ impl Db {
             [&agent.session],
             |row| row.get(0),
         )?;
-        let mut query=self.conn.prepare(&format!("SELECT m.id,m.state,(d.phase='reconcile' AND m.state IN('queued','sending')),EXISTS(SELECT 1 FROM agents a WHERE a.name=m.recipient AND a.provider='opencode' AND a.session=d.session),EXISTS(SELECT 1 FROM agents a JOIN opencode_leases l ON l.session=a.session WHERE a.name=m.recipient AND a.provider='opencode' AND a.session=d.session AND a.enabled=1 AND a.endpoint=l.endpoint AND l.expires>?2),d.phase {predicate} ORDER BY m.rowid LIMIT ?3"))?;
+        let mut query=self.conn.prepare(&format!("SELECT m.id,m.state,(d.phase='reconcile' AND m.state IN('queued','sending')),EXISTS(SELECT 1 FROM message_context c WHERE c.id=m.id AND json_extract(c.destination,'$.provider')='opencode' AND json_extract(c.destination,'$.session')=d.session AND NOT EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=m.recipient AND (a.provider<>'opencode' OR a.session<>d.session)) AND NOT EXISTS(SELECT 1 FROM agents inbox WHERE inbox.name=m.recipient AND (inbox.provider<>'opencode' OR inbox.session<>d.session))),EXISTS(SELECT 1 FROM opencode_leases l WHERE l.session=d.session AND l.expires>?2),d.phase {predicate} ORDER BY m.rowid LIMIT ?3"))?;
         let items=query.query_map(params![agent.session,now(),LIMIT as i64],|row| {
             let state = row.get::<_,String>(1)?;
             let reconcile = row.get::<_,bool>(2)?;
@@ -99,7 +92,6 @@ impl Db {
         Ok(())
     }
     pub(crate) fn opencode_tick(&self, time: i64) -> Result<()> {
-        self.conn.execute("UPDATE agents SET enabled=0 WHERE provider='opencode' AND EXISTS(SELECT 1 FROM opencode_leases l WHERE l.session=agents.session AND l.endpoint=agents.endpoint AND l.expires<=?1)", [time])?;
         // Queued is proof of no native attempt (including an explicit deferred
         // receipt). Bound waiting by queue capacity and the exact owning lease,
         // not elapsed native work/permission time. Keep schema 13's deadline
@@ -118,8 +110,7 @@ impl Db {
         let mut rows = self.conn.prepare(
             "SELECT d.id,d.reconcile_attempts FROM opencode_deliveries d
              JOIN messages m ON m.id=d.id AND m.recipient_session=d.session
-             JOIN agents a ON a.name=m.recipient AND a.provider='opencode' AND a.session=d.session AND a.enabled=1
-             JOIN opencode_leases l ON l.session=d.session AND l.endpoint=a.endpoint
+             JOIN opencode_leases l ON l.session=d.session
              WHERE d.phase IN ('uncertain','dispatched') AND m.state='uncertain'
                AND NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=d.id AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL))
                AND l.expires>?1 AND l.ready=1
@@ -206,7 +197,6 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("INSERT INTO opencode_leases VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session) DO UPDATE SET generation=excluded.generation,instance=excluded.instance,endpoint=excluded.endpoint,expires=excluded.expires,ready=excluded.ready", params![agent.session,generation,instance,agent.endpoint,time+LEASE_MS,ready])?;
         tx.commit()?;
-        self.register(agent, false)?;
         let namespace: String = self.conn.query_row(
             "SELECT value FROM settings WHERE key='opencode_namespace'",
             [],
@@ -228,10 +218,6 @@ impl Db {
             changed == 1,
             "OpenCode heartbeat has expired or belongs to a stale generation"
         );
-        self.conn.execute(
-            "UPDATE agents SET enabled=1 WHERE provider='opencode' AND session=?1 AND endpoint=?2",
-            params![session, endpoint],
-        )?;
         Ok(json!({"renewed":true}))
     }
 
@@ -256,7 +242,7 @@ impl Db {
         attempt: &str,
     ) -> Result<Value> {
         self.opencode_tick(now())?;
-        let allowed: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id JOIN agents a ON a.name=m.recipient JOIN opencode_leases l ON l.session=d.session WHERE d.id=?1 AND d.session=?2 AND d.generation=?3 AND d.attempt=?4 AND d.phase='dispatched' AND m.state='sending' AND a.provider='opencode' AND a.session=d.session AND a.enabled=1 AND a.endpoint=l.endpoint AND l.generation=d.generation AND l.instance=?5 AND l.expires>?6 AND l.ready=1 AND NOT EXISTS(SELECT 1 FROM inbound_transfers t WHERE t.local_id=m.id AND NOT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON g.peer_id=p.peer_id WHERE p.peer_id=t.peer_id AND p.revoked=0 AND g.provider=t.provider AND g.session=t.session AND g.permission='receive')))",params![id,session,generation,attempt,instance,now()],|r|r.get(0))?;
+        let allowed: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id JOIN message_context c ON c.id=m.id JOIN opencode_leases l ON l.session=d.session WHERE d.id=?1 AND d.session=?2 AND d.generation=?3 AND d.attempt=?4 AND d.phase='dispatched' AND m.state='sending' AND json_extract(c.destination,'$.provider')='opencode' AND json_extract(c.destination,'$.session')=d.session AND l.generation=d.generation AND l.instance=?5 AND l.expires>?6 AND l.ready=1 AND NOT EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=m.recipient AND (a.provider<>'opencode' OR a.session<>d.session)) AND NOT EXISTS(SELECT 1 FROM inbound_transfers t WHERE t.local_id=m.id AND NOT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON g.peer_id=p.peer_id WHERE p.peer_id=t.peer_id AND p.revoked=0 AND g.provider=t.provider AND g.session=t.session AND g.permission='receive')))",params![id,session,generation,attempt,instance,now()],|r|r.get(0))?;
         ensure!(
             allowed && !self.paused()?,
             "OpenCode native admission denied; claim, pause, policy or generation changed"
@@ -443,7 +429,7 @@ impl Db {
                 || (msg.state == "queued" && phase == "reconcile"),
             "OpenCode delivery cannot be retried in its current state"
         );
-        let agent = self.agent(&msg.recipient)?;
+        let agent = self.stored_destination(&msg)?;
         ensure!(
             agent.provider == Provider::OpenCode && agent.session == session,
             "OpenCode recipient identity changed; create a new message"
@@ -491,14 +477,13 @@ mod tests {
             provider: Provider::OpenCode,
             session: SESSION.into(),
             endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-            enabled: true,
         };
         let result = db.opencode_observe(&agent, true).unwrap();
         let generation = result["generation"].as_str().unwrap().to_owned();
         (root, db, agent, generation)
     }
     fn send(db: &Db, name: &str) -> Message {
-        db.send(
+        db.send_names(
             &uuid::Uuid::new_v4().to_string(),
             "user",
             name,
@@ -974,7 +959,7 @@ mod tests {
 
     #[test]
     fn remote_readonly_reconciliation_syncs_unknown_while_paused_running_and_restarted() {
-        use crate::network::wire::{RemoteAgent, WireResponse};
+        use crate::network::wire::WireResponse;
 
         let (root, mut receiver, agent, generation) = setup();
         let sender_path = root.path().join("sender");
@@ -1004,19 +989,9 @@ mod tests {
         receiver
             .share_peer_session(&origin, &agent.name, true)
             .unwrap();
-        sender
-            .replace_remote_agents(
-                &destination,
-                &[RemoteAgent {
-                    name: agent.name.clone(),
-                    provider: Provider::OpenCode,
-                    session: agent.session.clone(),
-                }],
-            )
-            .unwrap();
         let remote_id = uuid::Uuid::new_v4().to_string();
         sender
-            .send_remote(
+            .send_remote_names(
                 &origin,
                 &remote_id,
                 "user",
@@ -1032,7 +1007,7 @@ mod tests {
             .unwrap();
         sender.mark_transfer_attempt(&remote_id).unwrap();
         receiver
-            .accept_remote(&destination, &origin, &envelope)
+            .accept_remote_names(&destination, &origin, &envelope)
             .unwrap();
         sender
             .transfer_result(
@@ -1219,7 +1194,7 @@ mod tests {
                 &alias.name
             };
             let id = uuid::Uuid::new_v4().to_string();
-            db.send(
+            db.send_names(
                 &id,
                 "user",
                 recipient,
@@ -1277,7 +1252,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| item["route_matches"] == false && item["lease_available"] == false)
+                .any(|item| item["route_matches"] == false && item["lease_available"] == true)
         );
         assert!(db.history(&None, 100).unwrap().is_empty());
     }
@@ -1376,7 +1351,7 @@ mod tests {
             send(&db, &agent.name);
         }
         assert!(
-            db.send(
+            db.send_names(
                 &uuid::Uuid::new_v4().to_string(),
                 "user",
                 &agent.name,
@@ -1511,7 +1486,6 @@ mod tests {
             provider: Provider::Inbox,
             session: "unrelated".into(),
             endpoint: String::new(),
-            enabled: true,
         };
         db.register(&inbox, false).unwrap();
         let next = send(&db, &inbox.name);
@@ -1536,7 +1510,6 @@ mod tests {
         drop(db);
         let mut db = Db::open(&root.path().join("db")).unwrap();
         assert_eq!(db.get(&first.id).unwrap().state, "uncertain");
-        assert!(!db.agent(&agent.name).unwrap().enabled);
         db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
             .unwrap();
         db.retry(&first.id, true).unwrap();
@@ -1635,7 +1608,7 @@ mod tests {
     fn pre_upgrade_submitted_then_old_retry_queued_remains_readonly_after_migration() {
         let (root, db, agent, _) = setup();
         let legacy = db
-            .send(
+            .send_names(
                 "12345678-1234-4234-8234-123456789abc",
                 "user",
                 &agent.name,
@@ -1648,7 +1621,11 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         // Reconstitute schema 12, then exactly the old public retry transition:
         // submitted/uncertain -> queued with erased detail and no attempt record.
-        conn.execute_batch("DROP TRIGGER topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER opencode_enqueue_bound; DROP TRIGGER opencode_retry_bound; DROP TRIGGER opencode_enqueue_binding; DROP TABLE opencode_deliveries; DROP TABLE opencode_leases; PRAGMA user_version=12;").unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER IF EXISTS opencode_enqueue_bound; DROP TRIGGER IF EXISTS opencode_retry_bound; DROP TRIGGER IF EXISTS opencode_enqueue_binding; DROP TABLE opencode_deliveries; DROP TABLE opencode_leases;
+DROP TABLE IF EXISTS route_aliases; DROP TABLE IF EXISTS claude_bindings;
+CREATE TABLE IF NOT EXISTS session_metadata(provider TEXT NOT NULL,session TEXT NOT NULL,display_name TEXT,PRIMARY KEY(provider,session));
+CREATE TABLE IF NOT EXISTS remote_agents(peer_id TEXT NOT NULL,name TEXT NOT NULL,agent TEXT NOT NULL,PRIMARY KEY(peer_id,name));
+PRAGMA user_version=12;").unwrap();
         conn.execute(
             "UPDATE messages SET state='submitted',detail='Native insertion confirmed' WHERE id=?",
             [&legacy.id],
@@ -1717,17 +1694,18 @@ mod tests {
     #[test]
     fn attempted_reconciliation_cannot_cancel_or_disappear_on_alias_replacement() {
         let (_root, mut db, agent, _) = setup();
-        let first = send(&db, &agent.name);
-        let later = send(&db, &agent.name);
+        let mut route = agent.clone();
+        route.name = "route".into();
+        db.register(&route, false).unwrap();
+        let first = send(&db, &route.name);
+        let later = send(&db, &route.name);
         let (_, attempt) = dispatch(&mut db);
         db.opencode_finish(&first.id, &attempt, "uncertain", "could still insert")
             .unwrap();
         db.retry(&first.id, false).unwrap();
         assert!(db.cancel(&first.id).is_err());
-        let mut replacement = agent.clone();
-        replacement.provider = Provider::Inbox;
-        replacement.session = "different".into();
-        replacement.endpoint = String::new();
+        let mut replacement = route.clone();
+        replacement.session = "ses_abcdefghijklmnopqrstuvwxyz".into();
         db.register(&replacement, true).unwrap();
         assert_eq!(db.get(&first.id).unwrap().state, "uncertain");
         assert_eq!(db.get(&later.id).unwrap().state, "failed");
@@ -1790,7 +1768,6 @@ mod tests {
             provider: Provider::Inbox,
             session: "sink".into(),
             endpoint: String::new(),
-            enabled: true,
         };
         db.register(&inbox, false).unwrap();
         for _ in 0..1000 {
@@ -1798,8 +1775,25 @@ mod tests {
         }
         assert!(db.retry(&failed.id, false).is_err());
         assert_eq!(db.get(&failed.id).unwrap().state, "failed");
-        // The INSERT trigger also covers remote enqueue code inside its own transaction.
-        assert!(db.conn.execute("INSERT INTO messages VALUES(?1,'user',?2,?3,'remote enqueue',NULL,0,'queued',NULL,?4,?4)",params![uuid::Uuid::new_v4().to_string(),agent.name,SESSION,now()]).is_err());
+        // The explicit writer also covers remote enqueue code in its own transaction.
+        let source = Agent {
+            name: "user".into(),
+            provider: Provider::Inbox,
+            session: "user".into(),
+            endpoint: String::new(),
+        };
+        assert!(
+            crate::db::insert_message_in(
+                &db.conn,
+                &uuid::Uuid::new_v4().to_string(),
+                &source,
+                &agent,
+                "remote enqueue",
+                &None,
+                0,
+            )
+            .is_err()
+        );
         db.opencode_finish(&sending.id, &attempt, "queued", "busy before attempt")
             .unwrap();
         assert_eq!(db.get(&sending.id).unwrap().state, "failed");
@@ -1816,7 +1810,7 @@ mod tests {
     #[test]
     fn revoked_remote_reconciliation_is_readonly_and_independent_tail_can_deliver() {
         use crate::network::wire::{Envelope, RemoteAgent};
-        for policy_change in ["revoke", "unshare", "disable"] {
+        for policy_change in ["revoke", "unshare"] {
             let (_root, mut db, agent, _) = setup();
             let origin = libp2p_identity::Keypair::generate_ed25519()
                 .public()
@@ -1851,7 +1845,7 @@ mod tests {
                 parent: None,
                 hops: 0,
             };
-            db.accept_remote(&local, &origin, &incoming).unwrap();
+            db.accept_remote_names(&local, &origin, &incoming).unwrap();
             let (old, attempt) = dispatch(&mut db);
             db.opencode_finish(
                 &old.id,
@@ -2029,7 +2023,6 @@ mod tests {
             provider: Provider::OpenCode,
             session: SESSION.into(),
             endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-            enabled: true,
         };
         let first;
         {
@@ -2066,52 +2059,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(phase, "reconcile");
-    }
-
-    #[test]
-    fn v16_upgrade_recreates_the_enqueue_trigger_with_explicit_columns() {
-        let root = tempfile::tempdir().unwrap();
-        let mut db = Db::open(&root.path().join("db")).unwrap();
-        // Reconstruct the released v16 shape: the old positional trigger and no
-        // reconciliation columns. Db::open must upgrade it in place.
-        db.conn
-            .execute_batch(
-                "DROP TRIGGER topic_push_failed_gap;
-DROP TABLE topic_push_work;
-DROP TABLE topic_push_preferences;
-DROP TABLE topic_mentions;
-DROP TABLE topic_posts;
-DROP TABLE topics;
-ALTER TABLE opencode_deliveries DROP COLUMN reconcile_at;
-ALTER TABLE opencode_deliveries DROP COLUMN reconcile_attempts;
-DROP TRIGGER opencode_enqueue_binding;
-CREATE TRIGGER opencode_enqueue_binding AFTER INSERT ON messages WHEN (SELECT provider FROM agents WHERE name=NEW.recipient)='opencode' BEGIN
- INSERT INTO opencode_deliveries SELECT NEW.id,NEW.recipient_session,COALESCE((SELECT generation FROM opencode_leases WHERE session=NEW.recipient_session),'unleased'),(SELECT value FROM settings WHERE key='opencode_namespace'),'pending',NULL,NULL,'queued',NEW.created+120000;
-END;
-PRAGMA user_version=16;",
-            )
-            .unwrap();
-        crate::migrations::migrate(&mut db.conn).unwrap();
-        let trigger: String = db
-            .conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='opencode_enqueue_binding'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(trigger.contains("opencode_deliveries(id,session,generation,namespace,native_id,content,attempt,phase,deadline)"));
-        let agent = Agent {
-            name: format!("opencode-{SESSION}"),
-            provider: Provider::OpenCode,
-            session: SESSION.into(),
-            endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-            enabled: true,
-        };
-        db.opencode_observe(&agent, true).unwrap();
-        // The live trigger still enqueues after the upgrade.
-        let message = send(&db, &agent.name);
-        assert_eq!(db.get(&message.id).unwrap().state, "queued");
     }
 
     #[test]

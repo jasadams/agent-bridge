@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
+    os::unix::fs::MetadataExt,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -58,6 +60,44 @@ pub fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+}
+
+/// Reserved canonical native route: provider prefix plus a validator-accepted
+/// session ID. No database row is required or created for this identity.
+pub(crate) fn canonical_route(name: &str) -> Result<Option<(Provider, String)>> {
+    let Some((provider, session)) = name.split_once('-') else {
+        return Ok(None);
+    };
+    let Ok(provider) = provider.parse::<Provider>() else {
+        return Ok(None);
+    };
+    if provider == Provider::Inbox || crate::clients::validate_session(&provider, session).is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some((provider, session.to_owned())))
+}
+
+/// SessionEnd may arrive after the socket is removed. Match only the canonical
+/// parent path and never touch a replacement endpoint.
+fn normalize_claude_endpoint(endpoint: &str) -> Result<String> {
+    let path = Path::new(endpoint);
+    ensure!(path.is_absolute(), "Socket path must be absolute");
+    let parent = path
+        .parent()
+        .context("Missing Claude socket directory")?
+        .canonicalize()?;
+    let meta = std::fs::metadata(&parent)?;
+    ensure!(
+        meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
+        "Socket directory must be private to your user"
+    );
+    let normalized = parent.join(path.file_name().context("Missing socket filename")?);
+    ensure!(
+        normalized.as_os_str().len() < 104,
+        "Socket path is too long for macOS"
+    );
+    Ok(normalized.to_string_lossy().into_owned())
 }
 
 pub(crate) fn pair_in_transaction(
@@ -120,7 +160,6 @@ impl Db {
             [uuid::Uuid::new_v4().to_string()],
         )?;
         conn.execute("UPDATE opencode_deliveries SET namespace=(SELECT value FROM settings WHERE key='opencode_namespace') WHERE namespace='legacy'", [])?;
-        conn.execute("UPDATE agents SET enabled=0 WHERE provider='opencode'", [])?;
         {
             let tx = conn.transaction()?;
             // The time is when the broker detects interruption, not the time
@@ -280,7 +319,6 @@ impl Db {
         let tx = self.conn.transaction()?;
         tx.execute("UPDATE peers SET revoked=1 WHERE peer_id=?", [&peer_id])?;
         tx.execute("DELETE FROM peer_grants WHERE peer_id=?", [&peer_id])?;
-        tx.execute("DELETE FROM remote_agents WHERE peer_id=?", [&peer_id])?;
         tx.execute("UPDATE messages SET state=CASE WHEN EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued') THEN 'uncertain' ELSE 'blocked' END,detail='Peer was revoked',updated=? WHERE state='queued' AND (id IN (SELECT local_id FROM inbound_transfers WHERE peer_id=?) OR id IN (SELECT id FROM outbound_transfers WHERE peer_id=? AND state IN ('pending','awaiting_receipt')))", params![now(),peer_id,peer_id])?;
         tx.execute("UPDATE outbound_transfers SET state='blocked',detail='Peer was revoked' WHERE peer_id=? AND state IN ('pending','awaiting_receipt')", [&peer_id])?;
         tx.commit()?;
@@ -299,12 +337,8 @@ impl Db {
             !peer.revoked,
             "Peer is revoked; verify its fingerprint and pair again first"
         );
-        let agent = self.resolve_agent(agent)?;
+        let agent = self.agent(agent)?;
         crate::clients::validate_remote_session(&agent.provider, &agent.session)?;
-        ensure!(
-            !allow || agent.enabled,
-            "Cannot grant access to a disabled agent"
-        );
         if allow {
             self.conn.execute("INSERT OR IGNORE INTO peer_grants(peer_id,provider,session,permission) VALUES(?,?,?,?)", params![peer.peer_id,agent.provider.label(),agent.session,permission.label()])?;
         } else {
@@ -328,7 +362,132 @@ impl Db {
         if id.to_string() != peer {
             return Ok(false);
         }
-        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON p.peer_id=g.peer_id WHERE p.peer_id=?1 AND p.revoked=0 AND g.provider=?2 AND g.session=?3 AND g.permission=?4 AND EXISTS(SELECT 1 FROM agents a WHERE a.provider=g.provider AND a.session=g.session AND a.enabled=1))", params![peer,provider.label(),session,permission.label()], |r|r.get(0))?)
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON p.peer_id=g.peer_id WHERE p.peer_id=?1 AND p.revoked=0 AND g.provider=?2 AND g.session=?3 AND g.permission=?4)", params![peer,provider.label(),session,permission.label()], |r|r.get(0))?)
+    }
+
+    fn binding_endpoint(&self, provider: &Provider, session: &str) -> Result<String> {
+        match provider {
+            Provider::Claude => Ok(self
+                .conn
+                .query_row(
+                    "SELECT endpoint FROM claude_bindings WHERE session=?",
+                    [session],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_default()),
+            Provider::OpenCode => Ok(self
+                .conn
+                .query_row(
+                    "SELECT endpoint FROM opencode_leases WHERE session=?1 AND expires>?2",
+                    params![session, now()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_default()),
+            _ => Ok(String::new()),
+        }
+    }
+
+    fn config_agent(&self, name: &str) -> Result<Option<Agent>> {
+        let inbox: Option<String> = self
+            .conn
+            .query_row("SELECT session FROM agents WHERE name=?", [name], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(session) = inbox {
+            return Ok(Some(Agent {
+                name: name.into(),
+                provider: Provider::Inbox,
+                session,
+                endpoint: String::new(),
+            }));
+        }
+        let alias: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT provider,session FROM route_aliases WHERE name=?",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((provider, session)) = alias else {
+            return Ok(None);
+        };
+        let provider = provider.parse::<Provider>()?;
+        Ok(Some(Agent {
+            name: name.into(),
+            endpoint: self.binding_endpoint(&provider, &session)?,
+            provider,
+            session,
+        }))
+    }
+
+    /// Explicit configuration or a reserved canonical provider ID. Native
+    /// existence is verified by the connector state boundary, never here.
+    pub fn agent(&self, name: &str) -> Result<Agent> {
+        if let Some(agent) = self.config_agent(name)? {
+            return Ok(agent);
+        }
+        if let Some((provider, session)) = canonical_route(name)? {
+            return Ok(Agent {
+                name: name.into(),
+                endpoint: self.binding_endpoint(&provider, &session)?,
+                provider,
+                session,
+            });
+        }
+        bail!("Unknown agent; register it first")
+    }
+
+    pub fn agents(&self) -> Result<Vec<Agent>> {
+        self.listed_agents(true)
+    }
+
+    /// Local manual Inbox configuration plus explicit stable aliases. This is
+    /// route configuration, not a native catalog or availability snapshot.
+    pub fn listed_agents(&self, all: bool) -> Result<Vec<Agent>> {
+        let mut agents = Vec::new();
+        let mut inbox = self.conn.prepare(
+            "SELECT name,provider,session FROM agents WHERE ?1 OR enabled=1 ORDER BY name",
+        )?;
+        for row in inbox.query_map([all], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (name, provider, session) = row?;
+            agents.push(Agent {
+                name,
+                provider: provider.parse()?,
+                session,
+                endpoint: String::new(),
+            });
+        }
+        let mut aliases = self
+            .conn
+            .prepare("SELECT name,provider,session FROM route_aliases ORDER BY name")?;
+        for row in aliases.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (name, provider, session) = row?;
+            let provider = provider.parse::<Provider>()?;
+            agents.push(Agent {
+                name,
+                endpoint: self.binding_endpoint(&provider, &session)?,
+                provider,
+                session,
+            });
+        }
+        agents.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(agents)
     }
 
     pub fn register(&mut self, agent: &Agent, replace: bool) -> Result<()> {
@@ -337,30 +496,39 @@ impl Db {
             "Agent names use 1–100 letters, digits, dots, underscores or hyphens"
         );
         ensure!(
-            agent.name != "user",
+            agent.name != "user" || agent.provider == Provider::Inbox,
             "The name user is reserved for your inbox"
         );
         crate::clients::validate_session(&agent.provider, &agent.session)?;
-        if agent.provider == Provider::OpenCode {
-            let conflicting: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM agents WHERE provider='opencode' AND session=?1 AND enabled=1 AND endpoint<>?2)",
-                params![agent.session, agent.endpoint], |row| row.get(0),
-            )?;
-            ensure!(
-                !conflicting,
-                "OpenCode session is already registered by another plugin instance; unregister that exact session first"
-            );
-        }
+        ensure!(
+            canonical_route(&agent.name)?.is_none(),
+            "Canonical provider session IDs are reserved; choose an explicit alias"
+        );
         let tx = self.conn.transaction()?;
-        let old: Option<(String, String)> = tx
+        let inbox: Option<String> = tx
             .query_row(
-                "SELECT session,provider FROM agents WHERE name=?",
+                "SELECT session FROM agents WHERE name=?",
+                [&agent.name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let alias: Option<(String, String)> = tx
+            .query_row(
+                "SELECT session,provider FROM route_aliases WHERE name=?",
                 [&agent.name],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some((session, provider)) = old
-            && (session != agent.session || provider != agent.provider.label())
+        let current = inbox.map(|session| (Provider::Inbox, session)).or_else(|| {
+            alias.as_ref().and_then(|(session, provider)| {
+                provider
+                    .parse::<Provider>()
+                    .ok()
+                    .map(|provider| (provider, session.clone()))
+            })
+        });
+        if let Some((provider, session)) = current
+            && (provider != agent.provider || session != agent.session)
         {
             ensure!(
                 replace,
@@ -369,178 +537,259 @@ impl Db {
             tx.execute("UPDATE messages SET state='uncertain',detail='Recipient registration changed during attempted OpenCode reconciliation',updated=? WHERE recipient=? AND state='queued' AND id IN(SELECT id FROM opencode_deliveries WHERE phase<>'queued')",params![now(),agent.name])?;
             tx.execute("UPDATE messages SET state='failed',detail='Recipient registration was replaced',updated=? WHERE recipient=? AND state='queued'", params![now(), agent.name])?;
         }
-        tx.execute("INSERT INTO agents VALUES(?1,?2,?3,?4,?5) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider,session=excluded.session,endpoint=excluded.endpoint,enabled=excluded.enabled",params![agent.name, agent.provider.label(), agent.session, agent.endpoint, agent.enabled])?;
+        // One name resolves to one configuration row. Canonical native routes
+        // never enter either table.
+        tx.execute("DELETE FROM route_aliases WHERE name=?", [&agent.name])?;
+        tx.execute("DELETE FROM agents WHERE name=?", [&agent.name])?;
+        if agent.provider == Provider::Inbox {
+            ensure!(
+                agent.endpoint.is_empty(),
+                "Inbox registrations do not accept a socket endpoint"
+            );
+            tx.execute(
+                "INSERT INTO agents(name,provider,session,endpoint,enabled) VALUES(?1,'inbox',?2,'',1)",
+                params![agent.name, agent.session],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO route_aliases(name,provider,session) VALUES(?1,?2,?3)",
+                params![agent.name, agent.provider.label(), agent.session],
+            )?;
+        }
         tx.commit()?;
-        Ok(())
-    }
-
-    pub fn agent(&self, name: &str) -> Result<Agent> {
-        let (name, provider, session, endpoint, enabled): (String, String, String, String, bool) =
-            self.conn
-                .query_row(
-                    "SELECT name,provider,session,endpoint,enabled FROM agents WHERE name=?",
-                    [name],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
-                .optional()?
-                .context("Unknown agent; register it first")?;
-        let provider = provider.parse::<Provider>()?;
-        Ok(Agent {
-            name,
-            provider,
-            session,
-            endpoint,
-            enabled,
-        })
-    }
-
-    pub fn agents(&self) -> Result<Vec<Agent>> {
-        self.listed_agents(true)
-    }
-
-    pub fn listed_agents(&self, all: bool) -> Result<Vec<Agent>> {
-        let mut s = self
-            .conn
-            .prepare("SELECT name FROM agents WHERE ?1 OR enabled=1 ORDER BY name")?;
-        let names = s
-            .query_map([all], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        names.iter().map(|n| self.agent(n)).collect()
-    }
-
-    pub fn display_name(&self, provider: &Provider, session: &str) -> Result<Option<String>> {
-        if crate::clients::Adapter::for_provider(provider).is_none() {
-            return Ok(None);
-        }
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT display_name FROM session_metadata WHERE provider=? AND session=?",
-                params![provider.label(), session],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// Native names are aliases for stable IDs. Duplicate names must never guess a destination.
-    pub fn resolve_agent(&self, name: &str) -> Result<Agent> {
-        let exact: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE name=?)",
-            [name],
-            |r| r.get(0),
-        )?;
-        if exact {
-            return self.agent(name);
-        }
-        let (provider, title) = match name.split_once(':') {
-            Some((p, title)) => (Some(p.parse::<Provider>()?), title),
-            _ => (None, name),
-        };
-        let mut s = self.conn.prepare(
-            "SELECT a.name FROM agents a JOIN session_metadata n
-        ON a.session=n.session AND a.provider=n.provider
-        WHERE a.name=n.provider||'-'||n.session AND a.enabled=1 AND n.display_name=?1
-        AND (?2 IS NULL OR n.provider=?2) ORDER BY a.name",
-        )?;
-        let names = s
-            .query_map(
-                params![title, provider.as_ref().map(Provider::label)],
-                |r| r.get::<_, String>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
-            names.len() <= 1,
-            "Native name is ambiguous; use a stable agent ID: {}",
-            names.join(", ")
-        );
-        self.agent(
-            names
-                .first()
-                .context("Unknown agent name; use agent-bridge list")?,
-        )
-    }
-
-    pub fn observe_codex(
-        &mut self,
-        session: &str,
-        name: Option<&str>,
-        enabled: bool,
-    ) -> Result<()> {
-        let routing_name = crate::clients::lifecycle::routing_name(&Provider::Codex, session);
-        self.register(
-            &Agent {
-                name: routing_name,
-                provider: Provider::Codex,
-                session: session.into(),
-                endpoint: String::new(),
-                enabled,
-            },
-            false,
-        )?;
-        self.observe_session_name(&Provider::Codex, session, name)?;
-        Ok(())
-    }
-
-    pub fn observe_claude_name(&self, session: &str, name: &str) -> Result<()> {
-        self.observe_session_name(&Provider::Claude, session, Some(name))
-    }
-
-    /// Optional display metadata never registers or enables a session.
-    pub fn observe_session_name(
-        &self,
-        provider: &Provider,
-        session: &str,
-        name: Option<&str>,
-    ) -> Result<()> {
-        ensure!(
-            crate::clients::Adapter::for_provider(provider).is_some(),
-            "Inbox has no native display metadata"
-        );
-        crate::clients::validate_session(provider, session)?;
-        self.conn.execute("INSERT INTO session_metadata(provider,session,display_name) VALUES(?,?,?) ON CONFLICT(provider,session) DO UPDATE SET display_name=excluded.display_name", params![provider.label(),session,name])?;
-        Ok(())
-    }
-
-    pub fn codex_offline(&self, session: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE agents SET enabled=0 WHERE provider='codex' AND (?1 IS NULL OR session=?1)",
-            [session],
-        )?;
         Ok(())
     }
 
     pub fn unregister(&self, name: &str, session: &str) -> Result<()> {
         ensure!(name != "user", "Cannot unregister the user inbox");
-        self.conn.execute(
-            "UPDATE agents SET enabled=0 WHERE name=? AND session=?",
-            params![name, session],
-        )?;
-        Ok(())
-    }
-
-    /// Confirmed native lifecycle closure retires canonical aliases only after
-    /// verifying that the reporting exact route still names that session.
-    pub(crate) fn close_native(&self, name: &str, session: &str, endpoint: &str) -> Result<()> {
-        let agent = self.agent(name)?;
+        let inbox: Option<String> = self
+            .conn
+            .query_row("SELECT session FROM agents WHERE name=?", [name], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(stored) = inbox {
+            ensure!(
+                stored == session,
+                "Inbox registration session does not match"
+            );
+            self.conn.execute(
+                "UPDATE agents SET enabled=0 WHERE name=? AND session=?",
+                params![name, session],
+            )?;
+            return Ok(());
+        }
+        let alias: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT session FROM route_aliases WHERE name=?",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = alias {
+            ensure!(stored == session, "Route alias session does not match");
+            self.conn.execute(
+                "DELETE FROM route_aliases WHERE name=? AND session=?",
+                params![name, session],
+            )?;
+            return Ok(());
+        }
         ensure!(
-            agent.provider != Provider::Inbox
-                && agent.session == session
-                && agent.endpoint == endpoint,
-            "Native close requires the unchanged exact native registration"
+            canonical_route(name)?.is_none(),
+            "Canonical native session routes cannot be unregistered; no native membership is stored"
         );
+        bail!("Unknown local registration")
+    }
+
+    pub(crate) fn inbox_enabled(&self, name: &str, session: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE name=? AND session=? AND enabled=1)",
+            params![name, session],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Request-local OpenCode transport snapshot. Expired locators remain as
+    /// candidates; the preferred locator is the live owning endpoint only.
+    pub(crate) fn claude_binding_sessions(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT session FROM claude_bindings ORDER BY session")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn opencode_live_instances(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(DISTINCT instance) FROM opencode_leases WHERE expires>?",
+            [now()],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub(crate) fn opencode_lease_sessions(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT session FROM opencode_leases WHERE expires>? ORDER BY session")?
+            .query_map([now()], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn opencode_locators(
+        &self,
+        preferred_session: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        let mut endpoints = self
+            .conn
+            .prepare("SELECT DISTINCT endpoint FROM opencode_leases ORDER BY endpoint LIMIT 64")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        endpoints.sort();
+        endpoints.dedup();
+        let preferred = preferred_session
+            .map(|session| {
+                self.conn
+                    .query_row(
+                        "SELECT endpoint FROM opencode_leases WHERE session=?1 AND expires>?2",
+                        params![session, now()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+            })
+            .transpose()?
+            .flatten();
+        Ok((endpoints, preferred))
+    }
+
+    pub fn claude_bind(&self, session: &str, endpoint: &str) -> Result<()> {
+        crate::clients::validate_session(&Provider::Claude, session)?;
+        let normalized = crate::clients::claude::validate_socket(Path::new(endpoint))?
+            .to_string_lossy()
+            .into_owned();
         self.conn.execute(
-            "UPDATE agents SET enabled=0 WHERE provider=? AND session=?",
-            params![agent.provider.label(), session],
+            "INSERT INTO claude_bindings(session,endpoint) VALUES(?,?)
+             ON CONFLICT(session) DO UPDATE SET endpoint=excluded.endpoint",
+            params![session, normalized],
         )?;
         Ok(())
     }
 
-    pub fn send(
+    pub fn claude_unbind(&self, session: &str, endpoint: &str) -> Result<()> {
+        crate::clients::validate_session(&Provider::Claude, session)?;
+        let normalized = normalize_claude_endpoint(endpoint)?;
+        let changed = self.conn.execute(
+            "DELETE FROM claude_bindings WHERE session=? AND endpoint=?",
+            params![session, normalized],
+        )?;
+        ensure!(
+            changed == 1,
+            "Claude binding was already removed or replaced"
+        );
+        Ok(())
+    }
+
+    /// The single explicit durable message writer.
+    pub(crate) fn insert_message(
+        &self,
+        id: &str,
+        source: &Agent,
+        destination: &Agent,
+        body: &str,
+        parent: &Option<String>,
+        hops: u32,
+    ) -> Result<Message> {
+        insert_message_in(&self.conn, id, source, destination, body, parent, hops)?;
+        self.get(id)
+    }
+
+    /// Configuration-only test/administration helper. It resolves stable routes
+    /// without native I/O and delegates to the prepared writer.
+    pub fn send_names(
         &self,
         id: &str,
         sender: &str,
         recipient: &str,
+        body: &str,
+        parent: &Option<String>,
+    ) -> Result<Message> {
+        let source = self.agent(sender)?;
+        let destination = self.agent(recipient)?;
+        self.send(id, &source, &destination, body, parent)
+    }
+
+    /// Duplicate decode before any native lookup or probe. A current explicit
+    /// alias must still name the stored immutable identity; rebound routes conflict.
+    pub(crate) fn send_duplicate(
+        &self,
+        id: &str,
+        sender: &str,
+        recipient: &str,
+        body: &str,
+        parent: &Option<String>,
+    ) -> Result<Option<Message>> {
+        let Some(old) = self.get_optional(id)? else {
+            return Ok(None);
+        };
+        if recipient.contains('/') {
+            let request: Option<(String, String)> = self
+                .conn
+                .query_row(
+                    "SELECT requested_sender,requested_recipient FROM outbound_transfers WHERE id=?",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            ensure!(
+                request.is_some_and(|(stored_sender, stored_recipient)| {
+                    stored_sender == sender && stored_recipient == recipient
+                }) && old.body == body
+                    && old.parent == *parent,
+                "Message ID already exists with different contents"
+            );
+            return Ok(Some(old));
+        }
+        ensure!(
+            old.sender == sender
+                && old.recipient == recipient
+                && old.body == body
+                && old.parent == *parent,
+            "Message ID already exists with different contents"
+        );
+        if !recipient.contains('/')
+            && let Ok(agent) = self.agent(recipient)
+        {
+            ensure!(
+                agent.session == old.recipient_session,
+                "Message ID already exists under a rebound destination route"
+            );
+        }
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT json_extract(destination,'$.provider') FROM message_context WHERE id=?",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Ok(agent) = self.agent(recipient) {
+            ensure!(
+                stored.is_none_or(|provider| provider == agent.provider.label()),
+                "Message ID already exists under a rebound destination provider"
+            );
+        }
+        Ok(Some(old))
+    }
+
+    /// `source` and `destination` are prepared request-local identities. This
+    /// function performs no native lookup, so duplicates are decided first.
+    pub fn send(
+        &self,
+        id: &str,
+        source: &Agent,
+        destination: &Agent,
         body: &str,
         parent: &Option<String>,
     ) -> Result<Message> {
@@ -549,47 +798,42 @@ impl Db {
             !body.trim().is_empty() && body.len() <= MAX_BODY,
             "Message must contain 1–65536 bytes"
         );
-        let sender = self.resolve_agent(sender)?.name;
-        let target = self.resolve_agent(recipient)?;
-        let recipient = target.name.as_str();
         if let Some(old) = self.get_optional(id)? {
+            let stored: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT json_extract(destination,'$.provider') FROM message_context WHERE id=?",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
             ensure!(
-                old.sender == sender
-                    && old.recipient == recipient
+                old.sender == source.name
+                    && old.recipient == destination.name
+                    && old.recipient_session == destination.session
                     && old.body == body
-                    && old.parent == *parent,
-                "Message ID already exists with different contents"
+                    && old.parent == *parent
+                    && stored.is_none_or(|provider| provider == destination.provider.label()),
+                "Message ID already exists with different contents or a rebound route"
             );
             return Ok(old);
         }
-        ensure!(sender != recipient, "Sending to yourself is disabled");
+        ensure!(
+            source.name != destination.name,
+            "Sending to yourself is disabled"
+        );
         let hops = if let Some(parent) = parent {
             let p = self.get(parent)?;
             ensure!(
-                p.recipient == sender,
+                p.recipient == source.name,
                 "Only the recipient can reply to a message"
             );
             p.hops + 1
         } else {
             0
         };
-        ensure!(
-            hops <= MAX_REPLY_HOPS,
-            "Conversation reached the {MAX_REPLY_HOPS}-hop limit; ask the user to start a new exchange"
-        );
-        let count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM messages WHERE state='queued'",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(count < 1000, "Queue is full (1000 pending messages)");
-        crate::codex_admission::check(&self.conn, &target.provider, &target.session, None)?;
-        let t = now();
-        self.conn.execute(
-            "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',NULL,?8,?8)",
-            params![id, sender, recipient, target.session, body, parent, hops, t],
-        )?;
-        self.get(id)
+        self.insert_message(id, source, destination, body, parent, hops)
     }
 
     pub(crate) fn board_message_receipt(
@@ -733,29 +977,168 @@ impl Db {
         })
     }
 
-    // Claim one message per recipient. SQLite access is serialized by the service mutex.
+    pub(crate) fn stored_destination(&self, message: &Message) -> Result<Agent> {
+        let provider: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT json_extract(destination,'$.provider') FROM message_context WHERE id=?",
+                [&message.id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(provider) = provider else {
+            return self.agent(&message.recipient);
+        };
+        let provider = provider.parse::<Provider>()?;
+        Ok(Agent {
+            name: message.recipient.clone(),
+            endpoint: self.binding_endpoint(&provider, &message.recipient_session)?,
+            provider,
+            session: message.recipient_session.clone(),
+        })
+    }
+
+    // Claim one message per recipient. Native verification is the caller's
+    // request-local responsibility; this selects only durable work.
     pub fn claim(&mut self) -> Result<Option<(Message, Agent)>> {
-        self.claim_excluding_codex(&[])
+        self.claim_excluding_codex(&[], None)
     }
 
     pub(crate) fn claim_excluding_codex(
         &mut self,
         busy_codex: &[String],
+        ready: Option<&std::collections::HashSet<(String, String)>>,
     ) -> Result<Option<(Message, Agent)>> {
         if self.paused()? {
             return Ok(None);
         }
         self.block_revoked_inbound()?;
         self.opencode_tick(now())?;
-        let id:Option<String> = self.conn.query_row("SELECT m.id FROM messages m JOIN agents a ON a.name=m.recipient AND a.session=m.recipient_session AND a.enabled=1 WHERE (a.provider<>'codex' OR NOT EXISTS(SELECT 1 FROM json_each(?2) running WHERE running.value=m.recipient_session)) AND (m.state='queued' OR (a.provider='opencode' AND m.state='uncertain' AND EXISTS(SELECT 1 FROM opencode_deliveries requested WHERE requested.id=m.id AND requested.phase='reconcile'))) AND EXISTS(SELECT 1 FROM message_context identity WHERE identity.id=m.id AND (json_extract(identity.destination,'$.provider')=a.provider OR (a.provider<>'codex' AND json_extract(identity.destination,'$.provider') IS NULL))) AND NOT EXISTS(SELECT 1 FROM messages busy JOIN message_context bc ON bc.id=busy.id WHERE busy.state='sending' AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=busy.id) AND (busy.recipient=m.recipient OR (a.provider='codex' AND busy.recipient_session=m.recipient_session AND (json_extract(bc.destination,'$.provider')='codex' OR json_extract(bc.destination,'$.provider') IS NULL)))) AND (a.provider<>'opencode' OR (EXISTS(SELECT 1 FROM opencode_deliveries d JOIN opencode_leases l ON l.session=d.session WHERE d.id=m.id AND d.generation=l.generation AND l.endpoint=a.endpoint AND l.expires>?1 AND (l.ready=1 OR d.phase='reconcile')) AND (EXISTS(SELECT 1 FROM opencode_deliveries current WHERE current.id=m.id AND current.phase='reconcile') OR NOT EXISTS(SELECT 1 FROM opencode_deliveries head JOIN messages h ON h.id=head.id WHERE head.session=m.recipient_session AND h.id<>m.id AND (h.state='sending' OR (h.state='queued' AND head.phase='queued' AND h.rowid<m.rowid)))))) ORDER BY m.rowid LIMIT 1",params![now(),serde_json::to_string(busy_codex)?],|r|r.get(0)).optional()?;
-        let Some(id) = id else { return Ok(None) };
-        self.conn.execute(
-            "UPDATE messages SET state='sending',updated=? WHERE id=?",
-            params![now(), id],
-        )?;
-        let msg = self.get(&id)?;
-        let agent = self.agent(&msg.recipient)?;
-        Ok(Some((msg, agent)))
+        let candidates = {
+            let mut statement = self.conn.prepare(
+                "SELECT m.id,m.rowid,m.recipient,m.recipient_session,
+                 json_extract(c.destination,'$.provider')
+                 FROM messages m JOIN message_context c ON c.id=m.id
+                 WHERE (m.state='queued'
+                    OR (m.state='uncertain' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=m.id AND d.phase='reconcile')))
+                   AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=m.id)
+                 ORDER BY m.rowid LIMIT 1000",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let time = now();
+        for (id, rowid, recipient, session, provider) in candidates {
+            let Some(provider) = provider.and_then(|value| value.parse::<Provider>().ok()) else {
+                continue;
+            };
+            if provider == Provider::Codex && busy_codex.contains(&session) {
+                continue;
+            }
+            if provider != Provider::Inbox
+                && ready.is_some_and(|ready| {
+                    !ready.contains(&(provider.label().to_string(), session.clone()))
+                })
+            {
+                continue;
+            }
+            let alias_fence: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM route_aliases WHERE name=? AND (provider<>? OR session<>?))",
+                params![recipient, provider.label(), session],
+                |row| row.get(0),
+            )?;
+            if alias_fence {
+                continue;
+            }
+            if let Some((canonical_provider, canonical_session)) = canonical_route(&recipient)?
+                && (canonical_provider != provider || canonical_session != session)
+            {
+                continue;
+            }
+            if provider == Provider::Inbox {
+                let enabled: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE name=? AND session=? AND enabled=1)",
+                    params![recipient, session],
+                    |row| row.get(0),
+                )?;
+                if !enabled {
+                    continue;
+                }
+            }
+            let busy: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages busy WHERE busy.id<>?1 AND busy.state='sending' AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=busy.id) AND (busy.recipient=?2 OR (?3='codex' AND busy.recipient_session=?4)))",
+                params![id, recipient, provider.label(), session],
+                |row| row.get(0),
+            )?;
+            if busy {
+                continue;
+            }
+            let mut endpoint = String::new();
+            if provider == Provider::OpenCode {
+                let delivery: Option<(String, String)> = self
+                    .conn
+                    .query_row(
+                        "SELECT generation,phase FROM opencode_deliveries WHERE id=?",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((generation, phase)) = delivery else {
+                    continue;
+                };
+                let lease: Option<(String, String, bool, i64)> = self
+                    .conn
+                    .query_row(
+                        "SELECT generation,endpoint,ready,expires FROM opencode_leases WHERE session=?",
+                        [&session],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?;
+                let Some((lease_generation, lease_endpoint, ready, expires)) = lease else {
+                    continue;
+                };
+                if expires <= time
+                    || lease_generation != generation
+                    || (!ready && phase != "reconcile")
+                {
+                    continue;
+                }
+                let earlier: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM opencode_deliveries head JOIN messages h ON h.id=head.id WHERE head.session=?1 AND h.id<>?2 AND (h.state='sending' OR (h.state='queued' AND head.phase='queued' AND h.rowid<?3)))",
+                    params![session, id, rowid],
+                    |row| row.get(0),
+                )?;
+                if earlier {
+                    continue;
+                }
+                endpoint = lease_endpoint;
+            } else if provider == Provider::Claude {
+                endpoint = self.binding_endpoint(&provider, &session)?;
+            }
+            self.conn.execute(
+                "UPDATE messages SET state='sending',updated=? WHERE id=? AND state IN ('queued','uncertain')",
+                params![time, id],
+            )?;
+            let msg = self.get(&id)?;
+            let agent = Agent {
+                name: recipient,
+                provider,
+                session,
+                endpoint,
+            };
+            return Ok(Some((msg, agent)));
+        }
+        Ok(None)
     }
 
     pub fn finish(&self, id: &str, state: &str, detail: &str) -> Result<()> {
@@ -787,7 +1170,7 @@ impl Db {
                 .optional()?;
             if phase.as_deref() == Some("queued") {
                 let message = self.get(id)?;
-                self.topic_push_authorize(id, &self.agent(&message.recipient)?)?;
+                self.topic_push_authorize(id, &self.stored_destination(&message)?)?;
             }
         }
         if let Some(message) = self.opencode_retry(id)? {
@@ -799,18 +1182,25 @@ impl Db {
                 !matches!(m.state.as_str(), "uncertain" | "submitted"),
                 "Topic push has an ambiguous native outcome; it cannot be replayed"
             );
-            self.topic_push_authorize(id, &self.agent(&m.recipient)?)?;
+            self.topic_push_authorize(id, &self.stored_destination(&m)?)?;
         }
         ensure!(
             ["failed", "blocked"].contains(&m.state.as_str())
                 || (allow_duplicate && ["uncertain", "submitted"].contains(&m.state.as_str())),
             "Only failed or blocked deliveries can be retried directly; submitted/uncertain messages require --allow-duplicate after checking the native conversation"
         );
+        let destination = self.stored_destination(&m)?;
         ensure!(
-            self.agent(&m.recipient)?.session == m.recipient_session,
+            destination.session == m.recipient_session,
             "Recipient session changed; create a new message explicitly"
         );
-        self.codex_retry_admission(&m, &self.agent(&m.recipient)?)?;
+        if let Ok(current) = self.agent(&m.recipient) {
+            ensure!(
+                current.provider == destination.provider && current.session == destination.session,
+                "Recipient route was rebound; create a new message explicitly"
+            );
+        }
+        self.codex_retry_admission(&m, &destination)?;
         self.conn.execute(
             "UPDATE messages SET state='queued',detail=NULL,updated=? WHERE id=?",
             params![now(), id],
@@ -871,4 +1261,142 @@ impl Db {
         }
         Ok(serde_json::to_value(counts)?)
     }
+}
+
+pub(crate) fn insert_message_in(
+    conn: &Connection,
+    id: &str,
+    source: &Agent,
+    destination: &Agent,
+    body: &str,
+    parent: &Option<String>,
+    hops: u32,
+) -> Result<()> {
+    ensure!(
+        hops <= MAX_REPLY_HOPS,
+        "Conversation reached the {MAX_REPLY_HOPS}-hop limit; ask the user to start a new exchange"
+    );
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM messages WHERE state='queued'",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(count < 1000, "Queue is full (1000 pending messages)");
+    crate::codex_admission::check(conn, &destination.provider, &destination.session, None)?;
+    let local_opencode =
+        destination.provider == Provider::OpenCode && !destination.name.contains('/');
+    if local_opencode {
+        let lease: Option<String> = conn
+            .query_row(
+                "SELECT generation FROM opencode_leases WHERE session=?1 AND expires>?2",
+                params![destination.session, now()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ensure!(lease.is_some(), "OpenCode live lease required");
+        let pending: i64 = conn.query_row(
+                "SELECT count(*) FROM messages m JOIN opencode_deliveries d ON d.id=m.id WHERE d.session=? AND m.state IN ('queued','sending','uncertain')",
+                [&destination.session],
+                |row| row.get(0),
+            )?;
+        ensure!(
+            pending < 64,
+            "OpenCode session queue is full (64 pending messages)"
+        );
+    }
+    let machine: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='machine_name'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let snapshot = |agent: &Agent| {
+        json!({
+            "peer_id": Value::Null,
+            "machine_name": machine,
+            "agent": agent.name,
+            "provider": agent.provider.label(),
+            "session": agent.session,
+        })
+    };
+    let t = now();
+    // Caller transactions/savepoints stay owned by the caller.
+    let own_transaction = conn.is_autocommit();
+    let tx = if own_transaction {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let target = tx.as_ref();
+    let exec = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Result<usize> {
+        Ok(match target {
+            Some(tx) => tx.execute(sql, values)?,
+            None => conn.execute(sql, values)?,
+        })
+    };
+    exec(
+        "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',NULL,?8,?8)",
+        &[
+            &id,
+            &source.name,
+            &destination.name,
+            &destination.session,
+            &body,
+            parent,
+            &hops,
+            &t,
+        ],
+    )?;
+    let source_json = serde_json::to_string(&snapshot(source))?;
+    let destination_json = serde_json::to_string(&snapshot(destination))?;
+    exec(
+        "INSERT INTO message_context(id,source,destination) VALUES(?1,?2,?3)",
+        &[&id, &source_json, &destination_json],
+    )?;
+    if local_opencode {
+        let generation: String = match target {
+            Some(tx) => tx
+                .query_row(
+                    "SELECT generation FROM opencode_leases WHERE session=?",
+                    [&destination.session],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => conn
+                .query_row(
+                    "SELECT generation FROM opencode_leases WHERE session=?",
+                    [&destination.session],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        }
+        .unwrap_or_else(|| "unleased".into());
+        let namespace: String = match target {
+            Some(tx) => tx.query_row(
+                "SELECT value FROM settings WHERE key='opencode_namespace'",
+                [],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT value FROM settings WHERE key='opencode_namespace'",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        exec(
+            "INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,content,attempt,phase,deadline) VALUES(?1,?2,?3,?4,'pending',NULL,NULL,'queued',?5)",
+            &[
+                &id,
+                &destination.session,
+                &generation,
+                &namespace,
+                &(t + 120_000),
+            ],
+        )?;
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(())
 }

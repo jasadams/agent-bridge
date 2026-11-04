@@ -11,7 +11,7 @@ impl Db {
     /// stopping sharing removes all three, without affecting any other session.
     pub fn share_peer_session(&mut self, peer: &str, agent: &str, shared: bool) -> Result<Peer> {
         let peer = self.peer(peer)?;
-        let agent = self.resolve_agent(agent)?;
+        let agent = self.agent(agent)?;
         crate::clients::validate_remote_session(&agent.provider, &agent.session)?;
         let tx = self
             .conn
@@ -22,16 +22,21 @@ impl Db {
             |row| row.get(0),
         )?;
         ensure!(trusted, "Peer is revoked; pair again before sharing");
-        // Recheck the resolved registration and policy inside the write transaction.
-        let current: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE name=? AND provider=? AND session=? AND (?=0 OR enabled=1))",
-            params![agent.name, agent.provider.label(), agent.session, shared],
+        // Recheck the resolved route fence inside the write transaction.
+        let alias_fence: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM route_aliases WHERE name=? AND (provider<>? OR session<>?))",
+            params![agent.name, agent.provider.label(), agent.session],
             |row| row.get(0),
         )?;
-        ensure!(
-            current,
-            "Session registration changed or is disabled; select an enabled session before sharing"
-        );
+        ensure!(!alias_fence, "Session route changed while sharing");
+        if shared && agent.provider == Provider::Inbox {
+            let enabled: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE name=? AND session=? AND enabled=1)",
+                params![agent.name, agent.session],
+                |row| row.get(0),
+            )?;
+            ensure!(enabled, "Enable the inbox before sharing new work");
+        }
         if shared {
             for permission in ["discover", "send", "receive"] {
                 tx.execute(
@@ -87,14 +92,30 @@ impl Db {
         let mut result = Vec::with_capacity(groups.len());
         for (peer_id, provider, session) in groups {
             let peer = self.peer(&peer_id)?;
-            let mut statement = self.conn.prepare(
-                "SELECT name,enabled FROM agents WHERE provider=? AND session=? ORDER BY name",
-            )?;
-            let local = statement
-                .query_map(params![provider, session], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let (local, enabled, stale) = if provider == "inbox" {
+                let mut statement = self.conn.prepare(
+                    "SELECT name,enabled FROM agents WHERE provider='inbox' AND session=? ORDER BY name",
+                )?;
+                let local = statement
+                    .query_map([&session], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let enabled = local.iter().any(|(_, enabled)| *enabled);
+                let stale = local.is_empty();
+                (local, enabled, stale)
+            } else {
+                let mut statement = self.conn.prepare(
+                    "SELECT name FROM route_aliases WHERE provider=? AND session=? ORDER BY name",
+                )?;
+                let names = statement
+                    .query_map(params![provider, session], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let local = names.into_iter().map(|name| (name, true)).collect();
+                // Saved native grants survive disappearance. Absence is unknown,
+                // never fabricated as stale policy.
+                (local, true, false)
+            };
             let mut statement = self.conn.prepare(
                 "SELECT permission FROM peer_grants WHERE peer_id=? AND provider=? AND session=? ORDER BY permission",
             )?;
@@ -111,8 +132,8 @@ impl Db {
                 "provider":provider,
                 "session":session,
                 "local_names":local.iter().map(|(name,_)| name).collect::<Vec<_>>(),
-                "enabled":local.iter().any(|(_,enabled)| *enabled),
-                "stale":local.is_empty(),
+                "enabled":enabled,
+                "stale":stale,
                 "shared":permissions.len()==3,
                 "permissions":permissions,
             }));

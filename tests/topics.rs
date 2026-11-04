@@ -52,9 +52,9 @@ fn catalog_and_topics_preserve_exact_legacy_registry_sessions() {
     let topic = db.topic_create(&local, "Compatibility", &limits).unwrap();
     let uppercase = "ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF";
     let manual = "legacy\nmanual";
-    for (name, provider, session, enabled) in [
-        ("native-alias", Provider::Codex, uppercase, true),
-        ("manual-alias", Provider::Inbox, manual, false),
+    for (name, provider, session) in [
+        ("native-alias", Provider::Codex, uppercase),
+        ("manual-alias", Provider::Inbox, manual),
     ] {
         db.register(
             &Agent {
@@ -62,7 +62,6 @@ fn catalog_and_topics_preserve_exact_legacy_registry_sessions() {
                 provider,
                 session: session.into(),
                 endpoint: String::new(),
-                enabled,
             },
             false,
         )
@@ -88,9 +87,6 @@ fn catalog_and_topics_preserve_exact_legacy_registry_sessions() {
         .post;
     assert_eq!(post.author.agent_id, format!("codex-{uppercase}"));
     assert_eq!(post.mentions[0].agent_id, format!("inbox-{manual}"));
-    publication.id = id();
-    publication.author.agent_id = format!("codex-{}", uppercase.to_lowercase());
-    assert!(db.topic_publish(&local, &publication, &limits).is_err());
 }
 
 #[test]
@@ -380,21 +376,18 @@ fn exact_identity_mentions_parent_and_catalog() {
                 provider: Provider::Codex,
                 session: session.clone(),
                 endpoint: String::new(),
-                enabled: true,
             },
             false,
         )
         .unwrap();
     }
-    db.observe_session_name(&Provider::Codex, &session, Some("Current"))
-        .unwrap();
     let topic = db.topic_create(&local, "A", &limits).unwrap();
     let other = db.topic_create(&local, "B", &limits).unwrap();
     let mut req = request(&topic.reference, "hi");
     req.author = canonical.clone();
     req.mentions = vec![author(), author()];
     let p = db.topic_publish(&local, &req, &limits).unwrap().post;
-    assert_eq!(p.author_display_name, "Current");
+    assert_eq!(p.author_display_name, canonical.agent_id);
     assert_eq!(p.mentions.len(), 1);
     req.author.bridge_id = Some(local.clone());
     req.mentions = vec![author()];
@@ -429,25 +422,20 @@ fn exact_identity_mentions_parent_and_catalog() {
     assert!(db.topic_publish(&local, &req, &limits).unwrap().duplicate);
     let mut new = req.clone();
     new.id = id();
-    assert!(db.topic_publish(&local, &new, &limits).is_err());
-    db.observe_session_name(&Provider::Codex, &session, Some("Renamed"))
-        .unwrap();
+    assert_eq!(
+        db.topic_publish(&local, &new, &limits)
+            .unwrap()
+            .post
+            .author
+            .agent_id,
+        canonical.agent_id
+    );
     assert_eq!(
         db.topic_read(&local, &topic.reference, Some(""), None, 100)
             .unwrap()
             .posts[0]
             .author_display_name,
-        "Current"
-    );
-    let catalog = db.topic_agents(&local).unwrap();
-    assert_eq!(catalog.len(), 2);
-    assert_eq!(
-        catalog
-            .iter()
-            .find(|a| a.reference.agent_id == canonical.agent_id)
-            .unwrap()
-            .display_name,
-        "Renamed"
+        canonical.agent_id
     );
     db.register(
         &Agent {
@@ -455,7 +443,6 @@ fn exact_identity_mentions_parent_and_catalog() {
             provider: Provider::Inbox,
             session: "different".into(),
             endpoint: String::new(),
-            enabled: true,
         },
         true,
     )
@@ -465,11 +452,6 @@ fn exact_identity_mentions_parent_and_catalog() {
         catalog
             .iter()
             .any(|a| a.reference.agent_id == "inbox-different")
-    );
-    assert!(
-        catalog
-            .iter()
-            .any(|a| a.reference.agent_id == canonical.agent_id)
     );
 }
 
@@ -612,7 +594,6 @@ fn mention_bounds_immutable_history_and_callback_rollback() {
                 provider: Provider::Inbox,
                 session: session.clone(),
                 endpoint: String::new(),
-                enabled: false,
             },
             false,
         )
@@ -651,7 +632,7 @@ fn mention_bounds_immutable_history_and_callback_rollback() {
 }
 
 #[test]
-fn catalog_bound_and_current_metadata_fallback() {
+fn catalog_bound_and_immutable_display_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let mut db = Db::open(&path).unwrap();
@@ -663,20 +644,15 @@ fn catalog_bound_and_current_metadata_fallback() {
             name: "alias".into(),
             provider: Provider::Claude,
             session: session.clone(),
-            endpoint: "offline".into(),
-            enabled: true,
+            endpoint: String::new(),
         },
         false,
     )
     .unwrap();
-    db.observe_session_name(&Provider::Claude, &session, Some("Snapshot"))
-        .unwrap();
     let topic = db.topic_create(&local, "A", &limits).unwrap();
     let mut req = request(&topic.reference, "body");
     req.author.agent_id = format!("claude-{session}");
     db.topic_publish(&local, &req, &limits).unwrap();
-    db.observe_session_name(&Provider::Claude, &session, None)
-        .unwrap();
     assert_eq!(
         db.topic_agents(&local)
             .unwrap()
@@ -684,7 +660,7 @@ fn catalog_bound_and_current_metadata_fallback() {
             .find(|a| a.reference.agent_id == req.author.agent_id)
             .unwrap()
             .display_name,
-        "Snapshot"
+        req.author.agent_id
     );
     let conn = Connection::open(&path).unwrap();
     conn.execute("DELETE FROM agents WHERE name='alias'", [])
@@ -694,7 +670,7 @@ fn catalog_bound_and_current_metadata_fallback() {
             .unwrap()
             .posts[0]
             .author_display_name,
-        "Snapshot"
+        req.author.agent_id
     );
     for n in 0..1000 {
         conn.execute(

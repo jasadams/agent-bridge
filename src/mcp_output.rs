@@ -99,6 +99,27 @@ pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value
 }
 
 pub(super) fn agents(value: Value, verbose: bool) -> Value {
+    if let Value::Object(mut map) = value {
+        if !verbose && let Some(Value::Array(rows)) = map.get_mut("agents") {
+            *rows = rows
+                .drain(..)
+                .map(|row| {
+                    fields(
+                        row,
+                        &[
+                            "name",
+                            "provider",
+                            "display_name",
+                            "status",
+                            "enabled",
+                            "stale_reason",
+                        ],
+                    )
+                })
+                .collect();
+        }
+        return Value::Object(map);
+    }
     if verbose {
         return value;
     }
@@ -122,17 +143,7 @@ pub(super) fn agents(value: Value, verbose: bool) -> Value {
                         ],
                     )
                 } else {
-                    fields(
-                        row,
-                        &[
-                            "name",
-                            "provider",
-                            "display_name",
-                            "qualified_name",
-                            "enabled",
-                            "stale_reason",
-                        ],
-                    )
+                    fields(row, &["name", "provider", "display_name", "status"])
                 }
             })
             .collect(),
@@ -211,8 +222,8 @@ mod tests {
         assert_eq!(
             agents(local.clone(), false),
             json!([{
-                "name":"codex-id","provider":"codex","enabled":true,
-                "display_name":"Planner","qualified_name":"codex:Planner"
+                "name":"codex-id","provider":"codex",
+                "display_name":"Planner"
             }])
         );
         assert_eq!(agents(local.clone(), true), local);

@@ -12,13 +12,13 @@ fn agent(name: &str) -> Agent {
         provider: Provider::Inbox,
         session: uuid::Uuid::new_v4().to_string(),
         endpoint: String::new(),
-        enabled: true,
     }
 }
 
 fn send(db: &mut Db, recipient: &str) -> String {
     let id = uuid::Uuid::new_v4().to_string();
-    db.send(&id, "user", recipient, "body", &None).unwrap();
+    db.send_names(&id, "user", recipient, "body", &None)
+        .unwrap();
     id
 }
 
@@ -133,7 +133,9 @@ async fn broker_adds_metadata_and_keeps_legacy_history_unchanged() {
     let broker = &server.broker;
     broker
         .request(Request::Register {
-            agent: agent("worker"),
+            name: "worker".into(),
+            provider: Provider::Inbox,
+            session: "worker".into(),
             replace: false,
         })
         .unwrap();
@@ -186,21 +188,26 @@ async fn broker_adds_metadata_and_keeps_legacy_history_unchanged() {
 
     let session = uuid::Uuid::new_v4().to_string();
     broker
-        .observe_codex(&json!({"id":session,"name":"Friendly worker","status":{"type":"idle"}}))
+        .request(Request::Register {
+            name: "friendly".into(),
+            provider: Provider::Codex,
+            session: session.clone(),
+            replace: false,
+        })
         .unwrap();
     let native_id = uuid::Uuid::new_v4().to_string();
     broker
         .request(Request::Send {
             id: native_id.clone(),
             sender: "user".into(),
-            recipient: "Friendly worker".into(),
+            recipient: "friendly".into(),
             body: "native body".into(),
             parent: None,
         })
         .unwrap();
     let alias_page = broker
         .request(Request::HistorySince {
-            agent: Some("codex:Friendly worker".into()),
+            agent: Some("friendly".into()),
             cursor: None,
             limit: 1,
         })
@@ -208,7 +215,7 @@ async fn broker_adds_metadata_and_keeps_legacy_history_unchanged() {
     assert_eq!(alias_page["messages"][0]["id"], native_id);
     let canonical_page = broker
         .request(Request::HistorySince {
-            agent: Some(format!("codex-{session}")),
+            agent: Some("friendly".into()),
             cursor: Some(alias_page["cursor"].as_str().unwrap().into()),
             limit: 1,
         })

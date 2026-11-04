@@ -65,8 +65,8 @@ impl Db {
     ) -> Result<Message> {
         let agent = self.agent(recipient)?;
         ensure!(
-            agent.provider == Provider::Codex && agent.enabled && agent.session == session,
-            "Codex control notice requires the unchanged enabled exact local registration"
+            agent.provider == Provider::Codex && agent.session == session,
+            "Codex control notice requires the unchanged exact local registration"
         );
         let tx = self.conn.unchecked_transaction()?;
         let existing = self.get_optional(id)?;
@@ -76,7 +76,13 @@ impl Db {
                 "Notice ID already belongs to an ordinary message"
             );
         }
-        let message = self.send(id, "user", recipient, content, &None)?;
+        let source = Agent {
+            name: "user".into(),
+            provider: Provider::Inbox,
+            session: "user".into(),
+            endpoint: String::new(),
+        };
+        let message = self.send(id, &source, &agent, content, &None)?;
         tx.execute("INSERT OR IGNORE INTO codex_notices VALUES(?)", [id])?;
         if let Some(token) = token {
             self.event_control_record(id, token)?;
@@ -127,7 +133,6 @@ mod tests {
             provider: Provider::Codex,
             session: "123e4567-e89b-12d3-a456-426614174000".into(),
             endpoint: String::new(),
-            enabled: true,
         };
         let mut two = one.clone();
         two.name = "two".into();
@@ -136,7 +141,7 @@ mod tests {
         (root, db, one, two)
     }
     fn send(db: &Db, target: &Agent) -> Message {
-        db.send(
+        db.send_names(
             &uuid::Uuid::new_v4().to_string(),
             "user",
             &target.name,
@@ -172,7 +177,7 @@ mod tests {
             send(&db, &one);
         }
         let error = db
-            .send(
+            .send_names(
                 &uuid::Uuid::new_v4().to_string(),
                 "user",
                 &two.name,
@@ -182,7 +187,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("64 pending"));
         assert_eq!(
-            db.send(&first.id, "user", &one.name, "peer input", &None)
+            db.send_names(&first.id, "user", &one.name, "peer input", &None)
                 .unwrap()
                 .id,
             first.id
@@ -258,19 +263,15 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_alias_unregister_does_not_close_canonical_session_or_accept_stale_native_close() {
+    fn ordinary_alias_unregister_removes_only_that_exact_route() {
         let (_root, db, one, two) = setup();
         db.unregister(&one.name, &one.session).unwrap();
-        assert!(!db.agent(&one.name).unwrap().enabled);
-        assert!(db.agent(&two.name).unwrap().enabled);
+        assert!(db.agent(&one.name).is_err());
+        assert_eq!(db.agent(&two.name).unwrap().session, two.session);
         assert!(
-            db.close_native(&two.name, "wrong-session", &two.endpoint)
+            db.unregister(&format!("codex-{}", two.session), &two.session)
                 .is_err()
         );
-        assert!(db.agent(&two.name).unwrap().enabled);
-        db.close_native(&two.name, &two.session, &two.endpoint)
-            .unwrap();
-        assert!(!db.agent(&two.name).unwrap().enabled);
     }
 
     #[test]
@@ -350,7 +351,7 @@ mod tests {
             .execute("UPDATE messages SET state='failed' WHERE id=?", [&old.id])
             .unwrap();
         for _ in 0..1000 {
-            db.send(
+            db.send_names(
                 &uuid::Uuid::new_v4().to_string(),
                 "one",
                 "user",

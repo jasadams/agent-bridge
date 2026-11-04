@@ -3,7 +3,7 @@ mod support;
 use agent_bridge::{
     broker::{self, Broker},
     network::trust::Permission,
-    protocol::{Agent, Provider, Request},
+    protocol::{Provider, Request},
 };
 use serde_json::Value;
 use std::{
@@ -41,6 +41,26 @@ impl Running {
     }
 
     fn request(&self, request: Request) -> Value {
+        if matches!(
+            &request,
+            Request::RemoteList | Request::RemoteListPeer { .. }
+        ) {
+            let broker = self.broker.clone();
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(broker.request_async(request))
+                    })
+                    .join()
+                    .ok()
+                    .and_then(std::result::Result::ok)
+            })
+            .unwrap_or_else(|| serde_json::json!([]));
+        }
         self.broker.request(request).unwrap()
     }
 
@@ -135,28 +155,12 @@ async fn connect(alice: &Running, bob: &Running) {
     });
 }
 
-async fn directory(bridge: &Running, name: &str) {
-    wait(|| {
-        bridge
-            .request(Request::RemoteList)
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|agent| agent["name"] == name)
-            .cloned()
-    })
-    .await;
-}
-
 fn inbox(bridge: &Running, name: &str) {
     bridge.request(Request::Register {
-        agent: Agent {
-            name: name.into(),
-            provider: Provider::Inbox,
-            session: format!("{name}-session"),
-            endpoint: String::new(),
-            enabled: true,
-        },
+        name: name.into(),
+        provider: Provider::Inbox,
+        session: format!("{name}-session"),
+
         replace: false,
     });
 }
@@ -188,20 +192,26 @@ async fn two_brokers_deliver_once_to_native_socket_and_sync_delivery_and_reply()
     let native_path = native_dir.join("inbox.sock");
     let native = UnixListener::bind(&native_path).unwrap();
     std::fs::set_permissions(&native_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let reviewer_session = uuid::Uuid::new_v4().to_string();
     bob.request(Request::Register {
-        agent: Agent {
-            name: "reviewer".into(),
-            provider: Provider::Claude,
-            session: uuid::Uuid::new_v4().to_string(),
-            endpoint: native_path.to_string_lossy().into_owned(),
-            enabled: true,
-        },
+        name: "reviewer".into(),
+        provider: Provider::Claude,
+        session: reviewer_session.clone(),
+        replace: false,
+    });
+    bob.request(Request::ClaudeBind {
+        session: reviewer_session.clone(),
+        endpoint: native_path.to_string_lossy().into_owned(),
+    });
+    alice.request(Request::Register {
+        name: "reviewer".into(),
+        provider: Provider::Claude,
+        session: reviewer_session,
         replace: false,
     });
     grant(&alice, "bob", "user");
     grant(&bob, "alice", "reviewer");
     connect(&alice, &bob).await;
-    directory(&alice, "reviewer").await;
     let id = uuid::Uuid::new_v4().to_string();
     let body = "Remote quotes ' and literal $(nothing)\nUnicode 🦀";
     for _ in 0..2 {
@@ -284,10 +294,15 @@ async fn queued_transfer_survives_origin_restart_and_destination_offline_period(
     let bob = Running::start(&bob_path);
     pair(&alice, &bob);
     inbox(&bob, "reviewer");
+    alice.request(Request::Register {
+        name: "reviewer".into(),
+        provider: Provider::Inbox,
+        session: "reviewer-session".into(),
+        replace: false,
+    });
     grant(&alice, "bob", "user");
     grant(&bob, "alice", "reviewer");
     connect(&alice, &bob).await;
-    directory(&alice, "reviewer").await;
     let bob_address = bob.listening().await;
     // Retain the selected port across restart, and disable source transport before
     // enqueueing so this checks durable offline work rather than an in-flight race.
@@ -365,11 +380,16 @@ async fn revocation_blocks_a_durably_received_message_before_native_submission()
     let bob = Running::start(&root.path().join("b"));
     pair(&alice, &bob);
     inbox(&bob, "reviewer");
+    alice.request(Request::Register {
+        name: "reviewer".into(),
+        provider: Provider::Inbox,
+        session: "reviewer-session".into(),
+        replace: false,
+    });
     grant(&alice, "bob", "user");
     grant(&bob, "alice", "reviewer");
     bob.request(Request::Pause { paused: true });
     connect(&alice, &bob).await;
-    directory(&alice, "reviewer").await;
     let id = uuid::Uuid::new_v4().to_string();
     alice.request(Request::Send {
         id: id.clone(),
@@ -406,12 +426,6 @@ async fn revocation_blocks_a_durably_received_message_before_native_submission()
     })
     .await;
     message_state(&bob, received["id"].as_str().unwrap(), "pending").await;
-    assert!(
-        bob.request(Request::RemoteList)
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
     alice.stop().await;
     bob.stop().await;
 }

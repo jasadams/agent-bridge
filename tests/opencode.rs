@@ -76,7 +76,6 @@ impl PluginSocket {
             provider: Provider::OpenCode,
             session: SESSION.into(),
             endpoint: self.path.to_str().unwrap().into(),
-            enabled: true,
         }
     }
     fn finish(self) {
@@ -126,7 +125,6 @@ async fn broker_delivery(plugin: &PluginSocket) -> Message {
         &Request::OpenCodeObserve {
             session: SESSION.into(),
             endpoint: agent.endpoint,
-            title: Some("Delivery".into()),
             ready: true,
         },
     )
@@ -209,88 +207,67 @@ async fn wrong_instance_session_and_message_receipts_never_submit() {
 }
 
 #[tokio::test]
-async fn live_registration_titles_disposal_and_endpoint_conflicts_use_shared_registry() {
+async fn live_registration_endpoint_replacement_and_close_use_binding_state() {
     let plugin = PluginSocket::start(4, receipt);
     let agent = plugin.agent();
     let state = plugin.root.path().join("state");
     let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
     let server = tokio::spawn(broker::serve(bound));
-    for title in ["First", "Renamed"] {
+    for _ in 0..2 {
         broker::rpc(
             &state,
             &Request::OpenCodeObserve {
                 session: SESSION.into(),
                 endpoint: agent.endpoint.clone(),
-                title: Some(title.into()),
                 ready: true,
             },
         )
         .await
         .unwrap();
-        let listed = broker::rpc(&state, &Request::List { all: false })
-            .await
-            .unwrap();
-        assert!(
-            listed
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|a| a["session"] == SESSION && a["display_name"] == title)
-        );
     }
+    // Another session cannot claim the live owning instance.
     assert!(
         broker::rpc(
             &state,
             &Request::OpenCodeObserve {
                 session: OTHER.into(),
                 endpoint: agent.endpoint.clone(),
-                title: None,
                 ready: true,
             }
         )
         .await
         .is_err()
     );
-    let other = PluginSocket::start(1, receipt);
+    // Canonical native routes are not stored membership and cannot be unregistered.
     assert!(
         broker::rpc(
             &state,
-            &Request::OpenCodeObserve {
+            &Request::Unregister {
+                name: agent.name.clone(),
                 session: SESSION.into(),
-                endpoint: other.agent().endpoint,
-                title: None,
-                ready: true,
-            }
+            },
         )
         .await
         .is_err()
     );
-    other.finish();
     broker::rpc(
         &state,
-        &Request::Unregister {
-            name: agent.name.clone(),
+        &Request::OpenCodeClose {
             session: SESSION.into(),
-        },
-    )
-    .await
-    .unwrap();
-    let listed = broker::rpc(&state, &Request::List { all: false })
-        .await
-        .unwrap();
-    assert!(
-        !listed
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["session"] == SESSION)
-    );
-    // Re-registration still requires a live exact-session probe.
-    broker::rpc(
-        &state,
-        &Request::Register {
-            agent,
-            replace: false,
+            endpoint: agent.endpoint.clone(),
+            generation: broker::rpc(
+                &state,
+                &Request::OpenCodeObserve {
+                    session: SESSION.into(),
+                    endpoint: agent.endpoint.clone(),
+                    ready: true,
+                },
+            )
+            .await
+            .unwrap()["generation"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
         },
     )
     .await
@@ -459,7 +436,6 @@ async fn native_state_reply_cannot_satisfy_a_registration_probe() {
             .request(Request::OpenCodeObserve {
                 session: SESSION.into(),
                 endpoint: plugin.agent().endpoint,
-                title: None,
                 ready: true
             })
             .is_err()
@@ -598,7 +574,6 @@ async fn paused_broker_expires_crashed_leases_and_queued_deadlines_without_nativ
         &Request::OpenCodeObserve {
             session: SESSION.into(),
             endpoint: agent.endpoint.clone(),
-            title: None,
             ready: true,
         },
     )
@@ -627,17 +602,10 @@ async fn paused_broker_expires_crashed_leases_and_queued_deadlines_without_nativ
     // No broker requests or native events can supply the expiry observation.
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
-            let enabled: bool = conn
-                .query_row(
-                    "SELECT enabled FROM agents WHERE name=?",
-                    [&agent.name],
-                    |r| r.get(0),
-                )
-                .unwrap();
             let status: String = conn
                 .query_row("SELECT state FROM messages WHERE id=?", [ID], |r| r.get(0))
                 .unwrap();
-            if !enabled && status == "failed" {
+            if status == "failed" {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -744,7 +712,6 @@ async fn topic_push_opencode_admission_fences_old_epoch_but_not_accepted_work() 
             .request_async(Request::OpenCodeObserve {
                 session: SESSION.into(),
                 endpoint: plugin.agent().endpoint,
-                title: None,
                 ready: true,
             })
             .await
@@ -823,8 +790,8 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
         let storage = native.clone();
         let broker_state = state.clone();
         // Two probes, the lost event, an ordinary tail, explicit readback and
-        // a new lifecycle event. Missing proof must not block the latter two.
-        let plugin = PluginSocket::start_optional(6, move |frame, instance| {
+        // a new board event. Missing proof must not block the latter two.
+        let plugin = PluginSocket::start_optional(5, move |frame, instance| {
             if frame["op"] == "probe" {
                 return Some(receipt(frame, instance));
             }
@@ -859,7 +826,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
                 native.inserted.push(frame.clone());
                 native.frames.push(frame.clone());
                 if native.lost_event.is_none() {
-                    assert!(frame["content"].as_str().unwrap().contains("agent.opened"));
+                    assert!(frame["content"].as_str().unwrap().contains("board.changed"));
                     native.lost_event = Some(frame);
                     // The native insert happened, but the connection closes
                     // without its receipt: the real adapter must mark uncertain.
@@ -899,7 +866,6 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
         let observe = || Request::OpenCodeObserve {
             session: SESSION.into(),
             endpoint: plugin.path.to_str().unwrap().into(),
-            title: Some("event recipient".into()),
             ready: true,
         };
         broker.request_async(observe()).await.unwrap();
@@ -907,20 +873,21 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
         let subscribe = || Request::Subscribe {
             board_revisions: Default::default(),
             agent: route.clone(),
-            events: vec![EventSelector::AgentOpened {}],
+            events: vec![EventSelector::BoardChanged {
+                board: Default::default(),
+            }],
         };
         broker.request(subscribe()).unwrap();
+        let board = broker.request(Request::BoardRead).unwrap();
         broker
-            .request(Request::Register {
-                agent: Agent {
-                    name: "first-worker".into(),
-                    provider: Provider::Inbox,
-                    session: "first-worker".into(),
-                    endpoint: String::new(),
-                    enabled: true,
-                },
-                replace: false,
-            })
+            .request(Request::board_update(
+                Default::default(),
+                board["revision"].as_str().unwrap().into(),
+                vec![agent_bridge::board::Edit::Append {
+                    text: "\nboard event\n".into(),
+                }],
+                None,
+            ))
             .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -1088,25 +1055,13 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
                 .unwrap()["state"],
             "delivered"
         );
-        broker
-            .request(Request::Register {
-                agent: Agent {
-                    name: "fresh-worker".into(),
-                    provider: Provider::Inbox,
-                    session: "fresh-worker".into(),
-                    endpoint: String::new(),
-                    enabled: true,
-                },
-                replace: false,
-            })
-            .unwrap();
         broker.request(Request::Pause { paused: false }).unwrap();
         if proof_available {
             wait_message_state(&broker, &event_id, "delivered").await;
             wait_message_state(&broker, &tail_id, "delivered").await;
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    if native.lock().unwrap().inserted.len() == 3 {
+                    if native.lock().unwrap().inserted.len() == 2 {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1128,12 +1083,6 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
                     .as_str()
                     .unwrap()
                     .contains("ordinary tail after uncertain control")
-            );
-            assert!(
-                native.inserted[2]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("fresh-worker")
             );
         } else {
             // The public Unknown state also covers queued/in-flight readback.
@@ -1160,7 +1109,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
             .unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    if native.lock().unwrap().inserted.len() == 3 {
+                    if native.lock().unwrap().inserted.len() == 2 {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1170,14 +1119,8 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
             .unwrap();
             assert_eq!(
                 native.lock().unwrap().inserted.len(),
-                3,
+                2,
                 "Missing proof does not replay the original and later input proceeds"
-            );
-            assert!(
-                native.lock().unwrap().inserted[2]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("fresh-worker")
             );
             assert_eq!(
                 broker

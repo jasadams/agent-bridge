@@ -47,8 +47,6 @@ impl Pair {
             a.grant_peer(&bid, "user", permission, true).unwrap();
             b.grant_peer(&aid, "user", permission, true).unwrap();
         }
-        a.replace_remote_agents(&bid, &[user()]).unwrap();
-        b.replace_remote_agents(&aid, &[user()]).unwrap();
         Self {
             _dir: dir,
             a,
@@ -60,7 +58,7 @@ impl Pair {
     }
     fn send(&self, body: &str) -> Envelope {
         self.a
-            .send_remote(&self.aid, &id(), "user", "bob/user", body, &None)
+            .send_remote_names(&self.aid, &id(), "user", "bob/user", body, &None)
             .unwrap();
         self.a
             .pending_transfers(&self.bid, 100)
@@ -75,17 +73,17 @@ fn lost_receipt_duplicate_and_restart_never_replay_native_submission() {
     let mut p = Pair::new();
     let env = p.send("hello");
     p.a.mark_transfer_attempt(&env.id).unwrap();
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     assert_eq!(p.b.history(&None, 100).unwrap().len(), 1);
     let (message, _) = p.b.claim().unwrap().unwrap();
     assert_eq!(message.sender, format!("{}/user", p.aid));
     p.b.finish(&message.id, "submitted", "native accepted")
         .unwrap();
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     assert!(p.b.claim().unwrap().is_none());
     p.b = Db::open(&p.bpath).unwrap();
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     assert!(p.b.claim().unwrap().is_none());
     let events = p.b.sync_events(&p.aid, 0).unwrap();
     p.a.apply_events(&p.bid, &events).unwrap();
@@ -122,9 +120,9 @@ fn opencode_status_sync_preserves_legacy_unknown_without_local_phase_metadata() 
             provider: Provider::OpenCode,
             session: "ses_0123456789abcdefghijklmnop".into(),
             endpoint: format!("/tmp/{}.sock", id()),
-            enabled: true,
         };
         p.b.register(&agent, false).unwrap();
+        p.a.register(&agent, false).unwrap();
         // Native lease/phase APIs are crate-private. This isolated fixture sets
         // only their durable metadata; envelope admission and status production,
         // application, acceptance and restart use the real public store APIs.
@@ -135,17 +133,8 @@ fn opencode_status_sync_preserves_legacy_unknown_without_local_phase_metadata() 
         )
         .unwrap();
         p.b.share_peer_session(&p.aid, &agent.name, true).unwrap();
-        p.a.replace_remote_agents(
-            &p.bid,
-            &[RemoteAgent {
-                name: agent.name.clone(),
-                provider: agent.provider.clone(),
-                session: agent.session.clone(),
-            }],
-        )
-        .unwrap();
         let remote_id = id();
-        p.a.send_remote(
+        p.a.send_remote_names(
             &p.aid,
             &remote_id,
             "user",
@@ -156,7 +145,7 @@ fn opencode_status_sync_preserves_legacy_unknown_without_local_phase_metadata() 
         .unwrap();
         let envelope = p.a.pending_transfers(&p.bid, 1).unwrap().pop().unwrap();
         p.a.mark_transfer_attempt(&remote_id).unwrap();
-        p.b.accept_remote(&p.bid, &p.aid, &envelope).unwrap();
+        p.b.accept_remote_names(&p.bid, &p.aid, &envelope).unwrap();
         let local_id = p.b.history(&None, 1).unwrap()[0].id.clone();
         if phase == "inserted" {
             // The current delivery phase can already be terminal when old
@@ -225,43 +214,43 @@ fn opencode_status_sync_preserves_legacy_unknown_without_local_phase_metadata() 
 fn duplicate_acceptance_precedes_changed_permissions_rate_limits_and_session_lookup() {
     let mut p = Pair::new();
     let first = p.send("first");
-    p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &first).unwrap();
     for n in 1..30 {
         let mut env = first.clone();
         env.id = id();
         env.body = format!("message {n}");
-        p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+        p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     }
     let mut next = first.clone();
     next.id = id();
-    let error = p.b.accept_remote(&p.bid, &p.aid, &next).unwrap_err();
+    let error = p.b.accept_remote_names(&p.bid, &p.aid, &next).unwrap_err();
     assert!(retryable(&error));
-    p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &first).unwrap();
     p.b.grant_peer(&p.aid, "user", Permission::Receive, false)
         .unwrap();
-    p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &first).unwrap();
     assert!(!retryable(
-        &p.b.accept_remote(&p.bid, &p.aid, &next).unwrap_err()
+        &p.b.accept_remote_names(&p.bid, &p.aid, &next).unwrap_err()
     ));
     p.b.revoke_peer(&p.aid).unwrap();
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &first).is_err());
+    assert!(p.b.accept_remote_names(&p.bid, &p.aid, &first).is_err());
 }
 
 #[test]
 fn envelope_identity_conflicts_and_unrelated_statuses_are_rejected() {
     let p = Pair::new();
     let env = p.send("first");
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     let mut conflict = env.clone();
     conflict.body = "different".into();
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &conflict).is_err());
+    assert!(p.b.accept_remote_names(&p.bid, &p.aid, &conflict).is_err());
     let mut forged = env.clone();
     forged.id = id();
     forged.origin_peer = peer_id();
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &forged).is_err());
+    assert!(p.b.accept_remote_names(&p.bid, &p.aid, &forged).is_err());
     let mut forwarded = env.clone();
     forwarded.destination_peer = peer_id();
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &forwarded).is_err());
+    assert!(p.b.accept_remote_names(&p.bid, &p.aid, &forwarded).is_err());
     assert!(
         p.a.transfer_result(&p.bid, &env.id, &WireResponse::Accepted { id: id() })
             .is_err()
@@ -282,12 +271,11 @@ fn envelope_identity_conflicts_and_unrelated_statuses_are_rejected() {
 fn reply_uses_original_parent_session_and_correlates_local_ids() {
     let p = Pair::new();
     let env = p.send("question");
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     let local = p.b.history(&None, 1).unwrap().pop().unwrap();
-    // A reply remains possible from a pinned parent even without directory data.
-    p.b.replace_remote_agents(&p.aid, &[]).unwrap();
+    // A reply remains possible from a pinned parent without directory data.
     let reply_id = id();
-    p.b.send_remote(
+    p.b.send_remote_names(
         &p.bid,
         &reply_id,
         "user",
@@ -298,21 +286,21 @@ fn reply_uses_original_parent_session_and_correlates_local_ids() {
     .unwrap();
     let reply = p.b.pending_transfers(&p.aid, 1).unwrap().pop().unwrap();
     assert_eq!(reply.hops, 1);
-    p.a.accept_remote(&p.aid, &p.bid, &reply).unwrap();
+    p.a.accept_remote_names(&p.aid, &p.bid, &reply).unwrap();
     let answer = p.a.history(&None, 1).unwrap().pop().unwrap();
     assert_eq!(answer.parent, Some(env.id));
     assert_eq!(answer.body, "answer");
     let mut forged = reply;
     forged.id = id();
     forged.hops = 0;
-    assert!(p.a.accept_remote(&p.aid, &p.bid, &forged).is_err());
+    assert!(p.a.accept_remote_names(&p.aid, &p.bid, &forged).is_err());
 }
 
 #[test]
 fn remote_reply_chain_continues_beyond_eight_hops() {
     let p = Pair::new();
     let original = p.send("start");
-    p.b.accept_remote(&p.bid, &p.aid, &original).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &original).unwrap();
     let mut parent = p.b.history(&None, 1).unwrap()[0].id.clone();
     for hop in 1..=10 {
         let (sender, receiver, source_peer, destination_peer, destination) = if hop % 2 == 1 {
@@ -322,7 +310,7 @@ fn remote_reply_chain_continues_beyond_eight_hops() {
         };
         let message_id = id();
         sender
-            .send_remote(
+            .send_remote_names(
                 source_peer,
                 &message_id,
                 "user",
@@ -339,7 +327,7 @@ fn remote_reply_chain_continues_beyond_eight_hops() {
             .unwrap();
         assert_eq!(envelope.hops, hop);
         receiver
-            .accept_remote(destination_peer, source_peer, &envelope)
+            .accept_remote_names(destination_peer, source_peer, &envelope)
             .unwrap();
         parent = receiver.history(&None, 1).unwrap()[0].id.clone();
     }
@@ -350,7 +338,7 @@ fn remote_reply_hop_boundaries_apply_on_send_and_receive() {
     for hop in [9, 100] {
         let p = Pair::new();
         let original = p.send("question");
-        p.b.accept_remote(&p.bid, &p.aid, &original).unwrap();
+        p.b.accept_remote_names(&p.bid, &p.aid, &original).unwrap();
         let parent = p.b.history(&None, 1).unwrap().pop().unwrap().id;
         // Model a validated prior exchange at the boundary without bypassing
         // the per-minute rate limits with 100 artificial network deliveries.
@@ -363,7 +351,7 @@ fn remote_reply_hop_boundaries_apply_on_send_and_receive() {
         .unwrap();
         b.execute("UPDATE inbound_transfers SET envelope=json_set(envelope,'$.hops',?1) WHERE local_id=?2", rusqlite::params![hop - 1, parent]).unwrap();
         let reply_id = id();
-        p.b.send_remote(
+        p.b.send_remote_names(
             &p.bid,
             &reply_id,
             "user",
@@ -374,11 +362,11 @@ fn remote_reply_hop_boundaries_apply_on_send_and_receive() {
         .unwrap();
         let reply = p.b.pending_transfers(&p.aid, 1).unwrap().pop().unwrap();
         assert_eq!(reply.hops, hop);
-        p.a.accept_remote(&p.aid, &p.bid, &reply).unwrap();
+        p.a.accept_remote_names(&p.aid, &p.bid, &reply).unwrap();
         if hop == 100 {
             b.execute("UPDATE inbound_transfers SET envelope=json_set(envelope,'$.hops',100) WHERE local_id=?1", [&parent]).unwrap();
             let error =
-                p.b.send_remote(
+                p.b.send_remote_names(
                     &p.bid,
                     &id(),
                     "user",
@@ -391,7 +379,9 @@ fn remote_reply_hop_boundaries_apply_on_send_and_receive() {
             let mut excessive = reply;
             excessive.id = id();
             excessive.hops = 101;
-            let error = p.a.accept_remote(&p.aid, &p.bid, &excessive).unwrap_err();
+            let error =
+                p.a.accept_remote_names(&p.aid, &p.bid, &excessive)
+                    .unwrap_err();
             assert!(
                 error
                     .to_string()
@@ -405,11 +395,10 @@ fn remote_reply_hop_boundaries_apply_on_send_and_receive() {
 fn revocation_blocks_queued_work_and_clears_cached_directory_even_while_paused() {
     let mut p = Pair::new();
     let env = p.send("pending");
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     p.b.pause(true).unwrap();
     p.b.revoke_peer(&p.aid).unwrap();
     assert_eq!(p.b.history(&None, 1).unwrap()[0].state, "blocked");
-    assert_eq!(p.b.remote_agents().unwrap(), serde_json::json!([]));
     p.b.pause(false).unwrap();
     assert!(p.b.claim().unwrap().is_none());
     p.a.mark_transfer_attempt(&env.id).unwrap();
@@ -423,27 +412,17 @@ fn revocation_blocks_queued_work_and_clears_cached_directory_even_while_paused()
 }
 
 #[test]
-fn immutable_outbound_survives_directory_replacement_and_idempotent_retries() {
+fn immutable_outbound_survives_idempotent_retries_without_a_remote_catalog() {
     let p = Pair::new();
     let env = p.send("original");
-    p.a.replace_remote_agents(
-        &p.bid,
-        &[RemoteAgent {
-            session: "replacement".into(),
-            ..user()
-        }],
-    )
-    .unwrap();
-    p.a.send_remote(&p.aid, &env.id, "user", "bob/user", "original", &None)
+    p.a.send_remote_names(&p.aid, &env.id, "user", "bob/user", "original", &None)
         .unwrap();
     assert_eq!(p.a.pending_transfers(&p.bid, 1).unwrap()[0], env);
     assert!(
-        p.a.send_remote(&p.aid, &env.id, "user", "bob/user", "conflict", &None)
+        p.a.send_remote_names(&p.aid, &env.id, "user", "bob/user", "conflict", &None)
             .is_err()
     );
     let next = p.send("new");
-    assert_eq!(next.destination.session, "replacement");
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &next).is_err());
     assert!(p.a.cancel(&next.id).is_ok());
 }
 
@@ -467,31 +446,23 @@ fn configuration_addresses_and_exports_are_validated_and_persisted() {
             .is_err()
     );
     assert!(p.a.network_config().unwrap().enabled);
-    assert_eq!(p.a.export_agents(&p.bid).unwrap(), vec![user()]);
+    let directory = [Agent {
+        name: "user".into(),
+        provider: Provider::Inbox,
+        session: "user".into(),
+        endpoint: String::new(),
+    }];
+    assert_eq!(p.a.export_agents(&p.bid, &directory).unwrap(), vec![user()]);
     p.a.grant_peer(&p.bid, "user", Permission::Discover, false)
         .unwrap();
-    assert!(p.a.export_agents(&p.bid).unwrap().is_empty());
-    assert!(
-        p.a.replace_remote_agents(&p.bid, &[user(), user()])
-            .is_err()
-    );
-    assert!(
-        p.a.replace_remote_agents(
-            &p.bid,
-            &[RemoteAgent {
-                name: "bad/name".into(),
-                ..user()
-            }]
-        )
-        .is_err()
-    );
+    assert!(p.a.export_agents(&p.bid, &directory).unwrap().is_empty());
 }
 
 #[test]
 fn interrupted_native_delivery_is_uncertain_and_unicode_details_are_bounded() {
     let mut p = Pair::new();
     let env = p.send("first");
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     let (message, _) = p.b.claim().unwrap().unwrap();
     p.b = Db::open(&p.bpath).unwrap();
     assert_eq!(p.b.get(&message.id).unwrap().state, "uncertain");
@@ -519,7 +490,6 @@ fn destination_replacement_never_redirects_an_accepted_or_pending_message() {
             provider: Provider::Inbox,
             session: "original".into(),
             endpoint: String::new(),
-            enabled: true,
         },
         false,
     )
@@ -532,30 +502,29 @@ fn destination_replacement_never_redirects_an_accepted_or_pending_message() {
         provider: Provider::Inbox,
         session: "original".into(),
     };
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     p.b.register(
         &Agent {
             name: "sink".into(),
             provider: Provider::Inbox,
             session: "replacement".into(),
             endpoint: String::new(),
-            enabled: true,
         },
         true,
     )
     .unwrap();
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     assert!(p.b.claim().unwrap().is_none());
     let mut new = env;
     new.id = id();
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &new).is_err());
+    assert!(p.b.accept_remote_names(&p.bid, &p.aid, &new).is_err());
 }
 
 #[test]
 fn serialized_status_pages_fit_even_when_details_expand_as_json_controls() {
     let mut p = Pair::new();
     let env = p.send("bounded status");
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     for _ in 0..100 {
         let (message, _) = p.b.claim().unwrap().unwrap();
         p.b.finish(&message.id, "failed", &"\0".repeat(2000))
@@ -616,7 +585,7 @@ fn late_rejection_does_not_overwrite_an_existing_durable_acceptance() {
 fn blocked_inbound_can_be_explicitly_retried_after_trust_is_restored() {
     let mut p = Pair::new();
     let env = p.send("blocked");
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     let local = p.b.history(&None, 1).unwrap().pop().unwrap();
     p.b.revoke_peer(&p.aid).unwrap();
     assert_eq!(p.b.get(&local.id).unwrap().state, "blocked");
@@ -638,7 +607,6 @@ fn inbound_retry_cannot_redirect_to_another_provider_with_the_same_session_id() 
             provider: Provider::Inbox,
             session: session.clone(),
             endpoint: String::new(),
-            enabled: true,
         },
         false,
     )
@@ -651,7 +619,7 @@ fn inbound_retry_cannot_redirect_to_another_provider_with_the_same_session_id() 
         provider: Provider::Inbox,
         session: session.clone(),
     };
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     let local = p.b.history(&None, 1).unwrap().pop().unwrap();
     p.b.register(
         &Agent {
@@ -659,7 +627,6 @@ fn inbound_retry_cannot_redirect_to_another_provider_with_the_same_session_id() 
             provider: Provider::Codex,
             session,
             endpoint: String::new(),
-            enabled: true,
         },
         true,
     )
@@ -673,7 +640,7 @@ fn inbound_retry_cannot_redirect_to_another_provider_with_the_same_session_id() 
 fn retained_history_accounts_utf8_body_copies_and_survives_schema_nine_upgrade() {
     let mut p = Pair::new();
     let env = p.send("retained é🦀\0tail");
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     let conn = rusqlite::Connection::open(&p.bpath).unwrap();
     let expected = (env.body.len() + serde_json::to_string(&env).unwrap().len()) as i64;
     let usage: (i64, i64) = conn
@@ -696,7 +663,7 @@ fn retained_history_accounts_utf8_body_copies_and_survives_schema_nine_upgrade()
     );
     conn.execute_batch(include_str!("fixtures/native-metadata-v10.sql"))
         .unwrap();
-    conn.execute_batch("DROP TRIGGER inbound_usage_insert; DROP TRIGGER inbound_usage_delete; DROP TABLE inbound_usage; PRAGMA user_version=9;").unwrap();
+    conn.execute_batch("DROP TRIGGER IF EXISTS inbound_usage_insert; DROP TRIGGER IF EXISTS inbound_usage_delete; DROP TABLE inbound_usage; PRAGMA user_version=9;").unwrap();
     drop(conn);
     p.b = Db::open(&p.bpath).unwrap();
     let conn = rusqlite::Connection::open(&p.bpath).unwrap();
@@ -709,7 +676,7 @@ fn retained_history_accounts_utf8_body_copies_and_survives_schema_nine_upgrade()
         .unwrap(),
         expected
     );
-    p.b.accept_remote(&p.bid, &p.aid, &env).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &env).unwrap();
     assert_eq!(
         conn.query_row::<i64, _, _>(
             "SELECT messages FROM inbound_usage WHERE peer_id=?",
@@ -726,7 +693,7 @@ fn retained_history_quota_rejects_completed_message_growth_without_breaking_dedu
     for boundary in ["peer-bytes", "peer-rows", "global-bytes", "global-rows"] {
         let mut p = Pair::new();
         let first = p.send("first");
-        p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+        p.b.accept_remote_names(&p.bid, &p.aid, &first).unwrap();
         let next = p.send("more é🦀");
         let cost = (next.body.len() + serde_json::to_string(&next).unwrap().len()) as i64;
         let other = peer_id();
@@ -740,7 +707,7 @@ fn retained_history_quota_rejects_completed_message_growth_without_breaking_dedu
                     rusqlite::params![64 * 1024 * 1024 - cost, &p.aid],
                 )
                 .unwrap();
-                p.b.accept_remote(&p.bid, &p.aid, &next).unwrap();
+                p.b.accept_remote_names(&p.bid, &p.aid, &next).unwrap();
             }
             "peer-rows" => {
                 conn.execute(
@@ -766,7 +733,9 @@ fn retained_history_quota_rejects_completed_message_growth_without_breaking_dedu
         let before: i64 = conn
             .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
             .unwrap();
-        let error = p.b.accept_remote(&p.bid, &p.aid, &failed).unwrap_err();
+        let error =
+            p.b.accept_remote_names(&p.bid, &p.aid, &failed)
+                .unwrap_err();
         assert!(
             error.to_string().contains("history quota"),
             "{boundary}: {error}"
@@ -777,7 +746,7 @@ fn retained_history_quota_rejects_completed_message_growth_without_breaking_dedu
                 .unwrap(),
             before
         );
-        p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+        p.b.accept_remote_names(&p.bid, &p.aid, &first).unwrap();
         assert_eq!(
             conn.query_row::<i64, _, _>("SELECT count(*) FROM messages", [], |r| r.get(0))
                 .unwrap(),
@@ -794,7 +763,6 @@ fn codex_inbound_uses_canonical_alias_admission_and_duplicates_precede_pressure(
         provider: Provider::Codex,
         session: "123e4567-e89b-12d3-a456-426614174000".into(),
         endpoint: String::new(),
-        enabled: true,
     };
     p.b.register(&agent, false).unwrap();
     let mut alias = agent.clone();
@@ -802,20 +770,12 @@ fn codex_inbound_uses_canonical_alias_admission_and_duplicates_precede_pressure(
     p.b.register(&alias, false).unwrap();
     p.b.grant_peer(&p.aid, &agent.name, Permission::Receive, true)
         .unwrap();
-    p.a.replace_remote_agents(
-        &p.bid,
-        &[RemoteAgent {
-            name: agent.name.clone(),
-            provider: agent.provider.clone(),
-            session: agent.session.clone(),
-        }],
-    )
-    .unwrap();
+    p.a.register(&agent, false).unwrap();
     let remote_id = id();
-    p.a.send_remote(&p.aid, &remote_id, "user", "bob/native", "first", &None)
+    p.a.send_remote_names(&p.aid, &remote_id, "user", "bob/native", "first", &None)
         .unwrap();
     let first = p.a.pending_transfers(&p.bid, 100).unwrap().pop().unwrap();
-    p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &first).unwrap();
     let (claimed, _) = p.b.claim().unwrap().unwrap();
     p.b.finish(&claimed.id, "submitted", "native accepted")
         .unwrap();
@@ -823,12 +783,12 @@ fn codex_inbound_uses_canonical_alias_admission_and_duplicates_precede_pressure(
     // Delivered history does not consume admission capacity: all 64 genuinely
     // pending alias messages must still fit beside the completed remote message.
     for _ in 0..64 {
-        p.b.send(&id(), "user", &alias.name, "local", &None)
+        p.b.send_names(&id(), "user", &alias.name, "local", &None)
             .unwrap();
     }
-    p.b.accept_remote(&p.bid, &p.aid, &first).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &first).unwrap();
     let next_id = id();
-    p.a.send_remote(&p.aid, &next_id, "user", "bob/native", "full", &None)
+    p.a.send_remote_names(&p.aid, &next_id, "user", "bob/native", "full", &None)
         .unwrap();
     let next =
         p.a.pending_transfers(&p.bid, 100)
@@ -836,7 +796,7 @@ fn codex_inbound_uses_canonical_alias_admission_and_duplicates_precede_pressure(
             .into_iter()
             .find(|e| e.id == next_id)
             .unwrap();
-    let error = p.b.accept_remote(&p.bid, &p.aid, &next).unwrap_err();
+    let error = p.b.accept_remote_names(&p.bid, &p.aid, &next).unwrap_err();
     assert!(retryable(&error));
     assert!(error.to_string().contains("64 pending"));
     let history = p.b.history(&None, 100).unwrap();
@@ -863,22 +823,22 @@ fn outbound_remote_uuid_collision_never_uses_local_codex_slots_or_concurrency() 
         provider: Provider::Codex,
         session: session.into(),
         endpoint: String::new(),
-        enabled: true,
     };
     p.a.register(&local, false).unwrap();
-    p.a.replace_remote_agents(
-        &p.bid,
-        &[RemoteAgent {
+    p.a.register(
+        &Agent {
             name: "remote-native".into(),
             provider: Provider::Codex,
             session: session.into(),
-        }],
+            endpoint: String::new(),
+        },
+        false,
     )
     .unwrap();
     let mut outgoing = Vec::new();
     for _ in 0..64 {
         let identifier = id();
-        p.a.send_remote(
+        p.a.send_remote_names(
             &p.aid,
             &identifier,
             "user",
@@ -897,7 +857,7 @@ fn outbound_remote_uuid_collision_never_uses_local_codex_slots_or_concurrency() 
     )
     .unwrap();
     let message =
-        p.a.send(&id(), "user", &local.name, "local", &None)
+        p.a.send_names(&id(), "user", &local.name, "local", &None)
             .unwrap();
     assert_eq!(p.a.claim().unwrap().unwrap().0.id, message.id);
 }

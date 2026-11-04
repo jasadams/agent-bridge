@@ -24,7 +24,6 @@ fn agent(session: &str) -> Agent {
         provider: Provider::OpenCode,
         session: session.into(),
         endpoint: "/unused/plugin.sock".into(),
-        enabled: true,
     }
 }
 // Store contracts inject liveness records directly; native endpoint/probe contracts
@@ -73,8 +72,6 @@ impl Pair {
         fixture_lease(&root.path().join("b"), OTHER);
         a.register(&agent(SESSION), false).unwrap();
         b.register(&agent(OTHER), false).unwrap();
-        a.replace_remote_agents(&bid, &[remote(OTHER)]).unwrap();
-        b.replace_remote_agents(&aid, &[remote(SESSION)]).unwrap();
         Self {
             _root: root,
             a,
@@ -94,7 +91,15 @@ impl Pair {
     fn send(&self) -> Envelope {
         let mid = id();
         self.a
-            .send_remote(&self.aid, &mid, "native", "bob/native", "question", &None)
+            .send_remote_to(
+                &self.aid,
+                &mid,
+                "native",
+                "bob/native",
+                "question",
+                &None,
+                &remote(OTHER),
+            )
             .unwrap();
         self.a
             .pending_transfers(&self.bid, 100)
@@ -109,25 +114,45 @@ impl Pair {
 fn sharing_is_explicit_provider_and_session_scoped_and_legacy_export_stays_filtered() {
     let mut p = Pair::new();
     assert!(
-        p.a.export_agents_supported(&p.bid, &supported_providers())
+        p.a.export_agents_supported(&p.bid, &supported_providers(), &[agent(SESSION)])
             .unwrap()
             .is_empty()
     );
     assert!(
-        p.a.send_remote(&p.aid, &id(), "native", "bob/native", "private", &None)
-            .is_err()
+        p.a.send_remote_to(
+            &p.aid,
+            &id(),
+            "native",
+            "bob/native",
+            "private",
+            &None,
+            &remote(OTHER),
+        )
+        .is_err()
     );
     p.a.grant_peer(&p.bid, "native", Permission::Discover, true)
         .unwrap();
     assert_eq!(
-        p.a.export_agents_supported(&p.bid, &supported_providers())
+        p.a.export_agents_supported(&p.bid, &supported_providers(), &[agent(SESSION)])
             .unwrap(),
         vec![remote(SESSION)]
     );
-    assert!(p.a.export_agents(&p.bid).unwrap().is_empty());
     assert!(
-        p.a.send_remote(&p.aid, &id(), "native", "bob/native", "private", &None)
-            .is_err()
+        p.a.export_agents(&p.bid, &[agent(SESSION)])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        p.a.send_remote_to(
+            &p.aid,
+            &id(),
+            "native",
+            "bob/native",
+            "private",
+            &None,
+            &remote(OTHER),
+        )
+        .is_err()
     );
     p.share();
     for permission in [Permission::Discover, Permission::Send, Permission::Receive] {
@@ -146,29 +171,22 @@ fn sharing_is_explicit_provider_and_session_scoped_and_legacy_export_stays_filte
     }
     let envelope = p.send();
     p.b.share_peer_session(&p.aid, "native", false).unwrap();
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &envelope).is_err());
+    assert!(p.b.accept_remote_names(&p.bid, &p.aid, &envelope).is_err());
     p.b.share_peer_session(&p.aid, "native", true).unwrap();
-    p.b.accept_remote(&p.bid, &p.aid, &envelope).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &envelope).unwrap();
 }
 
 #[test]
 fn title_rename_disable_and_replacement_never_move_grants_or_queued_destination() {
     let mut p = Pair::new();
     p.share();
-    p.a.observe_session_name(&Provider::OpenCode, SESSION, Some("Renamed"))
-        .unwrap();
     assert_eq!(
-        p.a.export_agents_supported(&p.bid, &supported_providers())
+        p.a.export_agents_supported(&p.bid, &supported_providers(), &[agent(SESSION)])
             .unwrap(),
         vec![remote(SESSION)]
     );
     let envelope = p.send();
-    p.b.accept_remote(&p.bid, &p.aid, &envelope).unwrap();
-    let mut disabled = agent(OTHER);
-    disabled.enabled = false;
-    p.b.register(&disabled, false).unwrap();
-    assert!(p.b.share_peer_session(&p.aid, "native", true).is_err());
-    assert!(p.b.claim().unwrap().is_none());
+    p.b.accept_remote_names(&p.bid, &p.aid, &envelope).unwrap();
     p.b.share_peer_session(&p.aid, "native", false).unwrap();
     p.b.register(&agent(SESSION), true).unwrap();
     assert!(
@@ -178,7 +196,7 @@ fn title_rename_disable_and_replacement_never_move_grants_or_queued_destination(
     assert!(p.b.claim().unwrap().is_none());
     let mut fresh = envelope;
     fresh.id = id();
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &fresh).is_err());
+    assert!(p.b.accept_remote_names(&p.bid, &p.aid, &fresh).is_err());
     assert_eq!(p.b.history(&None, 10).unwrap().len(), 1);
 }
 
@@ -187,10 +205,9 @@ fn replies_pin_native_identity_without_a_directory_and_reject_replaced_sources()
     let mut p = Pair::new();
     p.share();
     let envelope = p.send();
-    p.b.accept_remote(&p.bid, &p.aid, &envelope).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &envelope).unwrap();
     let parent = p.b.history(&None, 1).unwrap()[0].id.clone();
-    p.b.replace_remote_agents(&p.aid, &[]).unwrap();
-    p.b.send_remote(
+    p.b.send_remote_names(
         &p.bid,
         &id(),
         "native",
@@ -202,7 +219,7 @@ fn replies_pin_native_identity_without_a_directory_and_reject_replaced_sources()
     let reply = p.b.pending_transfers(&p.aid, 1).unwrap().pop().unwrap();
     assert_eq!(reply.destination, remote(SESSION));
     assert_eq!(reply.source, remote(OTHER));
-    p.a.accept_remote(&p.aid, &p.bid, &reply).unwrap();
+    p.a.accept_remote_names(&p.aid, &p.bid, &reply).unwrap();
     assert!(
         p.a.history(&None, 10)
             .unwrap()
@@ -212,11 +229,11 @@ fn replies_pin_native_identity_without_a_directory_and_reject_replaced_sources()
     let mut forged = reply;
     forged.id = id();
     forged.source.session = SESSION.into();
-    assert!(p.a.accept_remote(&p.aid, &p.bid, &forged).is_err());
+    assert!(p.a.accept_remote_names(&p.aid, &p.bid, &forged).is_err());
     p.b.register(&agent(SESSION), true).unwrap();
     p.b.share_peer_session(&p.aid, "native", true).unwrap();
     assert!(
-        p.b.send_remote(
+        p.b.send_remote_names(
             &p.bid,
             &id(),
             "native",
@@ -233,16 +250,17 @@ fn reply_cannot_cross_provider_after_name_and_native_id_are_reused() {
     let mut p = Pair::new();
     p.share();
     let envelope = p.send();
-    p.b.accept_remote(&p.bid, &p.aid, &envelope).unwrap();
+    p.b.accept_remote_names(&p.bid, &p.aid, &envelope).unwrap();
     let parent = p.b.history(&None, 1).unwrap()[0].id.clone();
     let replacement = Agent {
         provider: Provider::Inbox,
+        endpoint: String::new(),
         ..agent(OTHER)
     };
     p.b.register(&replacement, true).unwrap();
     p.b.share_peer_session(&p.aid, "native", true).unwrap();
     assert!(
-        p.b.send_remote(
+        p.b.send_remote_names(
             &p.bid,
             &id(),
             "native",
@@ -267,10 +285,6 @@ fn malformed_directories_and_envelopes_are_rejected_atomically() {
         "ses_0123456789abcdefghijklmnop\n",
         "ses_é123456789abcdefghijklmnop",
     ] {
-        assert!(
-            p.a.replace_remote_agents(&p.bid, &[remote(OTHER), remote(invalid)])
-                .is_err()
-        );
         for source in [true, false] {
             let mut bad = envelope.clone();
             bad.id = id();
@@ -279,7 +293,7 @@ fn malformed_directories_and_envelopes_are_rejected_atomically() {
             } else {
                 bad.destination.session = invalid.into();
             }
-            assert!(p.b.accept_remote(&p.bid, &p.aid, &bad).is_err());
+            assert!(p.b.accept_remote_names(&p.bid, &p.aid, &bad).is_err());
         }
         assert!(
             p.a.unshare_peer_session(&p.bid, &Provider::OpenCode, invalid)
@@ -291,7 +305,10 @@ fn malformed_directories_and_envelopes_are_rejected_atomically() {
     let mut wrong_provider = envelope.clone();
     wrong_provider.id = id();
     wrong_provider.source.provider = Provider::Claude;
-    assert!(p.b.accept_remote(&p.bid, &p.aid, &wrong_provider).is_err());
+    assert!(
+        p.b.accept_remote_names(&p.bid, &p.aid, &wrong_provider)
+            .is_err()
+    );
     assert!(p.b.history(&None, 10).unwrap().is_empty());
 }
 
@@ -327,14 +344,14 @@ fn pre_opencode_strict_directory_reader_keeps_all_supported_clients_discoverable
             provider,
             session: id(),
             endpoint: String::new(),
-            enabled: true,
         };
         p.a.register(&native, false).unwrap();
         p.a.share_peer_session(&p.bid, &native.name, true).unwrap();
     }
     p.a.share_peer_session(&p.bid, "user", true).unwrap();
+    let directory = p.a.listed_agents(false).unwrap();
     let all =
-        p.a.export_agents_supported(&p.bid, &supported_providers())
+        p.a.export_agents_supported(&p.bid, &supported_providers(), &directory)
             .unwrap();
     assert_eq!(all.len(), 4);
     let unfiltered =
@@ -342,7 +359,7 @@ fn pre_opencode_strict_directory_reader_keeps_all_supported_clients_discoverable
             .unwrap();
     assert!(serde_json::from_value::<LegacyDirectory>(unfiltered).is_err());
     let filtered = serde_json::to_value(agent_bridge::network::wire::WireResponse::Directory {
-        agents: p.a.export_agents(&p.bid).unwrap(),
+        agents: p.a.export_agents(&p.bid, &directory).unwrap(),
     })
     .unwrap();
     let LegacyDirectory::Directory { agents } = serde_json::from_value(filtered).unwrap();
@@ -377,8 +394,11 @@ fn invalid_persisted_identity_cannot_gain_or_remove_session_grants() {
         "not-a-session",
     ] {
         // Simulate untrusted historical metadata; registration itself rejects it.
-        conn.execute("UPDATE agents SET session=? WHERE name='native'", [invalid])
-            .unwrap();
+        conn.execute(
+            "UPDATE route_aliases SET session=? WHERE name='native'",
+            [invalid],
+        )
+        .unwrap();
         for permission in [Permission::Discover, Permission::Send, Permission::Receive] {
             for allow in [true, false] {
                 assert!(p.a.grant_peer(&p.bid, "native", permission, allow).is_err());
@@ -395,9 +415,9 @@ fn schema_eleven_grants(path: &std::path::Path) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(path).unwrap();
     // Recreate the exact pre-OpenCode grant constraint and numbered schema.
     conn.execute_batch(
-        "DROP TRIGGER topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER opencode_enqueue_bound;
-DROP TRIGGER opencode_retry_bound;
-DROP TRIGGER opencode_enqueue_binding;
+        "DROP TRIGGER IF EXISTS topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER IF EXISTS opencode_enqueue_bound;
+DROP TRIGGER IF EXISTS opencode_retry_bound;
+DROP TRIGGER IF EXISTS opencode_enqueue_binding;
 DROP TABLE opencode_deliveries;
 DROP TABLE opencode_leases;
 ALTER TABLE peer_grants RENAME TO upgraded_grants;
@@ -441,7 +461,6 @@ fn schema_eleven_grants_upgrade_without_loss_and_reopen_idempotently() {
         // Reopening a database deliberately does not prove a conversation is
         // still open. Inject a fresh verified-live fixture generation before
         // exercising grant persistence; real probes are covered by network tests.
-        assert!(!db.agent("native").unwrap().enabled);
         fixture_lease(&path, SESSION);
         db.register(&agent(SESSION), false).unwrap();
         db.share_peer_session(&paired, "native", true).unwrap();
@@ -603,7 +622,6 @@ fn replies_from_another_alias_of_the_same_native_session_preserve_parent_identit
         };
         p.a.register(&source, true).unwrap();
         p.b.register(&manual, false).unwrap();
-        p.b.register(&canonical, false).unwrap();
         p.a.register(
             &Agent {
                 name: "origin-alias".into(),
@@ -619,23 +637,22 @@ fn replies_from_another_alias_of_the_same_native_session_preserve_parent_identit
             provider: provider.clone(),
             session: destination_session.clone(),
         };
-        p.a.replace_remote_agents(&p.bid, std::slice::from_ref(&destination))
-            .unwrap();
         let question_id = id();
-        p.a.send_remote(
+        p.a.send_remote_to(
             &p.aid,
             &question_id,
             &source.name,
             "bob/manual",
             "question",
             &None,
+            &destination,
         )
         .unwrap();
         let question = p.a.pending_transfers(&p.bid, 1).unwrap().pop().unwrap();
-        p.b.accept_remote(&p.bid, &p.aid, &question).unwrap();
+        p.b.accept_remote_names(&p.bid, &p.aid, &question).unwrap();
         let local_parent = p.b.history(&None, 1).unwrap()[0].id.clone();
         // The plugin's canonical route and owner's manual alias name one session.
-        p.b.send_remote(
+        p.b.send_remote_names(
             &p.bid,
             &id(),
             &canonical.name,
@@ -654,7 +671,7 @@ fn replies_from_another_alias_of_the_same_native_session_preserve_parent_identit
         assert_eq!(reference.id, question_id);
         assert_eq!(reference.peer_id, p.aid);
         assert_eq!(reply.hops, question.hops + 1);
-        p.a.accept_remote(&p.aid, &p.bid, &reply).unwrap();
+        p.a.accept_remote_names(&p.aid, &p.bid, &reply).unwrap();
         let answer =
             p.a.history(&None, 10)
                 .unwrap()
@@ -667,6 +684,9 @@ fn replies_from_another_alias_of_the_same_native_session_preserve_parent_identit
         let mut redirected = reply;
         redirected.id = id();
         redirected.destination.name = "origin-alias".into();
-        assert!(p.a.accept_remote(&p.aid, &p.bid, &redirected).is_err());
+        assert!(
+            p.a.accept_remote_names(&p.aid, &p.bid, &redirected)
+                .is_err()
+        );
     }
 }

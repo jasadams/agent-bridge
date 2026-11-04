@@ -7,7 +7,7 @@ use agent_bridge::{
         trust::Permission,
         wire::{Operation, RemoteAgent, WireResponse},
     },
-    protocol::{Agent, Provider, Request},
+    protocol::{Provider, Request},
 };
 use serde_json::Value;
 use std::{
@@ -42,6 +42,26 @@ impl Running {
     }
 
     fn request(&self, request: Request) -> Value {
+        if matches!(
+            &request,
+            Request::RemoteList | Request::RemoteListPeer { .. }
+        ) {
+            let broker = self.broker.clone();
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(broker.request_async(request))
+                    })
+                    .join()
+                    .ok()
+                    .and_then(std::result::Result::ok)
+            })
+            .unwrap_or_else(|| serde_json::json!([]));
+        }
         self.broker.request(request).unwrap()
     }
 
@@ -108,16 +128,6 @@ fn pair(bridge: &Running, peer: &str, alias: &str) {
     });
 }
 
-fn directory_machine(bridge: &Running, agent: &str, machine: &str) -> Option<Value> {
-    bridge
-        .request(Request::RemoteList)
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["name"] == agent && entry["machine_name"] == machine)
-        .cloned()
-}
-
 #[tokio::test]
 async fn authenticated_machine_names_survive_renaming_with_pinned_queued_delivery() {
     let root = tempfile::Builder::new()
@@ -142,13 +152,19 @@ async fn authenticated_machine_names_survive_renaming_with_pinned_queued_deliver
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let session = uuid::Uuid::new_v4().to_string();
     bob.request(Request::Register {
-        agent: Agent {
-            name: "reviewer".into(),
-            provider: Provider::Claude,
-            session: session.clone(),
-            endpoint: socket_path.to_string_lossy().into_owned(),
-            enabled: true,
-        },
+        name: "reviewer".into(),
+        provider: Provider::Claude,
+        session: session.clone(),
+        replace: false,
+    });
+    bob.request(Request::ClaudeBind {
+        session: session.clone(),
+        endpoint: socket_path.to_string_lossy().into_owned(),
+    });
+    alice.request(Request::Register {
+        name: "reviewer".into(),
+        provider: Provider::Claude,
+        session: session.clone(),
         replace: false,
     });
     pair(&alice, &bob_id, "destination");
@@ -171,12 +187,22 @@ async fn authenticated_machine_names_survive_renaming_with_pinned_queued_deliver
         peer: "origin".into(),
         address: alice_address,
     });
-    let directory = wait(|| directory_machine(&alice, "reviewer", "machine-b")).await;
-    assert_eq!(directory["peer_id"], bob_id);
-    assert_eq!(directory["machine_display_name"], "destination");
-    let local = alice.request(Request::List { all: false });
-    assert_eq!(local[0]["machine_name"], "machine-a");
-    assert_eq!(local[0]["peer_id"], alice_id);
+    let metadata = wait(|| {
+        alice
+            .request(Request::PeerConnections)
+            .as_array()?
+            .iter()
+            .find(|entry| entry["peer_id"] == bob_id && entry["machine_name"] == "machine-b")
+            .cloned()
+    })
+    .await;
+    assert_eq!(metadata["peer_id"], bob_id);
+    let local = alice.request(Request::List {
+        all: false,
+        max_age_days: 7,
+    });
+    assert_eq!(local["agents"][0]["machine_name"], "machine-a");
+    assert_eq!(local["agents"][0]["peer_id"], alice_id);
     bob.request(Request::Pause { paused: true });
     let id = uuid::Uuid::new_v4().to_string();
     alice.request(Request::Send {
@@ -196,8 +222,18 @@ async fn authenticated_machine_names_survive_renaming_with_pinned_queued_deliver
     bob.request(Request::MachineSetName {
         name: "renamed-machine-b".into(),
     });
-    let renamed = wait(|| directory_machine(&alice, "reviewer", "renamed-machine-b")).await;
-    assert_eq!(renamed["machine_display_name"], "destination");
+    let renamed = wait(|| {
+        alice
+            .request(Request::PeerConnections)
+            .as_array()?
+            .iter()
+            .find(|entry| {
+                entry["peer_id"] == bob_id && entry["machine_name"] == "renamed-machine-b"
+            })
+            .cloned()
+    })
+    .await;
+    assert_eq!(renamed["peer_id"], bob_id);
     assert_eq!(bob.identity(), bob_id);
     let peer = bob.request(Request::PeersList);
     assert_eq!(peer[0]["alias"], "origin");
@@ -393,17 +429,6 @@ async fn peer_without_machine_metadata_still_accepts_v1_message_transfers() {
         peer: "legacy".into(),
         address,
     });
-    let directory = wait(|| {
-        source
-            .request(Request::RemoteList)
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|agent| agent["name"] == "user")
-            .cloned()
-    })
-    .await;
-    assert!(directory["machine_name"].is_null());
     let id = uuid::Uuid::new_v4().to_string();
     source.request(Request::Send {
         id: id.clone(),

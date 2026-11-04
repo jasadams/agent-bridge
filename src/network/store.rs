@@ -15,7 +15,6 @@ use libp2p::Multiaddr;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkConfig {
@@ -176,74 +175,37 @@ impl Db {
         Ok(self.conn.prepare("SELECT a.peer_id,a.address FROM peer_addresses a JOIN peers p ON p.peer_id=a.peer_id WHERE p.revoked=0 ORDER BY a.peer_id")?.query_map([], |r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn remote_agents(&self) -> Result<Value> {
-        self.remote_agents_filtered(None)
+    pub fn export_agents(
+        &self,
+        peer: &str,
+        directory: &[crate::protocol::Agent],
+    ) -> Result<Vec<RemoteAgent>> {
+        self.export_agents_supported(
+            peer,
+            &["claude".into(), "codex".into(), "inbox".into()],
+            directory,
+        )
     }
 
-    pub fn remote_agents_for(&self, peer: &str) -> Result<Value> {
-        ensure!(
-            !peer.trim().is_empty(),
-            "Choose a nonempty peer alias or ID"
-        );
-        let peer = self.peer(peer)?;
-        self.require_peer(&peer.peer_id)?;
-        self.remote_agents_filtered(Some(&peer.peer_id))
-    }
-
-    fn remote_agents_filtered(&self, peer: Option<&str>) -> Result<Value> {
-        let rows = self.conn.prepare("SELECT r.peer_id,p.alias,r.agent FROM remote_agents r JOIN peers p ON p.peer_id=r.peer_id WHERE p.revoked=0 AND (?1 IS NULL OR r.peer_id=?1) ORDER BY r.peer_id,r.name")?.query_map([peer], |r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut result = Vec::new();
-        for (peer, alias, agent) in rows {
-            let agent: RemoteAgent = serde_json::from_str(&agent)?;
-            let metadata = self.peer(&peer)?;
-            result.push(json!({"peer_id":peer,"peer_alias":alias,"machine_name":metadata.machine_name,"machine_display_name":metadata.display_name,"name":agent.name,"provider":agent.provider,"session":agent.session,"qualified_name":format!("{}/{}",alias.as_deref().unwrap_or(&peer),agent.name)}));
-        }
-        Ok(json!(result))
-    }
-
-    pub fn replace_remote_agents(&self, peer: &str, agents: &[RemoteAgent]) -> Result<()> {
-        self.require_peer(peer)?;
-        ensure!(
-            agents.len() <= PAGE_SIZE,
-            "Remote directory exceeds 100 entries"
-        );
-        let mut names = HashSet::new();
-        for agent in agents {
-            validate_agent(agent)?;
-            ensure!(names.insert(&agent.name), "Duplicate remote agent name");
-        }
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM remote_agents WHERE peer_id=?", [peer])?;
-        for agent in agents {
-            tx.execute(
-                "INSERT INTO remote_agents VALUES(?,?,?)",
-                params![peer, agent.name, serde_json::to_string(agent)?],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn export_agents(&self, peer: &str) -> Result<Vec<RemoteAgent>> {
-        self.export_agents_supported(peer, &["claude".into(), "codex".into(), "inbox".into()])
-    }
-
+    /// Prepare the directory with the connector boundary before this call.
+    /// Recheck exact Discover grants under the locked request.
     pub fn export_agents_supported(
         &self,
         peer: &str,
         providers: &[String],
+        directory: &[crate::protocol::Agent],
     ) -> Result<Vec<RemoteAgent>> {
         super::wire::validate_providers(providers)?;
         self.require_peer(peer)?;
         let mut result = Vec::new();
-        for agent in self.listed_agents(false)? {
+        for agent in directory {
             if providers
                 .iter()
                 .any(|provider| provider == agent.provider.label())
                 && self.peer_allowed(peer, &agent.provider, &agent.session, Permission::Discover)?
             {
-                validate_agent(&remote(&agent))?;
-                result.push(remote(&agent));
+                validate_agent(&remote(agent))?;
+                result.push(remote(agent));
             }
         }
         ensure!(
@@ -253,7 +215,8 @@ impl Db {
         Ok(result)
     }
 
-    pub fn send_remote(
+    /// Configuration-only test/administration helper for prepared remote sends.
+    pub fn send_remote_names(
         &self,
         local_peer: &str,
         id: &str,
@@ -261,6 +224,62 @@ impl Db {
         recipient: &str,
         body: &str,
         parent: &Option<String>,
+    ) -> Result<Message> {
+        let source = self.agent(sender)?;
+        let (_, name) = recipient
+            .split_once('/')
+            .context("Remote destination must be peer/agent")?;
+        let local = self.agent(name)?;
+        let destination = RemoteAgent {
+            name: name.into(),
+            provider: local.provider,
+            session: local.session,
+        };
+        self.send_remote(
+            local_peer,
+            id,
+            &source,
+            recipient,
+            body,
+            parent,
+            Some(&destination),
+        )
+    }
+
+    /// Configuration-only helper for an explicitly prepared remote destination.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_remote_to(
+        &self,
+        local_peer: &str,
+        id: &str,
+        sender: &str,
+        recipient: &str,
+        body: &str,
+        parent: &Option<String>,
+        destination: &RemoteAgent,
+    ) -> Result<Message> {
+        let source = self.agent(sender)?;
+        self.send_remote(
+            local_peer,
+            id,
+            &source,
+            recipient,
+            body,
+            parent,
+            Some(destination),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_remote(
+        &self,
+        local_peer: &str,
+        id: &str,
+        source: &crate::protocol::Agent,
+        recipient: &str,
+        body: &str,
+        parent: &Option<String>,
+        destination: Option<&RemoteAgent>,
     ) -> Result<Message> {
         canonical_peer(local_peer)?;
         uuid::Uuid::parse_str(id).context("Message ID must be a UUID")?;
@@ -273,14 +292,13 @@ impl Db {
             ensure!(
                 request
                     .as_ref()
-                    .is_some_and(|(s, r)| s == sender && r == recipient)
+                    .is_some_and(|(s, r)| s == &source.name && r == recipient)
                     && old.body == body
                     && old.parent == *parent,
                 "Message ID already exists with different contents"
             );
             return Ok(old);
         }
-        let source = self.resolve_agent(sender)?;
         let (peer_name, agent_name) = recipient
             .split_once('/')
             .context("Remote destination must be peer/agent")?;
@@ -315,7 +333,7 @@ impl Db {
                 .context("Remote replies require a received remote parent")?;
             let previous: Envelope = serde_json::from_str(&encoded)?;
             ensure!(
-                same_session(&previous.destination, &remote(&source)),
+                same_session(&previous.destination, &remote(source)),
                 "Only the original recipient provider/session can reply"
             );
             ensure!(
@@ -331,18 +349,16 @@ impl Db {
                 previous.hops + 1,
             )
         } else {
-            let encoded: String = self
-                .conn
-                .query_row(
-                    "SELECT agent FROM remote_agents WHERE peer_id=? AND name=?",
-                    params![peer.peer_id, agent_name],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .context("Unknown remote session; fetch its permitted directory first")?;
-            (serde_json::from_str(&encoded)?, None, 0)
+            let destination = destination.context(
+                "Fetch the permitted peer directory before starting a new remote message",
+            )?;
+            ensure!(
+                destination.name == agent_name,
+                "Prepared remote destination does not match the requested agent"
+            );
+            (destination.clone(), None, 0)
         };
-        validate_agent(&remote(&source))?;
+        validate_agent(&remote(source))?;
         validate_agent(&destination)?;
         ensure!(
             hops <= MAX_REPLY_HOPS,
@@ -351,7 +367,7 @@ impl Db {
         let envelope = Envelope {
             origin_peer: local_peer.into(),
             id: id.into(),
-            source: remote(&source),
+            source: remote(source),
             destination_peer: peer.peer_id.clone(),
             destination,
             body: body.into(),
@@ -368,21 +384,14 @@ impl Db {
         );
         self.check_capacity(&peer.peer_id, false)?;
         let tx = self.conn.unchecked_transaction()?;
-        let t = now();
-        tx.execute(
-            "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',NULL,?8,?8)",
-            params![
-                id,
-                source.name,
-                format!("{}/{}", peer.peer_id, envelope.destination.name),
-                envelope.destination.session,
-                body,
-                parent,
-                hops,
-                t
-            ],
-        )?;
-        tx.execute("INSERT INTO outbound_transfers(id,peer_id,envelope,state,requested_sender,requested_recipient) VALUES(?,?,?,'pending',?,?)", params![id,peer.peer_id,serde_json::to_string(&envelope)?,sender,recipient])?;
+        let local_destination = crate::protocol::Agent {
+            name: format!("{}/{}", peer.peer_id, envelope.destination.name),
+            provider: envelope.destination.provider.clone(),
+            session: envelope.destination.session.clone(),
+            endpoint: String::new(),
+        };
+        crate::db::insert_message_in(&tx, id, source, &local_destination, body, parent, hops)?;
+        tx.execute("INSERT INTO outbound_transfers(id,peer_id,envelope,state,requested_sender,requested_recipient) VALUES(?,?,?,'pending',?,?)", params![id,peer.peer_id,serde_json::to_string(&envelope)?,source.name,recipient])?;
         tx.commit()?;
         self.get(id)
     }
@@ -503,11 +512,43 @@ impl Db {
         Ok(row.map(|(state,detail,observed_at)|json!({"state":state,"detail":detail,"observed_at":observed_at})))
     }
 
+    /// Configuration-only test/administration helper for prepared inbound accepts.
+    pub fn accept_remote_names(
+        &self,
+        local_peer: &str,
+        authenticated_peer: &str,
+        envelope: &Envelope,
+    ) -> Result<()> {
+        let destination = self.agent(&envelope.destination.name)?;
+        self.accept_remote(local_peer, authenticated_peer, envelope, &destination)
+    }
+
+    /// Duplicate envelope readback before any native lookup.
+    pub(crate) fn inbound_duplicate(&self, peer: &str, envelope: &Envelope) -> Result<bool> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT envelope FROM inbound_transfers WHERE peer_id=? AND origin_id=?",
+                params![peer, envelope.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            ensure!(
+                serde_json::from_str::<Envelope>(&existing)? == *envelope,
+                "Message ID already accepted with different contents"
+            );
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn accept_remote(
         &self,
         local_peer: &str,
         authenticated_peer: &str,
         envelope: &Envelope,
+        destination: &crate::protocol::Agent,
     ) -> Result<()> {
         self.require_peer(authenticated_peer)?;
         canonical_peer(local_peer)?;
@@ -549,11 +590,16 @@ impl Db {
             );
             return Ok(());
         }
-        let destination = self.agent(&envelope.destination.name)?;
         ensure!(
-            destination.enabled && remote(&destination) == envelope.destination,
-            "Destination session was replaced or disabled"
+            remote(destination) == envelope.destination,
+            "Destination session was replaced"
         );
+        if destination.provider == crate::protocol::Provider::Inbox {
+            ensure!(
+                self.inbox_enabled(&destination.name, &destination.session)?,
+                "Destination inbox is disabled"
+            );
+        }
         ensure!(
             self.peer_allowed(
                 authenticated_peer,
@@ -599,18 +645,20 @@ impl Db {
         let encoded = serde_json::to_string(envelope)?;
         check_retained_capacity(&tx, authenticated_peer, envelope.body.len() + encoded.len())?;
         let t = now();
-        tx.execute(
-            "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',NULL,?8,?8)",
-            params![
-                local_id,
-                format!("{}/{}", authenticated_peer, envelope.source.name),
-                destination.name,
-                destination.session,
-                envelope.body,
-                parent_local,
-                envelope.hops,
-                t
-            ],
+        let source = crate::protocol::Agent {
+            name: format!("{}/{}", authenticated_peer, envelope.source.name),
+            provider: envelope.source.provider.clone(),
+            session: envelope.source.session.clone(),
+            endpoint: String::new(),
+        };
+        crate::db::insert_message_in(
+            &tx,
+            &local_id,
+            &source,
+            destination,
+            &envelope.body,
+            &parent_local,
+            envelope.hops,
         )?;
         tx.execute(
             "INSERT INTO inbound_transfers VALUES(?,?,?,?,?,?)",
@@ -726,7 +774,7 @@ impl Db {
     }
 
     pub(crate) fn block_revoked_inbound(&self) -> Result<()> {
-        self.conn.execute("UPDATE messages SET state=CASE WHEN EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued') THEN 'uncertain' ELSE 'blocked' END,detail='Remote receiving policy or destination changed',updated=? WHERE state='queued' AND id IN (SELECT t.local_id FROM inbound_transfers t WHERE NOT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON g.peer_id=p.peer_id WHERE p.peer_id=t.peer_id AND p.revoked=0 AND g.provider=t.provider AND g.session=t.session AND g.permission='receive' AND EXISTS(SELECT 1 FROM agents a WHERE a.name=messages.recipient AND a.provider=t.provider AND a.session=t.session AND a.enabled=1)))", [now()])?;
+        self.conn.execute("UPDATE messages SET state=CASE WHEN EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued') THEN 'uncertain' ELSE 'blocked' END,detail='Remote receiving policy or destination changed',updated=? WHERE state='queued' AND id IN (SELECT t.local_id FROM inbound_transfers t WHERE NOT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON g.peer_id=p.peer_id WHERE p.peer_id=t.peer_id AND p.revoked=0 AND g.provider=t.provider AND g.session=t.session AND g.permission='receive') OR EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=messages.recipient AND (a.provider<>t.provider OR a.session<>t.session)) OR (t.provider='inbox' AND NOT EXISTS(SELECT 1 FROM agents a WHERE a.name=messages.recipient AND a.session=t.session AND a.enabled=1)))", [now()])?;
         Ok(())
     }
 

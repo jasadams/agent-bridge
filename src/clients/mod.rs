@@ -20,7 +20,6 @@ pub enum Capability {
     ControlNotices,
     /// Session-selected pairing prompts require a supported owner-input workflow.
     PairingPrompts,
-    LifecycleRegistration,
 }
 
 /// Native observations, never a persisted agent catalog. Endpoint selection is
@@ -54,7 +53,7 @@ impl std::error::Error for StateError {}
 /// Synchronous reads run outside the DB lock on the existing blocking worker.
 /// Empty/None mean confirmed absence; errors must never become empty success.
 /// Only supporting providers age-filter lists; exact lookup is never filtered.
-pub trait ConnectorState {
+pub trait ConnectorState: Send + Sync {
     fn provider(&self) -> Provider;
     fn list(&self, max_age_days: u32) -> std::result::Result<Vec<NativeState>, StateError>;
     fn get(&self, session: &str) -> std::result::Result<Option<NativeState>, StateError>;
@@ -192,9 +191,7 @@ impl Adapter {
             (self, capability),
             (
                 Self::Claude | Self::Codex | Self::OpenCode,
-                Capability::Messages
-                    | Capability::ControlNotices
-                    | Capability::LifecycleRegistration
+                Capability::Messages | Capability::ControlNotices
             ) | (Self::Claude | Self::Codex, Capability::PairingPrompts)
         )
     }
@@ -334,16 +331,17 @@ pub(crate) async fn deliver_notice(
     adapter.deliver(agent, msg, notice.text()).await
 }
 
-/// Observe loaded Codex sessions. Dropping this future cancels the observer.
-pub(crate) async fn observe(broker: crate::broker::Broker, codex_home: Option<PathBuf>) {
-    let codex_broker = broker.clone();
-    let codex_observer = async move {
-        if let Some(home) = codex_home {
-            codex_discovery::run(codex_broker, home).await;
-        }
-        std::future::pending::<()>().await;
-    };
-    codex_observer.await;
+/// Observe loaded Codex sessions into the broker's shared connector state.
+/// Dropping this future cancels the observer.
+pub(crate) async fn observe(
+    state: std::sync::Arc<codex_discovery::State>,
+    codex_home: Option<PathBuf>,
+    status: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
+) {
+    if let Some(home) = codex_home {
+        codex_discovery::run((*state).clone(), home, status).await;
+    }
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]
