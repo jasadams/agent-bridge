@@ -326,7 +326,11 @@ fn native_state_pages_use_only_updated_age_and_exact_lookup_ignores_age() {
     assert_eq!(state.list(30).unwrap().len(), 2);
     let exact = state.get(SESSION).unwrap().unwrap();
     assert_eq!(exact.session, SESSION);
-    assert_eq!(exact.transport_endpoint, Some(plugin.agent().endpoint));
+    let endpoint = std::fs::canonicalize(plugin.agent().endpoint)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(exact.transport_endpoint, Some(endpoint));
     plugin.finish();
 }
 fn state_row(session: &str, updated: Value) -> Value {
