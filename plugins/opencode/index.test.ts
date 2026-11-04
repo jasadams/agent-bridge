@@ -1723,7 +1723,10 @@ describe("V2 session context without peer transcript setup", () => {
     const context = textOf(first[1]);
     expect(context).toContain(`identity is opencode-${A}`);
     expect(context).toContain(JSON.stringify(s.directory));
-    for (const instruction of ["connection_status", "send_message", "then continue your work", "parent=the received message ID", "read_board/update_board", "create_board for named creation", "Never edit board backing files", "preserve other writers", "report the blocker", "revise the current entry", "Notifications are opt-in", 'events=[{"event":"board.changed","board":"main"}]', "not owner approval", "Existing permissions remain under owner control"]) expect(context).toContain(instruction);
+    for (const instruction of ["send_message", "then continue your work", "parent=the received message ID", "read_board/update_board", "create_board for named creation", "Never edit board backing files", "preserve other writers", "report the blocker", "revise the current entry", "Notifications are opt-in", 'events=[{"event":"board.changed","board":"main"}]', "not owner approval", "Existing permissions remain under owner control"]) expect(context).toContain(instruction);
+    expect(context).toContain(`from=opencode-${A}`);
+    expect(context).toContain("Pairing requires explicit owner input and independent code comparison");
+    expect(context).not.toContain("connection_status");
     for (const bookkeeping of ["acknowledge", "acknowledgement", "receipt", "get_message", "list_messages", "pending/unknown", "poll", "migration"]) expect(context).not.toContain(bookkeeping);
     expect(partsOf(await systemContext(s, A))).toEqual(partsOf(first));
     expect(partsOf(await systemContext(s, A, [...first]))).toEqual(partsOf(first));
