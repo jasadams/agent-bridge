@@ -604,7 +604,7 @@ impl Db {
     pub(crate) fn claude_binding_sessions(&self) -> Result<Vec<String>> {
         Ok(self
             .conn
-            .prepare("SELECT session FROM claude_bindings ORDER BY session")?
+            .prepare("SELECT session FROM claude_bindings WHERE endpoint<>'' ORDER BY session")?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -1076,14 +1076,26 @@ impl Db {
         Ok(())
     }
 
-    /// Local messages that may still become claimable on their own: queued, or
-    /// OpenCode receipts the reconcile sweep promotes. Matches `claim`'s scope.
-    pub fn has_unfinished_delivery(&self) -> Result<bool> {
+    /// A local message the claim loop can take now. Keep in step with the candidate
+    /// query in `claim_excluding_codex`: a narrower predicate here would strand work.
+    pub fn has_claimable(&self) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages m WHERE (m.state='queued' OR (m.state='uncertain' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=m.id AND d.phase IN ('uncertain','dispatched','reconcile') AND NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=m.id AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL))))) AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=m.id))",
+            "SELECT EXISTS(SELECT 1 FROM messages m WHERE (m.state='queued' OR (m.state='uncertain' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=m.id AND d.phase='reconcile'))) AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=m.id))",
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// Time until the reconcile sweep next has work (same scope as
+    /// `opencode_sweep_uncertain`, keep the two in step); None when nothing
+    /// time-driven is pending.
+    pub fn next_reconcile_in(&self) -> Result<Option<std::time::Duration>> {
+        let due: Option<i64> = self.conn.query_row(
+            "SELECT min(coalesce(d.reconcile_at,0)) FROM opencode_deliveries d JOIN messages m ON m.id=d.id AND m.recipient_session=d.session WHERE d.phase IN ('uncertain','dispatched') AND m.state='uncertain' AND NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=d.id AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL))",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(due.map(|due| std::time::Duration::from_millis((due - now()).max(1000) as u64)))
     }
 
     pub fn retry(&self, id: &str, allow_duplicate: bool) -> Result<Message> {

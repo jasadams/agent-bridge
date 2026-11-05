@@ -390,7 +390,8 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
             // retained during native delivery, and idle brokers do not poll it.
             let db = broker.db.lock().unwrap();
             let mut state = broker.board_notifications.lock().unwrap();
-            state.prune(|name| db.agent(name).ok());
+            // Watches are pruned by the delivery loop on every wake; each agent
+            // change is a request, so no per-tick agent lookups here.
             if let Some(name) = state.next_board() {
                 match broker.read_board_locked(&db, &name) {
                     Ok(board) => {

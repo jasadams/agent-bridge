@@ -536,34 +536,21 @@ impl Broker {
         }))
     }
 
-    /// Request-local directory for peer export and on-demand listing.
     /// Request-local native presence snapshot for claiming durable work. Native
     /// absence leaves queued work untouched; it never becomes a false delivery.
     fn native_readiness(&self) -> std::collections::HashSet<(String, String)> {
-        let bindings = {
-            let db = self.db.lock().unwrap();
-            db.claude_binding_sessions()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|session| {
-                    db.agent(&crate::clients::lifecycle::routing_name(
-                        &Provider::Claude,
-                        &session,
-                    ))
-                    .ok()
-                    .map(|agent| (session, agent.endpoint))
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut ready = std::collections::HashSet::new();
-        for binding in bindings.into_iter().flatten() {
-            // Bindings are delivery coordinates. Claiming does not probe the
-            // socket (that would create payload-free native connections); a dead
-            // socket fails the delivery attempt with its existing diagnostic.
-            if !binding.1.is_empty() {
-                ready.insert(("claude".into(), binding.0));
-            }
-        }
+        // Bindings are delivery coordinates. Claiming does not probe the socket
+        // (that would create payload-free native connections); a dead socket
+        // fails the delivery attempt with its existing diagnostic.
+        let mut ready: std::collections::HashSet<_> = self
+            .db
+            .lock()
+            .unwrap()
+            .claude_binding_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|session| ("claude".to_string(), session))
+            .collect();
         if let Ok(rows) = self.codex_state.list(7) {
             for row in rows {
                 ready.insert(("codex".into(), row.session));
@@ -2502,6 +2489,10 @@ impl Broker {
             while workers.len() < 16 {
                 let busy_codex = codex_workers.sessions();
                 let next = self.blocking(move |broker| -> Result<_> {
+                    // Readiness and housekeeping only matter for a claimable message.
+                    if !broker.db.lock().unwrap().has_claimable()? {
+                        return Ok(None);
+                    }
                     let readiness = broker.native_readiness();
                 let mut db = broker.db.lock().unwrap();
                     broker.revoke_event_controls_locked(&db)?;
@@ -2588,19 +2579,25 @@ impl Broker {
                 });
                 codex_workers.track(worker.id(), &worker_agent);
             }
-            // Every new message wakes this loop. Only unfinished work can become
-            // claimable without a wake (native readiness, reconcile due), so only
-            // then poll; an idle broker has no timer here.
-            let waiting = self
-                .blocking(|broker| broker.db.lock().unwrap().has_unfinished_delivery())
+            // Every new message wakes this loop. A claimable message may only be
+            // waiting on native readiness (poll); otherwise sleep until the next
+            // reconcile is due, and not at all when nothing is pending.
+            let wait = self
+                .blocking(|broker| {
+                    let db = broker.db.lock().unwrap();
+                    Ok(if db.has_claimable()? {
+                        Some(Duration::from_secs(1))
+                    } else {
+                        db.next_reconcile_in()?
+                    })
+                })
                 .await?;
             tokio::select! {
                 _=&mut notified=>{},
                 _=async {
-                    if waiting {
-                        tokio::time::sleep(Duration::from_secs(1)).await
-                    } else {
-                        std::future::pending().await
+                    match wait {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending().await,
                     }
                 }=>{},
                 Some(result)=workers.join_next_with_id(),if !workers.is_empty()=>{
