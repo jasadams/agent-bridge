@@ -26,25 +26,6 @@ fn agent(session: &str) -> Agent {
         endpoint: "/unused/plugin.sock".into(),
     }
 }
-// Store contracts inject liveness records directly; native endpoint/probe contracts
-// are exercised separately by the real-socket two-broker tests.
-fn fixture_lease(path: &std::path::Path, session: &str) {
-    let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute(
-        "INSERT INTO opencode_leases VALUES(?1,?2,?3,'/unused/plugin.sock',?4,1) ON CONFLICT(session) DO UPDATE SET generation=excluded.generation,instance=excluded.instance,expires=excluded.expires,ready=excluded.ready",
-        rusqlite::params![
-            session,
-            id(),
-            id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
-                + 20_000
-        ],
-    )
-    .unwrap();
-}
 fn remote(session: &str) -> RemoteAgent {
     RemoteAgent {
         name: "native".into(),
@@ -68,8 +49,6 @@ impl Pair {
         let bid = peer();
         a.pair_peer(&bid, &bid, Some("bob")).unwrap();
         b.pair_peer(&aid, &aid, Some("alice")).unwrap();
-        fixture_lease(&root.path().join("a"), SESSION);
-        fixture_lease(&root.path().join("b"), OTHER);
         a.register(&agent(SESSION), false).unwrap();
         b.register(&agent(OTHER), false).unwrap();
         Self {
@@ -419,7 +398,6 @@ fn schema_eleven_grants(path: &std::path::Path) -> rusqlite::Connection {
 DROP TRIGGER IF EXISTS opencode_retry_bound;
 DROP TRIGGER IF EXISTS opencode_enqueue_binding;
 DROP TABLE opencode_deliveries;
-DROP TABLE opencode_leases;
 ALTER TABLE peer_grants RENAME TO upgraded_grants;
 CREATE TABLE peer_grants(
  peer_id TEXT NOT NULL REFERENCES peers(peer_id) ON DELETE CASCADE,
@@ -458,10 +436,6 @@ fn schema_eleven_grants_upgrade_without_loss_and_reopen_idempotently() {
                     .unwrap()
             );
         }
-        // Reopening a database deliberately does not prove a conversation is
-        // still open. Inject a fresh verified-live fixture generation before
-        // exercising grant persistence; real probes are covered by network tests.
-        fixture_lease(&path, SESSION);
         db.register(&agent(SESSION), false).unwrap();
         db.share_peer_session(&paired, "native", true).unwrap();
         assert_eq!(db.peer(&paired).unwrap().grants.len(), 6);

@@ -284,3 +284,28 @@ fn schema_thirteen_unknown_local_codex_queue_is_blocked_without_replay_and_is_id
         assert!(db.claim().unwrap().is_none());
     }
 }
+
+#[test]
+fn version_twenty_one_drops_only_the_removed_registration_table_by_prefix() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    agent_bridge::migrations::migrate(&mut conn).unwrap();
+    let matching = |conn: &Connection| -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'opencode_l*'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    };
+    assert!(matching(&conn).is_empty());
+    // An upgraded-from-20 database carries exactly one removed registration table.
+    conn.execute_batch("CREATE TABLE opencode_lx(session TEXT); PRAGMA user_version=20;")
+        .unwrap();
+    assert_eq!(matching(&conn), ["opencode_lx"]);
+    agent_bridge::migrations::migrate(&mut conn).unwrap();
+    assert!(matching(&conn).is_empty());
+    conn.query_row("SELECT count(*) FROM opencode_deliveries", [], |_| Ok(()))
+        .unwrap();
+}

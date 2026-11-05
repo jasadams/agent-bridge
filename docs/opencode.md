@@ -69,36 +69,35 @@ contain `state` (null only for confirmed absence). Rows require `session`,
 status is null because these native APIs expose no live status. The authenticated
 transport endpoint is attached locally, never accepted from row JSON.
 
-State reads never bind, renew, prompt or write the receipt journal. Expired lease
-endpoints are transport locators, not membership. At most 64 locators, 64 pages,
-4096 distinct sessions and a five-second total deadline are allowed. The first
-usable authenticated plugin selects scope; later pages never switch services.
-Native failures are unavailable/incomplete, not successful empty results.
+State reads never prompt or write the receipt journal. The broker lists the fixed
+socket directory `/tmp/ab-oc-<uid>-<8 hex of sha256(real state dir)>/` (short so the path fits the macOS AF_UNIX limit) and asks every socket in parallel, each within a
+500 ms first-reply deadline; a socket that answers is live. A refused connection
+means the plugin is gone, so the broker unlinks that socket file. A hung plugin
+is skipped for that request and never unlinked. At most 64 sockets, 64 pages and
+4096 distinct sessions per socket are allowed. Rows for one session from several
+sockets are merged (the first socket in sorted order wins; a later socket only
+supplies status). Native failures are unavailable/incomplete, not successful empty
+results. The plugin reports `status` (`idle`, `busy` or `retry`) from its in-memory
+view of `session.status` events; it is not stored and is null until the first event
+after the plugin starts.
 Completed lists filter only native `time.updated` with inclusive age boundaries;
 unknown update times remain included and exact lookup ignores age. The provider
 accepts any positive u32 age (including 7 and 30), not a maximum of 30 days.
 
-Creation, prompt/activity and `tui.session.select` events prepare delivery bindings.
-An explicit exact-session probe can prepare a cold candidate without prompting;
-the provisional binding terminates the broker's verification probe recursion.
-Deleting/archiving a session or disposing the plugin closes its delivery binding.
-A crashed/closed instance expires through a 20-second lease, renewed roughly every
-five to seven seconds by the live plugin, with staggered renewal scheduling. Binding
-recovery uses bounded workers and runtime-wide RPC limits, with
-separate slots for lease renewal and delivery admission. Repeated activity for
-the same session is coalesced. Competing instances back off after a
-live-owner conflict before trying again. Broker expiry also runs while paused and without
-native events. Stale generations cannot renew, close or update a replacement.
-A new verified live instance can reopen the same conversation after expiry;
-old queued work cannot silently follow its new generation. Explicit retry of
-provably unattempted work checks the original exact identity before rebinding.
-Attempted work only reconciles read-only through retained validated native receipt
-proof or independent exact transcript evidence.
+Nothing registers, renews or closes a delivery binding: liveness is the plugin
+answering on its socket. A failed delivery is the failure; no pre-check gates it
+and nothing expires by time. Sending to or from a session no plugin answers for
+fails with an error naming the sender or the recipient. Queued work that finds no
+plugin fails immediately and is retried explicitly. Explicit retry of provably
+unattempted work checks the original exact identity. Attempted work only reconciles
+read-only through retained validated native receipt proof or independent exact
+transcript evidence.
 
 ## Private transport and receipts
 
-Each plugin instance has a random UUID-named Unix socket in a private owner-only
-directory. The endpoint is bound to that UUID, and every successful response must
+Each plugin instance has a random UUID-named Unix socket in the private owner-only
+directory `/tmp/ab-oc-<uid>-<8 hex of sha256(real state dir)>/` (short so the path fits the macOS AF_UNIX limit), which the plugin creates from its `stateDir` option.
+The endpoint is bound to that UUID, and every successful response must
 match both the socket instance and exact session. Rust validates socket type,
 owner, mode, private directory, path length and connected peer UID. The plugin
 checks the connecting UID with the native Unix credential API and rejects
@@ -106,14 +105,15 @@ unavailable credential checks. It validates one bounded newline JSON frame per
 connection, payload fields, UUID message IDs and live session membership before
 calling the client. Unknown, archived and mismatched sessions fail closed.
 
-The local `opencode_observe` operation registers a verified live generation and
-returns its durable broker namespace. Heartbeats, readiness, close and native
-admission bind that exact generation and endpoint instance. Metadata alone cannot
-enable a session. The lease readiness bit means eligible for native input admission,
-including during active work and unanswered permissions. Socket protocol **2** delivers bounded structured frames that
-bind session, broker message ID, namespace, generation, dispatch attempt, original
-rendered content and native message ID. Both plugin and broker must be upgraded
-together; protocol 1 cannot provide this recovery contract.
+Socket protocol **2** delivers bounded structured frames that bind session, broker
+message ID, namespace, dispatch attempt, original rendered content and native
+message ID. Native admission is checked by the broker (`opencode_admit`) against
+the dispatch attempt, pause and policy. At-most-once insertion rests on the broker
+message ID, the deterministic native message ID, the receipt journal (shared by
+every plugin instance of one state directory; a compare-and-swap lets exactly one
+instance prompt) and the dispatch attempt ID. Both plugin and broker must be
+upgraded together; an older plugin gets "OpenCode plugin is outdated; restart
+OpenCode".
 
 Ordering and bounded backpressure belong to the broker, keyed by provider and native
 session across aliases. At most 64 pending messages may target one OpenCode
@@ -126,9 +126,7 @@ an already issued model request cannot see it. The current native agent, model
 and variant remain selected by V2; prompt admission cannot override them.
 No tools or permission overrides are copied.
 Pause is checked again at admission; queued work remains cancellable until then.
-The plugin has no hidden future-submission queue. Unattempted broker work waits
-while its exact owning session/generation remains live, and is dispatched when
-admission becomes available.
+The plugin has no hidden future-submission queue.
 
 The local broker bounds active socket handlers. At capacity it stops accepting
 until a handler finishes; excess connections remain subject to the operating
@@ -136,23 +134,13 @@ system's bounded listen backlog and client timeouts. A client timeout after a
 request is written does not prove whether it was processed: inspect the existing
 message ID and do not automatically resubmit an Unknown outcome. Plugin RPCs
 that cannot obtain a local scheduling slot report that they were not submitted;
-they do not open a broker socket. Admission, renewal, close, observation and other
-RPCs have separate bounded capacity. Four stalled admissions can still delay or
+they do not open a broker socket. Admission and other RPCs have separate bounded capacity. Four stalled admissions can still delay or
 reject further admissions before submission; inspect the outcome rather than
-assuming a native attempt occurred. Recovery retains at most 1,024 previously bound
-delivery sessions per instance; unbound history and overflow never schedule rescans.
+assuming a native attempt occurred.
 Capacity diagnostics contain counts, not message bodies.
 
-For isolated load verification after building the broker, run
-`bun tools/opencode-overload.ts /absolute/path/to/agent-bridge`. This exercises
-eight plugin instances against one disposable broker and 58 simulated native
-sessions, including renewal, restart and an Unknown outcome. Set
-`AGENT_BRIDGE_FIXTURE_DIR` to an owner-private temporary directory if `/tmp`
-cannot store the fixture database. It is not a substitute for OpenCode runtime
-compatibility testing.
 Waiting is bounded by the queue count and message byte limits, rather than a
-120-second age limit. Lease loss, close or generation replacement still fails
-queued work without native events; restart does not extend a lease. Historical
+120-second age limit. Historical
 failed messages stay failed until explicit operator retry. A queued *reconciliation* of an earlier attempt cannot be cancelled as if
 it were unattempted work. Unresolved attempts do not block later eligible messages;
 they remain Unknown until positive read-only reconciliation proves acceptance.
@@ -185,8 +173,8 @@ delivery, finite creation time and absence of unexpected attachments. It atomica
 persists original guarded receipt facts in the existing journal. Delivered means
 client acceptance, **not** transcript insertion or model read. A lost/malformed/
 mismatched native return or failed proof commit is Unknown. Read-only retry can
-use that validated journal proof in the same generation; its fresh request nonce
-is distinct from the original dispatch attempt. Changed generation, old NULL-proof
+use that validated journal proof; its fresh request nonce
+is distinct from the original dispatch attempt. Old NULL-proof
 history, or lost native response before proof commit needs independent exact
 transcript evidence. No absence or `--allow-duplicate` permits another prompt.
 See [exact proof, field consumers, migration and limits](delivery-outcomes.md#opencode-v2-proof-and-retained-journal-fields).
@@ -238,10 +226,13 @@ requires a successful legacy directory response. The strict legacy directory
 fixture is pinned to pre-OpenCode commit `8fde538`.
 
 Schema 12 extends the strict session grant provider constraint to OpenCode while
-preserving existing permissions. Schema 13 adds local lease/generation and durable
-delivery binding tables with transactional enqueue/backpressure guards. Older
-binaries reject this newer database schema;
-a downgrade requires the matching pre-upgrade database backup and binary.
+preserving existing permissions. Schema 13 adds durable delivery binding tables with
+transactional enqueue/backpressure guards. Schema 21 drops the stored OpenCode
+registration table and the delivery generation column: no agent status or
+liveness is stored. It is one-way; back up the broker database (`messages.sqlite3`
+and its `-wal`/`-shm` files) before installing. Older binaries reject this newer
+database schema; a downgrade requires the matching pre-upgrade database backup
+and binary.
 
 No API `tools`/permissions fields, permission hooks, approval responses, automatic
 remote sharing or native peer cards are introduced.

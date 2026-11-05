@@ -90,7 +90,7 @@ A pinned OpenCode 2.2.5 V2 plugin and built-in local adapter register verified
 live sessions, retain shared native titles and submit peer messages to exact
 existing conversations with ordinary retry deduplication. Native insertion
 receipts remain distinct from model read, task completion and correlated replies.
-Canonical FIFO, bounded busy/permission deferral, generation leases, durable
+Canonical FIFO, bounded busy/permission deferral, durable
 receipt fences and read-only restart reconciliation are implemented. Real native
 fixtures cover busy tools, unanswered permissions, pause/cancel and the residual
 idle-to-busy race without cancellation or approval responses. OpenCode also uses

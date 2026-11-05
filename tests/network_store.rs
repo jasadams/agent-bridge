@@ -123,15 +123,10 @@ fn opencode_status_sync_preserves_legacy_unknown_without_local_phase_metadata() 
         };
         p.b.register(&agent, false).unwrap();
         p.a.register(&agent, false).unwrap();
-        // Native lease/phase APIs are crate-private. This isolated fixture sets
-        // only their durable metadata; envelope admission and status production,
-        // application, acceptance and restart use the real public store APIs.
+        // The crate-private delivery phase is set directly on this isolated
+        // fixture; envelope admission, status production, acceptance and
+        // restart use the real public store APIs.
         let conn = rusqlite::Connection::open(&p.bpath).unwrap();
-        conn.execute(
-            "INSERT INTO opencode_leases(session,generation,instance,endpoint,expires,ready) VALUES(?1,?2,?3,?4,?5,1)",
-            rusqlite::params![agent.session, id(), id(), agent.endpoint, i64::MAX],
-        )
-        .unwrap();
         p.b.share_peer_session(&p.aid, &agent.name, true).unwrap();
         let remote_id = id();
         p.a.send_remote_names(

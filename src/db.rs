@@ -164,7 +164,7 @@ impl Db {
             let tx = conn.transaction()?;
             // The time is when the broker detects interruption, not the time
             // of any native outcome. Preserve only existing dispatch identity.
-            tx.execute("UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail','Service stopped during delivery; native outcome unknown','$.opencode_attempt_generation',(SELECT generation FROM opencode_deliveries WHERE id=message_context.id),'$.opencode_attempt_id',(SELECT attempt FROM opencode_deliveries WHERE id=message_context.id),'$.opencode_attempt_timestamp',?1,'$.opencode_attempt_timestamp_kind','detected') WHERE json_type(destination,'$.opencode_attempt_detail') IS NULL AND json_type(destination,'$.opencode_attempt_generation') IS NULL AND json_type(destination,'$.opencode_attempt_id') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp_kind') IS NULL AND EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id WHERE d.id=message_context.id AND d.phase='dispatched' AND d.attempt IS NOT NULL AND m.state='sending')", [now()])?;
+            tx.execute("UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail','Service stopped during delivery; native outcome unknown','$.opencode_attempt_id',(SELECT attempt FROM opencode_deliveries WHERE id=message_context.id),'$.opencode_attempt_timestamp',?1,'$.opencode_attempt_timestamp_kind','detected') WHERE json_type(destination,'$.opencode_attempt_detail') IS NULL AND json_type(destination,'$.opencode_attempt_id') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp_kind') IS NULL AND EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id WHERE d.id=message_context.id AND d.phase='dispatched' AND d.attempt IS NOT NULL AND m.state='sending')", [now()])?;
             tx.execute("UPDATE messages SET state='uncertain', detail='Service stopped during delivery; inspect the native conversation before retrying.' WHERE state='sending' AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=messages.id)", [])?;
             // Requalify interrupted deliveries for read-only reconciliation.
             tx.execute("UPDATE opencode_deliveries SET phase='uncertain' WHERE phase='dispatched' AND id IN (SELECT id FROM messages WHERE state='uncertain')", [])?;
@@ -372,15 +372,6 @@ impl Db {
                 .query_row(
                     "SELECT endpoint FROM claude_bindings WHERE session=?",
                     [session],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .unwrap_or_default()),
-            Provider::OpenCode => Ok(self
-                .conn
-                .query_row(
-                    "SELECT endpoint FROM opencode_leases WHERE session=?1 AND expires>?2",
-                    params![session, now()],
                     |row| row.get(0),
                 )
                 .optional()?
@@ -610,48 +601,12 @@ impl Db {
         )?)
     }
 
-    /// Request-local OpenCode transport snapshot. Expired locators remain as
-    /// candidates; the preferred locator is the live owning endpoint only.
     pub(crate) fn claude_binding_sessions(&self) -> Result<Vec<String>> {
         Ok(self
             .conn
             .prepare("SELECT session FROM claude_bindings ORDER BY session")?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub(crate) fn opencode_lease_sessions(&self) -> Result<Vec<String>> {
-        Ok(self
-            .conn
-            .prepare("SELECT session FROM opencode_leases WHERE expires>? ORDER BY session")?
-            .query_map([now()], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub(crate) fn opencode_locators(
-        &self,
-        preferred_session: Option<&str>,
-    ) -> Result<(Vec<String>, Option<String>)> {
-        let mut endpoints = self
-            .conn
-            .prepare("SELECT DISTINCT endpoint FROM opencode_leases ORDER BY endpoint LIMIT 64")?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        endpoints.sort();
-        endpoints.dedup();
-        let preferred = preferred_session
-            .map(|session| {
-                self.conn
-                    .query_row(
-                        "SELECT endpoint FROM opencode_leases WHERE session=?1 AND expires>?2",
-                        params![session, now()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-            })
-            .transpose()?
-            .flatten();
-        Ok((endpoints, preferred))
     }
 
     pub fn claude_bind(&self, session: &str, endpoint: &str) -> Result<()> {
@@ -1007,7 +962,6 @@ impl Db {
             return Ok(None);
         }
         self.block_revoked_inbound()?;
-        self.opencode_tick(now())?;
         let candidates = {
             let mut statement = self.conn.prepare(
                 "SELECT m.id,m.rowid,m.recipient,m.recipient_session,
@@ -1038,7 +992,7 @@ impl Db {
             if provider == Provider::Codex && busy_codex.contains(&session) {
                 continue;
             }
-            if provider != Provider::Inbox
+            if !matches!(provider, Provider::Inbox | Provider::OpenCode)
                 && ready.is_some_and(|ready| {
                     !ready.contains(&(provider.label().to_string(), session.clone()))
                 })
@@ -1078,32 +1032,12 @@ impl Db {
             }
             let mut endpoint = String::new();
             if provider == Provider::OpenCode {
-                let delivery: Option<(String, String)> = self
-                    .conn
-                    .query_row(
-                        "SELECT generation,phase FROM opencode_deliveries WHERE id=?",
-                        [&id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                let Some((generation, phase)) = delivery else {
-                    continue;
-                };
-                let lease: Option<(String, String, bool, i64)> = self
-                    .conn
-                    .query_row(
-                        "SELECT generation,endpoint,ready,expires FROM opencode_leases WHERE session=?",
-                        [&session],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )
-                    .optional()?;
-                let Some((lease_generation, lease_endpoint, ready, expires)) = lease else {
-                    continue;
-                };
-                if expires <= time
-                    || lease_generation != generation
-                    || (!ready && phase != "reconcile")
-                {
+                let delivery: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM opencode_deliveries WHERE id=?)",
+                    [&id],
+                    |row| row.get(0),
+                )?;
+                if !delivery {
                     continue;
                 }
                 let earlier: bool = self.conn.query_row(
@@ -1114,7 +1048,6 @@ impl Db {
                 if earlier {
                     continue;
                 }
-                endpoint = lease_endpoint;
             } else if provider == Provider::Claude {
                 endpoint = self.binding_endpoint(&provider, &session)?;
             }
@@ -1279,14 +1212,6 @@ pub(crate) fn insert_message_in(
     let local_opencode =
         destination.provider == Provider::OpenCode && !destination.name.contains('/');
     if local_opencode {
-        let lease: Option<String> = conn
-            .query_row(
-                "SELECT generation FROM opencode_leases WHERE session=?1 AND expires>?2",
-                params![destination.session, now()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        ensure!(lease.is_some(), "OpenCode live lease required");
         let pending: i64 = conn.query_row(
                 "SELECT count(*) FROM messages m JOIN opencode_deliveries d ON d.id=m.id WHERE d.session=? AND m.state IN ('queued','sending','uncertain')",
                 [&destination.session],
@@ -1348,23 +1273,6 @@ pub(crate) fn insert_message_in(
         &[&id, &source_json, &destination_json],
     )?;
     if local_opencode {
-        let generation: String = match target {
-            Some(tx) => tx
-                .query_row(
-                    "SELECT generation FROM opencode_leases WHERE session=?",
-                    [&destination.session],
-                    |row| row.get(0),
-                )
-                .optional()?,
-            None => conn
-                .query_row(
-                    "SELECT generation FROM opencode_leases WHERE session=?",
-                    [&destination.session],
-                    |row| row.get(0),
-                )
-                .optional()?,
-        }
-        .unwrap_or_else(|| "unleased".into());
         let namespace: String = match target {
             Some(tx) => tx.query_row(
                 "SELECT value FROM settings WHERE key='opencode_namespace'",
@@ -1378,14 +1286,8 @@ pub(crate) fn insert_message_in(
             )?,
         };
         exec(
-            "INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,content,attempt,phase,deadline) VALUES(?1,?2,?3,?4,'pending',NULL,NULL,'queued',?5)",
-            &[
-                &id,
-                &destination.session,
-                &generation,
-                &namespace,
-                &(t + 120_000),
-            ],
+            "INSERT INTO opencode_deliveries(id,session,namespace,native_id,content,attempt,phase,deadline) VALUES(?1,?2,?3,'pending',NULL,NULL,'queued',?4)",
+            &[&id, &destination.session, &namespace, &(t + 120_000)],
         )?;
     }
     if let Some(tx) = tx {

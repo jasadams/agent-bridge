@@ -67,7 +67,7 @@ native operation bound before any pair row. Global health can precede project
 bootstrap, so readiness now includes a retriable read of the project session API
 before any create mutation. Another attempt passed six local directions, then
 found a disabled destination registration before sharing. The driver now waits
-for the old lease and explicitly resumes the exact existing disposable session
+for the old registration and explicitly resumes the exact existing disposable session
 before selecting it for sharing; the reason the registration expired was not
 independently established. A later private installer command exceeded its initial
 30-second bound before any pairs. Setup commands now have a bounded 120 seconds
@@ -78,9 +78,9 @@ cleanup, with regression tests. The reported updater throttle test passed in the
 initial unchanged full suite; no updater test or implementation was changed.
 
 Faster health probes also exposed a lifecycle sequencing error in the harness:
-broker restart disables a route before its old generation lease ends. A fresh
+broker restart disables a route before its old plugin generation ends. A fresh
 plugin cannot replace that still-live generation merely because discovery omits
-the disabled route. The harness now waits for the documented old-lease fence
+the disabled route. The harness now waits for the documented old-registration fence
 before its explicit replacement/resume. The unsuccessful early resume was
 recorded, not treated as a successful native lifecycle check.
 On the merged named-board source, an initial run passed all six local directions

@@ -655,7 +655,7 @@ async fn rejected_opencode_send_does_not_return_a_phantom_message_id() {
         error["error"]
             .as_str()
             .unwrap()
-            .contains("OpenCode live lease required"),
+            .contains("Recipient opencode-target is not reachable"),
         "{error}"
     );
     assert!(

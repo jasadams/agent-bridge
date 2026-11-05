@@ -5,38 +5,34 @@ import { sameUser } from "./peer.ts";
 
 export const MAX_FRAME = 256 * 1024;
 export class RpcNotSubmittedError extends Error {}
-// Shared by plugin instances in this runtime. Keep lifecycle traffic from
-// consuming every socket while preserving slots for admission and renewals.
-const RPC_LIMIT = 32, OBSERVE_LIMIT = 12, HEARTBEAT_LIMIT = 8, CLOSE_LIMIT = 4, ADMISSION_LIMIT = 4, OTHER_LIMIT = 4, WAIT_LIMIT = 608, OBSERVE_WAIT_LIMIT = 384, HEARTBEAT_WAIT_LIMIT = 96, CLOSE_WAIT_LIMIT = 64, ADMISSION_WAIT_LIMIT = 32, OTHER_WAIT_LIMIT = 32, WAIT_MS = 4000;
-type Kind = "observation" | "heartbeat" | "close" | "admission" | "other";
+// Shared by plugin instances in this runtime. Keep admission from being
+// starved by other broker traffic.
+const RPC_LIMIT = 32, ADMISSION_LIMIT = 4, OTHER_LIMIT = 4, WAIT_LIMIT = 64, ADMISSION_WAIT_LIMIT = 32, OTHER_WAIT_LIMIT = 32, WAIT_MS = 4000;
+type Kind = "admission" | "other";
 type Waiter = { kind: Kind; start: () => void; timer: ReturnType<typeof setTimeout> };
-type Scheduler = { running: number; observations: number; heartbeats: number; closes: number; admissions: number; others: number; waiting: Waiter[] };
+type Scheduler = { running: number; admissions: number; others: number; waiting: Waiter[] };
 const globalScheduler = globalThis as typeof globalThis & { [key: symbol]: unknown };
-const schedulerKey = Symbol.for("agent-bridge.opencode.rpc-scheduler.v1");
-const scheduler = (globalScheduler[schedulerKey] ??= { running: 0, observations: 0, heartbeats: 0, closes: 0, admissions: 0, others: 0, waiting: [] }) as Scheduler;
+const schedulerKey = Symbol.for("agent-bridge.opencode.rpc-scheduler.v2");
+const scheduler = (globalScheduler[schedulerKey] ??= { running: 0, admissions: 0, others: 0, waiting: [] }) as Scheduler;
 const waiting = scheduler.waiting;
 function pump() {
   while (scheduler.running < RPC_LIMIT) {
-    const index = waiting.findIndex(item => item.kind === "other" && scheduler.others < OTHER_LIMIT || item.kind === "admission" && scheduler.admissions < ADMISSION_LIMIT || item.kind === "close" && scheduler.closes < CLOSE_LIMIT || item.kind === "observation" && scheduler.observations < OBSERVE_LIMIT || item.kind === "heartbeat" && scheduler.heartbeats < HEARTBEAT_LIMIT);
+    const index = waiting.findIndex(item => item.kind === "other" ? scheduler.others < OTHER_LIMIT : scheduler.admissions < ADMISSION_LIMIT);
     if (index < 0) return;
     const item = waiting.splice(index, 1)[0]!;
     clearTimeout(item.timer);
     scheduler.running++;
-    if (item.kind === "observation") scheduler.observations++;
-    if (item.kind === "heartbeat") scheduler.heartbeats++;
-    if (item.kind === "close") scheduler.closes++;
-    if (item.kind === "admission") scheduler.admissions++;
-    if (item.kind === "other") scheduler.others++;
+    if (item.kind === "admission") scheduler.admissions++; else scheduler.others++;
     item.start();
   }
 }
 function slot(kind: Kind): Promise<() => void> {
   const sameKind = waiting.filter(item => item.kind === kind).length;
-  if (waiting.length >= WAIT_LIMIT || kind === "observation" && sameKind >= OBSERVE_WAIT_LIMIT || kind === "heartbeat" && sameKind >= HEARTBEAT_WAIT_LIMIT || kind === "close" && sameKind >= CLOSE_WAIT_LIMIT || kind === "admission" && sameKind >= ADMISSION_WAIT_LIMIT || kind === "other" && sameKind >= OTHER_WAIT_LIMIT) return Promise.reject(new RpcNotSubmittedError(`Broker RPC capacity exhausted before submission (active=${scheduler.running}, queued=${waiting.length})`));
+  if (waiting.length >= WAIT_LIMIT || sameKind >= (kind === "admission" ? ADMISSION_WAIT_LIMIT : OTHER_WAIT_LIMIT)) return Promise.reject(new RpcNotSubmittedError(`Broker RPC capacity exhausted before submission (active=${scheduler.running}, queued=${waiting.length})`));
   return new Promise((resolve, reject) => {
     const item: Waiter = {
       kind,
-      start: () => resolve(() => { scheduler.running--; if (kind === "observation") scheduler.observations--; if (kind === "heartbeat") scheduler.heartbeats--; if (kind === "close") scheduler.closes--; if (kind === "admission") scheduler.admissions--; if (kind === "other") scheduler.others--; pump(); }),
+      start: () => resolve(() => { scheduler.running--; if (kind === "admission") scheduler.admissions--; else scheduler.others--; pump(); }),
       timer: setTimeout(() => {
         const index = waiting.indexOf(item);
         if (index >= 0) waiting.splice(index, 1);
@@ -54,10 +50,10 @@ export async function privateSocket(path: string): Promise<void> {
 }
 export async function brokerRpc(state: string, request: unknown): Promise<unknown> {
   const op = !!request && typeof request === "object" ? (request as { op?: unknown }).op : undefined;
-  const release = await slot(op === "opencode_observe" ? "observation" : op === "opencode_heartbeat" ? "heartbeat" : op === "opencode_close" ? "close" : op === "opencode_admit" ? "admission" : "other");
+  const proceed = await slot(op === "opencode_admit" ? "admission" : "other");
   try {
     return await performRpc(state, request);
-  } finally { release(); }
+  } finally { proceed(); }
 }
 async function performRpc(state: string, request: unknown): Promise<unknown> {
   const path = join(state, "bridge.sock");

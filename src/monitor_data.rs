@@ -348,7 +348,7 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         db.send_names(&id, "user", "bob", "reconciliation", &None)
             .unwrap();
-        db.conn.execute("INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,phase,deadline) VALUES(?,'original-destination','legacy','legacy','pending','reconcile',0)", [&id]).unwrap();
+        db.conn.execute("INSERT INTO opencode_deliveries(id,session,namespace,native_id,phase,deadline) VALUES(?,'original-destination','legacy','pending','reconcile',0)", [&id]).unwrap();
         expected.entry("unknown").or_default().push(id);
         let before = db.conn.total_changes();
         for (outcome, ids) in expected {
@@ -398,7 +398,7 @@ mod tests {
             db.conn
                 .execute("UPDATE messages SET state='sending' WHERE id=?", [&id])
                 .unwrap();
-            db.conn.execute("INSERT INTO opencode_deliveries(id,session,generation,namespace,native_id,phase,deadline) VALUES(?1,'original-destination','legacy','legacy','pending',?2,0)", [&id, phase]).unwrap();
+            db.conn.execute("INSERT INTO opencode_deliveries(id,session,namespace,native_id,phase,deadline) VALUES(?1,'original-destination','legacy','pending',?2,0)", [&id, phase]).unwrap();
             let before = db.conn.total_changes();
             assert_eq!(
                 db.monitor_detail(&id, &machine).unwrap()["message"]["state"],

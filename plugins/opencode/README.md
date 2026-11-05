@@ -45,7 +45,7 @@ permissions. The explicit installer also configures the MCP connection; the
 manual plugin-only example above does not.
 
 The V2 context hook adds a stable exact-session messaging/board block to each
-model request after live identity verification. Compaction augments the default
+model request after native session verification. Compaction augments the default
 summary context, and later requests refresh the block without appending setup to
 peer transcript messages. Ordinary peer text is a concise sender label, complete
 body and minimal route/message references. System context still consumes request
@@ -54,44 +54,39 @@ opt-in and retain own-write suppression, debounce, pause and lifecycle cleanup.
 Native owner pairing prompts remain unavailable; use the explicit owner CLI
 workflow. Peer text and board edits never supply consent.
 
-## Scope and leases
+## Scope
 
-The plugin registers verified live sessions by exact session ID, rather
-than claiming to follow one selected TUI tab. Creation, the prompt hook, native
-activity/status and `tui.session.select` activate an exact existing session.
-Startup does not enumerate sessions and renames never synchronize registrations.
-UI selection paths without a server event are observed on the next native activity. Build/plan mode
-never becomes a routing identity. Stable routes are `opencode-<session ID>`.
+The plugin serves exact session IDs rather than claiming to follow one selected
+TUI tab. It keeps no registration or liveness state and sends the broker
+no lifecycle traffic; the broker reaches it through its socket and reads native
+state through `state_list`/`state_get`. Build/plan mode never becomes a routing
+identity. Stable routes are `opencode-<session ID>`.
 
 Read-only protocol-2 `{op:"state_list",cursor:null|string}` and
 `{op:"state_get",session}` expose the native service directory, including cold/idle
-sessions, without bindings, heartbeats, prompts or journal writes. Rows contain
+sessions, without bindings, prompts or journal writes. Rows contain
 only `session,display_name,status,directory,updated_ms`; unknown metadata is null.
+`status` is `idle`, `busy` or `retry` from an in-memory map (at most 4096 sessions)
+fed by `session.status`/`session.idle` events; it is not persisted and is null until
+the first event for that session after plugin start.
 Exact absence is null; failures are `unavailable`/`incomplete`, never empty success.
 Replies bind instance/operation and are not delivery receipts. State transport,
 age/pagination limits and the separately staged broker cutover are described in
 [native state and delivery bindings](../../docs/opencode.md#native-state-and-delivery-bindings).
 
-Each plugin instance atomically creates a 0700 directory under `/tmp` and a 0600
-socket named `<instance UUID>.sock`. The short path avoids macOS `TMPDIR` length
-limits. Linux `SO_PEERCRED` or macOS `getpeereid` verifies connected same-user
-peers; unavailable Bun descriptors fail closed. Frames are strict bounded UTF-8
-newline JSON, one per connection; at most 64 socket/native handlers are active.
-
-Registration returns a broker namespace and exact session generation. Heartbeats
-every five seconds renew a 20-second lease and report event-cached readiness;
-they never poll the native model/session API. Every delivery and asynchronous
-continuation checks generation, membership and lease. Close/delete/archive and
-normal disposal close the exact generation. Crashes expire; another instance may
-take over after expiry. A persisted conversation alone never proves liveness.
-Stale heartbeats, closes and late callbacks cannot authorize a replacement.
+Each plugin instance binds a 0600 socket named `<instance UUID>.sock` in the
+0700 directory `/tmp/ab-oc-<uid>-<8 hex of sha256(real stateDir)>` (short so the path fits the macOS AF_UNIX limit; the broker derives the same name; created if missing; it must be a directory owned by
+this user with no group/other bits, and the full socket path must be at most 100
+bytes). Disposal stops the listener and unlinks only its own socket. Linux
+`SO_PEERCRED` or macOS `getpeereid` verifies connected same-user peers;
+unavailable Bun descriptors fail closed. Frames are strict bounded UTF-8 newline
+JSON, one per connection; at most 64 socket/native handlers are active.
 
 ## Durable receipt protocol
 
-Probe frames are `{op:"probe",session}`. Successful probe replies bind `protocol:2`,
-instance and exact session. Delivery/reconciliation frames additionally carry
-`id`, `content`, `namespace`, `generation`, `attempt` and `native_message_id`.
-Namespaces, generations, attempts and broker IDs are UUIDs. The native ID is
+Delivery/reconciliation frames carry exactly `op`, `session`, `id`, `content`,
+`namespace`, `attempt` and `native_message_id`; any other key is rejected.
+Namespaces, attempts and broker IDs are UUIDs. The native ID is
 `msg_` plus SHA-256 of `namespace + NUL + exactSession + NUL + lowercaseBrokerUUID`.
 Reply identities echo these fences. Status is `inserted`, `deferred` or `uncertain`.
 
@@ -100,7 +95,7 @@ FULL synchronous commits. Immutable namespace/ID/session/content/native-ID
 mappings progress through `prepared`, `attempting`, and `inserted`. Only the winner
 of a committed cross-process `prepared`→`attempting` compare-and-set can call
 `session.prompt`. The broker also admits that exact in-flight claim immediately
-before the fence, checking pause/cancel/current generation. No asynchronous queue
+before the fence, checking pause/cancel. No asynchronous queue
 continues submission after a deferred result. A rejected or lost broker admission
 response defers only while the durable mapping is still `prepared`; an existing
 attempt fence always requires read-only reconciliation.
@@ -115,14 +110,14 @@ compaction; preserve it with the matching broker state.
 
 V2 `session.prompt` returns after durable native inbox admission. The plugin
 validates the returned exact native ID/session/user type/text/steer delivery/time,
-then atomically commits bounded original generation/attempt/receipt facts in the
+then atomically commits bounded original attempt/receipt facts in the
 existing journal before returning `inserted`. That retained token means verified
 client acceptance, **not** transcript insertion, model read or task completion.
 Exact scoped transcript readback remains independent acceptance evidence. See
 [provider proof and every journal-field consumer](../../docs/delivery-outcomes.md#opencode-v2-proof-and-retained-journal-fields).
 
 Reconciliation is strictly read-only: no admission, journal transition or prompt
-call, including ordinary retries and `--allow-duplicate`. Same-generation durable
+call, including ordinary retries and `--allow-duplicate`. Durable
 receipt proof or exact native transcript readback can prove acceptance, including after a missing journal
 mapping or legacy migration. This never creates or mutates a journal row.
 An existing mapping must still match the immutable identity/content. Corrupt
@@ -132,17 +127,16 @@ require manual inspection. Legacy UUID-based native IDs are
 accepted only for read-only reconciliation; absent legacy mappings require exact native proof or remain
 Unknown. Journal schema 2 adds nullable `acceptance` to the existing table; old
 inserted rows have no fabricated receipt. A fresh reconciliation nonce is not the
-original guarded dispatch attempt. Changed generation or lost native response
+original guarded dispatch attempt. A lost native response
 before proof commit needs exact transcript evidence. No same-ID replay repairs
 an Unknown result.
 
 ## Busy and permission behavior
 
 Eligible-work ordering, bounded queued work and pause/cancel are
-broker-owned. Live unattempted work has no 120-second age expiry; lease loss or
-generation replacement still fails it. The updated plugin advertises readiness
-for native input admission during active model/tool work and pending permissions.
-It verifies session ownership and lifecycle before a fresh attempt. V2 keeps its
+broker-owned. Live unattempted work has no 120-second age expiry. The plugin
+accepts native input during active model/tool work and pending permissions.
+It verifies native session identity and archive state before a fresh attempt. V2 keeps its
 own current agent/model/variant; the prompt API does not override that selection.
 The plugin copies no tools or policy fields.
 

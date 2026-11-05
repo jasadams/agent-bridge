@@ -126,8 +126,10 @@ impl Marker {
             .all(|s| !s.chars().any(char::is_control) && !s.contains("-->") && !s.contains("<!--"))
             && crate::clients::validate_session(&self.owner.provider, &self.owner.session).is_ok()
             && match self.owner.provider {
-                Provider::Codex | Provider::Inbox => self.owner.endpoint.is_empty(),
-                _ => {
+                Provider::Codex | Provider::Inbox | Provider::OpenCode => {
+                    self.owner.endpoint.is_empty()
+                }
+                Provider::Claude => {
                     !self.owner.endpoint.is_empty()
                         && self.owner.endpoint.len() <= 4096
                         && std::path::Path::new(&self.owner.endpoint).is_absolute()

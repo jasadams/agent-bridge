@@ -8,7 +8,7 @@ adapter: its history and message availability remain broker-owned.
 The Claude adapter owns private Unix socket validation and user-frame generation.
 The OpenCode adapter uses its pinned V2 plugin private socket, verifies exact live
 sessions and native client acceptance receipts, and shares native title metadata.
-Its durable canonical queue, generation leases and admission remain broker-owned;
+Its durable canonical queue and admission remain broker-owned;
 typed OpenCode controls enter that same queue with their raw control text.
 Direct adapter delivery without the broker's durable context fails closed. See
 [OpenCode recovery invariants](opencode-recovery.md).

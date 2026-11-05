@@ -1,14 +1,12 @@
-//! Durable local OpenCode ordering, admission, and liveness. No native I/O here.
+//! Durable local OpenCode ordering and admission. No native I/O here.
 use crate::{
     db::{Db, now},
     protocol::{Agent, Message, Provider},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-
-pub(crate) const LEASE_MS: i64 = 20_000;
 
 pub(crate) fn native_id(namespace: &str, session: &str, id: &str) -> String {
     let mut hash = Sha256::new();
@@ -28,14 +26,11 @@ pub(crate) fn native_id(namespace: &str, session: &str, id: &str) -> String {
 #[derive(Clone, Debug)]
 pub(crate) struct Dispatch {
     pub frame: Value,
-    pub generation: String,
     pub attempt: String,
-    pub endpoint: String,
 }
 struct AttemptDiagnosticRow {
     session: String,
     detail: Option<String>,
-    generation: Option<String>,
     attempt: Option<String>,
     timestamp: Option<i64>,
     timestamp_kind: Option<String>,
@@ -43,11 +38,11 @@ struct AttemptDiagnosticRow {
 impl Db {
     pub(crate) fn opencode_attempt_diagnostic(&self, id: &str) -> Result<Option<Value>> {
         let row: Option<AttemptDiagnosticRow> = self.conn.query_row(
-            "SELECT d.session,json_extract(c.destination,'$.opencode_attempt_detail'),json_extract(c.destination,'$.opencode_attempt_generation'),json_extract(c.destination,'$.opencode_attempt_id'),json_extract(c.destination,'$.opencode_attempt_timestamp'),json_extract(c.destination,'$.opencode_attempt_timestamp_kind') FROM message_context c JOIN opencode_deliveries d ON d.id=c.id JOIN messages m ON m.id=d.id WHERE c.id=? AND (json_extract(c.destination,'$.opencode_attempt_detail') IS NOT NULL OR m.state='uncertain' OR d.phase IN ('legacy','reconcile') OR (d.phase='inserted' AND length(d.native_id)=36 AND substr(d.native_id,1,4)='msg_'))",
-            [id], |r| Ok(AttemptDiagnosticRow { session: r.get(0)?, detail: r.get(1)?, generation: r.get(2)?, attempt: r.get(3)?, timestamp: r.get(4)?, timestamp_kind: r.get(5)? }),
+            "SELECT d.session,json_extract(c.destination,'$.opencode_attempt_detail'),json_extract(c.destination,'$.opencode_attempt_id'),json_extract(c.destination,'$.opencode_attempt_timestamp'),json_extract(c.destination,'$.opencode_attempt_timestamp_kind') FROM message_context c JOIN opencode_deliveries d ON d.id=c.id JOIN messages m ON m.id=d.id WHERE c.id=? AND (json_extract(c.destination,'$.opencode_attempt_detail') IS NOT NULL OR m.state='uncertain' OR d.phase IN ('legacy','reconcile') OR (d.phase='inserted' AND length(d.native_id)=36 AND substr(d.native_id,1,4)='msg_'))",
+            [id], |r| Ok(AttemptDiagnosticRow { session: r.get(0)?, detail: r.get(1)?, attempt: r.get(2)?, timestamp: r.get(3)?, timestamp_kind: r.get(4)? }),
         ).optional()?;
         Ok(row.map(|row| match row.detail {
-            Some(detail) => json!({"status":"recorded","message_id":id,"session":row.session,"detail":detail,"generation":row.generation,"attempt":row.attempt,"timestamp":row.timestamp,"timestamp_kind":row.timestamp_kind}),
+            Some(detail) => json!({"status":"recorded","message_id":id,"session":row.session,"detail":detail,"attempt":row.attempt,"timestamp":row.timestamp,"timestamp_kind":row.timestamp_kind}),
             None => json!({"status":"unavailable","message_id":id,"session":row.session}),
         }))
     }
@@ -65,18 +60,18 @@ impl Db {
             [&agent.session],
             |row| row.get(0),
         )?;
-        let mut query=self.conn.prepare(&format!("SELECT m.id,m.state,(d.phase='reconcile' AND m.state IN('queued','sending')),EXISTS(SELECT 1 FROM message_context c WHERE c.id=m.id AND json_extract(c.destination,'$.provider')='opencode' AND json_extract(c.destination,'$.session')=d.session AND NOT EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=m.recipient AND (a.provider<>'opencode' OR a.session<>d.session)) AND NOT EXISTS(SELECT 1 FROM agents inbox WHERE inbox.name=m.recipient AND (inbox.provider<>'opencode' OR inbox.session<>d.session))),EXISTS(SELECT 1 FROM opencode_leases l WHERE l.session=d.session AND l.expires>?2),d.phase {predicate} ORDER BY m.rowid LIMIT ?3"))?;
-        let items=query.query_map(params![agent.session,now(),LIMIT as i64],|row| {
+        let mut query=self.conn.prepare(&format!("SELECT m.id,m.state,(d.phase='reconcile' AND m.state IN('queued','sending')),EXISTS(SELECT 1 FROM message_context c WHERE c.id=m.id AND json_extract(c.destination,'$.provider')='opencode' AND json_extract(c.destination,'$.session')=d.session AND NOT EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=m.recipient AND (a.provider<>'opencode' OR a.session<>d.session)) AND NOT EXISTS(SELECT 1 FROM agents inbox WHERE inbox.name=m.recipient AND (inbox.provider<>'opencode' OR inbox.session<>d.session))),d.phase {predicate} ORDER BY m.rowid LIMIT ?2"))?;
+        let items=query.query_map(params![agent.session,LIMIT as i64],|row| {
             let state = row.get::<_,String>(1)?;
             let reconcile = row.get::<_,bool>(2)?;
-            let phase = row.get::<_,String>(5)?;
+            let phase = row.get::<_,String>(4)?;
             let outcome = crate::protocol::delivery_outcome(&state, Some("opencode"), Some(&phase));
-            Ok(json!({"id":row.get::<_,String>(0)?,"state":outcome,"reconciliation_pending":reconcile,"route_matches":row.get::<_,bool>(3)?,"lease_available":row.get::<_,bool>(4)?}))
+            Ok(json!({"id":row.get::<_,String>(0)?,"state":outcome,"reconciliation_pending":reconcile,"route_matches":row.get::<_,bool>(3)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut recovery = json!({"total":total,"truncated":total>LIMIT as i64,"items":items});
         if total > 0 {
             recovery["instruction"] = json!(
-                "An uncertain native insertion does not block later eligible messages, though queue capacity and route or lease restrictions still apply. Inspect each ID, then explicitly run agent-bridge --state-dir SAME_BROKER_STATE_DIR retry ID (default allow_duplicate=false). Retry reads existing native proof only; missing proof remains uncertain. Queued reconciliation has not necessarily run; after restart or lease change, explicitly retry the same ID again if it remains queued. Route or lease mismatches may require restoring the original exact session registration before retry."
+                "An uncertain native insertion does not block later eligible messages, though queue capacity and route restrictions still apply. Inspect each ID, then explicitly run agent-bridge --state-dir SAME_BROKER_STATE_DIR retry ID (default allow_duplicate=false). Retry reads existing native proof only; missing proof remains uncertain. Queued reconciliation has not necessarily run; after restart, explicitly retry the same ID again if it remains queued. Route mismatches may require restoring the original exact session registration before retry."
             );
         }
         Ok(recovery)
@@ -91,29 +86,17 @@ impl Db {
         self.conn.execute("UPDATE message_context SET destination=json_set(destination,'$.control_notice',1) WHERE id=?", [id])?;
         Ok(())
     }
-    pub(crate) fn opencode_tick(&self, time: i64) -> Result<()> {
-        // Queued is proof of no native attempt (including an explicit deferred
-        // receipt). Bound waiting by queue capacity and the exact owning lease,
-        // not elapsed native work/permission time. Keep schema 13's deadline
-        // column as compatibility metadata; it no longer authorizes expiry.
-        self.conn.execute("UPDATE messages SET state='failed',detail='OpenCode lease/generation expired; explicitly retry after live registration',updated=?1 WHERE state='queued' AND id IN(SELECT d.id FROM opencode_deliveries d LEFT JOIN opencode_leases l ON l.session=d.session WHERE d.phase='queued' AND (l.expires<=?1 OR l.generation<>d.generation OR l.session IS NULL))", [time])?;
-        Ok(())
-    }
-
     /// Unresolved OpenCode receipts would otherwise block their session queue
     /// forever. Promotion is a read-only reconciliation: it can only prove an
     /// insertion that already happened, never submit again, so per-session order
     /// and the dedup guarantee are preserved. Each promotion is atomic (savepoint)
-    /// and non-fatal; the delivery row is CAS-guarded and rebound to the live
-    /// lease generation exactly like an explicit retry.
+    /// and non-fatal; the delivery row is CAS-guarded.
     pub(crate) fn opencode_sweep_uncertain(&self, time: i64) -> Result<usize> {
         let mut rows = self.conn.prepare(
             "SELECT d.id,d.reconcile_attempts FROM opencode_deliveries d
              JOIN messages m ON m.id=d.id AND m.recipient_session=d.session
-             JOIN opencode_leases l ON l.session=d.session
              WHERE d.phase IN ('uncertain','dispatched') AND m.state='uncertain'
                AND NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=d.id AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL))
-               AND l.expires>?1 AND l.ready=1
                AND (d.reconcile_at IS NULL OR d.reconcile_at<=?1)
              ORDER BY m.rowid LIMIT 64",
         )?;
@@ -133,7 +116,7 @@ impl Db {
             self.conn.execute_batch("SAVEPOINT opencode_sweep")?;
             let result = (|| -> Result<bool> {
                 let changed = self.conn.execute(
-                    "UPDATE opencode_deliveries SET phase='reconcile',generation=(SELECT generation FROM opencode_leases WHERE session=opencode_deliveries.session),reconcile_attempts=reconcile_attempts+1,reconcile_at=?1 WHERE id=?2 AND phase IN ('uncertain','dispatched')",
+                    "UPDATE opencode_deliveries SET phase='reconcile',reconcile_attempts=reconcile_attempts+1,reconcile_at=?1 WHERE id=?2 AND phase IN ('uncertain','dispatched')",
                     params![time + seconds * 1000, id],
                 )?;
                 if changed == 0 {
@@ -163,89 +146,11 @@ impl Db {
         Ok(promoted)
     }
 
-    #[cfg(test)]
-    pub(crate) fn opencode_observe(&mut self, agent: &Agent, ready: bool) -> Result<Value> {
-        self.opencode_observe_at(agent, ready, now())
-    }
-
-    pub(crate) fn opencode_observe_at(
-        &mut self,
-        agent: &Agent,
-        ready: bool,
-        time: i64,
-    ) -> Result<Value> {
-        self.opencode_tick(time)?;
-        let instance =
-            crate::clients::opencode::endpoint_instance(std::path::Path::new(&agent.endpoint))?;
-        let old: Option<(String, String, i64)> = self
-            .conn
-            .query_row(
-                "SELECT generation,instance,expires FROM opencode_leases WHERE session=?",
-                [&agent.session],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        ensure!(
-            old.as_ref()
-                .is_none_or(|(_, owner, expires)| *expires <= time || *owner == instance),
-            "OpenCode session has an unexpired owning instance"
-        );
-        let generation = old
-            .filter(|(_, owner, expires)| *owner == instance && *expires > time)
-            .map(|v| v.0)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("INSERT INTO opencode_leases VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session) DO UPDATE SET generation=excluded.generation,instance=excluded.instance,endpoint=excluded.endpoint,expires=excluded.expires,ready=excluded.ready", params![agent.session,generation,instance,agent.endpoint,time+LEASE_MS,ready])?;
-        tx.commit()?;
-        let namespace: String = self.conn.query_row(
-            "SELECT value FROM settings WHERE key='opencode_namespace'",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(json!({"agent":agent,"generation":generation,"namespace":namespace}))
-    }
-
-    pub(crate) fn opencode_heartbeat(
-        &self,
-        session: &str,
-        endpoint: &str,
-        generation: &str,
-        ready: bool,
-    ) -> Result<Value> {
-        self.opencode_tick(now())?;
-        let changed = self.conn.execute("UPDATE opencode_leases SET expires=?1,ready=?2 WHERE session=?3 AND endpoint=?4 AND generation=?5 AND expires>?6",params![now()+LEASE_MS,ready,session,endpoint,generation,now()])?;
-        ensure!(
-            changed == 1,
-            "OpenCode heartbeat has expired or belongs to a stale generation"
-        );
-        Ok(json!({"renewed":true}))
-    }
-
-    pub(crate) fn opencode_close(
-        &self,
-        session: &str,
-        endpoint: &str,
-        generation: &str,
-    ) -> Result<Value> {
-        let changed = self.conn.execute("UPDATE opencode_leases SET expires=0,ready=0 WHERE session=?1 AND endpoint=?2 AND generation=?3",params![session,endpoint,generation])?;
-        ensure!(changed == 1, "Stale OpenCode close generation");
-        self.opencode_tick(now())?;
-        Ok(json!({"closed":true}))
-    }
-
-    pub(crate) fn opencode_admit(
-        &self,
-        id: &str,
-        session: &str,
-        generation: &str,
-        instance: &str,
-        attempt: &str,
-    ) -> Result<Value> {
-        self.opencode_tick(now())?;
-        let allowed: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id JOIN message_context c ON c.id=m.id JOIN opencode_leases l ON l.session=d.session WHERE d.id=?1 AND d.session=?2 AND d.generation=?3 AND d.attempt=?4 AND d.phase='dispatched' AND m.state='sending' AND json_extract(c.destination,'$.provider')='opencode' AND json_extract(c.destination,'$.session')=d.session AND l.generation=d.generation AND l.instance=?5 AND l.expires>?6 AND l.ready=1 AND NOT EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=m.recipient AND (a.provider<>'opencode' OR a.session<>d.session)) AND NOT EXISTS(SELECT 1 FROM inbound_transfers t WHERE t.local_id=m.id AND NOT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON g.peer_id=p.peer_id WHERE p.peer_id=t.peer_id AND p.revoked=0 AND g.provider=t.provider AND g.session=t.session AND g.permission='receive')))",params![id,session,generation,attempt,instance,now()],|r|r.get(0))?;
+    pub(crate) fn opencode_admit(&self, id: &str, session: &str, attempt: &str) -> Result<Value> {
+        let allowed: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id JOIN message_context c ON c.id=m.id WHERE d.id=?1 AND d.session=?2 AND d.attempt=?3 AND d.phase='dispatched' AND m.state='sending' AND json_extract(c.destination,'$.provider')='opencode' AND json_extract(c.destination,'$.session')=d.session AND NOT EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=m.recipient AND (a.provider<>'opencode' OR a.session<>d.session)) AND NOT EXISTS(SELECT 1 FROM inbound_transfers t WHERE t.local_id=m.id AND NOT EXISTS(SELECT 1 FROM peers p JOIN peer_grants g ON g.peer_id=p.peer_id WHERE p.peer_id=t.peer_id AND p.revoked=0 AND g.provider=t.provider AND g.session=t.session AND g.permission='receive')))",params![id,session,attempt],|r|r.get(0))?;
         ensure!(
             allowed && !self.paused()?,
-            "OpenCode native admission denied; claim, pause, policy or generation changed"
+            "OpenCode native admission denied; claim, pause or policy changed"
         );
         Ok(json!({"admitted":true}))
     }
@@ -296,20 +201,12 @@ impl Db {
             agent.provider == Provider::OpenCode,
             "Wrong native provider"
         );
-        let (generation, namespace, old_native, old_content, phase): (String,String,String,Option<String>,String) = self.conn.query_row("SELECT generation,namespace,native_id,content,phase FROM opencode_deliveries WHERE id=?",[&msg.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        let (owner_generation, endpoint): (String, String) = self
-            .conn
-            .query_row(
-                "SELECT generation,endpoint FROM opencode_leases WHERE session=?1 AND expires>?2",
-                params![msg.recipient_session, now()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-            .context("OpenCode session lease expired")?;
-        ensure!(
-            owner_generation == generation && endpoint == agent.endpoint,
-            "OpenCode generation changed before dispatch"
-        );
+        let (namespace, old_native, old_content, phase): (String, String, Option<String>, String) =
+            self.conn.query_row(
+                "SELECT namespace,native_id,content,phase FROM opencode_deliveries WHERE id=?",
+                [&msg.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
         let reconcile = phase == "reconcile" || phase == "legacy" || phase == "uncertain";
         let native = if old_native == "pending" {
             native_id(&namespace, &agent.session, &msg.id)
@@ -320,10 +217,8 @@ impl Db {
         let attempt = uuid::Uuid::new_v4().to_string();
         self.conn.execute("UPDATE opencode_deliveries SET content=?1,native_id=?2,attempt=?3,phase=?4 WHERE id=?5",params![content,native,attempt,if reconcile {"reconcile"} else {"dispatched"},msg.id])?;
         Ok(Dispatch {
-            frame: json!({"op":if reconcile {"reconcile"} else {"deliver"},"session":agent.session,"id":msg.id,"content":content,"namespace":namespace,"generation":generation,"attempt":attempt,"native_message_id":native}),
-            generation,
+            frame: json!({"op":if reconcile {"reconcile"} else {"deliver"},"session":agent.session,"id":msg.id,"content":content,"namespace":namespace,"attempt":attempt,"native_message_id":native}),
             attempt,
-            endpoint,
         })
     }
 
@@ -334,57 +229,22 @@ impl Db {
         state: &str,
         detail: &str,
     ) -> Result<()> {
-        let valid: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id JOIN opencode_leases l ON l.session=d.session WHERE m.state='sending' AND d.id=?1 AND d.generation=?2 AND d.attempt=?3 AND l.generation=d.generation AND l.endpoint=?4 AND l.expires>?5)",params![id,dispatch.generation,dispatch.attempt,dispatch.endpoint,now()],|r|r.get(0))?;
-        if dispatch.frame["op"] == "deliver"
-            && state != "queued"
-            && (state != "submitted" || !valid)
-        {
-            let original_detail = if state == "submitted" && !valid {
-                "OpenCode generation changed before receipt; read-only reconciliation required"
-            } else {
-                detail
-            };
-            self.conn.execute(
-                "UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail',?1,'$.opencode_attempt_generation',?2,'$.opencode_attempt_id',?3,'$.opencode_attempt_timestamp',?5,'$.opencode_attempt_timestamp_kind','detected') WHERE id=?4 AND json_type(destination,'$.opencode_attempt_detail') IS NULL AND json_type(destination,'$.opencode_attempt_generation') IS NULL AND json_type(destination,'$.opencode_attempt_id') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp_kind') IS NULL AND EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id WHERE d.id=?4 AND d.generation=?2 AND d.attempt=?3 AND m.state='sending')",
-                params![original_detail, dispatch.generation, dispatch.attempt, id, now()],
-            )?;
-        }
+        let valid: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM opencode_deliveries d JOIN messages m ON m.id=d.id WHERE m.state='sending' AND d.id=?1 AND d.attempt=?2)",params![id,dispatch.attempt],|r|r.get(0))?;
         if !valid {
-            if state == "queued" && dispatch.frame["op"] == "deliver" {
-                // A correlated deferred receipt proves this dispatch made no
-                // native attempt. Lease loss still requires explicit retry: do
-                // not silently rebind it or affect a newer in-flight attempt.
-                let tx = self.conn.unchecked_transaction()?;
-                let changed = tx.execute("UPDATE opencode_deliveries SET phase='queued' WHERE id=?1 AND generation=?2 AND attempt=?3 AND phase='dispatched' AND EXISTS(SELECT 1 FROM messages m WHERE m.id=?1 AND m.state='sending')", params![id,dispatch.generation,dispatch.attempt])?;
-                if changed == 1 {
-                    tx.execute("UPDATE messages SET state='failed',detail=?1,updated=?2 WHERE id=?3 AND state='sending'", params![format!("OpenCode deferred before native attempt; lease changed, explicitly retry: {detail}"),now(),id])?;
-                }
-                tx.commit()?;
-                return Ok(());
-            }
-            self.conn.execute("UPDATE messages SET state='uncertain',detail='OpenCode generation changed before receipt; read-only reconciliation required',updated=?1 WHERE id=?2 AND state='sending' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=?2 AND d.generation=?3 AND d.attempt=?4)",params![now(),id,dispatch.generation,dispatch.attempt])?;
-            self.conn.execute("UPDATE opencode_deliveries SET phase='uncertain' WHERE id=?1 AND generation=?2 AND attempt=?3",params![id,dispatch.generation,dispatch.attempt])?;
             return Ok(());
         }
-        let deferred = state == "queued";
-        let full = deferred
-            && self.conn.query_row(
-                "SELECT count(*)>=1000 FROM messages WHERE state='queued' AND id<>?",
-                [id],
-                |r| r.get::<_, bool>(0),
+        let deliver = dispatch.frame["op"] == "deliver";
+        if deliver && state == "uncertain" {
+            self.conn.execute(
+                "UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail',?1,'$.opencode_attempt_id',?2,'$.opencode_attempt_timestamp',?4,'$.opencode_attempt_timestamp_kind','detected') WHERE id=?3 AND json_type(destination,'$.opencode_attempt_detail') IS NULL AND json_type(destination,'$.opencode_attempt_id') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp') IS NULL AND json_type(destination,'$.opencode_attempt_timestamp_kind') IS NULL",
+                params![detail, dispatch.attempt, id, now()],
             )?;
-        let next_state = if full { "failed" } else { state };
-        let detail = if full {
-            "OpenCode deferred before insertion but broker queue is full; explicitly retry after backpressure clears"
-        } else {
-            detail
-        };
-        let phase = if deferred {
-            "queued"
-        } else if state == "submitted" {
-            "inserted"
-        } else {
-            "uncertain"
+        }
+        // A failed delivery sent nothing, so its row returns to queued.
+        let phase = match state {
+            "submitted" => "inserted",
+            "failed" if deliver => "queued",
+            _ => "uncertain",
         };
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -393,20 +253,13 @@ impl Db {
         )?;
         // Backoff state is terminal-only: an unresolved receipt keeps its
         // attempt count so retries continue to widen.
-        if phase == "inserted" || next_state == "failed" {
+        if phase == "inserted" || state == "failed" {
             tx.execute(
                 "UPDATE opencode_deliveries SET reconcile_attempts=0,reconcile_at=NULL WHERE id=?",
                 [id],
             )?;
         }
-        // A deferred head stays queued but sleeps until an idle heartbeat/event.
-        if deferred {
-            tx.execute(
-                "UPDATE opencode_leases SET ready=0 WHERE generation=?",
-                [&dispatch.generation],
-            )?;
-        }
-        self.finish(id, next_state, detail)?;
+        self.finish(id, state, detail)?;
         tx.commit()?;
         Ok(())
     }
@@ -434,23 +287,10 @@ impl Db {
             agent.provider == Provider::OpenCode && agent.session == session,
             "OpenCode recipient identity changed; create a new message"
         );
-        // An explicitly queued read-only reconciliation can refresh a replaced
-        // lease after restart. Its immutable native ID/content and reconcile phase
-        // remain intact; a sending attempt cannot be rebound or started twice.
-        let generation: String = self
-            .conn
-            .query_row(
-                "SELECT generation FROM opencode_leases WHERE session=?1 AND expires>?2",
-                params![session, now()],
-                |r| r.get(0),
-            )
-            .optional()?
-            .context("OpenCode retry requires a live session lease")?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "UPDATE opencode_deliveries SET generation=?1,phase=?2,attempt=NULL WHERE id=?3",
+            "UPDATE opencode_deliveries SET phase=?1,attempt=NULL WHERE id=?2",
             params![
-                generation,
                 if phase == "queued" {
                     "queued"
                 } else {
@@ -469,18 +309,16 @@ impl Db {
 mod tests {
     use super::*;
     const SESSION: &str = "ses_0123456789abcdefghijklmnop";
-    fn setup() -> (tempfile::TempDir, Db, Agent, String) {
+    fn setup() -> (tempfile::TempDir, Db, Agent) {
         let root = tempfile::tempdir().unwrap();
-        let mut db = Db::open(&root.path().join("db")).unwrap();
+        let db = Db::open(&root.path().join("db")).unwrap();
         let agent = Agent {
             name: format!("opencode-{SESSION}"),
             provider: Provider::OpenCode,
             session: SESSION.into(),
             endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
         };
-        let result = db.opencode_observe(&agent, true).unwrap();
-        let generation = result["generation"].as_str().unwrap().to_owned();
-        (root, db, agent, generation)
+        (root, db, agent)
     }
     fn send(db: &Db, name: &str) -> Message {
         db.send_names(
@@ -492,6 +330,18 @@ mod tests {
         )
         .unwrap()
     }
+    /// Put a dispatched delivery back at the head of its queue.
+    fn requeue(db: &Db, id: &str) {
+        db.conn
+            .execute(
+                "UPDATE opencode_deliveries SET phase='queued',attempt=NULL WHERE id=?",
+                [id],
+            )
+            .unwrap();
+        db.conn
+            .execute("UPDATE messages SET state='queued' WHERE id=?", [id])
+            .unwrap();
+    }
     fn dispatch(db: &mut Db) -> (Message, Dispatch) {
         let (msg, agent) = db.claim().unwrap().unwrap();
         let dispatch = db
@@ -502,7 +352,7 @@ mod tests {
 
     #[test]
     fn unknown_attempt_does_not_block_later_delivery_or_replay() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         let (claimed, attempt) = dispatch(&mut db);
         assert_eq!(claimed.id, first.id);
@@ -523,7 +373,7 @@ mod tests {
 
     #[test]
     fn legacy_unknown_does_not_block_new_delivery() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let legacy = send(&db, &agent.name);
         db.conn
             .execute(
@@ -558,7 +408,7 @@ mod tests {
 
     #[test]
     fn failed_head_does_not_block_later_delivery() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         db.conn
             .execute("UPDATE messages SET state='failed' WHERE id=?", [&first.id])
@@ -572,7 +422,7 @@ mod tests {
 
     #[test]
     fn original_attempt_diagnostic_survives_readonly_reconciliation() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         let (_, attempt) = dispatch(&mut db);
         db.opencode_finish(
@@ -604,7 +454,7 @@ mod tests {
 
     #[test]
     fn original_diagnostic_includes_identity_and_survives_reconciliations_and_restart() {
-        let (root, mut db, agent, _) = setup();
+        let (root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         let (_, attempt) = dispatch(&mut db);
         let before = now();
@@ -613,7 +463,6 @@ mod tests {
         let original = db.opencode_attempt_diagnostic(&first.id).unwrap().unwrap();
         assert_eq!(original["message_id"], first.id);
         assert_eq!(original["session"], SESSION);
-        assert_eq!(original["generation"], attempt.generation);
         assert_eq!(original["attempt"], attempt.attempt);
         assert!(original["timestamp"].as_i64().unwrap() >= before);
         for _ in 0..2 {
@@ -648,7 +497,7 @@ mod tests {
 
     #[test]
     fn legacy_unknown_reports_original_evidence_unavailable() {
-        let (_root, db, agent, _) = setup();
+        let (_root, db, agent) = setup();
         let legacy = send(&db, &agent.name);
         db.conn
             .execute(
@@ -669,7 +518,7 @@ mod tests {
 
     #[test]
     fn restart_during_dispatch_retains_original_identity_across_reconciliations() {
-        let (root, mut db, agent, _) = setup();
+        let (root, mut db, agent) = setup();
         let message = send(&db, &agent.name);
         let (_, attempt) = dispatch(&mut db);
         drop(db);
@@ -680,10 +529,8 @@ mod tests {
             .unwrap();
         assert_eq!(original["status"], "recorded");
         assert_eq!(original["attempt"], attempt.attempt);
-        assert_eq!(original["generation"], attempt.generation);
         assert!(original["detail"].as_str().unwrap().contains("stopped"));
         assert!(original["timestamp"].is_number());
-        db.opencode_observe(&agent, true).unwrap();
         for _ in 0..2 {
             db.retry(&message.id, false).unwrap();
             let (_, readback) = dispatch(&mut db);
@@ -700,10 +547,10 @@ mod tests {
 
     #[test]
     fn restart_does_not_fill_missing_timestamp_of_existing_original_evidence() {
-        let (root, mut db, agent, _) = setup();
+        let (root, mut db, agent) = setup();
         let message = send(&db, &agent.name);
         let (_, attempt) = dispatch(&mut db);
-        db.conn.execute("UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail','historical original','$.opencode_attempt_generation',?1,'$.opencode_attempt_id',?2) WHERE id=?3", params![attempt.generation, attempt.attempt, message.id]).unwrap();
+        db.conn.execute("UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail','historical original','$.opencode_attempt_id',?1) WHERE id=?2", params![attempt.attempt, message.id]).unwrap();
         drop(db);
         let db = Db::open(&root.path().join("db")).unwrap();
         let original = db
@@ -717,7 +564,7 @@ mod tests {
 
     #[test]
     fn later_outcome_does_not_fill_missing_original_evidence() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let message = send(&db, &agent.name);
         let (_, attempt) = dispatch(&mut db);
         db.conn.execute("UPDATE message_context SET destination=json_insert(destination,'$.opencode_attempt_detail','historical original') WHERE id=?", [&message.id]).unwrap();
@@ -734,35 +581,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_success_records_generation_change_as_unknown_cause() {
-        let (_root, mut db, agent, generation) = setup();
-        let message = send(&db, &agent.name);
-        let (_, attempt) = dispatch(&mut db);
-        db.opencode_close(SESSION, &agent.endpoint, &generation)
-            .unwrap();
-        db.opencode_finish(
-            &message.id,
-            &attempt,
-            "submitted",
-            "native acceptance verified",
-        )
-        .unwrap();
-        let original = db
-            .opencode_attempt_diagnostic(&message.id)
-            .unwrap()
-            .unwrap();
-        assert!(
-            original["detail"]
-                .as_str()
-                .unwrap()
-                .contains("generation changed")
-        );
-        assert_eq!(original["attempt"], attempt.attempt);
-    }
-
-    #[test]
     fn legacy_unavailable_evidence_remains_visible_after_positive_reconciliation() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let message = send(&db, &agent.name);
         let legacy_native = format!("msg_{}", message.id.replace('-', ""));
         db.conn
@@ -791,92 +611,10 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_attempt_diagnostic_supersedes_earlier_safe_deferral() {
-        let (_root, mut db, agent, generation) = setup();
-        let message = send(&db, &agent.name);
-        let (_, deferred) = dispatch(&mut db);
-        db.opencode_finish(&message.id, &deferred, "queued", "safe lookup deferral")
-            .unwrap();
-        db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
-            .unwrap();
-        let (_, attempted) = dispatch(&mut db);
-        db.opencode_finish(&message.id, &attempted, "uncertain", "native receipt lost")
-            .unwrap();
-        db.retry(&message.id, false).unwrap();
-        let (_, reconcile) = dispatch(&mut db);
-        db.opencode_finish(
-            &message.id,
-            &reconcile,
-            "uncertain",
-            "reconciliation absent",
-        )
-        .unwrap();
-        let diagnostic = db
-            .opencode_attempt_diagnostic(&message.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(diagnostic["detail"], "native receipt lost");
-        assert_eq!(diagnostic["attempt"], attempted.attempt);
-        assert_eq!(diagnostic["generation"], attempted.generation);
-    }
-
-    #[test]
-    fn proven_pre_attempt_deferral_survives_generation_close_without_unknown() {
-        let (_root, mut db, agent, generation) = setup();
-        let message = send(&db, &agent.name);
-        let (_, attempt) = dispatch(&mut db);
-        db.opencode_close(SESSION, &agent.endpoint, &generation)
-            .unwrap();
-        db.opencode_finish(
-            &message.id,
-            &attempt,
-            "queued",
-            "lookup rejected before admission",
-        )
-        .unwrap();
-        assert_eq!(
-            db.delivery_state(&db.get(&message.id).unwrap()).unwrap(),
-            "failed"
-        );
-        let phase: String = db
-            .conn
-            .query_row(
-                "SELECT phase FROM opencode_deliveries WHERE id=?",
-                [&message.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(phase, "queued");
-        let mut replacement = agent.clone();
-        replacement.endpoint = format!("/tmp/{}.sock", uuid::Uuid::new_v4());
-        db.opencode_observe(&replacement, true).unwrap();
-        db.retry(&message.id, false).unwrap();
-        let (_, newer) = dispatch(&mut db);
-        db.opencode_finish(&message.id, &attempt, "queued", "late stale deferred")
-            .unwrap();
-        assert_eq!(db.get(&message.id).unwrap().state, "sending");
-        let phase: String = db
-            .conn
-            .query_row(
-                "SELECT phase FROM opencode_deliveries WHERE id=?",
-                [&message.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(phase, "dispatched");
-        db.opencode_finish(&message.id, &newer, "uncertain", "new native receipt lost")
-            .unwrap();
-        assert_eq!(
-            db.delivery_state(&db.get(&message.id).unwrap()).unwrap(),
-            "unknown"
-        );
-    }
-
-    #[test]
     fn readonly_reconciliation_stays_unknown_through_claim_and_dispatch_until_exact_proof() {
         for hidden_control in [false, true] {
             for automatic in [false, true] {
-                let (_root, mut db, agent, _) = setup();
+                let (_root, mut db, agent) = setup();
                 let first = send(&db, &agent.name);
                 if hidden_control {
                     db.opencode_notice_content(&first.id, "typed control")
@@ -961,7 +699,7 @@ mod tests {
     fn remote_readonly_reconciliation_syncs_unknown_while_paused_running_and_restarted() {
         use crate::network::wire::WireResponse;
 
-        let (root, mut receiver, agent, generation) = setup();
+        let (root, mut receiver, agent) = setup();
         let sender_path = root.path().join("sender");
         let mut sender = Db::open(&sender_path).unwrap();
         let origin = libp2p_identity::Keypair::generate_ed25519()
@@ -1096,9 +834,6 @@ mod tests {
             "unknown"
         );
         sync(&sender, &receiver, "uncertain", "unknown");
-        receiver
-            .opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
-            .unwrap();
         receiver.retry(&message.id, false).unwrap();
         let (claimed, proof) = dispatch(&mut receiver);
         assert_eq!(claimed.id, message.id);
@@ -1181,7 +916,7 @@ mod tests {
 
     #[test]
     fn hidden_control_recovery_is_bounded_canonical_and_reports_original_route_mismatch() {
-        let (_root, mut db, agent, _generation) = setup();
+        let (_root, mut db, agent) = setup();
         let alias = Agent {
             name: "manual-alias".into(),
             ..agent.clone()
@@ -1227,7 +962,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|item| item["route_matches"] == true && item["lease_available"] == true)
+                .all(|item| item["route_matches"] == true)
         );
         assert!(
             !recovery
@@ -1252,31 +987,25 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| item["route_matches"] == false && item["lease_available"] == true)
+                .any(|item| item["route_matches"] == false)
         );
         assert!(db.history(&None, 100).unwrap().is_empty());
     }
 
     #[test]
     fn canonical_alias_fifo_deferral_and_unknown_reconciliation() {
-        let (_root, mut db, agent, generation) = setup();
+        let (_root, mut db, agent) = setup();
         let mut alias = agent.clone();
         alias.name = "alias".into();
         db.register(&alias, false).unwrap();
         let first = send(&db, &agent.name);
         let second = send(&db, &alias.name);
-        let (msg, attempt) = dispatch(&mut db);
+        let (msg, _attempt) = dispatch(&mut db);
         assert_eq!(msg.id, first.id);
         assert!(db.claim().unwrap().is_none());
-        db.opencode_finish(&first.id, &attempt, "queued", "busy")
-            .unwrap();
-        assert!(db.claim().unwrap().is_none());
-        db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
-            .unwrap();
+        requeue(&db, &first.id);
         let (_, attempt) = dispatch(&mut db);
         db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
-            .unwrap();
-        db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
             .unwrap();
         let (msg, next) = dispatch(&mut db);
         assert_eq!(msg.id, second.id);
@@ -1294,51 +1023,24 @@ mod tests {
     }
     #[test]
     fn admission_refreshes_pause_and_cancel_and_queue_capacity_includes_retries() {
-        let (_root, mut db, agent, _generation) = setup();
+        let (_root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         let (msg, attempt) = dispatch(&mut db);
-        let instance =
-            crate::clients::opencode::endpoint_instance(std::path::Path::new(&agent.endpoint))
-                .unwrap();
         db.pause(true).unwrap();
         assert!(
-            db.opencode_admit(
-                &msg.id,
-                SESSION,
-                &attempt.generation,
-                &instance,
-                &attempt.attempt
-            )
-            .is_err()
+            db.opencode_admit(&msg.id, SESSION, &attempt.attempt)
+                .is_err()
         );
         assert!(db.cancel(&first.id).is_err());
         db.pause(false).unwrap();
-        db.opencode_admit(
-            &msg.id,
-            SESSION,
-            &attempt.generation,
-            &instance,
-            &attempt.attempt,
-        )
-        .unwrap();
-        db.opencode_finish(
-            &msg.id,
-            &attempt,
-            "queued",
-            "admission deferred before attempt",
-        )
-        .unwrap();
+        db.opencode_admit(&msg.id, SESSION, &attempt.attempt)
+            .unwrap();
+        requeue(&db, &msg.id);
         db.cancel(&first.id).unwrap();
         // A cancelled queue head never becomes a native admission.
         assert!(
-            db.opencode_admit(
-                &msg.id,
-                SESSION,
-                &attempt.generation,
-                &instance,
-                &attempt.attempt
-            )
-            .is_err()
+            db.opencode_admit(&msg.id, SESSION, &attempt.attempt)
+                .is_err()
         );
         let failed = send(&db, &agent.name);
         db.conn
@@ -1364,136 +1066,8 @@ mod tests {
         assert_eq!(db.get(&failed.id).unwrap().state, "failed");
     }
     #[test]
-    fn lease_takeover_fences_queued_work_renew_close_and_late_outcomes() {
-        let (_root, mut db, agent, old_generation) = setup();
-        let first = send(&db, &agent.name);
-        let queued = send(&db, &agent.name);
-        let (_, old_attempt) = dispatch(&mut db);
-        db.conn
-            .execute("UPDATE opencode_leases SET expires=0", [])
-            .unwrap();
-        db.opencode_tick(now()).unwrap();
-        assert_eq!(db.get(&queued.id).unwrap().state, "failed");
-        let mut replacement = agent.clone();
-        replacement.endpoint = format!("/tmp/{}.sock", uuid::Uuid::new_v4());
-        let current = db.opencode_observe(&replacement, true).unwrap();
-        let current_generation = current["generation"].as_str().unwrap();
-        assert_ne!(old_generation, current_generation);
-        assert!(
-            db.opencode_heartbeat(SESSION, &agent.endpoint, &old_generation, true)
-                .is_err()
-        );
-        assert!(
-            db.opencode_close(SESSION, &agent.endpoint, &old_generation)
-                .is_err()
-        );
-        db.opencode_finish(
-            &first.id,
-            &old_attempt,
-            "submitted",
-            "stale insertion receipt",
-        )
-        .unwrap();
-        assert_eq!(db.get(&first.id).unwrap().state, "uncertain");
-        db.retry(&first.id, true).unwrap();
-        let (_, new_attempt) = dispatch(&mut db);
-        assert_eq!(new_attempt.frame["op"], "reconcile");
-        db.opencode_finish(
-            &first.id,
-            &old_attempt,
-            "submitted",
-            "very late previous generation",
-        )
-        .unwrap();
-        assert_eq!(db.get(&first.id).unwrap().state, "sending");
-        db.opencode_finish(
-            &first.id,
-            &new_attempt,
-            "submitted",
-            "current exact readback",
-        )
-        .unwrap();
-        assert_eq!(db.get(&first.id).unwrap().state, "submitted");
-        db.opencode_finish(&first.id, &old_attempt, "uncertain", "very late error")
-            .unwrap();
-        assert_eq!(db.get(&first.id).unwrap().state, "submitted");
-    }
-    #[test]
-    fn live_unattempted_work_survives_old_busy_deadline_and_restart() {
-        for deferred in [false, true] {
-            let (root, mut db, agent, generation) = setup();
-            let first = send(&db, &agent.name);
-            let alias = Agent {
-                name: "alias".into(),
-                ..agent.clone()
-            };
-            db.register(&alias, false).unwrap();
-            let second = send(&db, &alias.name);
-            if deferred {
-                let (_, attempt) = dispatch(&mut db);
-                db.opencode_finish(&first.id, &attempt, "queued", "busy before native attempt")
-                    .unwrap();
-            }
-            db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, false)
-                .unwrap();
-            let deadline: i64 = db
-                .conn
-                .query_row(
-                    "SELECT deadline FROM opencode_deliveries WHERE id=?",
-                    [&first.id],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            // Advance tick deterministically past the old age limit while the
-            // exact generation remains live, as continuing heartbeats guarantee.
-            db.conn
-                .execute(
-                    "UPDATE opencode_leases SET expires=?",
-                    [deadline + LEASE_MS],
-                )
-                .unwrap();
-            db.opencode_tick(deadline + 1).unwrap();
-            assert_eq!(db.get(&first.id).unwrap().state, "queued");
-            assert!(db.claim().unwrap().is_none());
-            drop(db);
-            let mut db = Db::open(&root.path().join("db")).unwrap();
-            assert_eq!(db.get(&first.id).unwrap().state, "queued");
-            assert!(db.claim().unwrap().is_none());
-            db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
-                .unwrap();
-            let (msg, attempt) = dispatch(&mut db);
-            assert_eq!(msg.id, first.id);
-            assert_eq!(attempt.frame["op"], "deliver");
-            db.opencode_finish(&first.id, &attempt, "submitted", "native inserted")
-                .unwrap();
-            assert_eq!(db.claim().unwrap().unwrap().0.id, second.id);
-        }
-    }
-    #[test]
-    fn expiry_between_claim_and_prepare_fails_one_message_without_stopping_other_clients() {
-        let (_root, mut db, agent, _) = setup();
-        let first = send(&db, &agent.name);
-        let (msg, target) = db.claim().unwrap().unwrap();
-        db.conn
-            .execute("UPDATE opencode_leases SET expires=0", [])
-            .unwrap();
-        let error = db.opencode_dispatch(&msg, &target, "body").unwrap_err();
-        db.opencode_dispatch_failed(&msg.id, &error.to_string())
-            .unwrap();
-        assert_eq!(db.get(&first.id).unwrap().state, "failed");
-        let inbox = Agent {
-            name: "unrelated".into(),
-            provider: Provider::Inbox,
-            session: "unrelated".into(),
-            endpoint: String::new(),
-        };
-        db.register(&inbox, false).unwrap();
-        let next = send(&db, &inbox.name);
-        assert_eq!(db.claim().unwrap().unwrap().0.id, next.id);
-    }
-    #[test]
     fn broker_restart_and_outcome_commit_failure_preserve_readonly_recovery() {
-        let (root, mut db, agent, generation) = setup();
+        let (root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         let (_, attempt) = dispatch(&mut db);
         db.conn.execute_batch("CREATE TRIGGER fail_outcome BEFORE UPDATE OF state ON messages WHEN NEW.state='submitted' BEGIN SELECT RAISE(ABORT,'injected outcome storage failure'); END;").unwrap();
@@ -1510,8 +1084,6 @@ mod tests {
         drop(db);
         let mut db = Db::open(&root.path().join("db")).unwrap();
         assert_eq!(db.get(&first.id).unwrap().state, "uncertain");
-        db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
-            .unwrap();
         db.retry(&first.id, true).unwrap();
         let (_, reconcile) = dispatch(&mut db);
         assert_eq!(reconcile.frame["op"], "reconcile");
@@ -1526,7 +1098,7 @@ mod tests {
     }
     #[test]
     fn ordinary_native_rendered_content_stays_in_history_but_typed_controls_do_not() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let peer = send(&db, &agent.name);
         let (claimed, dispatch) = dispatch(&mut db);
         assert_eq!(claimed.id, peer.id);
@@ -1551,15 +1123,13 @@ mod tests {
 
     #[test]
     fn typed_notices_share_canonical_fifo_pause_and_admission() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let peer = send(&db, &agent.name);
         let notice = send(&db, &agent.name);
         db.opencode_notice_content(&notice.id, "raw typed control notice")
             .unwrap();
-        let (_, head) = dispatch(&mut db);
-        db.opencode_finish(&peer.id, &head, "queued", "busy")
-            .unwrap();
-        assert!(db.claim().unwrap().is_none());
+        let (_, _head) = dispatch(&mut db);
+        requeue(&db, &peer.id);
         db.pause(true).unwrap();
         assert!(db.claim().unwrap().is_none());
         db.cancel(&notice.id).unwrap();
@@ -1581,32 +1151,8 @@ mod tests {
         );
     }
     #[test]
-    fn historical_unattempted_failure_requires_explicit_retry() {
-        let (_root, mut db, agent, generation) = setup();
-        let queued = send(&db, &agent.name);
-        // A historical broker may already have failed this unattempted ID.
-        db.conn
-            .execute(
-                "UPDATE messages SET state='failed' WHERE id=?",
-                [&queued.id],
-            )
-            .unwrap();
-        db.opencode_heartbeat(SESSION, &agent.endpoint, &generation, true)
-            .unwrap();
-        db.opencode_tick(now()).unwrap();
-        assert_eq!(db.get(&queued.id).unwrap().state, "failed");
-        assert!(db.claim().unwrap().is_none());
-        db.retry(&queued.id, false).unwrap();
-        let (_, dispatch) = dispatch(&mut db);
-        assert_eq!(dispatch.frame["op"], "deliver");
-        assert_eq!(
-            dispatch.frame["native_message_id"].as_str().unwrap().len(),
-            68
-        );
-    }
-    #[test]
     fn pre_upgrade_submitted_then_old_retry_queued_remains_readonly_after_migration() {
-        let (root, db, agent, _) = setup();
+        let (root, db, agent) = setup();
         let legacy = db
             .send_names(
                 "12345678-1234-4234-8234-123456789abc",
@@ -1621,7 +1167,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         // Reconstitute schema 12, then exactly the old public retry transition:
         // submitted/uncertain -> queued with erased detail and no attempt record.
-        conn.execute_batch("DROP TRIGGER IF EXISTS topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER IF EXISTS opencode_enqueue_bound; DROP TRIGGER IF EXISTS opencode_retry_bound; DROP TRIGGER IF EXISTS opencode_enqueue_binding; DROP TABLE opencode_deliveries; DROP TABLE opencode_leases;
+        conn.execute_batch("DROP TRIGGER IF EXISTS topic_push_failed_gap; DROP TABLE topic_push_work; DROP TABLE topic_push_preferences; DROP TABLE topic_mentions; DROP TABLE topic_posts; DROP TABLE topics; DROP TABLE board_lifecycle; DROP TABLE board_message_receipts; DROP TABLE codex_notices; DROP TRIGGER IF EXISTS opencode_enqueue_bound; DROP TRIGGER IF EXISTS opencode_retry_bound; DROP TRIGGER IF EXISTS opencode_enqueue_binding; DROP TABLE opencode_deliveries;
 DROP TABLE IF EXISTS route_aliases; DROP TABLE IF EXISTS claude_bindings;
 CREATE TABLE IF NOT EXISTS session_metadata(provider TEXT NOT NULL,session TEXT NOT NULL,display_name TEXT,PRIMARY KEY(provider,session));
 CREATE TABLE IF NOT EXISTS remote_agents(peer_id TEXT NOT NULL,name TEXT NOT NULL,agent TEXT NOT NULL,PRIMARY KEY(peer_id,name));
@@ -1641,7 +1187,6 @@ PRAGMA user_version=12;").unwrap();
         drop(conn);
         let mut db = Db::open(&path).unwrap();
         assert_eq!(db.get(&legacy.id).unwrap().state, "uncertain");
-        db.opencode_observe(&agent, true).unwrap();
         db.pause(false).unwrap();
         let newer = send(&db, &agent.name);
         let (tail, tail_attempt) = dispatch(&mut db);
@@ -1674,7 +1219,7 @@ PRAGMA user_version=12;").unwrap();
         ))
         .unwrap();
         let mut normalized = reconcile.frame.clone();
-        for field in ["namespace", "generation", "attempt"] {
+        for field in ["namespace", "attempt"] {
             let actual = reconcile.frame[field].as_str().unwrap();
             assert_eq!(uuid::Uuid::parse_str(actual).unwrap().to_string(), actual);
             // Opaque runtime ownership tokens are normalized only after proving
@@ -1693,7 +1238,7 @@ PRAGMA user_version=12;").unwrap();
     }
     #[test]
     fn attempted_reconciliation_cannot_cancel_or_disappear_on_alias_replacement() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let mut route = agent.clone();
         route.name = "route".into();
         db.register(&route, false).unwrap();
@@ -1712,7 +1257,7 @@ PRAGMA user_version=12;").unwrap();
     }
     #[test]
     fn readonly_reconciliation_can_resolve_multiple_uncertainties_without_deadlock() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let earlier = send(&db, &agent.name);
         db.conn
             .execute(
@@ -1753,7 +1298,7 @@ PRAGMA user_version=12;").unwrap();
     }
     #[test]
     fn retry_and_defer_respect_global_backpressure_without_losing_claim_state() {
-        let (_root, mut db, agent, _) = setup();
+        let (_root, mut db, agent) = setup();
         let failed = send(&db, &agent.name);
         db.conn
             .execute(
@@ -1794,7 +1339,7 @@ PRAGMA user_version=12;").unwrap();
             )
             .is_err()
         );
-        db.opencode_finish(&sending.id, &attempt, "queued", "busy before attempt")
+        db.opencode_finish(&sending.id, &attempt, "failed", "busy before attempt")
             .unwrap();
         assert_eq!(db.get(&sending.id).unwrap().state, "failed");
         let phase: String = db
@@ -1811,7 +1356,7 @@ PRAGMA user_version=12;").unwrap();
     fn revoked_remote_reconciliation_is_readonly_and_independent_tail_can_deliver() {
         use crate::network::wire::{Envelope, RemoteAgent};
         for policy_change in ["revoke", "unshare"] {
-            let (_root, mut db, agent, _) = setup();
+            let (_root, mut db, agent) = setup();
             let origin = libp2p_identity::Keypair::generate_ed25519()
                 .public()
                 .to_peer_id()
@@ -1904,7 +1449,7 @@ PRAGMA user_version=12;").unwrap();
 
     #[test]
     fn uncertain_receipts_sweep_to_read_only_reconcile_without_duplication_or_starvation() {
-        let (_root, mut db, agent, _generation) = setup();
+        let (_root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         let second = send(&db, &agent.name);
         let (msg, attempt) = dispatch(&mut db);
@@ -1956,7 +1501,7 @@ PRAGMA user_version=12;").unwrap();
 
     #[test]
     fn uncertain_sweep_backs_off_and_only_terminal_outcomes_reset_it() {
-        let (_root, mut db, agent, _generation) = setup();
+        let (_root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         let (_, attempt) = dispatch(&mut db);
         db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
@@ -1994,7 +1539,7 @@ PRAGMA user_version=12;").unwrap();
 
     #[test]
     fn sweep_never_overwrites_manual_or_in_flight_reconciliation() {
-        let (_root, mut db, agent, _generation) = setup();
+        let (_root, mut db, agent) = setup();
         let first = send(&db, &agent.name);
         let (_, attempt) = dispatch(&mut db);
         db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
@@ -2012,85 +1557,5 @@ PRAGMA user_version=12;").unwrap();
             .unwrap();
         assert_eq!(phase, "reconcile");
         assert_eq!(attempts, 0, "manual retry is left untouched by the sweep");
-    }
-
-    #[test]
-    fn restart_requalifies_stale_attempts_and_sweeps_after_reobserve() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("db");
-        let agent = Agent {
-            name: format!("opencode-{SESSION}"),
-            provider: Provider::OpenCode,
-            session: SESSION.into(),
-            endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-        };
-        let first;
-        {
-            let mut db = Db::open(&path).unwrap();
-            db.opencode_observe(&agent, true).unwrap();
-            first = send(&db, &agent.name);
-            let (msg, attempt) = dispatch(&mut db);
-            assert_eq!(msg.id, first.id);
-            // Broker stops mid-attempt: the message stays 'sending'.
-            assert_eq!(db.get(&first.id).unwrap().state, "sending");
-            let _ = attempt;
-        }
-        let mut db = Db::open(&path).unwrap();
-        assert_eq!(db.get(&first.id).unwrap().state, "uncertain");
-        let phase: String = db
-            .conn
-            .query_row(
-                "SELECT phase FROM opencode_deliveries WHERE id=?",
-                [&first.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(phase, "uncertain");
-        // Plugins reconnect, then the ordinary tick sweeps the stale attempt.
-        db.opencode_observe(&agent, true).unwrap();
-        let now = crate::db::now();
-        db.opencode_sweep_uncertain(now).unwrap();
-        let phase: String = db
-            .conn
-            .query_row(
-                "SELECT phase FROM opencode_deliveries WHERE id=?",
-                [&first.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(phase, "reconcile");
-    }
-
-    #[test]
-    fn sweep_rebinds_a_plugin_restart_to_the_live_generation() {
-        let (_root, mut db, agent, _generation) = setup();
-        let first = send(&db, &agent.name);
-        let (_, attempt) = dispatch(&mut db);
-        db.opencode_finish(&first.id, &attempt, "uncertain", "lost native receipt")
-            .unwrap();
-        // A new plugin instance (new endpoint UUID) takes the session over.
-        db.conn
-            .execute(
-                "UPDATE opencode_leases SET expires=0 WHERE session=?",
-                [SESSION],
-            )
-            .unwrap();
-        let replacement = Agent {
-            endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-            ..agent
-        };
-        let live = db.opencode_observe(&replacement, true).unwrap();
-        let generation = live["generation"].as_str().unwrap().to_owned();
-        assert_eq!(db.opencode_sweep_uncertain(crate::db::now()).unwrap(), 1);
-        let (phase, bound): (String, String) = db
-            .conn
-            .query_row(
-                "SELECT phase,generation FROM opencode_deliveries WHERE id=?",
-                [&first.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(phase, "reconcile");
-        assert_eq!(bound, generation);
     }
 }

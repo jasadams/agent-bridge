@@ -166,8 +166,8 @@ permission and does not create a durable availability catalog. See the
 
 For OpenCode, subscribe/unsubscribe receipts include bounded `recovery`
 diagnostics for hidden attempted controls: total count, truncation, and at most
-16 items containing ID, state, pending reconciliation and current route/lease
-availability. Other providers return the same empty recovery shape. A fresh
+16 items containing ID, state, pending reconciliation and current route
+match. Other providers return the same empty recovery shape. A fresh
 snapshot can coexist with blocked native delivery. Inspect the ID, then use
 `agent-bridge --state-dir "/same/private/state" retry CONTROL_ID` for explicit
 read-only native reconciliation through that broker. This never reinserts an

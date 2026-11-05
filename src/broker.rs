@@ -270,25 +270,15 @@ impl Broker {
     }
 
     /// One connector implementation per provider for this request. OpenCode's
-    /// transport locators are snapshotted from leases; no DB lock is held while
+    /// sockets are discovered in the state directory; no DB lock is held while
     /// the native read runs.
-    fn connector(
-        &self,
-        provider: &Provider,
-        preferred_session: Option<&str>,
-    ) -> Result<Option<Arc<dyn ConnectorState>>> {
+    fn connector(&self, provider: &Provider) -> Result<Option<Arc<dyn ConnectorState>>> {
         Ok(match provider {
             Provider::Claude => Some(self.claude_state.clone()),
             Provider::Codex => Some(self.codex_state.clone()),
-            Provider::OpenCode => {
-                let (endpoints, preferred) = {
-                    let db = self.db.lock().unwrap();
-                    db.opencode_locators(preferred_session)?
-                };
-                Some(Arc::new(crate::clients::opencode::State::new(
-                    endpoints, preferred,
-                )))
-            }
+            Provider::OpenCode => Some(Arc::new(crate::clients::opencode::State::new(
+                &self.state_dir,
+            ))),
             Provider::Inbox => None,
         })
     }
@@ -298,7 +288,7 @@ impl Broker {
         provider: &Provider,
         session: &str,
     ) -> Result<Option<NativeState>> {
-        let Some(connector) = self.connector(provider, Some(session))? else {
+        let Some(connector) = self.connector(provider)? else {
             return Ok(None);
         };
         connector
@@ -311,7 +301,7 @@ impl Broker {
         provider: &Provider,
         max_age_days: u32,
     ) -> std::result::Result<Vec<NativeState>, crate::clients::StateError> {
-        match self.connector(provider, None) {
+        match self.connector(provider) {
             Ok(Some(connector)) => connector.list(max_age_days),
             Ok(None) => Ok(Vec::new()),
             Err(error) => Err(crate::clients::StateError::Unavailable(error.to_string())),
@@ -340,12 +330,10 @@ impl Broker {
             }
             return Ok(agent);
         }
-        if agent.provider == Provider::OpenCode && !agent.endpoint.is_empty() {
-            // A live lease already provides the exact request-local transport
-            // locator. Cold explicit sends without a lease still perform GET.
-            return Ok(agent);
-        }
-        if require_present && let Ok(Some(state)) = self.native_get(&agent.provider, &agent.session)
+        // OpenCode sockets are resolved per delivery, never pinned to the agent.
+        if require_present
+            && agent.provider != Provider::OpenCode
+            && let Ok(Some(state)) = self.native_get(&agent.provider, &agent.session)
         {
             // Enrich only this request from the connector observation. Absence
             // never fabricates a catalog row; durable work remains queued for
@@ -414,18 +402,28 @@ impl Broker {
         }
         let source = self.prepare_agent(sender, true)?;
         let destination = self.prepare_agent(recipient, true)?;
+        for (side, agent) in [("Sender", &source), ("Recipient", &destination)] {
+            if agent.provider == Provider::OpenCode
+                && !matches!(
+                    self.native_get(&agent.provider, &agent.session),
+                    Ok(Some(_))
+                )
+            {
+                return Err(crate::protocol::SendNotPersisted(format!(
+                    "{side} {} is not reachable: no OpenCode plugin answered for its session",
+                    agent.name
+                ))
+                .into());
+            }
+        }
         Ok(PreparedSend::Local(source, destination))
     }
 
     fn prepare_list(&self, all: bool, max_age_days: u32) -> Result<Value> {
         ensure!(max_age_days >= 1, "max_age_days must be at least 1");
-        let (configured, machine, opencode_leased) = {
+        let (configured, machine) = {
             let db = self.db.lock().unwrap();
-            (
-                db.listed_agents(all)?,
-                self.local_machine(&db)?,
-                db.opencode_lease_sessions(),
-            )
+            (db.listed_agents(all)?, self.local_machine(&db)?)
         };
         let mut providers = Vec::new();
         let mut rows: std::collections::BTreeMap<(String, String, String), Value> =
@@ -443,43 +441,7 @@ impl Broker {
             }
             match self.native_list(&provider, max_age_days) {
                 Ok(states) => {
-                    // One request queries a single OpenCode service. Several plugin
-                    // sockets of that service are covered by its listing; a live
-                    // lease it does not list belongs to another service. The
-                    // listing is age-filtered, so confirm a missing session with
-                    // an exact lookup through the same (unpreferred) connector.
-                    let uncovered = if provider == Provider::OpenCode {
-                        match &opencode_leased {
-                            Err(_) => Some("OpenCode lease state is unreadable"),
-                            Ok(leased) => {
-                                let listed: std::collections::HashSet<&str> =
-                                    states.iter().map(|state| state.session.as_str()).collect();
-                                let exact = self.connector(&provider, None).ok().flatten();
-                                let missing = leased.iter().any(|session| {
-                                    // Not native_get: it prefers the session's own lease
-                                    // endpoint, so another service would confirm itself.
-                                    !listed.contains(session.as_str())
-                                        && !exact.as_ref().is_some_and(|connector| {
-                                            matches!(connector.get(session), Ok(Some(_)))
-                                        })
-                                });
-                                missing.then_some(
-                                    "A live OpenCode session is outside the queried service scope",
-                                )
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(detail) = uncovered {
-                        providers.push(json!({
-                            "provider":provider,
-                            "state":"incomplete",
-                            "detail":detail,
-                        }));
-                    } else {
-                        providers.push(json!({"provider":provider,"state":"complete"}));
-                    }
+                    providers.push(json!({"provider":provider,"state":"complete"}));
                     for state in states {
                         native_sessions
                             .insert((provider.label().to_string(), state.session.clone()));
@@ -578,23 +540,20 @@ impl Broker {
     /// Request-local native presence snapshot for claiming durable work. Native
     /// absence leaves queued work untouched; it never becomes a false delivery.
     fn native_readiness(&self) -> std::collections::HashSet<(String, String)> {
-        let (bindings, leases) = {
+        let bindings = {
             let db = self.db.lock().unwrap();
-            (
-                db.claude_binding_sessions()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|session| {
-                        db.agent(&crate::clients::lifecycle::routing_name(
-                            &Provider::Claude,
-                            &session,
-                        ))
-                        .ok()
-                        .map(|agent| (session, agent.endpoint))
-                    })
-                    .collect::<Vec<_>>(),
-                db.opencode_lease_sessions().unwrap_or_default(),
-            )
+            db.claude_binding_sessions()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|session| {
+                    db.agent(&crate::clients::lifecycle::routing_name(
+                        &Provider::Claude,
+                        &session,
+                    ))
+                    .ok()
+                    .map(|agent| (session, agent.endpoint))
+                })
+                .collect::<Vec<_>>()
         };
         let mut ready = std::collections::HashSet::new();
         for binding in bindings.into_iter().flatten() {
@@ -605,9 +564,6 @@ impl Broker {
                 ready.insert(("claude".into(), binding.0));
             }
         }
-        for session in leases {
-            ready.insert(("opencode".into(), session));
-        }
         if let Ok(rows) = self.codex_state.list(7) {
             for row in rows {
                 ready.insert(("codex".into(), row.session));
@@ -617,20 +573,9 @@ impl Broker {
     }
 
     pub(crate) fn prepare_directory(&self) -> Result<Vec<Agent>> {
-        let (configured, opencode_sessions) = {
-            let db = self.db.lock().unwrap();
-            (db.listed_agents(true)?, db.opencode_lease_sessions()?)
-        };
+        let configured = self.db.lock().unwrap().listed_agents(true)?;
         let mut directory = Vec::new();
-        for session in opencode_sessions {
-            directory.push(Agent {
-                name: crate::clients::lifecycle::routing_name(&Provider::OpenCode, &session),
-                provider: Provider::OpenCode,
-                session,
-                endpoint: String::new(),
-            });
-        }
-        for provider in [Provider::Claude, Provider::Codex] {
+        for provider in [Provider::Claude, Provider::Codex, Provider::OpenCode] {
             let Ok(rows) = self.native_list(&provider, 7) else {
                 continue;
             };
@@ -922,9 +867,6 @@ impl Broker {
 
     pub async fn request_async(&self, req: Request) -> Result<Value> {
         match req {
-            req @ (Request::OpenCodeObserve { .. } | Request::OpenCodeHeartbeat { .. }) => {
-                self.blocking(move |broker| broker.request(req)).await
-            }
             req @ Request::Register {
                 provider: Provider::OpenCode,
                 ..
@@ -1052,31 +994,10 @@ impl Broker {
             Request::Subscribe { agent, .. } => Some(self.prepare_agent(agent, true)?),
             _ => None,
         };
-        // Register stores explicit routing configuration only. Native presence
-        // is checked request-locally for routing and listing, never stored.
-        let candidate = match &req {
-            Request::OpenCodeObserve {
-                session, endpoint, ..
-            }
-            | Request::OpenCodeHeartbeat {
-                session, endpoint, ..
-            } => Some(Agent {
-                name: crate::clients::lifecycle::routing_name(&Provider::OpenCode, session),
-                provider: Provider::OpenCode,
-                session: session.clone(),
-                endpoint: endpoint.clone(),
-            }),
-            _ => None,
-        };
-        if let Some(mut agent) = candidate {
-            crate::clients::validate_registration(&mut agent)?;
-            crate::clients::opencode::verify_registration(&agent)?;
-        }
         let mut db = self
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("Database lock poisoned"))?;
-        db.opencode_tick(crate::db::now())?;
         {
             let mut state = self.board_notifications.lock().unwrap();
             state.prune(|name| db.agent(name).ok());
@@ -1408,59 +1329,9 @@ impl Broker {
                     db.claude_unbind(&session, &endpoint)?;
                     json!({"unbound":true,"session":session})
                 }
-                Request::OpenCodeObserve {
-                    session,
-                    endpoint,
-                    ready,
-                } => {
-                    let mut agent = Agent {
-                        name: crate::clients::lifecycle::routing_name(
-                            &Provider::OpenCode,
-                            &session,
-                        ),
-                        provider: Provider::OpenCode,
-                        session,
-                        endpoint,
-                    };
-                    crate::clients::validate_registration(&mut agent)?;
-                    let observed_at = crate::db::now();
-                    db.opencode_tick(observed_at)?;
-                    db.opencode_observe_at(&agent, ready, observed_at)?
-                }
-                Request::OpenCodeHeartbeat {
-                    session,
-                    endpoint,
-                    generation,
-                    ready,
-                } => {
-                    let endpoint = crate::clients::opencode::validate_endpoint(&endpoint)?
-                        .to_string_lossy()
-                        .into_owned();
-                    db.opencode_heartbeat(&session, &endpoint, &generation, ready)?
-                }
-                Request::OpenCodeClose {
-                    session,
-                    endpoint,
-                    generation,
-                } => {
-                    let path = std::path::Path::new(&endpoint);
-                    let endpoint = path
-                        .parent()
-                        .context("Missing OpenCode endpoint directory")?
-                        .canonicalize()?
-                        .join(
-                            path.file_name()
-                                .context("Missing OpenCode endpoint filename")?,
-                        )
-                        .to_string_lossy()
-                        .into_owned();
-                    db.opencode_close(&session, &endpoint, &generation)?
-                }
                 Request::OpenCodeAdmit {
                     id,
                     session,
-                    generation,
-                    instance,
                     attempt,
                 } => {
                     let message = db.get(&id)?;
@@ -1469,7 +1340,7 @@ impl Broker {
                     if let Some(token) = db.event_control_token(&id)? {
                         self.authorize_event_locked(&db, &agent, &token)?;
                     }
-                    db.opencode_admit(&id, &session, &generation, &instance, &attempt)?
+                    db.opencode_admit(&id, &session, &attempt)?
                 }
                 Request::OpenCodeNotice {
                     id,
@@ -2335,18 +2206,6 @@ impl Broker {
                 &owner.endpoint,
             )));
         }
-        if owner.provider == Provider::OpenCode {
-            let live = self
-                .db
-                .lock()
-                .unwrap()
-                .opencode_locators(Some(&owner.session))
-                .map(|(_, preferred)| preferred.is_some())
-                .unwrap_or(false);
-            if !live {
-                return Ok(Some("OpenCode live lease required".into()));
-            }
-        }
         Ok(None)
     }
 
@@ -2440,7 +2299,7 @@ impl Broker {
         {
             return Reply::error(503, "unavailable", "Message input inbox is disabled");
         }
-        // The native admission checks and OpenCode durable lease/queue guards in
+        // The native admission checks and OpenCode durable queue guards in
         // Db::insert_message remain authoritative. No native conversation starts here.
         let result = (|| -> Result<Value> {
             let tx = db.conn.unchecked_transaction()?;
@@ -2470,8 +2329,7 @@ impl Broker {
                     || message.contains("queue is full")
                 {
                     Reply::error(429, "rejected", error)
-                } else if message.contains("lease")
-                    || message.contains("admission")
+                } else if message.contains("admission")
                     || message.contains("session")
                     || message.contains("disabled")
                 {
@@ -2627,7 +2485,6 @@ impl Broker {
             self.blocking(move |broker| -> Result<()> {
                 let db = broker.db.lock().unwrap();
                 let now = crate::db::now();
-                db.opencode_tick(now)?;
                 // Unresolved receipts block their session queue; reconcile them
                 // read-only with bounded backoff instead of waiting for a manual retry.
                 if let Err(error) = db.opencode_sweep_uncertain(now) {
@@ -2685,7 +2542,7 @@ impl Broker {
                             crate::clients::deliver_content(&agent, &msg, &msg.body).await
                         }
                     } else if let Some(dispatch) = &dispatch {
-                        crate::clients::opencode::deliver_dispatch(&agent, dispatch).await
+                        crate::clients::opencode::deliver_dispatch(&this.state_dir, &agent, dispatch).await
                     } else {
                         delivery::deliver_with_machines(
                             &agent,
@@ -2757,8 +2614,17 @@ impl Broker {
                     frame.len() <= MAX_FRAME && frame.last() == Some(&b'\n'),
                     "Request must be one newline-terminated JSON frame, at most 256 KiB"
                 );
-                self.request_async(serde_json::from_slice(&frame).context("Invalid request")?)
-                    .await
+                self.request_async(serde_json::from_slice(&frame).map_err(|error| {
+                    if ["opencode_observe", "opencode_heartbeat", "opencode_close"]
+                        .iter()
+                        .any(|op| frame.windows(op.len()).any(|w| w == op.as_bytes()))
+                    {
+                        anyhow::anyhow!("OpenCode plugin is outdated; restart OpenCode")
+                    } else {
+                        anyhow::Error::new(error).context("Invalid request")
+                    }
+                })?)
+                .await
             }
             .await,
         );
@@ -3222,14 +3088,6 @@ mod opencode_admission_tests {
             session: "ses_0123456789abcdefghijklmnop".into(),
             endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
         };
-        // A verified-live registration fixture isolates the capability selector;
-        // native endpoint/probe checks have separate real-socket coverage.
-        broker
-            .db
-            .lock()
-            .unwrap()
-            .opencode_observe(&agent, true)
-            .unwrap();
         assert!(
             broker
                 .request(Request::Subscribe {
@@ -3289,7 +3147,6 @@ mod opencode_admission_tests {
                 let mut db = broker.db.lock().unwrap();
                 // Inject a verified-live database fixture; native probes have
                 // separate real-socket coverage. No dispatcher runs in this test.
-                db.opencode_observe(&agent, true).unwrap();
                 db.pair_peer(&origin, &origin, Some("origin")).unwrap();
                 db.share_peer_session(&origin, &agent.name, true).unwrap();
                 let envelope = Envelope {
@@ -3320,13 +3177,9 @@ mod opencode_admission_tests {
             // This is the deterministic gate after receiving the delivery frame,
             // before the plugin invokes the real privileged admission operation.
             assert_eq!(dispatch.frame["op"], "deliver");
-            let instance =
-                crate::clients::opencode::endpoint_instance(Path::new(&agent.endpoint)).unwrap();
             let admission = || Request::OpenCodeAdmit {
                 id: message.id.clone(),
                 session: agent.session.clone(),
-                generation: dispatch.generation.clone(),
-                instance: instance.clone(),
                 attempt: dispatch.attempt.clone(),
             };
             broker.request(admission()).expect("Positive control: the current remote Receive grant admits this valid claimed frame");
