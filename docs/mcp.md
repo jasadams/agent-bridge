@@ -315,7 +315,7 @@ reconnect/restart MCP to discover the new tools. Legacy main read/update calls k
 request forms where supported. Event subscriptions require the generic operations. Named boards add no network sharing.
 
 Existing `list_messages` calls return recent-history arrays. To opt into incremental
-reads, start with an empty cursor and the desired agent scope:
+reads, start with an empty cursor (or the non-empty `start`, for clients that drop empty-string arguments) and the desired agent scope:
 
 ```json
 {"agent":"<registered-agent>","cursor":"","limit":30}
@@ -329,7 +329,7 @@ messages. Cursors survive broker restarts and reject malformed values or a diffe
 scope. They track **newly inserted messages**, not subsequent delivery-state changes;
 use `get_message` to check delivery outcome, and incremental reads
 to receive new replies. If a cursor
-anchor has been removed, restart with an empty cursor. No waiting or polling behavior
+anchor has been removed, restart with an empty or `start` cursor. No waiting or polling behavior
 is introduced by these options.
 
 ## Approval and transport boundaries

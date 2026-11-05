@@ -287,7 +287,7 @@ fn encode_cursor(local: &str, topic: &TopicRef, after: i64) -> Result<String> {
 }
 
 fn decode_cursor(local: &str, topic: &TopicRef, raw: &str, high_water: i64) -> Result<i64> {
-    if raw.is_empty() {
+    if raw.is_empty() || raw == crate::protocol::START_CURSOR {
         return Ok(0);
     }
     ensure!(raw.len() <= 4096, "topic_invalid: cursor too large");
@@ -934,8 +934,8 @@ impl Db {
             "topic_invalid: cursor and before are mutually exclusive"
         );
         ensure!(
-            before != Some(""),
-            "topic_invalid: before cursor cannot be empty"
+            before != Some("") && before != Some(crate::protocol::START_CURSOR),
+            "topic_invalid: before cursor cannot be empty or start"
         );
         let tx = self.conn.transaction()?;
         let high_water = get_topic(&tx, local, &topic.topic_id)?.high_water;

@@ -1164,3 +1164,104 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
         plugin.finish();
     }
 }
+
+fn service_plugin(session: &'static str) -> PluginSocket {
+    // Every plugin socket of one OpenCode service lists the whole service.
+    // The queried socket is whichever sorts first, so allow one probe plus one
+    // list on each; unused accepts stay parked on a detached thread.
+    PluginSocket::start(2, move |frame, instance| match frame["op"].as_str() {
+        Some("probe") => json!({"ok":true,"protocol":2,"session":session,"instance":instance}),
+        _ => state_reply(
+            &frame,
+            instance,
+            json!([
+                state_row(SESSION, Value::Null),
+                state_row(OTHER, Value::Null)
+            ]),
+        ),
+    })
+}
+
+async fn opencode_list_state(state: &std::path::Path, sockets: &[(&str, &PluginSocket)]) -> Value {
+    for (session, plugin) in sockets {
+        broker::rpc(
+            state,
+            &Request::OpenCodeObserve {
+                session: (*session).into(),
+                endpoint: plugin.agent().endpoint,
+                ready: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let listed = broker::rpc(
+        state,
+        &Request::List {
+            all: false,
+            max_age_days: 7,
+        },
+    )
+    .await
+    .unwrap();
+    listed["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["provider"] == "opencode")
+        .unwrap()
+        .clone()
+}
+
+#[tokio::test]
+async fn list_is_complete_when_several_sockets_belong_to_one_service() {
+    let first = service_plugin(SESSION);
+    let second = service_plugin(OTHER);
+    let state = first.root.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    let provider = opencode_list_state(&state, &[(SESSION, &first), (OTHER, &second)]).await;
+    assert_eq!(provider["state"], "complete", "{provider}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn list_is_incomplete_when_a_live_session_is_outside_the_queried_service() {
+    // The second socket belongs to a different service whose sessions the
+    // queried service does not list.
+    // Exact lookups of a foreign session answer "absent", never an error.
+    let first = PluginSocket::start(3, |frame, instance| match frame["op"].as_str() {
+        Some("probe") => json!({"ok":true,"protocol":2,"session":SESSION,"instance":instance}),
+        Some("state_get") => state_reply(&frame, instance, Value::Null),
+        _ => state_reply(&frame, instance, json!([state_row(SESSION, Value::Null)])),
+    });
+    let second = PluginSocket::start(3, |frame, instance| match frame["op"].as_str() {
+        Some("probe") => json!({"ok":true,"protocol":2,"session":OTHER,"instance":instance}),
+        Some("state_get") => state_reply(&frame, instance, Value::Null),
+        _ => state_reply(&frame, instance, json!([state_row(OTHER, Value::Null)])),
+    });
+    let state = first.root.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    let provider = opencode_list_state(&state, &[(SESSION, &first), (OTHER, &second)]).await;
+    assert_eq!(provider["state"], "incomplete", "{provider}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn list_is_complete_for_a_live_session_older_than_the_age_window() {
+    // The listing drops the idle session by age; an exact lookup still finds it
+    // in the same service, so it is covered rather than outside the service.
+    let plugin = PluginSocket::start(3, |frame, instance| match frame["op"].as_str() {
+        Some("probe") => json!({"ok":true,"protocol":2,"session":SESSION,"instance":instance}),
+        Some("state_get") => state_reply(&frame, instance, state_row(SESSION, json!(1))),
+        _ => state_reply(&frame, instance, json!([state_row(SESSION, json!(1))])),
+    });
+    let state = plugin.root.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    let provider = opencode_list_state(&state, &[(SESSION, &plugin)]).await;
+    assert_eq!(provider["state"], "complete", "{provider}");
+    server.abort();
+    plugin.finish();
+}

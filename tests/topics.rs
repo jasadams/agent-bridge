@@ -725,3 +725,30 @@ fn concurrent_identical_uuid_only_one_acceptance() {
         1
     );
 }
+
+#[test]
+fn start_sentinel_reads_from_the_beginning_like_the_empty_cursor() {
+    // Some MCP clients drop an empty-string argument and send invalid JSON,
+    // so the documented "from start" cursor needs a non-empty spelling.
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(&dir.path().join("db")).unwrap();
+    let local = local();
+    let topic = db
+        .topic_create(&local, "Engineering", &TopicLimits::default())
+        .unwrap();
+    publish(&mut db, &local, &topic.reference, "one");
+    publish(&mut db, &local, &topic.reference, "two");
+    let empty = db
+        .topic_read(&local, &topic.reference, Some(""), None, 1)
+        .unwrap();
+    let start = db
+        .topic_read(&local, &topic.reference, Some("start"), None, 1)
+        .unwrap();
+    assert_eq!(start.posts[0].sequence, 1);
+    assert_eq!(start.next_cursor, empty.next_cursor);
+    assert!(
+        db.topic_read(&local, &topic.reference, None, Some("start"), 1)
+            .is_err(),
+        "the sentinel is a forward cursor, not a before cursor"
+    );
+}

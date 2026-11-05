@@ -620,15 +620,6 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub(crate) fn opencode_live_instances(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT count(DISTINCT instance) FROM opencode_leases WHERE expires>?",
-            [now()],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
-
     pub(crate) fn opencode_lease_sessions(&self) -> Result<Vec<String>> {
         Ok(self
             .conn
@@ -926,7 +917,9 @@ impl Db {
         limit: usize,
     ) -> Result<HistoryPage> {
         ensure!((1..=100).contains(&limit), "Message limit must be 1–100");
-        let mut cursor = match cursor.filter(|value| !value.is_empty()) {
+        let mut cursor = match cursor
+            .filter(|value| !value.is_empty() && *value != crate::protocol::START_CURSOR)
+        {
             Some(value) => {
                 ensure!(value.len() <= 1024, "Invalid message cursor");
                 let bytes = URL_SAFE_NO_PAD
@@ -956,7 +949,7 @@ impl Db {
                     |row| row.get(0),
                 )
                 .optional()?
-                .context("Message cursor anchor is missing; restart with an empty cursor")?,
+                .context("Message cursor anchor is missing; restart with an empty or start cursor")?,
             None => 0,
         };
         let mut statement = self.conn.prepare(

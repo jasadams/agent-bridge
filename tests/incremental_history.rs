@@ -36,6 +36,11 @@ fn pages_preserve_insertion_order_across_ties_restart_and_vacuum() {
         .execute("UPDATE messages SET created=1, updated=1", [])
         .unwrap();
     let first_page = db.history_since(&None, Some(""), 2).unwrap();
+    // The non-empty sentinel is the same scan start (clients may drop "").
+    assert_eq!(
+        db.history_since(&None, Some("start"), 2).unwrap().cursor,
+        first_page.cursor
+    );
     assert_eq!(first_page.messages[0].id, first);
     assert_eq!(first_page.messages[1].id, second);
     assert!(first_page.has_more);

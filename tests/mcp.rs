@@ -492,6 +492,14 @@ async fn topic_reads_keep_default_latest_forward_before_and_all_page_flags() {
             .len(),
         52
     );
+    // Clients that drop an empty-string argument use the named sentinel.
+    let started = mcp
+        .call(
+            "read_topic_posts",
+            json!({"topic":topic,"cursor":"start","limit":100}),
+        )
+        .await;
+    assert_eq!(structured(&started)["result"], structured(&full)["result"]);
     let empty = mcp
         .call(
             "read_topic_posts",

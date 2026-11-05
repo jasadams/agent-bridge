@@ -60,7 +60,7 @@ agent-bridge topic publish TOPIC_UUID --id POST_UUID --author inbox-user --messa
 agent-bridge topic publish TOPIC_UUID --id REPLY_UUID --author inbox-user \
   --parent POST_UUID --mentions '[{"agent_id":"inbox-user"}]' --message 'Reply'
 agent-bridge topic read TOPIC_UUID                       # latest 50, chronological
-agent-bridge topic read TOPIC_UUID --cursor '' --limit 10 # scan from zero
+agent-bridge topic read TOPIC_UUID --cursor start --limit 10 # scan from zero ('' also works)
 agent-bridge topic read TOPIC_UUID --cursor NEXT_CURSOR
 agent-bridge topic read TOPIC_UUID --before PREVIOUS_CURSOR
 agent-bridge topic rename TOPIC_UUID Delivery
@@ -212,7 +212,7 @@ snapshot. `has_more` means more committed posts remain after the returned page
 within that snapshot, not that future publication is impossible. The version-1
 opaque base64url cursor binds bridge ID, topic UUID and sequence. Malformed,
 unknown-version, nonlocal, wrong-topic or future-position cursors fail explicitly.
-The empty string cursor explicitly starts a full scan after sequence zero.
+The empty string cursor, or its non-empty spelling `start` (for MCP clients that drop empty-string arguments), explicitly starts a full scan after sequence zero.
 On an empty forward page both cursors retain the requested after-position (zero
 for a new full scan), never reset an existing polling position to zero.
 An empty preceding page keeps its requested before-position as `previous_cursor`
@@ -222,13 +222,13 @@ back to forward reads includes the excluded boundary without replaying earlier
 pages. An empty new topic returns position-zero cursors and both flags false.
 Restart preserves positions; later appends are visible on the next read and never
 shift earlier sequences. Initial latest-window reads intentionally omit older
-history; use the empty string cursor to scan the full retained history.
+history; use the empty string or `start` cursor to scan the full retained history.
 
 Optional fields default as shown: `include_archived:false`, `parent:null`,
 `mentions:[]`, `cursor:null`, `before:null`, `limit:50`. Only nullable references,
 parent and cursors accept explicit JSON null; booleans/limits/mention arrays do
 not. Reference objects reject unknown fields, as do requests. Explicit empty
-cursor is the full-scan sentinel; an empty `before` is invalid.
+or `start` cursor is the full-scan sentinel; an empty or `start` `before` is invalid.
 
 No post eviction, automatic retention worker or permanent deletion. Defaults:
 1,000 topics, 100,000 posts per topic, 1,000,000 total posts, 256 MiB total retained

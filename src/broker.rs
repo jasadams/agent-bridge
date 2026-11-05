@@ -419,12 +419,12 @@ impl Broker {
 
     fn prepare_list(&self, all: bool, max_age_days: u32) -> Result<Value> {
         ensure!(max_age_days >= 1, "max_age_days must be at least 1");
-        let (configured, machine, opencode_multi) = {
+        let (configured, machine, opencode_leased) = {
             let db = self.db.lock().unwrap();
             (
                 db.listed_agents(all)?,
                 self.local_machine(&db)?,
-                db.opencode_live_instances().unwrap_or(0) > 1,
+                db.opencode_lease_sessions(),
             )
         };
         let mut providers = Vec::new();
@@ -443,11 +443,39 @@ impl Broker {
             }
             match self.native_list(&provider, max_age_days) {
                 Ok(states) => {
-                    if provider == Provider::OpenCode && opencode_multi {
+                    // One request queries a single OpenCode service. Several plugin
+                    // sockets of that service are covered by its listing; a live
+                    // lease it does not list belongs to another service. The
+                    // listing is age-filtered, so confirm a missing session with
+                    // an exact lookup through the same (unpreferred) connector.
+                    let uncovered = if provider == Provider::OpenCode {
+                        match &opencode_leased {
+                            Err(_) => Some("OpenCode lease state is unreadable"),
+                            Ok(leased) => {
+                                let listed: std::collections::HashSet<&str> =
+                                    states.iter().map(|state| state.session.as_str()).collect();
+                                let exact = self.connector(&provider, None).ok().flatten();
+                                let missing = leased.iter().any(|session| {
+                                    // Not native_get: it prefers the session's own lease
+                                    // endpoint, so another service would confirm itself.
+                                    !listed.contains(session.as_str())
+                                        && !exact.as_ref().is_some_and(|connector| {
+                                            matches!(connector.get(session), Ok(Some(_)))
+                                        })
+                                });
+                                missing.then_some(
+                                    "A live OpenCode session is outside the queried service scope",
+                                )
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(detail) = uncovered {
                         providers.push(json!({
                             "provider":provider,
                             "state":"incomplete",
-                            "detail":"Multiple OpenCode instances are live; this request uses one service scope",
+                            "detail":detail,
                         }));
                     } else {
                         providers.push(json!({"provider":provider,"state":"complete"}));
