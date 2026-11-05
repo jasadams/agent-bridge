@@ -1076,6 +1076,16 @@ impl Db {
         Ok(())
     }
 
+    /// Local messages that may still become claimable on their own: queued, or
+    /// OpenCode receipts the reconcile sweep promotes. Matches `claim`'s scope.
+    pub fn has_unfinished_delivery(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages m WHERE (m.state='queued' OR (m.state='uncertain' AND EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=m.id AND d.phase IN ('uncertain','dispatched','reconcile') AND NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=m.id AND (json_extract(c.destination,'$.control_notice')=1 OR json_extract(c.destination,'$.event_control') IS NOT NULL))))) AND NOT EXISTS(SELECT 1 FROM outbound_transfers o WHERE o.id=m.id))",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn retry(&self, id: &str, allow_duplicate: bool) -> Result<Message> {
         if let Some(message) = self.retry_transfer(id)? {
             return Ok(message);

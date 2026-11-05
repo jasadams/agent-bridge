@@ -381,6 +381,9 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
                 continue;
             },
         }
+        if workers.is_empty() && broker.board_notifications.lock().unwrap().boards.is_empty() {
+            continue; // no subscribed board: nothing to read, so no DB read either
+        }
         let notices = {
             // Administration always takes the DB lock before subscription state.
             // Filesystem reads are bounded to one 64 KiB document. No lock is

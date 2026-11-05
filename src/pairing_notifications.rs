@@ -241,6 +241,14 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tick.tick().await;
+        {
+            // No pairing window or watched transaction: nothing to progress, and
+            // an idle broker must not read the database for it.
+            let state = broker.pairing_notifications.lock().unwrap();
+            if state.window.is_none() && state.transactions.is_empty() {
+                continue;
+            }
+        }
         let progress = {
             // Match administration/network worker ordering. Never hold a lock over native I/O.
             let db = broker.db.lock().unwrap();
