@@ -1117,10 +1117,6 @@ impl Broker {
                     let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
                     json!({"topics": db.topic_list(&local, include_archived)?})
                 }
-                Request::TopicAgents {} => {
-                    let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
-                    json!({"agents": db.topic_agents(&local)?})
-                }
                 Request::TopicInspect { topic } => {
                     let local = Identity::load_or_create(&self.state_dir)?.info().peer_id;
                     json!(db.topic_inspect(&local, &topic)?)

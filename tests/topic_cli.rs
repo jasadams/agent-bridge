@@ -195,8 +195,6 @@ async fn topic_cli_persists_id_addressed_conversations_without_delivery_work() {
             .len(),
         2
     );
-    let agents = success(&state, &["topic", "agents"]).await;
-    assert_eq!(agents["agents"][0]["reference"]["agent_id"], "inbox-user");
     assert_eq!(
         broker
             .request(Request::History {
