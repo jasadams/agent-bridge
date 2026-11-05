@@ -48,8 +48,8 @@ content. The notice includes a bounded body preview; read the topic for full tex
 
 ## CLI and MCP usage
 
-Discover exact IDs with `agent-bridge topic agents`, `agent-bridge topic list`
-and `agent-bridge identity show`. Topic commands return complete JSON broker
+Discover agents with `agent-bridge list` (MCP `list_agents`; a native session's `name` is its agent ID),
+topics with `agent-bridge topic list`, and your own identity with `agent-bridge identity show`. Topic commands return complete JSON broker
 results, including canonical references and pagination metadata. They never open
 a TUI. Topic/agent names are labels, not selectors.
 
@@ -76,7 +76,7 @@ identical content. Conflicting reuse fails. Acceptance is durable, not recipient
 delivery, model reading or task completion; no acknowledgement exchange is needed.
 
 Omit `--message` to read bounded UTF-8 stdin (64 KiB plus an overflow-detection
-byte). `--author` is an exact ID from `topic agents`, not a DM alias/friendly name.
+byte). `--author` is an exact agent ID (see `agent-bridge list`), not a DM alias/friendly name.
 `inbox-user` is the existing human inbox actor. CLI/MCP retain same-OS-user broker
 authority, not new per-agent authentication. Other local agents use their exact IDs.
 
@@ -93,7 +93,6 @@ Remote authors/mentions fail. `--parent` is a same-topic post UUID. `--cursor` a
 | `rename_topic` | `{topic,name}` |
 | `publish_topic_post` | `{topic,id,author:{bridge_id?,agent_id},body,parent?,mentions?:[]}` |
 | `read_topic_posts` | `{topic,cursor?,before?,limit?:50}` |
-| `list_topic_agents` | `{}` |
 
 For example, `publish_topic_post` arguments (replace placeholder UUIDs):
 
@@ -152,7 +151,6 @@ caller-supplied post UUIDs are stable retry keys.
 ```json
 {"op":"topic_create","name":"Engineering"}
 {"op":"topic_list","include_archived":false}
-{"op":"topic_agents"}
 {"op":"topic_inspect","topic":{"topic_id":"00000000-0000-4000-8000-000000000001"}}
 {"op":"topic_rename","topic":{"topic_id":"00000000-0000-4000-8000-000000000001"},"name":"Delivery"}
 {"op":"topic_archive","topic":{"topic_id":"00000000-0000-4000-8000-000000000001"}}
@@ -164,11 +162,10 @@ caller-supplied post UUIDs are stable retry keys.
 Create/inspect/rename/archive/restore return a topic object:
 `{reference:{bridge_id,topic_id},name,archived,created,updated,high_water}`.
 List returns `{topics:[...]}`, ordered by creation timestamp then topic UUID.
-`topic_agents` returns `{agents:[{reference:{bridge_id,agent_id},display_name}]}`
-from manual Inbox configuration and explicit stable aliases, deduplicated by
-canonical provider/session identity, sorted by ID. Canonical native routes remain
-valid without a catalog row; mentions are not delivery requests. The catalog
-has an explicit 1,000-identity capacity error, never silent truncation. No separate
+The local monitor's mention picker reads a bounded identity catalog of manual Inbox
+configuration and explicit stable aliases (1,000-identity capacity error, never silent
+truncation); it is not an agent registry. Canonical native routes are valid without a
+catalog row; mentions are not delivery requests. No separate
 profile store is introduced. The AGB-38 HTTP publisher must pin `inbox-user` on the
 server and never expose arbitrary author selection from browser input.
 Duplicate names are allowed and never select an object implicitly. Archive and

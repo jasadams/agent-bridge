@@ -73,13 +73,12 @@ unchanged. See [OpenCode support and limits](opencode.md).
 | `archive_board`, `restore_board` | Archive or restore an exact named board using its current revision; archives permanently expire after 30 days. |
 | `subscribe`, `unsubscribe` | Add/remove explicit local board-change and agent-lifecycle event selectors for an exact registered route. |
 | `connection_status` | Inspect the local broker and peer connections. |
-| `list_agents` | List local sessions by default, or one explicitly selected peer's permitted sessions. |
+| `list_agents` | The only agent discovery tool and registry of routable sessions: call it before creating a worker. Lists local sessions by default, or one explicitly selected peer's permitted sessions. |
 | `list_messages`, `get_message` | Inspect history; diagnose delivery failures or missing responses. |
 | `send_message` | Persist a message with an idempotent UUID and optional reply ID. |
 | `create_topic`, `list_topics`, `get_topic`, `rename_topic` | Manage local topics by canonical reference, never a display name. |
 | `archive_topic`, `restore_topic` | Keep history readable while blocking new posts, or restore the same identity/history. |
 | `publish_topic_post`, `read_topic_posts` | Required caller UUID/exact author; bounded chronological latest/after/before pages; pushes only for opted-in subscribers. |
-| `list_topic_agents` | Discover canonical local agent references and friendly labels, including stale registrations. |
 | `get_topic_push`, `set_topic_push` | Inspect or opt an exact local agent into `manual`, `all`, or `mentions` topic delivery; `manual` unsubscribes. |
 | `configure_network` | Explicitly enable or disable networking and LAN discovery. |
 | `open_pairing`, `create_invite`, `connect_peer` | Organize pairing and choose the local session that receives owner prompts. |

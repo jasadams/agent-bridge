@@ -143,7 +143,7 @@ fn reference_and_request_fields_are_strict() {
 }
 
 #[tokio::test]
-async fn bounded_older_pages_and_catalog_use_ids_not_names() {
+async fn bounded_older_pages_use_ids_not_names() {
     let root = tempfile::tempdir().unwrap();
     let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
     let broker = &bound.broker;
@@ -159,24 +159,6 @@ async fn bounded_older_pages_and_catalog_use_ids_not_names() {
         )
         .unwrap();
     }
-    let catalog = request(broker, json!({"op":"topic_agents"})).unwrap();
-    let agents = catalog["agents"].as_array().unwrap();
-    assert_eq!(agents.len(), 3); // user plus two identities, not three aliases
-    assert!(
-        agents
-            .iter()
-            .any(|agent| agent["reference"]["agent_id"] == "inbox-worker-one")
-    );
-    assert!(
-        agents
-            .iter()
-            .any(|agent| agent["reference"]["agent_id"] == "inbox-worker-two")
-    );
-    assert!(
-        !agents
-            .iter()
-            .any(|agent| agent["reference"]["agent_id"] == "alias-one")
-    );
     let topic =
         request(broker, json!({"op":"topic_create","name":"Pages"})).unwrap()["reference"].clone();
     let publish = |n| {

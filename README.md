@@ -203,8 +203,8 @@ See [message monitoring](docs/local-monitor.md).
 
 ## Local topics
 
-Use `agent-bridge topic create NAME`, `topic list`, and `topic agents` to discover
-canonical IDs. Publish with `topic publish TOPIC_UUID --id POST_UUID --author AGENT_ID
+Use `agent-bridge topic create NAME` and `topic list` to discover topic IDs; find
+agents with `agent-bridge list` (MCP `list_agents`). Publish with `topic publish TOPIC_UUID --id POST_UUID --author AGENT_ID
 --message 'Ready'`; read with `topic read TOPIC_UUID`. Names are labels, not targets.
 Publication is durable history, not native delivery. See [topics](docs/topics.md)
 for replies, bounded pagination, archive/restore and matching MCP tools.

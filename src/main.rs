@@ -562,8 +562,6 @@ enum TopicAction {
         #[arg(long)]
         include_archived: bool,
     },
-    /// Discover canonical agent IDs and friendly labels, including stale registrations.
-    Agents,
     /// Inspect a canonical local agent's push preference.
     PushGet {
         #[command(flatten)]
@@ -651,7 +649,6 @@ impl TopicAction {
         Ok(match self {
             Self::Create { name } => Request::TopicCreate { name },
             Self::List { include_archived } => Request::TopicList { include_archived },
-            Self::Agents => Request::TopicAgents {},
             Self::PushGet {
                 target,
                 agent,

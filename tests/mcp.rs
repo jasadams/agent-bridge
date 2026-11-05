@@ -169,7 +169,7 @@ impl Mcp {
             assert!(response.get("id").is_none() || response["id"].is_null());
         }
     }
-    async fn initialize(&mut self) {
+    async fn initialize(&mut self) -> Value {
         let response = self
             .request(
                 "initialize",
@@ -180,6 +180,7 @@ impl Mcp {
         assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
         self.write(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await;
+        response
     }
     async fn call(&mut self, name: &str, arguments: Value) -> Value {
         self.request("tools/call", json!({"name":name,"arguments":arguments}))
@@ -316,7 +317,6 @@ async fn topic_tools_discover_and_publish_durable_history_without_native_input()
         "restore_topic",
         "publish_topic_post",
         "read_topic_posts",
-        "list_topic_agents",
     ] {
         assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
     }
@@ -337,16 +337,7 @@ async fn topic_tools_discover_and_publish_durable_history_without_native_input()
         .await;
     let reference = structured(&created)["result"]["reference"].clone();
     let topic = json!({"topic_id":reference["topic_id"]});
-    let catalog = mcp.call("list_topic_agents", json!({})).await;
     let author = json!({"agent_id":format!("claude-{}", native.session)});
-    let agents = structured(&catalog)["result"]["agents"].as_array().unwrap();
-    assert!(
-        agents
-            .iter()
-            .any(|agent| agent["reference"]["agent_id"] == author["agent_id"]
-                && agent["reference"]["bridge_id"] == reference["bridge_id"]
-                && agent["display_name"].is_string())
-    );
     let id = uuid::Uuid::new_v4().to_string();
     let args = json!({"topic":topic,"id":id,"author":author,"body":"Exact body\n  ✓","mentions":[{"agent_id":"inbox-inbox-reader"},{"agent_id":"inbox-inbox-reader"}]});
     let accepted = mcp.call("publish_topic_post", args.clone()).await;
@@ -391,14 +382,6 @@ async fn topic_tools_discover_and_publish_durable_history_without_native_input()
         .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
         .unwrap();
     assert_eq!(dm_count, 0);
-    let catalog = mcp.call("list_topic_agents", json!({})).await;
-    assert!(
-        structured(&catalog)["result"]["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|agent| agent["reference"]["agent_id"] == author["agent_id"])
-    );
     let renamed = mcp
         .call("rename_topic", json!({"topic":topic,"name":"Delivery"}))
         .await;
@@ -1014,6 +997,25 @@ async fn strict_tools_reject_unknown_fields_and_cannot_supply_owner_approval() {
     assert_eq!(running.request(Request::PeersList), json!([]));
     // A malformed tool call does not kill the persistent server.
     assert!(!failed(&mcp.call("connection_status", json!({})).await));
+    mcp.close().await;
+}
+
+#[tokio::test]
+async fn list_agents_is_the_only_discovery_tool_and_says_so() {
+    let root = root();
+    let mut mcp = Mcp::start(&root.path().join("state"));
+    let init = mcp.initialize().await;
+    let tools = mcp.request("tools/list", json!({})).await;
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().all(|tool| tool["name"] != "list_topic_agents"));
+    let registry = tools
+        .iter()
+        .find(|tool| tool["name"] == "list_agents")
+        .unwrap();
+    let description = registry["description"].as_str().unwrap();
+    assert!(description.starts_with("Canonical registry of local agent sessions"));
+    assert!(description.contains("before creating a new session"));
+    assert!(init.to_string().contains("only with list_agents"));
     mcp.close().await;
 }
 

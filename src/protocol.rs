@@ -124,7 +124,6 @@ pub enum Request {
         #[serde(default)]
         include_archived: bool,
     },
-    TopicAgents {},
     TopicInspect {
         topic: crate::topics::TopicRef,
     },
