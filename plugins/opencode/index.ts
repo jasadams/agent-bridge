@@ -72,7 +72,7 @@ const AgentBridge = Plugin.define({
     const state = options.stateDir ?? process.env.AGENT_BRIDGE_STATE_DIR;
     if (typeof state !== "string" || !isAbsolute(state)) throw new Error("Agent Bridge plugin requires an absolute stateDir");
     const instance = randomUUID(), socketDirectory = socketDir(state), endpoint = join(socketDirectory, instance + ".sock");
-    if (Buffer.byteLength(endpoint) > MAX_SOCKET_PATH) throw new Error(`Agent Bridge socket path exceeds ${MAX_SOCKET_PATH} bytes; `);
+    if (Buffer.byteLength(endpoint) > MAX_SOCKET_PATH) throw new Error(`Agent Bridge socket path exceeds ${MAX_SOCKET_PATH} bytes`);
     await mkdir(socketDirectory, { recursive: true, mode: 0o700 });
     await chmod(socketDirectory, 0o700);
     const dir = await lstat(socketDirectory);
