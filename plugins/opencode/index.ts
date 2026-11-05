@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { brokerRpc, MAX_FRAME } from "./rpc.ts";
-import { sameUser } from "./peer.ts";
+import { sameUser, socketDir } from "./peer.ts";
 import { Journal, JournalCapacityError, nativeID, validateAcceptance, type Identity } from "./journal.ts";
 
 const SESSION = /^ses_[a-zA-Z0-9]{26}$/;
@@ -71,8 +71,8 @@ const AgentBridge = Plugin.define({
     const options = ctx.options as { stateDir?: unknown };
     const state = options.stateDir ?? process.env.AGENT_BRIDGE_STATE_DIR;
     if (typeof state !== "string" || !isAbsolute(state)) throw new Error("Agent Bridge plugin requires an absolute stateDir");
-    const instance = randomUUID(), socketDirectory = join(state, "oc"), endpoint = join(socketDirectory, instance + ".sock");
-    if (Buffer.byteLength(endpoint) > MAX_SOCKET_PATH) throw new Error(`Agent Bridge socket path exceeds ${MAX_SOCKET_PATH} bytes; use a shorter stateDir`);
+    const instance = randomUUID(), socketDirectory = socketDir(state), endpoint = join(socketDirectory, instance + ".sock");
+    if (Buffer.byteLength(endpoint) > MAX_SOCKET_PATH) throw new Error(`Agent Bridge socket path exceeds ${MAX_SOCKET_PATH} bytes; `);
     await mkdir(socketDirectory, { recursive: true, mode: 0o700 });
     await chmod(socketDirectory, 0o700);
     const dir = await lstat(socketDirectory);

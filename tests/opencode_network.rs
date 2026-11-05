@@ -142,7 +142,7 @@ impl Native {
     }
     /// Publish this plugin socket in the bridge's fixed socket directory.
     fn observe(&self, bridge: &Running) {
-        let dir = bridge.state.join("oc");
+        let dir = agent_bridge::clients::opencode::socket_dir(&bridge.state);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = std::fs::hard_link(&self.path, dir.join(self.path.file_name().unwrap()));

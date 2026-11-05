@@ -75,7 +75,7 @@ age/pagination limits and the separately staged broker cutover are described in
 [native state and delivery bindings](../../docs/opencode.md#native-state-and-delivery-bindings).
 
 Each plugin instance binds a 0600 socket named `<instance UUID>.sock` in the
-0700 directory `<stateDir>/oc` (created if missing; it must be a directory owned by
+0700 directory `/tmp/ab-oc-<uid>-<8 hex of sha256(real stateDir)>` (short so the path fits the macOS AF_UNIX limit; the broker derives the same name; created if missing; it must be a directory owned by
 this user with no group/other bits, and the full socket path must be at most 100
 bytes). Disposal stops the listener and unlinks only its own socket. Linux
 `SO_PEERCRED` or macOS `getpeereid` verifies connected same-user peers;

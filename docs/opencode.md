@@ -70,7 +70,7 @@ status is null because these native APIs expose no live status. The authenticate
 transport endpoint is attached locally, never accepted from row JSON.
 
 State reads never prompt or write the receipt journal. The broker lists the fixed
-socket directory `<state-dir>/oc/` and asks every socket in parallel, each within a
+socket directory `/tmp/ab-oc-<uid>-<8 hex of sha256(real state dir)>/` (short so the path fits the macOS AF_UNIX limit) and asks every socket in parallel, each within a
 500 ms first-reply deadline; a socket that answers is live. A refused connection
 means the plugin is gone, so the broker unlinks that socket file. A hung plugin
 is skipped for that request and never unlinked. At most 64 sockets, 64 pages and
@@ -96,7 +96,7 @@ transcript evidence.
 ## Private transport and receipts
 
 Each plugin instance has a random UUID-named Unix socket in the private owner-only
-directory `<state-dir>/oc/`, which the plugin creates from its `stateDir` option.
+directory `/tmp/ab-oc-<uid>-<8 hex of sha256(real state dir)>/` (short so the path fits the macOS AF_UNIX limit), which the plugin creates from its `stateDir` option.
 The endpoint is bound to that UUID, and every successful response must
 match both the socket instance and exact session. Rust validates socket type,
 owner, mode, private directory, path length and connected peer UID. The plugin

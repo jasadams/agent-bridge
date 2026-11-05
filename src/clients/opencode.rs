@@ -7,6 +7,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     io::{Read, Write},
@@ -94,10 +95,26 @@ pub struct State {
     dir: PathBuf,
 }
 const PROBE: Duration = Duration::from_millis(500);
+
+/// Short socket directory shared by every plugin of one state directory (a
+/// state-dir path would exceed the AF_UNIX limit on macOS). The plugin derives
+/// the same name from its `stateDir`.
+pub fn socket_dir(state_dir: &Path) -> PathBuf {
+    let state = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_owned());
+    let hash = Sha256::digest(state.as_os_str().as_bytes());
+    PathBuf::from(format!(
+        "/tmp/ab-oc-{}-{}",
+        unsafe { libc::geteuid() },
+        hash[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ))
+}
 impl State {
     pub fn new(state_dir: &Path) -> Self {
         Self {
-            dir: state_dir.join("oc"),
+            dir: socket_dir(state_dir),
         }
     }
 
@@ -688,6 +705,23 @@ pub(crate) async fn deliver_dispatch(
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+    #[test]
+    fn socket_dir_is_short_and_matches_the_plugin_derivation() {
+        // plugins/opencode/index.test.ts pins the same hash for the same path.
+        let dir = socket_dir(Path::new("/tmp/agb51-no-such-state"));
+        assert_eq!(
+            dir,
+            PathBuf::from(format!("/tmp/ab-oc-{}-fd370c44", unsafe {
+                libc::geteuid()
+            }))
+        );
+        assert!(
+            dir.join(format!("{}.sock", uuid::Uuid::nil()))
+                .as_os_str()
+                .len()
+                < 90
+        );
+    }
     #[test]
     fn native_state_age_is_inclusive_unknown_preserving_and_saturating() {
         let now = 40 * 86_400_000;

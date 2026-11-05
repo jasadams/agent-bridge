@@ -8,6 +8,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import { Database } from "bun:sqlite";
 import { brokerRpc } from "./rpc.ts";
+import { socketDir } from "./peer.ts";
 import { nativeID } from "./journal.ts";
 
 const binary = process.argv[2];
@@ -188,8 +189,8 @@ try {
     const created = await api("/api/session", { title, location: { directory: workspace } });
     const id = created.id;
     const registration = await waitFor<any>("native plugin socket", async () => {
-      const socket = (await readdir(join(state, "oc"))).find(name => name.endsWith(".sock"));
-      return socket && { name: `opencode-${id}`, endpoint: join(state, "oc", socket) };
+      const socket = (await readdir(socketDir(state))).find(name => name.endsWith(".sock"));
+      return socket && { name: `opencode-${id}`, endpoint: join(socketDir(state), socket) };
     });
     return { id, registration };
   }

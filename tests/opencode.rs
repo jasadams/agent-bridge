@@ -83,7 +83,7 @@ impl PluginSocket {
     }
     /// Publish this socket in a broker's fixed plugin socket directory.
     fn publish(&self, state: &std::path::Path) {
-        let dir = state.join("oc");
+        let dir = clients::opencode::socket_dir(state);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = std::fs::hard_link(&self.path, dir.join(self.path.file_name().unwrap()));
@@ -1090,9 +1090,7 @@ async fn refused_socket_is_ignored_and_unlinked_and_a_hung_plugin_is_bounded() {
     let server = tokio::spawn(broker::serve(bound));
     live.publish(&state);
     hung.publish(&state);
-    let dead = state
-        .join("oc")
-        .join(format!("{}.sock", uuid::Uuid::new_v4()));
+    let dead = clients::opencode::socket_dir(&state).join(format!("{}.sock", uuid::Uuid::new_v4()));
     drop(UnixListener::bind(&dead).unwrap());
     std::fs::set_permissions(&dead, std::fs::Permissions::from_mode(0o600)).unwrap();
     let started = std::time::Instant::now();
@@ -1108,8 +1106,7 @@ async fn refused_socket_is_ignored_and_unlinked_and_a_hung_plugin_is_bounded() {
     assert!(!dead.exists(), "a refused socket is unlinked");
     assert!(
         live.path.exists()
-            && state
-                .join("oc")
+            && clients::opencode::socket_dir(&state)
                 .join(hung.path.file_name().unwrap())
                 .exists(),
         "live and hung sockets are never unlinked"

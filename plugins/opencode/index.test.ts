@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { Journal, nativeID, MAX_JOURNAL_ROWS, MAX_JOURNAL_BYTES } from "./journal.ts";
 import AgentBridge from "./index.ts";
-import { sameUser } from "./peer.ts";
+import { sameUser, socketDir } from "./peer.ts";
 import { brokerRpc } from "./rpc.ts";
 
 const A = "ses_0123456789abcdefghijklmnop";
@@ -243,8 +243,8 @@ async function setup(preexisting: string[] = [], initialBrokerResponse?: (reques
   const created = async (id = A) => {
     if (!sessions.has(id)) sessions.set(id, { id, projectID: "project", location: { directory }, title: id === A ? "Alpha" : "Beta", version: "2.2.5", time: { created: 1, updated: 1 } });
   };
-  const endpoints = () => readdirSync(join(directory, "oc")).filter(name => name.endsWith(".sock")).map(name => join(directory, "oc", name));
-  const endpoint = () => join(directory, "oc", readdirSync(join(directory, "oc")).find(name => name.endsWith(".sock"))!);
+  const endpoints = () => readdirSync(socketDir(directory)).filter(name => name.endsWith(".sock")).map(name => join(socketDir(directory), name));
+  const endpoint = () => join(socketDir(directory), readdirSync(socketDir(directory)).find(name => name.endsWith(".sock"))!);
   const journalState = () => {
     const db = new Database(join(directory, "opencode-receipts.sqlite3"), { readonly: true });
     try { return db.query("SELECT namespace,id,session,state FROM receipts ORDER BY id").all(); } finally { db.close(); }
@@ -472,9 +472,12 @@ describe("V2 plugin with real private Unix sockets", () => {
   test("missing and invalid connected descriptors fail peer authentication", () => {
     expect(sameUser({})).toBe(false); expect(sameUser({ fd: -1 })).toBe(false); expect(sameUser({ fd: 99999999 })).toBe(false);
   });
-  test("socket lives under <stateDir>/oc, is private and is unlinked on dispose", async () => {
+  test("socket directory derivation matches the broker's", () => {
+    expect(socketDir("/tmp/agb51-no-such-state")).toBe(`/tmp/ab-oc-${process.getuid!()}-fd370c44`);
+  });
+  test("socket lives in the short per-state directory, is private and is unlinked on dispose", async () => {
     const s = await setup();
-    const endpoint = s.endpoint(), dir = join(s.directory, "oc");
+    const endpoint = s.endpoint(), dir = socketDir(s.directory);
     expect(endpoint).toMatch(new RegExp(`^${dir}/[0-9a-f-]{36}\\.sock$`));
     expect((await stat(endpoint)).mode & 0o777).toBe(0o600);
     expect((await stat(dir)).mode & 0o777).toBe(0o700);
