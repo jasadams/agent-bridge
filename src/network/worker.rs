@@ -42,7 +42,6 @@ struct Completed {
 struct Schedule {
     hello: Instant,
     next: Instant,
-    directory: Instant,
     sync: Instant,
     failures: u32,
     providers: Option<Vec<String>>,
@@ -57,7 +56,6 @@ impl Default for Schedule {
         Self {
             hello: now,
             next: now,
-            directory: now,
             sync: now,
             failures: 0,
             providers: None,
@@ -315,7 +313,6 @@ fn complete_request(broker: &Broker, done: Completed, schedule: &mut Schedule) -
         schedule.legacy = true;
         schedule.fallback = false;
         schedule.probe = Instant::now() + Duration::from_secs(60);
-        schedule.directory = Instant::now() + Duration::from_secs(5);
     }
     Ok(())
 }
@@ -650,7 +647,6 @@ pub async fn run(broker: Broker) {
                     // A changed LAN port must not inherit a stale connection's backoff.
                     let schedule = schedules.entry(peer.clone()).or_default();
                     schedule.next = Instant::now();
-                    schedule.directory = Instant::now();
                 }
             }
             last_routes = peers.clone();
@@ -702,19 +698,6 @@ pub async fn run(broker: Broker) {
                                 providers: supported_providers(),
                             },
                         )));
-                    }
-                    if now >= schedule.directory {
-                        schedule.directory = now + Duration::from_secs(5);
-                        return Ok(Some(if schedule.providers.is_some() {
-                            (
-                                Kind::DirectorySupported(None),
-                                Operation::DirectorySupported {
-                                    providers: supported_providers(),
-                                },
-                            )
-                        } else {
-                            (Kind::Directory, Operation::Directory)
-                        }));
                     }
                     if now >= schedule.sync {
                         schedule.sync = now + Duration::from_secs(1);
@@ -801,7 +784,6 @@ pub async fn run(broker: Broker) {
                             schedule.legacy = false;
                             schedule.fallback = false;
                             schedule.send_permit = send_id;
-                            schedule.directory = Instant::now() + Duration::from_secs(5);
                         }
                         Err(error) => {
                             // An unknown extension or codec failure must not back off
