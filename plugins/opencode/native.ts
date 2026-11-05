@@ -1,7 +1,7 @@
 /** Actual pinned OpenCode + broker/MCP execution, driven by a local scripted
  * model. Every session, credential placeholder and configuration is disposable.
  * Native inbox acceptance and later model visibility are verified separately. */
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
@@ -42,8 +42,8 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, async 
   const url = new URL(request.url), token = url.searchParams.get("token") ?? "";
   if (url.pathname === "/block") {
     started.add(token); embeddedBun = url.searchParams.get("runtime") ?? "";
-    await new Promise<void>(release => gates.set(token, release));
-    return new Response("released");
+    await new Promise<void>(proceed => gates.set(token, proceed));
+    return new Response("resumed");
   }
   if (url.pathname === "/complete") { finished.add(token); return new Response("ok"); }
   if (url.pathname === "/aborted") { aborted.add(token); return new Response("ok"); }
@@ -94,7 +94,7 @@ const model = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, async 
     const stream = new ReadableStream({ async start(controller) {
       controller.enqueue(new TextEncoder().encode(chunk({ ...response, object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "Original held assistant context." }, finish_reason: null }] })));
       streamStarted.add(heldScenario);
-      await new Promise<void>(release => gates.set(heldScenario, release));
+      await new Promise<void>(proceed => gates.set(heldScenario, proceed));
       streamFinished.add(heldScenario);
       const ending = heldScenario === errorMarker ? chunk({ error: { message: "Controlled fixture stream failure", type: "invalid_request_error", code: "fixture_error" } }) : chunk({ ...response, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) + "data: [DONE]\n\n";
       controller.enqueue(new TextEncoder().encode(ending)); controller.close();
@@ -187,10 +187,9 @@ try {
   async function session(title: string) {
     const created = await api("/api/session", { title, location: { directory: workspace } });
     const id = created.id;
-    const registration = await waitFor<any>("native lifecycle registration", async () => {
-      const result = await brokerRpc(state, { op: "list", all: false }) as any;
-      const agents = Array.isArray(result) ? result : result.agents;
-      return agents?.find((agent: any) => agent.name === `opencode-${id}`);
+    const registration = await waitFor<any>("native plugin socket", async () => {
+      const socket = (await readdir(join(state, "oc"))).find(name => name.endsWith(".sock"));
+      return socket && { name: `opencode-${id}`, endpoint: join(state, "oc", socket) };
     });
     return { id, registration };
   }
@@ -248,7 +247,7 @@ try {
   assert(receipt?.id === mapped && receipt.type === "user" && receipt.text === dispatch.content, "Missing exact native insertion");
   const before = new Database(join(state, "opencode-receipts.sqlite3"), { readonly: true });
   const journalBefore = before.query("SELECT * FROM receipts WHERE namespace=? AND id=?").get(dispatch.namespace, incoming); before.close();
-  const reconciled = await socketFrame(first.registration.endpoint, { op: "reconcile", session: first.id, id: incoming, content: dispatch.content, namespace: dispatch.namespace, generation: dispatch.generation, attempt: dispatch.attempt, native_message_id: mapped });
+  const reconciled = await socketFrame(first.registration.endpoint, { op: "reconcile", session: first.id, id: incoming, content: dispatch.content, namespace: dispatch.namespace, attempt: dispatch.attempt, native_message_id: mapped });
   assert(reconciled.ok === true && reconciled.status === "inserted" && reconciled.native_message_id === mapped, "Read-only native reconciliation failed");
   const after = new Database(join(state, "opencode-receipts.sqlite3"), { readonly: true });
   const journalAfter = after.query("SELECT * FROM receipts WHERE namespace=? AND id=?").get(dispatch.namespace, incoming); after.close();
@@ -259,7 +258,7 @@ try {
 
   const owner = (variant: string) => ({ agent: "owner", model: { providerID: "fixture", id: "owner", variant } });
   const countText = (capture: any, text: string) => JSON.stringify(capture.messages).split(text).length - 1;
-  const waiting = (id: string) => query<any>("SELECT m.state,m.created,d.phase,d.attempt,d.content,d.generation,l.generation AS live_generation,l.ready,l.expires FROM messages m JOIN opencode_deliveries d ON d.id=m.id JOIN opencode_leases l ON l.session=d.session WHERE m.id=?", id);
+  const waiting = (id: string) => query<any>("SELECT m.state,m.created,d.phase,d.attempt,d.content FROM messages m JOIN opencode_deliveries d ON d.id=m.id WHERE m.id=?", id);
   async function sendPeer(target: { id: string; registration: any }, body: string, recipient = target.registration.name) {
     const id = randomUUID();
     await brokerRpc(state, { op: "send", id, sender: "native-probe", recipient, body, parent: null });
@@ -346,7 +345,6 @@ try {
   const heldLong = waiting(longPeer.id), heldPermission = waiting(permissionPeer.id);
   for (const held of [heldLong, heldPermission]) {
     assert(Date.now() - held.created > 120000 && held.state === "queued" && held.phase === "queued" && held.attempt === null, "Live paused unattempted work did not survive old expiry");
-    assert(held.generation === held.live_generation && held.expires > Date.now(), "Exact native lease was lost during long wait");
   }
   assert(!await nativeMessage(long.id, longPeer.native) && !await nativeMessage(permission.id, permissionPeer.native), "Pause did not prevent native input");
   assert(!finished.has(longMarker) && !aborted.has(longMarker) && !permissionFinished.has(permissionMarker), "Held native work or permission changed");
@@ -399,7 +397,7 @@ try {
     try { await child.exited; } finally { clearTimeout(deadline); }
   }
   await Promise.all([stopChild(native), stopChild(broker)]);
-  for (const release of gates.values()) release();
+  for (const proceed of gates.values()) proceed();
   model.stop(true);
   const output = await Promise.all(logs); if (!success) console.error(output.filter(Boolean).join("\n"));
   await writeFile(join(root, "native-prompt-receipts.json"), JSON.stringify(nativeReceipts, null, 2));

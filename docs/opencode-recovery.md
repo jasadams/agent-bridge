@@ -31,18 +31,15 @@ legacy phase names and protocol-2 receipt tokens are internal compatibility data
   retained without eviction. Capacity exhaustion fails closed.
 * Deferred receipts occur only before a native attempt, with no asynchronous
   retained work. Phase `queued` proves no native attempt, including a fenced
-  deferred receipt. Its wait has no native-work age limit: continuing heartbeats
-  from the exact live generation preserve queued work through tools and unanswered
-  permissions, and admission readiness enables automatic FIFO dispatch. Existing
-  per-session/global count and message byte limits bound retained work. Schema
-  13's deadline column remains compatibility metadata, not an expiry condition.
-  Lease expiry still runs without native events; restart never extends a lease.
-  Historical failed messages are never automatically resurrected.
-* Leases bind generation, instance and endpoint. Renewal, close, readiness and
-  delivery outcomes are fenced against stale generations. Reopening after expiry
-  requires verified live observation. Old queued work cannot silently cross a
-  new generation; explicit retry is restricted to its original exact identity.
-* Native admission checks broker pause, claim, generation, liveness and current
+  deferred receipt. Its wait has no native-work age limit and nothing expires by
+  time. Existing per-session/global count and message byte limits bound retained
+  work. Schema 13's deadline column remains compatibility metadata, not an expiry
+  condition. A delivery that finds no plugin answering fails (nothing was sent) and
+  is retried explicitly. Historical failed messages are never automatically
+  resurrected.
+* Delivery outcomes are fenced by the dispatch attempt ID; a stale attempt cannot
+  update a newer one. Explicit retry is restricted to the original exact identity.
+* Native admission checks broker pause, claim, attempt and current
   access immediately before the journal attempt. Admission is the linearization
   point: subsequent pause/cancel does not recall already admitted in-flight work.
   Native status/selection reads do not reserve the runner or lock owner selection.
@@ -67,30 +64,29 @@ The 64-per-session and 1000-global broker limits cover queued/sending/unknown ba
 work, not Delivered native records awaiting model consumption. Durable journal
 row/byte ceilings still bound lifetime acceptance, including stored proof bytes.
 Protocol 2 retains its existing tokens; V1 implementation/harness paths are
-superseded. Refresh assets with `opencode install`; V2 reloads config. Heartbeats use events,
-not continuous model polling.
+superseded. Refresh assets with `opencode install`; V2 reloads config. The plugin tracks status
+from events, not continuous model polling.
 
 Crash outcomes: before the attempt fence, no prompt has been authorized; after the
 fence but before a validated receipt is durably journaled, the outcome may remain
 Unknown. Exact transcript readback can independently recover Delivered. A lost
-broker response after journal commit can recover from the original receipt in
-the same generation. The current reconciliation nonce is fresh, echoed for
+broker response after journal commit can recover from the original receipt. The current reconciliation nonce is fresh, echoed for
 response fencing and never substituted for the original guarded proof attempt.
-Different-generation and historical NULL-proof rows require transcript evidence.
+Historical NULL-proof rows require transcript evidence.
 A lost native return or proof-write failure cannot use pending-inbox readback:
 that HTTP method is not exposed by the supported plugin context. No recovery
-invokes another prompt. An Unknown head does not block newer work; lease renewal
-alone does not resolve it.
+invokes another prompt. An Unknown head does not block newer work; a plugin
+answering alone does not resolve it.
 
 Policy revocation, unsharing and registration replacement preserve attempted
 uncertainty instead of converting it to a cancellable blocked/failed queue entry.
 An explicit pending read-only reconciliation may still inspect historical native
 proof without restoring a revoked Receive grant; it needs the current exact live
 registration and never grants native submission authority. A failed proof remains
-Unknown, and no heartbeat automatically retries it.
+Unknown, and nothing automatically retries it.
 
 The additive journal upgrade is transactional and preserves all old rows without
-inventing provenance. Its single `acceptance` column stores original generation,
+inventing provenance. Its single `acceptance` column stores original
 attempt and validated native type/delivery/creation time; identity and content stay
 in the existing immutable row. Preparation and proof commit count content plus
 proof bytes against 64 MiB, retaining the 65,536-row cap and every tombstone.

@@ -84,7 +84,7 @@ impl Native {
                     Err(error) => panic!("native accept: {error}"),
                 };
                 let frame = read_native_frame(&stream);
-                assert_eq!(frame["session"], session);
+                assert!(frame["op"] == "state_list" || frame["session"] == session);
                 let mut receipt =
                     json!({"ok":true,"protocol":2,"session":session,"instance":instance});
                 if frame["op"] == "state_get" || frame["op"] == "state_list" {
@@ -106,7 +106,7 @@ impl Native {
                     let id = frame["id"].as_str().unwrap();
                     uuid::Uuid::parse_str(id).unwrap();
                     receipt["id"] = json!(id);
-                    for key in ["native_message_id", "namespace", "generation", "attempt"] {
+                    for key in ["native_message_id", "namespace", "attempt"] {
                         receipt[key] = frame[key].clone();
                     }
                     receipt["status"] = json!("inserted");
@@ -117,18 +117,9 @@ impl Native {
                 } else {
                     // The broker's automatic recovery may issue read-only
                     // reconciliation frames; they must never re-submit.
-                    assert!(matches!(
-                        frame["op"].as_str(),
-                        Some("probe") | Some("reconcile")
-                    ));
+                    assert_eq!(frame["op"], "reconcile");
                     if frame["op"] == "reconcile" {
-                        for key in [
-                            "id",
-                            "native_message_id",
-                            "namespace",
-                            "generation",
-                            "attempt",
-                        ] {
+                        for key in ["id", "native_message_id", "namespace", "attempt"] {
                             receipt[key] = frame[key].clone();
                         }
                         receipt["status"] = json!("uncertain");
@@ -149,12 +140,12 @@ impl Native {
     fn name(&self) -> String {
         format!("opencode-{}", self.session)
     }
+    /// Publish this plugin socket in the bridge's fixed socket directory.
     fn observe(&self, bridge: &Running) {
-        bridge.request(Request::OpenCodeObserve {
-            session: self.session.into(),
-            endpoint: self.path.to_str().unwrap().into(),
-            ready: true,
-        });
+        let dir = bridge.state.join("oc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::hard_link(&self.path, dir.join(self.path.file_name().unwrap()));
     }
     fn frames(&self) -> Vec<Value> {
         self.frames.lock().unwrap().clone()
@@ -167,6 +158,7 @@ impl Drop for Native {
     }
 }
 struct Running {
+    state: PathBuf,
     broker: Broker,
     task: JoinHandle<anyhow::Result<()>>,
 }
@@ -174,6 +166,7 @@ impl Running {
     fn start(path: &Path) -> Self {
         let bound = Broker::bind(path.into(), "/missing/codex".into()).unwrap();
         Self {
+            state: path.into(),
             broker: bound.broker.clone(),
             task: tokio::spawn(broker::serve(bound)),
         }
@@ -199,15 +192,13 @@ impl Running {
             })
             .unwrap_or_else(|| serde_json::json!([]));
         }
-        if matches!(&request, Request::OpenCodeObserve { .. })
-            || matches!(
-                &request,
-                Request::Register {
-                    provider: Provider::OpenCode,
-                    ..
-                }
-            )
-        {
+        if matches!(
+            &request,
+            Request::Register {
+                provider: Provider::OpenCode,
+                ..
+            }
+        ) {
             // The synchronous registration API performs its live async probe on
             // a private runtime, just as the broker RPC blocking worker does.
             std::thread::scope(|scope| scope.spawn(|| self.broker.request(request)).join().unwrap())
@@ -501,18 +492,14 @@ async fn unsharing_and_revocation_block_queued_opencode_before_native_submission
 
 #[tokio::test]
 async fn replacing_the_shared_route_does_not_transfer_native_provider_or_session_grants() {
-    for provider in [Provider::OpenCode] {
+    for _provider in [Provider::OpenCode] {
         let root = temp();
         let a = Running::start(&root.path().join("a"));
         let b = Running::start(&root.path().join("b"));
         let na = Native::start(A, false);
         let nb = Native::start(B, false);
-        let replacement = Native::start(A, false);
         setup(&a, &b, &na, &nb);
         connect(&a, &b).await;
-        if provider == Provider::OpenCode {
-            replacement.observe(&b);
-        }
         let shared = b.request(Request::SharedSessions);
         assert_eq!(shared[0]["provider"], "opencode");
         assert_eq!(shared[0]["session"], B);

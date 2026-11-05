@@ -514,20 +514,12 @@ class Qualification:
         require("<agent-bridge-session-context>" not in found[0]["text"], "Native message text accumulated setup context")
         return found[0]["id"]
 
-    @staticmethod
-    def lease_ended(state, session):
-        with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
-            row = db.execute("SELECT expires FROM opencode_leases WHERE session=?", (session,)).fetchone()
-        return row is None or row[0] <= int(time.time() * 1000)
-
     def lifecycle(self, route):
         info, state, native = self.fixture.routes[route], self.states["a"], self.oc["a"]
         session = info["session"]
         path = "/api/session/" + session
         self.oc_api("a", path, {"title": "Qualification renamed"}, "PATCH")
         wait_for("native rename discovery", lambda: any(a["name"] == route and a.get("display_name") == "Qualification renamed" for a in rpc(state, {"op": "list", "all": False})))
-        with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
-            old_generation = db.execute("SELECT generation FROM opencode_leases WHERE session=?", (session,)).fetchone()[0]
         identity = rpc(state, {"op": "identity"})
         def durable_grants():
             # Live enabled/name/machine labels may change during restart; the
@@ -547,40 +539,25 @@ class Qualification:
         rpc(state, {"op": "pause", "paused": False})
         self.processes.stop(native["process"])
         wait_for("closed plugin expires native routes", lambda: not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})))
-        # A broker restart disables routes before their old leases expire. A new
-        # plugin must respect that live-generation fence, rather than using the
-        # disabled presentation flag as evidence that replacement is allowed.
-        wait_for("closed plugin generation lease ends", lambda: self.lease_ended(state, session))
         native["process"] = self.processes.start("opencode-a-restarted", native["argv"], self.envs["a"], self.work("a"))
         wait_for("native restart health", lambda: self.oc_api("a", "/api/info", timeout=2))
         # V2 exposes canonical unarchived server sessions without a TUI tab or
-        # explicit prompt. Recovery must own a fresh live lease, not infer
-        # liveness from saved files, and must not manufacture native input.
+        # explicit prompt. Recovery needs an answering plugin, not saved files,
+        # and must not manufacture native input.
         recovered_session = self.oc_api("a", path)
         self.oc_api("a", "/api/config")
         recovered = wait_for("V2 canonical session recovery", lambda: next((a for a in rpc(state, {"op": "list", "all": False}) if a["name"] == route), None))
-        with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
-            db.row_factory = sqlite3.Row
-            lease = dict(db.execute("SELECT * FROM opencode_leases WHERE session=?", (session,)).fetchone())
         native_users_after = [m for m in self.oc_messages("a", session) if m["type"] == "user"]
         observed_at = int(time.time() * 1000)
-        self.evidence["v2_recovery_observation"] = {"session": recovered_session, "registration": recovered, "lease": lease,
+        self.evidence["v2_recovery_observation"] = {"session": recovered_session, "registration": recovered,
             "native_users_before": native_users_before, "native_users_after": native_users_after,
             "no_unintended_native_input": native_users_before == native_users_after, "observed_at_ms": observed_at}
         require(recovered_session["id"] == session and recovered_session["location"]["directory"] == str(self.work("a"))
                 and not recovered_session["time"].get("archived"), "Recovery did not expose the exact unarchived canonical V2 session")
-        require(recovered["provider"] == "opencode" and recovered["session"] == session and recovered["enabled"]
-                and recovered["endpoint"] == lease["endpoint"] and lease["ready"] == 1 and lease["expires"] > observed_at
-                and lease["generation"] != old_generation, "Recovery lacks a fresh owning live plugin lease")
-        endpoint = Path(lease["endpoint"]).lstat()
-        require(stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid == os.getuid(), "Recovered plugin endpoint is not an owned live socket")
+        require(recovered["provider"] == "opencode" and recovered["session"] == session and recovered["enabled"], "Recovery lacks an answering owning plugin")
         require(native_users_before == native_users_after, "Canonical recovery admitted unintended native input")
         explicit_id = self.oc_prompt("a", session, "Explicit disposable resume after reload.")
         self.route("opencode", session, state)
-        with sqlite3.connect(f"file:{state / 'messages.sqlite3'}?mode=ro", uri=True) as db:
-            new_generation = db.execute("SELECT generation FROM opencode_leases WHERE session=?", (session,)).fetchone()[0]
-        require(new_generation != old_generation, "Plugin replacement reused a stale generation")
-        require(new_generation == lease["generation"], "Explicit input replaced the recovered plugin generation")
         def explicit_projection():
             rows = [m for m in self.oc_messages("a", session) if m["type"] == "user"]
             return rows if any(m["id"] == explicit_id for m in rows) else None
@@ -599,18 +576,17 @@ class Qualification:
         before_archive = [m for m in self.oc_messages("a", session) if m["type"] == "user"]
         self.oc_api("a", path, {"archived": True}, "PATCH")
         wait_for("native archive removes live registration", lambda: not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})))
-        wait_for("archived plugin lease ends", lambda: self.lease_ended(state, session))
         archived = self.oc_api("a", path)
         require(archived["id"] == session and archived["time"].get("archived"), "Canonical API did not retain exact archived session")
         require([m for m in self.oc_messages("a", session) if m["type"] == "user"] == before_archive, "Archive/history lookup admitted native input")
         require(not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})), "Archived history lookup reactivated native route")
-        self.evidence["v2_archive_observation"] = {"session": archived, "lease_ended": True, "route_absent": True, "no_unintended_native_input": True}
+        self.evidence["v2_archive_observation"] = {"session": archived, "route_absent": True, "no_unintended_native_input": True}
         self.oc_api("a", path, method="DELETE")
         wait_for("native delete removes registration", lambda: not any(a["name"] == route for a in rpc(state, {"op": "list", "all": False})))
         self.evidence["lifecycle"] = {"native_rename": True, "broker_restart_retained_identity_history_grants_pause": True,
-            "plugin_close": True, "closed_plugin_lease_ended": True, "canonical_v2_recovery_with_live_lease_no_input": True,
+            "plugin_close": True, "canonical_v2_recovery_no_input": True,
             "archived_history_inactive": True, "explicit_resume_same_native_id": True, "explicit_native_input_once": True,
-            "replacement_new_generation": True, "native_history_no_duplicates_after_restart": True, "native_delete_unregister": True}
+            "native_history_no_duplicates_after_restart": True, "native_delete_unregister": True}
 
     def pair_brokers(self, first, second):
         a, b = self.states["a"], self.states["b"]
@@ -630,7 +606,6 @@ class Qualification:
                 # disposable conversation before choosing it for owner sharing;
                 # neither the observer nor an incoming peer creates/resumes it.
                 info = self.fixture.routes[name]
-                wait_for("old sharing generation ends", lambda: self.lease_ended(state, info["session"]))
                 side = "a" if state == a else "b"
                 self.oc_prompt(side, info["session"], "Explicitly resume this disposable conversation for sharing qualification.")
                 self.route("opencode", info["session"], state)

@@ -226,7 +226,7 @@ fn known_agent(conn: &Connection, agent: &AgentRef, enabled: bool) -> Result<()>
         match provider {
             // Codex has no local binding/catalog; exact presence is supplied by
             // the request-local observer and a rowless canonical route is valid.
-            "codex" => true,
+            "codex" | "opencode" => true,
             "claude" => {
                 exact_alias
                     || conn.query_row(
@@ -235,12 +235,6 @@ fn known_agent(conn: &Connection, agent: &AgentRef, enabled: bool) -> Result<()>
                         |r| r.get(0),
                     )?
             }
-            "opencode" => exact_alias
-                || conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM opencode_leases WHERE session=? AND expires>?)",
-                    params![session, crate::db::now()],
-                    |r| r.get(0),
-                )?,
             _ => false,
         }
     };
@@ -372,14 +366,6 @@ fn schedule_topic_pushes(tx: &Transaction<'_>, post: &TopicPost) -> Result<()> {
                     )
                     .optional()?
                     .unwrap_or_default(),
-                Provider::OpenCode => tx
-                    .query_row(
-                        "SELECT endpoint FROM opencode_leases WHERE session=?1 AND expires>?2",
-                        params![session, crate::db::now()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-                    .unwrap_or_default(),
                 _ => String::new(),
             };
             let destination = crate::protocol::Agent {
@@ -453,7 +439,6 @@ fn schedule_topic_pushes(tx: &Transaction<'_>, post: &TopicPost) -> Result<()> {
                         )?;
                         let text = error.to_string();
                         if text.contains("Queue is full")
-                            || text.contains("OpenCode live lease required")
                             || text.contains("OpenCode session queue is full")
                         {
                             gap = true;
@@ -479,10 +464,10 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("UPDATE messages SET state='failed',detail='Topic preference changed before native admission',updated=?1 WHERE state='queued' AND EXISTS (SELECT 1 FROM topic_push_work w WHERE w.message_id=messages.id AND NOT EXISTS(SELECT 1 FROM topic_push_preferences p WHERE p.bridge_id=w.bridge_id AND p.topic_id=w.topic_id AND p.agent_id=w.agent_id AND p.epoch=w.epoch AND p.mode<>'manual')) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')",[now()])?;
         tx.execute("UPDATE messages SET state='failed',detail='Exact topic recipient route changed before admission; read history to catch up',updated=?1 WHERE state='queued' AND EXISTS (SELECT 1 FROM topic_push_work w JOIN message_context c ON c.id=w.message_id WHERE w.message_id=messages.id AND (EXISTS(SELECT 1 FROM route_aliases a WHERE a.name=messages.recipient AND (a.provider<>json_extract(c.destination,'$.provider') OR a.session<>messages.recipient_session)) OR (json_extract(c.destination,'$.provider')='inbox' AND NOT EXISTS(SELECT 1 FROM agents a WHERE a.name=messages.recipient AND a.enabled=1 AND a.session=messages.recipient_session)))) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')",[now()])?;
-        // A native topic subscriber without a live local binding/lease cannot be
+        // A native topic subscriber without a live local binding cannot be
         // claimed. Record the existing one-gap outcome instead of stranding queued
         // work forever; Codex presence is observer-owned and remains durable.
-        tx.execute("UPDATE messages SET state='failed',detail='Topic subscriber is not currently reachable; read history to catch up',updated=?1 WHERE state='queued' AND EXISTS (SELECT 1 FROM topic_push_work w JOIN message_context c ON c.id=w.message_id WHERE w.message_id=messages.id AND ((json_extract(c.destination,'$.provider')='claude' AND NOT EXISTS(SELECT 1 FROM claude_bindings b WHERE b.session=messages.recipient_session)) OR (json_extract(c.destination,'$.provider')='opencode' AND NOT EXISTS(SELECT 1 FROM opencode_leases l WHERE l.session=messages.recipient_session AND l.expires>?1)))) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')",[now()])?;
+        tx.execute("UPDATE messages SET state='failed',detail='Topic subscriber is not currently reachable; read history to catch up',updated=?1 WHERE state='queued' AND EXISTS (SELECT 1 FROM topic_push_work w JOIN message_context c ON c.id=w.message_id WHERE w.message_id=messages.id AND ((json_extract(c.destination,'$.provider')='claude' AND NOT EXISTS(SELECT 1 FROM claude_bindings b WHERE b.session=messages.recipient_session)))) AND NOT EXISTS(SELECT 1 FROM opencode_deliveries d WHERE d.id=messages.id AND d.phase<>'queued')",[now()])?;
         tx.commit()?;
         Ok(())
     }
@@ -1335,7 +1320,6 @@ mod push_admission_tests {
             session: session.into(),
             endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
         };
-        db.opencode_observe(&recipient, true).unwrap();
         let topic = db
             .topic_create(&local, "Deferred", &TopicLimits::default())
             .unwrap();
@@ -1359,86 +1343,25 @@ mod push_admission_tests {
         db.topic_publish(&local, &post, &TopicLimits::default())
             .unwrap();
         let (message, owner) = db.claim().unwrap().unwrap();
-        let dispatch = db.opencode_dispatch(&message, &owner, "ignored").unwrap();
+        db.opencode_dispatch(&message, &owner, "ignored").unwrap();
         db.topic_push_set(&local, &topic.reference, &agent, "manual")
             .unwrap();
         assert!(db.topic_push_authorize(&message.id, &owner).is_err());
-        db.opencode_finish(
-            &message.id,
-            &dispatch,
-            "queued",
-            "denied before native attempt",
-        )
-        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE opencode_deliveries SET phase='queued',attempt=NULL WHERE id=?",
+                [&message.id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE messages SET state='queued' WHERE id=?",
+                [&message.id],
+            )
+            .unwrap();
         assert_eq!(db.get(&message.id).unwrap().state, "queued");
         db.topic_push_revoke_obsolete().unwrap();
         assert_eq!(db.get(&message.id).unwrap().state, "failed");
         assert!(db.retry(&message.id, false).is_err());
-    }
-
-    #[test]
-    fn opencode_lease_expiry_records_exactly_one_gap_across_restart() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("db");
-        let mut db = Db::open(&path).unwrap();
-        let local = libp2p_identity::Keypair::generate_ed25519()
-            .public()
-            .to_peer_id()
-            .to_string();
-        let session = "ses_0123456789abcdefghijklmnop";
-        let recipient = Agent {
-            name: format!("opencode-{session}"),
-            provider: Provider::OpenCode,
-            session: session.into(),
-            endpoint: format!("/tmp/{}.sock", uuid::Uuid::new_v4()),
-        };
-        db.opencode_observe(&recipient, true).unwrap();
-        let topic = db
-            .topic_create(&local, "Expiry", &TopicLimits::default())
-            .unwrap();
-        let agent = AgentRef {
-            bridge_id: None,
-            agent_id: recipient.name.clone(),
-        };
-        db.topic_push_set(&local, &topic.reference, &agent, "all")
-            .unwrap();
-        let post = TopicPublication {
-            topic: topic.reference.clone(),
-            id: uuid::Uuid::new_v4().to_string(),
-            author: AgentRef {
-                bridge_id: None,
-                agent_id: "inbox-user".into(),
-            },
-            body: "lease expiry".into(),
-            parent: None,
-            mentions: vec![],
-        };
-        db.topic_publish(&local, &post, &TopicLimits::default())
-            .unwrap();
-        db.conn
-            .execute(
-                "UPDATE opencode_leases SET expires=0 WHERE session=?",
-                [session],
-            )
-            .unwrap();
-        db.opencode_tick(now()).unwrap();
-        let diag = db
-            .topic_push_diagnostics(&local, &topic.reference, &agent)
-            .unwrap();
-        assert_eq!(diag.failed, 1);
-        assert_eq!(
-            diag.gap_count, 1,
-            "expiry before admission must record a catch-up gap"
-        );
-        assert_eq!(diag.last_gap_sequence, Some(1));
-        db.opencode_tick(now()).unwrap();
-        drop(db);
-        let db = Db::open(&path).unwrap();
-        assert_eq!(
-            db.topic_push_get(&local, &topic.reference, &agent)
-                .unwrap()
-                .gap_count,
-            1
-        );
     }
 }

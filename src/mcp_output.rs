@@ -305,7 +305,7 @@ mod tests {
     fn compact_event_receipts_keep_nonempty_recovery_diagnostics() {
         let recovery = json!({"total":17,"truncated":true,"items":(0..16).map(|index| {
             json!({"id":format!("control-{index}"),"state":"uncertain",
-                "reconciliation_pending":false,"route_matches":true,"lease_available":false})
+                "reconciliation_pending":false,"route_matches":true})
         }).collect::<Vec<_>>(),"instruction":"Inspect the ID and explicitly reconcile through the same broker."});
         for tool in ["subscribe", "unsubscribe"] {
             let full = json!({"agent":"route","events":[],"agents":[],"persistent":false,

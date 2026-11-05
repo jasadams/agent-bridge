@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 
 export type Identity = { namespace: string; id: string; session: string; content: string; native_message_id: string };
-export type AttemptIdentity = Identity & { generation: string; attempt: string };
+export type AttemptIdentity = Identity & { attempt: string };
 type Acceptance = { id: string; sessionID: string; type: "user"; payload: { text: string }; delivery: "steer"; time: { created: number } };
 export function validateAcceptance(identity: Identity, value: unknown): Acceptance {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Malformed native acceptance receipt");
@@ -79,7 +79,7 @@ export class Journal {
     // Identity/content already live in the immutable row. Retain only bounded
     // native receipt facts and original dispatch provenance, not duplicate text
     // or arbitrary native metadata/attachments.
-    const proof = JSON.stringify({ generation: identity.generation, attempt: identity.attempt, type: native.type, delivery: native.delivery, created: native.time.created });
+    const proof = JSON.stringify({ attempt: identity.attempt, type: native.type, delivery: native.delivery, created: native.time.created });
     this.db.transaction(() => {
       this.find(identity);
       const size = this.db.query("SELECT coalesce(sum(length(CAST(content AS BLOB))+coalesce(length(CAST(acceptance AS BLOB)),0)),0) AS bytes FROM receipts").get() as { bytes: number };
@@ -93,7 +93,7 @@ export class Journal {
     if (row?.state !== "inserted" || !row.acceptance) return false;
     const proof = JSON.parse(row.acceptance);
     const uuid = /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/;
-    if (!proof || proof.generation !== identity.generation || typeof proof.attempt !== "string" || !uuid.test(proof.attempt) || (!readonly && proof.attempt !== identity.attempt) || proof.type !== "user" || proof.delivery !== "steer" || typeof proof.created !== "number" || !Number.isFinite(proof.created)) return false;
+    if (!proof || typeof proof.attempt !== "string" || !uuid.test(proof.attempt) || (!readonly && proof.attempt !== identity.attempt) || proof.type !== "user" || proof.delivery !== "steer" || typeof proof.created !== "number" || !Number.isFinite(proof.created)) return false;
     // A reconciliation request has a fresh response-fencing nonce, NOT the
     // original dispatch attempt. Original provenance was committed only by
     // accepted() after the guarded winning prompt; it is never rewritten here.

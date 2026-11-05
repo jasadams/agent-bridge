@@ -88,50 +88,93 @@ pub(crate) fn endpoint_instance(path: &Path) -> Result<String> {
     Ok(stem.to_owned())
 }
 
-/// Request-local transport locators, not native session membership. The broker
-/// snapshots these (including expired locators) before releasing its DB lock.
+/// The plugins' fixed socket directory is the registry: a socket that answers is
+/// live, one that refuses a connection is stale and is unlinked.
 pub struct State {
-    endpoints: Vec<String>,
-    preferred: Option<String>,
+    dir: PathBuf,
 }
+const PROBE: Duration = Duration::from_millis(500);
 impl State {
-    pub fn new(mut endpoints: Vec<String>, preferred: Option<String>) -> Self {
-        endpoints.sort();
-        endpoints.dedup();
+    pub fn new(state_dir: &Path) -> Self {
         Self {
-            endpoints,
-            preferred,
+            dir: state_dir.join("oc"),
         }
     }
 
-    fn first(&self, frame: &Value, deadline: Instant) -> Result<(PathBuf, StateReply), StateError> {
-        if self.endpoints.len() > 64 {
-            return Err(incomplete("Too many OpenCode transport locators"));
+    fn sockets(&self) -> Result<Vec<PathBuf>, StateError> {
+        use std::os::unix::fs::MetadataExt;
+        let unavailable = |detail: &str| StateError::Unavailable(detail.into());
+        let meta = match std::fs::symlink_metadata(&self.dir) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(unavailable("Cannot inspect the OpenCode socket directory")),
+        };
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+            return Err(unavailable("OpenCode socket directory is not private"));
         }
-        let mut endpoints: Vec<_> = self.endpoints.iter().collect();
-        if frame["op"] == "state_get" {
-            endpoints.sort_by_key(|endpoint| {
-                (
-                    Some(endpoint.as_str()) != self.preferred.as_deref(),
-                    *endpoint,
-                )
-            });
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.dir)
+            .map_err(|_| unavailable("Cannot list the OpenCode socket directory"))?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                validate_endpoint(path.to_str()?).ok().map(|_| path)
+            })
+            .collect();
+        paths.sort();
+        if paths.len() > 64 {
+            return Err(incomplete("Too many OpenCode sockets"));
         }
-        for endpoint in endpoints {
-            let Ok(path) = validate_endpoint(endpoint) else {
-                continue;
-            };
-            match exchange_sync(&path, frame, deadline) {
-                Ok(bytes) => return Ok((path.clone(), decode_state(&bytes, &path, frame)?)),
-                Err(error) if error.downcast_ref::<StateError>().is_some() => {
-                    return Err(incomplete("Invalid OpenCode state frame"));
-                }
-                Err(_) => {} // A stale/missing locator is not native absence.
+        Ok(paths)
+    }
+
+    /// Ask every socket in parallel. `None` from `ask` is a stale socket.
+    fn each<T: Send>(
+        &self,
+        ask: impl Fn(&Path) -> Result<Option<T>, StateError> + Sync,
+    ) -> Result<Vec<T>, StateError> {
+        let paths = self.sockets()?;
+        let answers: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = paths.iter().map(|path| scope.spawn(|| ask(path))).collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(incomplete("OpenCode state worker failed")))
+                })
+                .collect()
+        });
+        let (mut found, mut failure) = (Vec::new(), None);
+        for answer in answers {
+            match answer {
+                Ok(Some(value)) => found.push(value),
+                Ok(None) => {}
+                Err(error) => failure = failure.or(Some(error)),
             }
         }
-        Err(StateError::Unavailable(
-            "No usable OpenCode transport locator".into(),
-        ))
+        match failure {
+            Some(error) if found.is_empty() => Err(error),
+            _ => Ok(found),
+        }
+    }
+}
+
+fn ask(path: &Path, frame: &Value, deadline: Instant) -> Result<Option<StateReply>, StateError> {
+    match exchange_sync(path, frame, deadline) {
+        Ok(bytes) => decode_state(&bytes, path, frame).map(Some),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) =>
+        {
+            let _ = std::fs::remove_file(path);
+            Ok(None)
+        }
+        Err(error) if error.downcast_ref::<StateError>().is_some() => {
+            Err(incomplete("Invalid OpenCode state frame"))
+        }
+        Err(_) => Err(StateError::Unavailable(
+            "An OpenCode plugin did not answer".into(),
+        )),
     }
 }
 
@@ -225,73 +268,97 @@ impl ConnectorState for State {
         if max_age_days == 0 {
             return Err(incomplete("max_age_days must be at least 1"));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let (path, mut reply) = self.first(&json!({"op":"state_list","cursor":null}), deadline)?;
-        let mut rows = BTreeMap::new();
-        let mut cursors = HashSet::new();
-        for page in 0..64 {
-            let StateReply::List {
-                sessions,
-                next_cursor,
-            } = reply
-            else {
-                return Err(incomplete("Expected an OpenCode state list"));
+        let pages = self.each(|path| {
+            let frame = json!({"op":"state_list","cursor":null});
+            let Some(mut reply) = ask(path, &frame, Instant::now() + PROBE)? else {
+                return Ok(None);
             };
-            for row in sessions {
-                let row = row.native(&path)?;
-                if let Some(old) = rows.insert(row.session.clone(), row.clone())
-                    && old != row
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut rows, mut cursors) = (Vec::new(), HashSet::new());
+            for page in 0..64 {
+                let StateReply::List {
+                    sessions,
+                    next_cursor,
+                } = reply
+                else {
+                    return Err(incomplete("Expected an OpenCode state list"));
+                };
+                for row in sessions {
+                    rows.push(row.native(path)?);
+                    if rows.len() > 4096 {
+                        return Err(incomplete("OpenCode state exceeds 4096 sessions"));
+                    }
+                }
+                let Some(cursor) = next_cursor else {
+                    return Ok(Some(rows));
+                };
+                if page == 63
+                    || cursor.is_empty()
+                    || cursor.len() > 4096
+                    || !cursors.insert(cursor.clone())
                 {
-                    return Err(incomplete("Conflicting OpenCode session records"));
+                    return Err(incomplete("OpenCode state pagination incomplete"));
                 }
-                if rows.len() > 4096 {
-                    return Err(incomplete("OpenCode state exceeds 4096 sessions"));
-                }
+                let frame = json!({"op":"state_list","cursor":cursor});
+                reply = ask(path, &frame, deadline)
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| incomplete("OpenCode state page unavailable"))?;
             }
-            let Some(cursor) = next_cursor else {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| StateError::Unavailable("System clock unavailable".into()))?
-                    .as_millis()
-                    .min(i64::MAX as u128) as i64;
-                return Ok(rows
-                    .into_values()
-                    .filter(|row| within_age(row.updated_ms, max_age_days, now))
-                    .collect());
-            };
-            if page == 63
-                || cursor.is_empty()
-                || cursor.len() > 4096
-                || !cursors.insert(cursor.clone())
-            {
-                return Err(incomplete("OpenCode state pagination incomplete"));
-            }
-            let frame = json!({"op":"state_list","cursor":cursor});
-            let bytes = exchange_sync(&path, &frame, deadline)
-                .map_err(|_| incomplete("OpenCode state page unavailable"))?;
-            reply = decode_state(&bytes, &path, &frame)
-                .map_err(|_| incomplete("OpenCode state page incomplete"))?;
+            unreachable!("bounded page loop returns at the final page")
+        })?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StateError::Unavailable("System clock unavailable".into()))?
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let mut merged = BTreeMap::new();
+        for row in pages.into_iter().flatten() {
+            merge(
+                merged.entry(row.session.clone()).or_insert(row.clone()),
+                row,
+            );
         }
-        unreachable!("bounded page loop returns at the final page")
+        Ok(merged
+            .into_values()
+            .filter(|row| within_age(row.updated_ms, max_age_days, now))
+            .collect())
     }
     fn get(&self, session: &str) -> Result<Option<NativeState>, StateError> {
         validate_session(session)
             .map_err(|_| incomplete("OpenCode lookup requires an exact session ID"))?;
-        let (path, reply) = self.first(
-            &json!({"op":"state_get","session":session}),
-            Instant::now() + Duration::from_secs(5),
-        )?;
-        let StateReply::Get {
-            session: echoed,
-            state,
-        } = reply
-        else {
-            return Err(incomplete("Expected an OpenCode state lookup"));
-        };
-        if echoed != session || state.as_ref().is_some_and(|row| row.session != session) {
-            return Err(incomplete("OpenCode state session mismatch"));
+        let rows = self.each(|path| {
+            let frame = json!({"op":"state_get","session":session});
+            let Some(reply) = ask(path, &frame, Instant::now() + PROBE)? else {
+                return Ok(None);
+            };
+            let StateReply::Get {
+                session: echoed,
+                state,
+            } = reply
+            else {
+                return Err(incomplete("Expected an OpenCode state lookup"));
+            };
+            if echoed != session || state.as_ref().is_some_and(|row| row.session != session) {
+                return Err(incomplete("OpenCode state session mismatch"));
+            }
+            state.map(|row| row.native(path)).transpose().map(Some)
+        })?;
+        let mut found: Option<NativeState> = None;
+        for row in rows.into_iter().flatten() {
+            match &mut found {
+                Some(first) => merge(first, row),
+                None => found = Some(row),
+            }
         }
-        state.map(|row| row.native(&path)).transpose()
+        Ok(found)
+    }
+}
+
+/// The first (sorted) socket's record wins; a later socket only supplies status.
+fn merge(first: &mut NativeState, other: NativeState) {
+    if first.status.is_none() {
+        first.status = other.status;
     }
 }
 
@@ -331,10 +398,17 @@ fn exchange_sync(path: &Path, frame: &Value, deadline: Instant) -> Result<Vec<u8
     }
     let connected =
         unsafe { libc::connect(fd, (&address as *const libc::sockaddr_un).cast(), length) };
-    ensure!(
-        connected == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINPROGRESS),
-        "Native socket unavailable"
-    );
+    if connected != 0 {
+        let error = std::io::Error::last_os_error();
+        ensure!(
+            error.raw_os_error() == Some(libc::EINPROGRESS)
+                || error.kind() == std::io::ErrorKind::ConnectionRefused,
+            "Native socket unavailable"
+        );
+        if error.kind() == std::io::ErrorKind::ConnectionRefused {
+            return Err(error.into());
+        }
+    }
     let wait = |events| -> Result<()> {
         loop {
             let remaining = deadline
@@ -451,8 +525,6 @@ struct Receipt {
     #[serde(default)]
     namespace: Option<String>,
     #[serde(default)]
-    generation: Option<String>,
-    #[serde(default)]
     attempt: Option<String>,
     #[serde(default)]
     session: Option<String>,
@@ -470,8 +542,8 @@ struct Receipt {
 
 fn unconfirmed_receipt_detail(receipt: &Receipt) -> String {
     let category = match receipt.error.as_deref() {
-        Some("Native session, lease or insertion unconfirmed") => {
-            "native session, lease or insertion unconfirmed"
+        Some("Native session or insertion unconfirmed") => {
+            "native session or insertion unconfirmed"
         }
         Some(
             "Receipt journal capacity reached; existing native insertion requires reconciliation",
@@ -540,18 +612,11 @@ fn decode_receipt(response: &[u8], path: &Path, frame: &Value) -> Result<Receipt
         receipt.instance.as_deref() == Some(endpoint_instance(path)?.as_str()),
         "OpenCode receipt instance mismatch"
     );
-    for key in [
-        "id",
-        "namespace",
-        "generation",
-        "attempt",
-        "native_message_id",
-    ] {
+    for key in ["id", "namespace", "attempt", "native_message_id"] {
         if let Some(expected) = frame.get(key).and_then(Value::as_str) {
             let actual = match key {
                 "id" => receipt.id.as_deref(),
                 "namespace" => receipt.namespace.as_deref(),
-                "generation" => receipt.generation.as_deref(),
                 "attempt" => receipt.attempt.as_deref(),
                 _ => receipt.native_message_id.as_deref(),
             };
@@ -561,31 +626,33 @@ fn decode_receipt(response: &[u8], path: &Path, frame: &Value) -> Result<Receipt
     Ok(receipt)
 }
 
-/// Registration uses the same connected-peer and exact-session checks as delivery.
-/// Run on a blocking worker when called from the async broker.
-pub(crate) fn verify_registration(agent: &Agent) -> Result<()> {
-    validate_session(&agent.session)?;
-    let path = validate_endpoint(&agent.endpoint)?;
-    let frame = json!({"op":"probe","session":agent.session});
-    let bytes = exchange_sync(&path, &frame, Instant::now() + Duration::from_secs(5))?;
-    let receipt = decode_receipt(&bytes, &path, &frame)?;
-    ensure!(receipt.ok, "OpenCode exact-session probe rejected");
-    Ok(())
-}
-
 pub(crate) async fn deliver(_agent: &Agent, _msg: &Message, _content: &str) -> Outcome {
-    Outcome::failed(
-        "OpenCode delivery requires the broker's durable lease, queue and admission context",
-    )
+    Outcome::failed("OpenCode delivery requires the broker's durable queue and admission context")
 }
 
 pub(crate) async fn deliver_dispatch(
+    state_dir: &Path,
     agent: &Agent,
     dispatch: &crate::opencode_state::Dispatch,
 ) -> Outcome {
-    let path = match validate_endpoint(&agent.endpoint) {
-        Ok(path) => path,
-        Err(error) => return Outcome::uncertain(error),
+    let deliver = dispatch.frame["op"] == "deliver";
+    // Nothing is sent to a recipient that no plugin holds. A delivery is only
+    // retryable if nothing was written; a reconciliation just stays unresolved.
+    let unreachable = |why: &str| {
+        let detail = format!("Recipient {} is not reachable: {why}", agent.name);
+        if deliver {
+            Outcome::failed(detail)
+        } else {
+            Outcome::uncertain(detail)
+        }
+    };
+    let (dir, session) = (state_dir.to_owned(), agent.session.clone());
+    let path = match tokio::task::spawn_blocking(move || State::new(&dir).get(&session)).await {
+        Ok(Ok(Some(NativeState {
+            transport_endpoint: Some(path),
+            ..
+        }))) => PathBuf::from(path),
+        _ => return unreachable("no OpenCode plugin holds its session"),
     };
     let mut written = false;
     let result = timeout(
@@ -600,19 +667,15 @@ pub(crate) async fn deliver_dispatch(
             )
         }
         Ok(Ok(receipt))
-            if !receipt.ok
-                && receipt.status.as_deref() == Some("deferred")
-                && dispatch.frame["op"] == "deliver" =>
+            if !receipt.ok && receipt.status.as_deref() == Some("deferred") && deliver =>
         {
-            Outcome {
-                state: "queued",
-                detail: format!(
-                    "OpenCode deferred before insertion: {}",
-                    deferred_receipt_detail(&receipt)
-                ),
-            }
+            Outcome::failed(format!(
+                "OpenCode deferred before insertion: {}; explicitly retry",
+                deferred_receipt_detail(&receipt)
+            ))
         }
         Ok(Ok(receipt)) => Outcome::uncertain(unconfirmed_receipt_detail(&receipt)),
+        Ok(Err(_)) if !written => unreachable("its plugin refused the connection"),
         Ok(Err(_)) => Outcome::uncertain(
             "OpenCode uncertain: transport or receipt validation failed; read-only reconciliation required",
         ),

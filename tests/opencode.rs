@@ -20,18 +20,14 @@ const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
 struct PluginSocket {
     root: tempfile::TempDir,
     path: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: std::thread::JoinHandle<()>,
 }
 impl PluginSocket {
-    fn start(count: usize, response: impl Fn(Value, &str) -> Value + Send + 'static) -> Self {
-        Self::start_optional(count, move |frame, instance| {
-            Some(response(frame, instance))
-        })
+    fn start(response: impl Fn(Value, &str) -> Value + Send + 'static) -> Self {
+        Self::start_optional(move |frame, instance| Some(response(frame, instance)))
     }
-    fn start_optional(
-        count: usize,
-        response: impl Fn(Value, &str) -> Option<Value> + Send + 'static,
-    ) -> Self {
+    fn start_optional(response: impl Fn(Value, &str) -> Option<Value> + Send + 'static) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ab-oc-")
             .tempdir_in("/tmp")
@@ -40,10 +36,20 @@ impl PluginSocket {
         let instance = uuid::Uuid::new_v4().to_string();
         let path = root.path().join(format!("{instance}.sock"));
         let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
         let worker = std::thread::spawn(move || {
-            for _ in 0..count {
-                let (mut stream, _) = listener.accept().unwrap();
+            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
@@ -68,7 +74,19 @@ impl PluginSocket {
                 }
             }
         });
-        Self { root, path, worker }
+        Self {
+            root,
+            path,
+            stop,
+            worker,
+        }
+    }
+    /// Publish this socket in a broker's fixed plugin socket directory.
+    fn publish(&self, state: &std::path::Path) {
+        let dir = state.join("oc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::hard_link(&self.path, dir.join(self.path.file_name().unwrap()));
     }
     fn agent(&self) -> Agent {
         Agent {
@@ -79,10 +97,23 @@ impl PluginSocket {
         }
     }
     fn finish(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         self.worker.join().unwrap();
     }
 }
 fn receipt(frame: Value, instance: &str) -> Value {
+    if frame["op"] == "state_get" || frame["op"] == "state_list" {
+        let row = state_row(SESSION, Value::Null);
+        return state_reply(
+            &frame,
+            instance,
+            if frame["op"] == "state_get" {
+                row
+            } else {
+                json!([row])
+            },
+        );
+    }
     if frame["session"] != SESSION {
         return json!({"ok":false,"error":"unknown session"});
     }
@@ -92,7 +123,7 @@ fn receipt(frame: Value, instance: &str) -> Value {
         assert!(frame.get("permissions").is_none());
         assert!(frame.get("tools").is_none());
         value["id"] = frame["id"].clone();
-        for key in ["native_message_id", "namespace", "generation", "attempt"] {
+        for key in ["native_message_id", "namespace", "attempt"] {
             value[key] = frame[key].clone();
         }
         value["status"] = json!("inserted");
@@ -120,16 +151,7 @@ async fn broker_delivery(plugin: &PluginSocket) -> Message {
     let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
     let server = tokio::spawn(broker::serve(bound));
     let agent = plugin.agent();
-    broker::rpc(
-        &state,
-        &Request::OpenCodeObserve {
-            session: SESSION.into(),
-            endpoint: agent.endpoint,
-            ready: true,
-        },
-    )
-    .await
-    .unwrap();
+    plugin.publish(&state);
     broker::rpc(
         &state,
         &Request::Send {
@@ -163,7 +185,7 @@ async fn broker_delivery(plugin: &PluginSocket) -> Message {
 
 #[tokio::test]
 async fn exact_session_receipts_bind_native_and_broker_ids() {
-    let plugin = PluginSocket::start(2, receipt);
+    let plugin = PluginSocket::start(receipt);
     let outcome = broker_delivery(&plugin).await;
     assert_eq!(outcome.state, "delivered", "{:?}", outcome.detail);
     let detail = outcome.detail.unwrap();
@@ -177,8 +199,8 @@ async fn exact_session_receipts_bind_native_and_broker_ids() {
 #[tokio::test]
 async fn wrong_instance_session_and_message_receipts_never_submit() {
     for field in ["instance", "session", "id", "native_message_id"] {
-        let plugin = PluginSocket::start(2, move |frame, instance| {
-            if frame["op"] == "probe" {
+        let plugin = PluginSocket::start(move |frame, instance| {
+            if frame["op"] == "state_get" || frame["op"] == "state_list" {
                 return receipt(frame, instance);
             }
             let mut value = receipt(frame, instance);
@@ -189,7 +211,7 @@ async fn wrong_instance_session_and_message_receipts_never_submit() {
         assert_eq!(outcome.state, "unknown");
         plugin.finish();
     }
-    let plugin = PluginSocket::start(0, receipt);
+    let plugin = PluginSocket::start(receipt);
     let mut msg = message();
     msg.recipient_session = OTHER.into();
     assert_eq!(
@@ -206,83 +228,13 @@ async fn wrong_instance_session_and_message_receipts_never_submit() {
     plugin.finish();
 }
 
-#[tokio::test]
-async fn live_registration_endpoint_replacement_and_close_use_binding_state() {
-    let plugin = PluginSocket::start(4, receipt);
-    let agent = plugin.agent();
-    let state = plugin.root.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
-    let server = tokio::spawn(broker::serve(bound));
-    for _ in 0..2 {
-        broker::rpc(
-            &state,
-            &Request::OpenCodeObserve {
-                session: SESSION.into(),
-                endpoint: agent.endpoint.clone(),
-                ready: true,
-            },
-        )
-        .await
-        .unwrap();
-    }
-    // Another session cannot claim the live owning instance.
-    assert!(
-        broker::rpc(
-            &state,
-            &Request::OpenCodeObserve {
-                session: OTHER.into(),
-                endpoint: agent.endpoint.clone(),
-                ready: true,
-            }
-        )
-        .await
-        .is_err()
-    );
-    // Canonical native routes are not stored membership and cannot be unregistered.
-    assert!(
-        broker::rpc(
-            &state,
-            &Request::Unregister {
-                name: agent.name.clone(),
-                session: SESSION.into(),
-            },
-        )
-        .await
-        .is_err()
-    );
-    broker::rpc(
-        &state,
-        &Request::OpenCodeClose {
-            session: SESSION.into(),
-            endpoint: agent.endpoint.clone(),
-            generation: broker::rpc(
-                &state,
-                &Request::OpenCodeObserve {
-                    session: SESSION.into(),
-                    endpoint: agent.endpoint.clone(),
-                    ready: true,
-                },
-            )
-            .await
-            .unwrap()["generation"]
-                .as_str()
-                .unwrap()
-                .to_owned(),
-        },
-    )
-    .await
-    .unwrap();
-    server.abort();
-    plugin.finish();
-}
-
 #[test]
 fn native_state_pages_use_only_updated_age_and_exact_lookup_ignores_age() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let plugin = PluginSocket::start(5, move |frame, instance| {
+    let plugin = PluginSocket::start(move |frame, instance| {
         let old = state_row(SESSION, json!(now - 15 * 86_400_000));
         if frame["op"] == "state_get" {
             state_reply(&frame, instance, old)
@@ -295,7 +247,7 @@ fn native_state_pages_use_only_updated_age_and_exact_lookup_ignores_age() {
             state_reply(&frame, instance, json!([state_row(OTHER, Value::Null)]))
         }
     });
-    let state = clients::opencode::State::new(vec![plugin.agent().endpoint.clone()], None);
+    let (_dir, state) = state_for(&plugin);
     assert_eq!(state.provider(), Provider::OpenCode);
     let recent = state.list(7).unwrap();
     assert_eq!(recent.len(), 1);
@@ -303,12 +255,20 @@ fn native_state_pages_use_only_updated_age_and_exact_lookup_ignores_age() {
     assert_eq!(state.list(30).unwrap().len(), 2);
     let exact = state.get(SESSION).unwrap().unwrap();
     assert_eq!(exact.session, SESSION);
-    let endpoint = std::fs::canonicalize(plugin.agent().endpoint)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    assert_eq!(exact.transport_endpoint, Some(endpoint));
+    assert!(
+        exact
+            .transport_endpoint
+            .unwrap()
+            .ends_with(plugin.path.file_name().unwrap().to_str().unwrap())
+    );
     plugin.finish();
+}
+/// A scratch state directory whose socket directory holds this plugin socket.
+fn state_for(plugin: &PluginSocket) -> (tempfile::TempDir, clients::opencode::State) {
+    let dir = tempfile::tempdir().unwrap();
+    plugin.publish(dir.path());
+    let state = clients::opencode::State::new(dir.path());
+    (dir, state)
 }
 fn state_row(session: &str, updated: Value) -> Value {
     json!({"session":session,"display_name":"same title","status":null,"directory":"/cold/location","updated_ms":updated})
@@ -328,7 +288,7 @@ fn state_reply(frame: &Value, instance: &str, rows: Value) -> Value {
 #[test]
 fn native_state_strict_identity_and_required_metadata_reject_receipts_and_cross_scope_rows() {
     for variant in 0..9 {
-        let plugin = PluginSocket::start(1, move |frame, instance| {
+        let plugin = PluginSocket::start(move |frame, instance| {
             let mut value = state_reply(&frame, instance, state_row(SESSION, Value::Null));
             match variant {
                 0 => value["instance"] = json!(uuid::Uuid::new_v4().to_string()),
@@ -344,76 +304,40 @@ fn native_state_strict_identity_and_required_metadata_reject_receipts_and_cross_
                 }
                 6 => value["state"]["transport_endpoint"] = json!("/forged.sock"),
                 7 => value["status"] = json!("inserted"),
-                _ => return receipt(frame, instance),
+                _ => return json!({"ok":true,"protocol":2,"session":SESSION,"instance":instance}),
             }
             value
         });
-        let state = clients::opencode::State::new(vec![plugin.agent().endpoint], None);
+        let (_dir, state) = state_for(&plugin);
+        let got = state.get(SESSION);
         assert!(
-            matches!(state.get(SESSION), Err(StateError::Incomplete(_))),
-            "variant {variant}"
+            matches!(got, Err(StateError::Incomplete(_))),
+            "variant {variant}: {got:?}"
         );
         plugin.finish();
     }
 }
 
 #[test]
-fn native_state_locators_are_not_membership_and_preferred_service_can_confirm_absence() {
-    let unused = PluginSocket::start(0, receipt);
-    let selected = PluginSocket::start(1, |frame, instance| {
-        state_reply(&frame, instance, Value::Null)
-    });
-    let endpoint = selected.agent().endpoint;
-    let state = clients::opencode::State::new(
-        vec![
-            unused.agent().endpoint,
-            endpoint.clone(),
-            "/missing/native.sock".into(),
-        ],
-        Some(endpoint),
-    );
-    assert!(state.get(SESSION).unwrap().is_none());
-    selected.finish();
-    unused.finish();
-    assert!(matches!(
-        clients::opencode::State::new(vec![], None).list(7),
-        Err(StateError::Unavailable(_))
-    ));
-    let excessive = clients::opencode::State::new(
-        (0..65).map(|n| format!("/missing/{n}.sock")).collect(),
-        None,
-    );
-    assert!(matches!(excessive.list(7), Err(StateError::Incomplete(_))));
-    assert!(matches!(
-        excessive.get("same title"),
-        Err(StateError::Incomplete(_))
-    ));
-    assert!(matches!(excessive.list(0), Err(StateError::Incomplete(_))));
-}
-
-#[test]
 fn native_state_partial_pages_cycles_overflow_and_native_errors_are_not_empty_success() {
     for variant in 0..4 {
-        let plugin = PluginSocket::start(
-            if variant < 2 { 2 } else { 1 },
-            move |frame, instance| {
-                if variant == 3 {
-                    return json!({"ok":false,"protocol":2,"instance":instance,"op":frame["op"],"error":"unavailable"});
-                }
-                let mut reply = state_reply(&frame, instance, json!([]));
-                if variant == 2 {
-                    reply["sessions"] = json!([state_row(SESSION, Value::Null)]);
-                    reply["sessions"][0]["display_name"] =
-                        json!("x".repeat(agent_bridge::protocol::MAX_FRAME));
-                } else if frame["cursor"].is_null() || variant == 0 {
-                    reply["next_cursor"] = json!("same");
-                } else {
-                    reply = json!({"ok":false,"protocol":2,"instance":instance,"op":frame["op"],"error":"unavailable"});
-                }
-                reply
-            },
-        );
-        let state = clients::opencode::State::new(vec![plugin.agent().endpoint], None);
+        let plugin = PluginSocket::start(move |frame, instance| {
+            if variant == 3 {
+                return json!({"ok":false,"protocol":2,"instance":instance,"op":frame["op"],"error":"unavailable"});
+            }
+            let mut reply = state_reply(&frame, instance, json!([]));
+            if variant == 2 {
+                reply["sessions"] = json!([state_row(SESSION, Value::Null)]);
+                reply["sessions"][0]["display_name"] =
+                    json!("x".repeat(agent_bridge::protocol::MAX_FRAME));
+            } else if frame["cursor"].is_null() || variant == 0 {
+                reply["next_cursor"] = json!("same");
+            } else {
+                reply = json!({"ok":false,"protocol":2,"instance":instance,"op":frame["op"],"error":"unavailable"});
+            }
+            reply
+        });
+        let (_dir, state) = state_for(&plugin);
         let result = state.list(7);
         assert!(if variant == 3 {
             matches!(result, Err(StateError::Unavailable(_)))
@@ -424,29 +348,10 @@ fn native_state_partial_pages_cycles_overflow_and_native_errors_are_not_empty_su
     }
 }
 
-#[tokio::test]
-async fn native_state_reply_cannot_satisfy_a_registration_probe() {
-    let plugin = PluginSocket::start(1, |_, instance| {
-        state_reply(&json!({"op":"state_list"}), instance, json!([]))
-    });
-    let bound = Broker::bind(plugin.root.path().join("state"), "/missing/codex".into()).unwrap();
-    assert!(
-        bound
-            .broker
-            .request(Request::OpenCodeObserve {
-                session: SESSION.into(),
-                endpoint: plugin.agent().endpoint,
-                ready: true
-            })
-            .is_err()
-    );
-    plugin.finish();
-}
-
 #[test]
 fn native_state_session_and_page_limits_never_return_partial_directories() {
     for count in [4096, 4097] {
-        let plugin = PluginSocket::start(41, move |frame, instance| {
+        let plugin = PluginSocket::start(move |frame, instance| {
             let start: usize = frame["cursor"]
                 .as_str()
                 .map(|s| s.parse().unwrap())
@@ -461,7 +366,10 @@ fn native_state_session_and_page_limits_never_return_partial_directories() {
             }
             reply
         });
-        let result = clients::opencode::State::new(vec![plugin.agent().endpoint], None).list(7);
+        let result = {
+            let (_dir, state) = state_for(&plugin);
+            state.list(7)
+        };
         if count == 4096 {
             assert_eq!(result.unwrap().len(), count);
         } else {
@@ -469,7 +377,7 @@ fn native_state_session_and_page_limits_never_return_partial_directories() {
         }
         plugin.finish();
     }
-    let plugin = PluginSocket::start(64, |frame, instance| {
+    let plugin = PluginSocket::start(|frame, instance| {
         let next = frame["cursor"]
             .as_str()
             .map(|s| s.parse::<usize>().unwrap())
@@ -480,7 +388,10 @@ fn native_state_session_and_page_limits_never_return_partial_directories() {
         reply
     });
     assert!(matches!(
-        clients::opencode::State::new(vec![plugin.agent().endpoint], None).list(7),
+        {
+            let (_dir, state) = state_for(&plugin);
+            state.list(7)
+        },
         Err(StateError::Incomplete(_))
     ));
     plugin.finish();
@@ -488,13 +399,16 @@ fn native_state_session_and_page_limits_never_return_partial_directories() {
 
 #[test]
 fn native_state_total_deadline_bounds_a_stalled_native_reply() {
-    let plugin = PluginSocket::start_optional(1, |_, _| {
+    let plugin = PluginSocket::start_optional(|_, _| {
         std::thread::sleep(std::time::Duration::from_millis(5100));
         None
     });
     let start = std::time::Instant::now();
     assert!(matches!(
-        clients::opencode::State::new(vec![plugin.agent().endpoint], None).list(7),
+        {
+            let (_dir, state) = state_for(&plugin);
+            state.list(7)
+        },
         Err(StateError::Unavailable(_))
     ));
     assert!(start.elapsed() < std::time::Duration::from_secs(6));
@@ -521,8 +435,8 @@ fn native_identity_and_remote_boundary_are_provider_specific() {
 #[tokio::test]
 async fn rejected_oversized_and_extra_field_receipts_fail_closed() {
     for variant in 0..3 {
-        let plugin = PluginSocket::start(2, move |frame, instance| {
-            if frame["op"] == "probe" {
+        let plugin = PluginSocket::start(move |frame, instance| {
+            if frame["op"] == "state_get" || frame["op"] == "state_list" {
                 return receipt(frame, instance);
             }
             match variant {
@@ -545,7 +459,7 @@ async fn rejected_oversized_and_extra_field_receipts_fail_closed() {
 
 #[test]
 fn opencode_endpoint_requires_private_socket_and_canonical_instance() {
-    let plugin = PluginSocket::start(0, receipt);
+    let plugin = PluginSocket::start(receipt);
     clients::opencode::validate_endpoint(plugin.path.to_str().unwrap()).unwrap();
     std::fs::set_permissions(&plugin.path, std::fs::Permissions::from_mode(0o666)).unwrap();
     assert!(clients::opencode::validate_endpoint(plugin.path.to_str().unwrap()).is_err());
@@ -559,62 +473,6 @@ fn opencode_endpoint_requires_private_socket_and_canonical_instance() {
     std::fs::set_permissions(plugin.root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(clients::opencode::validate_endpoint(plugin.path.to_str().unwrap()).is_err());
     std::fs::set_permissions(plugin.root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    plugin.finish();
-}
-
-#[tokio::test]
-async fn paused_broker_expires_crashed_leases_and_queued_deadlines_without_native_events() {
-    let plugin = PluginSocket::start(1, receipt);
-    let state = plugin.root.path().join("expiry-state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
-    let server = tokio::spawn(broker::serve(bound));
-    let agent = plugin.agent();
-    broker::rpc(
-        &state,
-        &Request::OpenCodeObserve {
-            session: SESSION.into(),
-            endpoint: agent.endpoint.clone(),
-            ready: true,
-        },
-    )
-    .await
-    .unwrap();
-    broker::rpc(&state, &Request::Pause { paused: true })
-        .await
-        .unwrap();
-    broker::rpc(
-        &state,
-        &Request::Send {
-            id: ID.into(),
-            sender: "user".into(),
-            recipient: agent.name.clone(),
-            body: "still queued".into(),
-            parent: None,
-        },
-    )
-    .await
-    .unwrap();
-    let conn = rusqlite::Connection::open(state.join("messages.sqlite3")).unwrap();
-    conn.execute("UPDATE opencode_leases SET expires=0", [])
-        .unwrap();
-    conn.execute("UPDATE opencode_deliveries SET deadline=0", [])
-        .unwrap();
-    // No broker requests or native events can supply the expiry observation.
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let status: String = conn
-                .query_row("SELECT state FROM messages WHERE id=?", [ID], |r| r.get(0))
-                .unwrap();
-            if status == "failed" {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    server.abort();
-    let _ = server.await;
     plugin.finish();
 }
 
@@ -654,8 +512,8 @@ async fn topic_push_opencode_admission_fences_old_epoch_but_not_accepted_work() 
         let (resume_tx, resume_rx) = mpsc::channel();
         let inserted = Arc::new(Mutex::new(Vec::<String>::new()));
         let native = inserted.clone();
-        let plugin = PluginSocket::start(2, move |frame, instance| {
-            if frame["op"] == "probe" {
+        let plugin = PluginSocket::start(move |frame, instance| {
+            if frame["op"] == "state_get" || frame["op"] == "state_list" {
                 return receipt(frame, instance);
             }
             assert_eq!(frame["op"], "deliver");
@@ -669,8 +527,6 @@ async fn topic_push_opencode_admission_fences_old_epoch_but_not_accepted_work() 
                         &Request::OpenCodeAdmit {
                             id: frame["id"].as_str().unwrap().into(),
                             session: SESSION.into(),
-                            generation: frame["generation"].as_str().unwrap().into(),
-                            instance: instance.into(),
                             attempt: frame["attempt"].as_str().unwrap().into(),
                         },
                     ))
@@ -705,17 +561,10 @@ async fn topic_push_opencode_admission_fences_old_epoch_but_not_accepted_work() 
                 deferred
             }
         });
-        let bound = Broker::bind(state, "/missing/codex".into()).unwrap();
+        let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
         let broker = bound.broker.clone();
         let server = tokio::spawn(broker::serve(bound));
-        broker
-            .request_async(Request::OpenCodeObserve {
-                session: SESSION.into(),
-                endpoint: plugin.agent().endpoint,
-                ready: true,
-            })
-            .await
-            .unwrap();
+        plugin.publish(&state);
         let topic: TopicRef = serde_json::from_value(
             broker
                 .request(Request::TopicCreate {
@@ -791,8 +640,8 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
         let broker_state = state.clone();
         // Two probes, the lost event, an ordinary tail, explicit readback and
         // a new board event. Missing proof must not block the latter two.
-        let plugin = PluginSocket::start_optional(5, move |frame, instance| {
-            if frame["op"] == "probe" {
+        let plugin = PluginSocket::start_optional(move |frame, instance| {
+            if frame["op"] == "state_get" || frame["op"] == "state_list" {
                 return Some(receipt(frame, instance));
             }
             assert!(frame["op"] == "deliver" || frame["op"] == "reconcile");
@@ -808,8 +657,6 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
                         &Request::OpenCodeAdmit {
                             id: frame["id"].as_str().unwrap().into(),
                             session: SESSION.into(),
-                            generation: frame["generation"].as_str().unwrap().into(),
-                            instance: instance.into(),
                             attempt: frame["attempt"].as_str().unwrap().into(),
                         },
                     ))
@@ -863,12 +710,7 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
         let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
         let mut broker = bound.broker.clone();
         let mut server = tokio::spawn(broker::serve(bound));
-        let observe = || Request::OpenCodeObserve {
-            session: SESSION.into(),
-            endpoint: plugin.path.to_str().unwrap().into(),
-            ready: true,
-        };
-        broker.request_async(observe()).await.unwrap();
+        plugin.publish(&state);
         let route = format!("opencode-{SESSION}");
         let subscribe = || Request::Subscribe {
             board_revisions: Default::default(),
@@ -919,7 +761,6 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
         assert_eq!(recovery["items"][0]["id"], event_id);
         assert_eq!(recovery["items"][0]["state"], "unknown");
         assert_eq!(recovery["items"][0]["reconciliation_pending"], false);
-        assert_eq!(recovery["items"][0]["lease_available"], true);
         assert!(
             recovery["instruction"]
                 .as_str()
@@ -1013,15 +854,6 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
         let _ = server.await;
         drop(broker);
         support::wait_for_shutdown(&state).await;
-        // The plugin may return after the old lease expired; stored queued
-        // reconciliation must stay read-only while an explicit retry rebinds it.
-        rusqlite::Connection::open(state.join("messages.sqlite3"))
-            .unwrap()
-            .execute(
-                "UPDATE opencode_leases SET expires=0 WHERE session=?",
-                [SESSION],
-            )
-            .unwrap();
         let rebound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
         broker = rebound.broker.clone();
         server = tokio::spawn(broker::serve(rebound));
@@ -1033,7 +865,6 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
                 .unwrap()["state"],
             "unknown"
         );
-        broker.request_async(observe()).await.unwrap();
         let resumed = broker.request(subscribe()).unwrap();
         assert_eq!(
             resumed["recovery"]["items"][0]["reconciliation_pending"],
@@ -1165,37 +996,8 @@ async fn hidden_uncertain_event_recovery_is_explicit_readonly_and_allows_later_d
     }
 }
 
-fn service_plugin(session: &'static str) -> PluginSocket {
-    // Every plugin socket of one OpenCode service lists the whole service.
-    // The queried socket is whichever sorts first, so allow one probe plus one
-    // list on each; unused accepts stay parked on a detached thread.
-    PluginSocket::start(2, move |frame, instance| match frame["op"].as_str() {
-        Some("probe") => json!({"ok":true,"protocol":2,"session":session,"instance":instance}),
-        _ => state_reply(
-            &frame,
-            instance,
-            json!([
-                state_row(SESSION, Value::Null),
-                state_row(OTHER, Value::Null)
-            ]),
-        ),
-    })
-}
-
-async fn opencode_list_state(state: &std::path::Path, sockets: &[(&str, &PluginSocket)]) -> Value {
-    for (session, plugin) in sockets {
-        broker::rpc(
-            state,
-            &Request::OpenCodeObserve {
-                session: (*session).into(),
-                endpoint: plugin.agent().endpoint,
-                ready: true,
-            },
-        )
-        .await
-        .unwrap();
-    }
-    let listed = broker::rpc(
+async fn list_opencode(state: &std::path::Path) -> Value {
+    broker::rpc(
         state,
         &Request::List {
             all: false,
@@ -1203,65 +1005,157 @@ async fn opencode_list_state(state: &std::path::Path, sockets: &[(&str, &PluginS
         },
     )
     .await
-    .unwrap();
-    listed["providers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["provider"] == "opencode")
-        .unwrap()
-        .clone()
+    .unwrap()
+}
+
+fn row_status(frame: Value, instance: &str, status: Value) -> Value {
+    let mut row = state_row(SESSION, Value::Null);
+    row["status"] = status;
+    state_reply(
+        &frame,
+        instance,
+        if frame["op"] == "state_get" {
+            row
+        } else {
+            json!([row])
+        },
+    )
 }
 
 #[tokio::test]
-async fn list_is_complete_when_several_sockets_belong_to_one_service() {
-    let first = service_plugin(SESSION);
-    let second = service_plugin(OTHER);
-    let state = first.root.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
-    let server = tokio::spawn(broker::serve(bound));
-    let provider = opencode_list_state(&state, &[(SESSION, &first), (OTHER, &second)]).await;
-    assert_eq!(provider["state"], "complete", "{provider}");
-    server.abort();
-}
-
-#[tokio::test]
-async fn list_is_incomplete_when_a_live_session_is_outside_the_queried_service() {
-    // The second socket belongs to a different service whose sessions the
-    // queried service does not list.
-    // Exact lookups of a foreign session answer "absent", never an error.
-    let first = PluginSocket::start(3, |frame, instance| match frame["op"].as_str() {
-        Some("probe") => json!({"ok":true,"protocol":2,"session":SESSION,"instance":instance}),
-        Some("state_get") => state_reply(&frame, instance, Value::Null),
-        _ => state_reply(&frame, instance, json!([state_row(SESSION, Value::Null)])),
-    });
-    let second = PluginSocket::start(3, |frame, instance| match frame["op"].as_str() {
-        Some("probe") => json!({"ok":true,"protocol":2,"session":OTHER,"instance":instance}),
-        Some("state_get") => state_reply(&frame, instance, Value::Null),
-        _ => state_reply(&frame, instance, json!([state_row(OTHER, Value::Null)])),
-    });
-    let state = first.root.path().join("state");
-    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
-    let server = tokio::spawn(broker::serve(bound));
-    let provider = opencode_list_state(&state, &[(SESSION, &first), (OTHER, &second)]).await;
-    assert_eq!(provider["state"], "incomplete", "{provider}");
-    server.abort();
-}
-
-#[tokio::test]
-async fn list_is_complete_for_a_live_session_older_than_the_age_window() {
-    // The listing drops the idle session by age; an exact lookup still finds it
-    // in the same service, so it is covered rather than outside the service.
-    let plugin = PluginSocket::start(3, |frame, instance| match frame["op"].as_str() {
-        Some("probe") => json!({"ok":true,"protocol":2,"session":SESSION,"instance":instance}),
-        Some("state_get") => state_reply(&frame, instance, state_row(SESSION, json!(1))),
-        _ => state_reply(&frame, instance, json!([state_row(SESSION, json!(1))])),
+async fn plugin_without_any_registration_is_listed_with_its_status_and_deliverable() {
+    let plugin = PluginSocket::start(|frame, instance| {
+        if frame["op"] == "state_get" || frame["op"] == "state_list" {
+            row_status(frame, instance, json!("busy"))
+        } else {
+            receipt(frame, instance)
+        }
     });
     let state = plugin.root.path().join("state");
     let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
     let server = tokio::spawn(broker::serve(bound));
-    let provider = opencode_list_state(&state, &[(SESSION, &plugin)]).await;
-    assert_eq!(provider["state"], "complete", "{provider}");
+    plugin.publish(&state);
+    let listed = list_opencode(&state).await;
+    let row = listed["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session"] == SESSION)
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(row["status"], "busy");
+    broker::rpc(
+        &state,
+        &Request::Send {
+            id: ID.into(),
+            sender: "user".into(),
+            recipient: format!("opencode-{SESSION}"),
+            body: "test".into(),
+            parent: None,
+        },
+    )
+    .await
+    .unwrap();
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message: Message = serde_json::from_value(
+                broker::rpc(&state, &Request::Get { id: ID.into() })
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if message.state == "delivered" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        delivered.is_ok(),
+        "no registration step may precede delivery"
+    );
+    server.abort();
+    plugin.finish();
+}
+
+#[tokio::test]
+async fn refused_socket_is_ignored_and_unlinked_and_a_hung_plugin_is_bounded() {
+    let live = PluginSocket::start(receipt);
+    let hung = PluginSocket::start_optional(|_, _| {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        None
+    });
+    let state = live.root.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    live.publish(&state);
+    hung.publish(&state);
+    let dead = state
+        .join("oc")
+        .join(format!("{}.sock", uuid::Uuid::new_v4()));
+    drop(UnixListener::bind(&dead).unwrap());
+    std::fs::set_permissions(&dead, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let started = std::time::Instant::now();
+    let listed = list_opencode(&state).await;
+    assert!(started.elapsed() < std::time::Duration::from_millis(2500));
+    assert!(
+        listed["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["session"] == SESSION)
+    );
+    assert!(!dead.exists(), "a refused socket is unlinked");
+    assert!(
+        live.path.exists()
+            && state
+                .join("oc")
+                .join(hung.path.file_name().unwrap())
+                .exists(),
+        "live and hung sockets are never unlinked"
+    );
+    server.abort();
+    live.finish();
+    hung.finish();
+}
+
+#[tokio::test]
+async fn failed_send_names_the_unreachable_side() {
+    let plugin = PluginSocket::start(receipt);
+    let state = plugin.root.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    plugin.publish(&state);
+    let send = |sender: String, recipient: String| {
+        let state = state.clone();
+        async move {
+            broker::rpc(
+                &state,
+                &Request::Send {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    sender,
+                    recipient,
+                    body: "test".into(),
+                    parent: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+        }
+    };
+    let gone = format!("opencode-{OTHER}");
+    let live = format!("opencode-{SESSION}");
+    assert!(
+        send("user".into(), gone.clone())
+            .await
+            .contains(&format!("Recipient {gone} is not reachable"))
+    );
+    assert!(
+        send(gone.clone(), live)
+            .await
+            .contains(&format!("Sender {gone} is not reachable"))
+    );
     server.abort();
     plugin.finish();
 }

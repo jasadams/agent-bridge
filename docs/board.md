@@ -386,7 +386,7 @@ retried; the board remains available through `read_board`.
 OpenCode notices use its durable native admission and receipt path: busy or
 permission-waiting work can delay insertion, pause holds delivery, and an
 Unknown native attempt is not resubmitted. Unsubscribe prevents pending notices
-for the removed selectors from starting native delivery; close, lease expiry or
+for the removed selectors from starting native delivery; close or
 registration replacement removes the subscription. Broker restart invalidates
 pending notices too. Native I/O already admitted before cancellation may finish;
 unsubscribe does not cancel that I/O or retained selectors' work. A notice is

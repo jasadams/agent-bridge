@@ -103,7 +103,7 @@ round trips over two real loopback-QUIC brokers. Each direction reached actual
 native model input with exact references and one useful correlated MCP reply,
 without recipient acknowledgement tools. Claude outcomes remained Unknown.
 Default-private directories, independent exact-session grants, rename, broker
-restart identity/pause/grants/history, plugin close/lease expiry, fresh generation,
+restart identity/pause/grants/history, plugin close, fresh plugin instance,
 exactly-once history and archive/delete fences passed. All owned children exited,
 the HTTP thread stopped, the owned Codex socket was absent and cleanup errors were
 empty.
@@ -133,9 +133,9 @@ Attempt 01 exited 1 with **zero pairs** because the provenance gate rejected a
 null embedded commit. It is not qualification. Attempt 04 reproduced an inherited
 V1-only expectation that an unarchived session must remain inactive until explicit
 UI resume. The final check instead uses the existing supported V2 contract:
-canonical live API session plus a fresh, ready, unexpired owning plugin lease
+canonical live API session plus an answering owning plugin
 establishes availability without a TUI. It captured unchanged native user inputs,
-then one subsequent explicit input exactly once. Archived history ended its lease
+then one subsequent explicit input exactly once. Archived history ended its plugin route
 and route without adding input. No production lifecycle policy changed.
 
 These matrix checks use Python **3.14.4** and websockets **15.0.1**. Codex workflows
