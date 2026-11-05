@@ -703,6 +703,19 @@ impl Db {
         Ok(events)
     }
 
+    /// Status events only describe messages we sent to `peer`. With none still
+    /// awaiting a final state, polling the peer for events cannot return anything.
+    /// failed/blocked stay open for ten minutes after their last event, so a quick
+    /// retry at the destination is seen; later reports arrive with the next Sync
+    /// (events are cursor-based, so nothing is lost).
+    pub fn has_open_transfers(&self, peer: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbound_transfers t JOIN messages m ON m.id=t.id WHERE t.peer_id=?1 AND t.state IN ('pending','awaiting_receipt','accepted') AND (m.state NOT IN ('acknowledged','cancelled','failed','blocked') OR (m.state IN ('failed','blocked') AND t.observed_at>?2)))",
+            params![peer, now() - 600_000],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn sync_cursor(&self, peer: &str) -> Result<u64> {
         self.require_peer(peer)?;
         let cursor: i64 = self

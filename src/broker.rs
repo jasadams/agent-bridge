@@ -2588,9 +2588,21 @@ impl Broker {
                 });
                 codex_workers.track(worker.id(), &worker_agent);
             }
+            // Every new message wakes this loop. Only unfinished work can become
+            // claimable without a wake (native readiness, reconcile due), so only
+            // then poll; an idle broker has no timer here.
+            let waiting = self
+                .blocking(|broker| broker.db.lock().unwrap().has_unfinished_delivery())
+                .await?;
             tokio::select! {
                 _=&mut notified=>{},
-                _=tokio::time::sleep(Duration::from_secs(1))=>{},
+                _=async {
+                    if waiting {
+                        tokio::time::sleep(Duration::from_secs(1)).await
+                    } else {
+                        std::future::pending().await
+                    }
+                }=>{},
                 Some(result)=workers.join_next_with_id(),if !workers.is_empty()=>{
                     codex_workers.completed(&result);
                     result.context("Delivery task panicked")?;

@@ -46,6 +46,19 @@ fn fixed_address() -> String {
     )
 }
 
+/// User + system CPU time of this process in clock ticks (1/100 s).
+#[cfg(target_os = "linux")]
+fn cpu_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let fields: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
 fn spawns(log: &Path) -> usize {
     std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
 }
@@ -133,17 +146,29 @@ async fn idle_paired_brokers_never_list_native_sessions_but_peer_listing_still_w
     .await
     .expect("brokers never connected");
 
-    // Let the connect-time Hello/capability probe finish, then watch an idle
-    // window: the removed 5 s directory poll fired at least twice per side here.
+    // Idle window: nothing is pending, so nothing may poll. Zero spawns covers
+    // the old 5 s directory poll and the connect/60 s capability probe; the CPU
+    // budget covers the old 200 ms network loop re-reading the database.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let before = spawns(&log);
+    #[cfg(target_os = "linux")]
+    let cpu_before = cpu_ticks();
     tokio::time::sleep(Duration::from_secs(14)).await;
+    #[cfg(target_os = "linux")]
+    let cpu_used = cpu_ticks() - cpu_before;
+    // Debug build, two brokers plus libp2p in one process: the fixed tree uses
+    // about 50 ticks here, the 200 ms re-reading loop about 156.
+    #[cfg(target_os = "linux")]
+    assert!(
+        cpu_used < 110,
+        "idle paired brokers used {cpu_used} CPU ticks (1/100 s) in 14 s"
+    );
     assert_eq!(
         spawns(&log),
-        before,
+        0,
         "idle paired brokers spawned the native CLI: {}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
+    let before = spawns(&log);
 
     // On-demand peer listing still asks the peer to list natively.
     let listed = alice

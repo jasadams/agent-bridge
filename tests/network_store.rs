@@ -856,3 +856,76 @@ fn outbound_remote_uuid_collision_never_uses_local_codex_slots_or_concurrency() 
             .unwrap();
     assert_eq!(p.a.claim().unwrap().unwrap().0.id, message.id);
 }
+
+#[test]
+fn status_polling_is_needed_only_while_a_sent_message_awaits_a_final_state() {
+    let p = Pair::new();
+    assert!(!p.a.has_open_transfers(&p.bid).unwrap());
+    assert!(!p.a.has_unfinished_delivery().unwrap());
+    let env = p.send("hello");
+    assert!(p.a.has_open_transfers(&p.bid).unwrap());
+    assert!(
+        !p.a.has_unfinished_delivery().unwrap(),
+        "a queued message awaiting a remote transfer is not claimable locally"
+    );
+    p.a.transfer_result(
+        &p.bid,
+        &env.id,
+        &WireResponse::Accepted { id: env.id.clone() },
+    )
+    .unwrap();
+    let event = |sequence, state: &str| StatusEvent {
+        sequence,
+        id: env.id.clone(),
+        state: state.into(),
+        detail: None,
+        updated: 1,
+    };
+    p.a.apply_events(&p.bid, &[event(1, "submitted")]).unwrap();
+    assert!(
+        p.a.has_open_transfers(&p.bid).unwrap(),
+        "submitted can still become acknowledged or uncertain"
+    );
+    p.a.apply_events(&p.bid, &[event(2, "failed")]).unwrap();
+    assert!(
+        p.a.has_open_transfers(&p.bid).unwrap(),
+        "a destination retry of a failed message must still reach us"
+    );
+    // Ten minutes after the last event a failed message stops forcing a poll;
+    // later reports still arrive with the next Sync (the cursor is persisted).
+    let old = rusqlite::Connection::open(p._dir.path().join("a.sqlite")).unwrap();
+    old.execute("UPDATE outbound_transfers SET observed_at=1", [])
+        .unwrap();
+    assert!(!p.a.has_open_transfers(&p.bid).unwrap());
+    p.a.apply_events(&p.bid, &[event(3, "acknowledged")])
+        .unwrap();
+    assert!(!p.a.has_open_transfers(&p.bid).unwrap());
+    assert!(!p.a.has_unfinished_delivery().unwrap());
+    assert!(!p.a.has_open_transfers(&peer_id()).unwrap());
+}
+
+#[test]
+fn delivery_polling_covers_only_work_the_loop_can_act_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(&dir.path().join("messages.sqlite3")).unwrap();
+    let agent = |name: &str| Agent {
+        name: name.into(),
+        provider: Provider::Inbox,
+        session: name.into(),
+        endpoint: String::new(),
+    };
+    let (alice, bob) = (agent("alice"), agent("bob"));
+    db.register(&alice, false).unwrap();
+    db.register(&bob, false).unwrap();
+    assert!(!db.has_unfinished_delivery().unwrap());
+    let message = db.send(&id(), &alice, &bob, "hello", &None).unwrap();
+    assert!(db.has_unfinished_delivery().unwrap(), "queued is claimable");
+    let (claimed, _) = db.claim().unwrap().unwrap();
+    assert_eq!(claimed.id, message.id);
+    db.finish(&message.id, "uncertain", "ambiguous native attempt")
+        .unwrap();
+    assert!(
+        !db.has_unfinished_delivery().unwrap(),
+        "an uncertain message without an OpenCode reconcile phase waits for a manual retry"
+    );
+}

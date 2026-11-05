@@ -71,23 +71,18 @@ impl Default for Schedule {
 fn peer_routes(
     db: &Db,
     discovered: &[DiscoveredPeer],
+    relays: &[super::relay_config::RelayNode],
+    trusted: &HashSet<String>,
 ) -> Result<BTreeMap<String, Vec<libp2p::Multiaddr>>> {
     let mut routes: BTreeMap<String, Vec<libp2p::Multiaddr>> = BTreeMap::new();
-    let relays = db.relay_nodes()?;
     for (peer, address) in db.network_peers()? {
         if address.contains("/p2p-circuit/")
-            && super::relay_config::configured_circuit(&address, &peer, &relays).is_err()
+            && super::relay_config::configured_circuit(&address, &peer, relays).is_err()
         {
             continue;
         }
         routes.entry(peer).or_default().push(address.parse()?);
     }
-    let trusted: HashSet<_> = db
-        .peers()?
-        .into_iter()
-        .filter(|peer| !peer.revoked)
-        .map(|peer| peer.peer_id)
-        .collect();
     for entry in discovered.iter().take(256) {
         if !trusted.contains(&entry.peer_id) {
             continue;
@@ -312,7 +307,6 @@ fn complete_request(broker: &Broker, done: Completed, schedule: &mut Schedule) -
     if legacy_fallback {
         schedule.legacy = true;
         schedule.fallback = false;
-        schedule.probe = Instant::now() + Duration::from_secs(60);
     }
     Ok(())
 }
@@ -340,6 +334,10 @@ fn next_transfer(
                         retryable: false,
                     },
                 )?;
+                // A cached negative must not outlive this rejection: the next
+                // OpenCode send re-probes (the periodic probe no longer does).
+                schedule.legacy = false;
+                schedule.providers = None;
                 continue;
             }
             if schedule.send_permit.as_deref() != Some(&envelope.id) {
@@ -379,34 +377,59 @@ pub async fn run(broker: Broker) {
     let mut busy = HashSet::new();
     let mut schedules: HashMap<String, Schedule> = HashMap::new();
     let mut last_routes = BTreeMap::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut start_after = Instant::now();
     let mut last_error: Option<String> = None;
+    // Local changes always notify `network_wake`; only then (or without a
+    // transport) are config, name, relays and trusted peers re-read.
+    let mut dirty = true;
     loop {
         let notified = broker.network_wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let config_result = broker.db.lock().unwrap().network_config();
+        let refresh = std::mem::take(&mut dirty) || active.is_none();
+        let (config_result, machine_name, relays_result, allowed) = if refresh {
+            let db = broker.db.lock().unwrap();
+            let peers = db.peers().unwrap_or_else(|_| {
+                dirty = true;
+                Vec::new()
+            });
+            (
+                db.network_config(),
+                db.machine_name().unwrap_or_else(|_| {
+                    dirty = true;
+                    "agent-bridge".into()
+                }),
+                db.relay_nodes(),
+                peers
+                    .into_iter()
+                    .filter(|peer| !peer.revoked)
+                    .filter_map(|peer| peer.peer_id.parse::<libp2p::PeerId>().ok())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                Ok(configured.clone().unwrap()),
+                configured_name.clone().unwrap(),
+                Ok(configured_relays.clone()),
+                allowed_cache.clone(),
+            )
+        };
         let config = match config_result {
             Ok(config) => config,
             Err(error) => {
+                dirty = true;
                 *broker.network_status.lock().unwrap() =
                     json!({"enabled":false,"last_error":error.to_string()});
                 tick.tick().await;
                 continue;
             }
         };
-        let machine_name = broker
-            .db
-            .lock()
-            .unwrap()
-            .machine_name()
-            .unwrap_or_else(|_| "agent-bridge".into());
-        let relays_result = broker.db.lock().unwrap().relay_nodes();
         let relays = match relays_result {
             Ok(relays) => relays,
             Err(error) => {
+                dirty = true;
                 *broker.network_status.lock().unwrap() =
                     json!({"enabled":false,"last_error":error.to_string()});
                 tick.tick().await;
@@ -449,16 +472,6 @@ pub async fn run(broker: Broker) {
             last_error = None;
             *broker.network_status.lock().unwrap() = json!({"enabled":false});
         }
-        let allowed: Vec<_> = broker
-            .db
-            .lock()
-            .unwrap()
-            .peers()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|peer| !peer.revoked)
-            .filter_map(|peer| peer.peer_id.parse::<libp2p::PeerId>().ok())
-            .collect();
         if config.enabled && active.is_none() && Instant::now() >= start_after {
             let started = (|| -> Result<Transport> {
                 let identity = Identity::load_or_create(&broker.state_dir)?;
@@ -511,6 +524,7 @@ pub async fn run(broker: Broker) {
                         };
                         match paired {
                             Ok(_) => {
+                                dirty = true;
                                 let _ = manager.mark_paired(&trusted.id);
                             }
                             Err(error) => {
@@ -528,7 +542,10 @@ pub async fn run(broker: Broker) {
             if allowed_cache != allowed {
                 match transport.handle.set_allowed(allowed.clone()).await {
                     Ok(()) => allowed_cache = allowed,
-                    Err(error) => last_error = Some(error.to_string()),
+                    Err(error) => {
+                        dirty = true;
+                        last_error = Some(error.to_string());
+                    }
                 }
             }
             let open = broker
@@ -619,10 +636,10 @@ pub async fn run(broker: Broker) {
                     PairingCompleted { id: out.id, result }
                 }));
             }
-            let mut peers =
-                peer_routes(&broker.db.lock().unwrap(), &discovered).unwrap_or_default();
             // Infrastructure hints never create endpoint trust or session permissions.
             let trusted: HashSet<_> = allowed_cache.iter().map(ToString::to_string).collect();
+            let mut peers = peer_routes(&broker.db.lock().unwrap(), &discovered, &relays, &trusted)
+                .unwrap_or_default();
             for (peer, routes) in &public_routes {
                 if !trusted.contains(peer) {
                     continue;
@@ -664,9 +681,6 @@ pub async fn run(broker: Broker) {
                 }
                 let work = (|| -> Result<Option<(Kind, Operation)>> {
                     let db = broker.db.lock().unwrap();
-                    if !db.network_config()?.enabled {
-                        return Ok(None);
-                    }
                     if now >= schedule.hello {
                         schedule.hello = now + Duration::from_secs(300);
                         return Ok(Some((
@@ -690,16 +704,7 @@ pub async fn run(broker: Broker) {
                         }
                         return Ok(Some((Kind::Directory, Operation::Directory)));
                     }
-                    if now >= schedule.probe {
-                        schedule.probe = now + Duration::from_secs(60);
-                        return Ok(Some((
-                            Kind::DirectorySupported(None),
-                            Operation::DirectorySupported {
-                                providers: supported_providers(),
-                            },
-                        )));
-                    }
-                    if now >= schedule.sync {
+                    if now >= schedule.sync && db.has_open_transfers(&peer)? {
                         schedule.sync = now + Duration::from_secs(1);
                         return Ok(Some((
                             Kind::Sync,
@@ -736,7 +741,7 @@ pub async fn run(broker: Broker) {
                 json!({"enabled":false,"last_error":last_error});
         }
         tokio::select! {
-            _ = &mut notified => {},
+            _ = &mut notified => dirty = true,
             _ = tick.tick(), if config.enabled => {},
             incoming = async {
                 match active.as_mut() {
@@ -801,7 +806,9 @@ pub async fn run(broker: Broker) {
                 if matches!(done.kind, Kind::Hello) {
                     // Metadata is optional: old peers can reject this operation.
                     // Keep the unchanged v1 message protocol usable in either case.
-                    schedule.hello = Instant::now() + Duration::from_secs(if apply(&broker, done).is_ok() { 5 } else { 300 });
+                    // A rename clears every schedule and re-sends Hello at once;
+                    // otherwise Hello is refreshed every 300 s.
+                    let _ = apply(&broker, done);
                     schedule.next = Instant::now();
                     continue;
                 }
@@ -884,7 +891,6 @@ mod tests {
         .unwrap();
         assert!(schedule.legacy);
         assert!(!schedule.fallback);
-        assert!(schedule.probe > Instant::now());
     }
 
     #[test]
@@ -1014,7 +1020,9 @@ mod tests {
                 addresses: vec!["/ip4/192.168.1.22/udp/44002/quic-v1".into()],
             },
         ];
-        let routes = peer_routes(&db, &discoveries).unwrap();
+        let relays = db.relay_nodes().unwrap();
+        let allowed = HashSet::from([trusted.clone()]);
+        let routes = peer_routes(&db, &discoveries, &relays, &allowed).unwrap();
         assert_eq!(routes.len(), 1);
         let addresses = &routes[&trusted];
         assert_eq!(addresses.len(), 2);
@@ -1023,13 +1031,20 @@ mod tests {
             addresses[1].to_string(),
             "/ip4/192.168.1.21/udp/44002/quic-v1"
         );
-        assert_eq!(peer_routes(&db, &[]).unwrap()[&trusted].len(), 1);
+        assert_eq!(
+            peer_routes(&db, &[], &relays, &allowed).unwrap()[&trusted].len(),
+            1
+        );
         assert!(
             !db.peer_allowed(&trusted, &Provider::Inbox, "user", Permission::Receive)
                 .unwrap()
         );
         db.revoke_peer(&trusted).unwrap();
-        assert!(peer_routes(&db, &discoveries).unwrap().is_empty());
+        assert!(
+            peer_routes(&db, &discoveries, &relays, &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
