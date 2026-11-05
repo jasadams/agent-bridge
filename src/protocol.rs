@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 256 * 1024;
+
+/// Non-empty spelling of the empty "start from the beginning" cursor. Some MCP
+/// clients drop empty-string arguments and send invalid JSON, so every cursor
+/// whose documented start value is empty also accepts this. It cannot collide
+/// with a real cursor, which is base64url of JSON.
+pub const START_CURSOR: &str = "start";
 pub const MAX_BODY: usize = 64 * 1024;
 pub const MAX_REPLY_HOPS: u32 = 100;
 
@@ -240,7 +246,7 @@ pub enum Request {
         #[serde(default = "history_limit")]
         limit: usize,
     },
-    /// Creation-only incremental history in insertion order. An empty cursor starts a scan.
+    /// Creation-only incremental history in insertion order. An empty cursor, or `start`, starts a scan.
     HistorySince {
         #[serde(default)]
         agent: Option<String>,

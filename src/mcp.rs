@@ -103,7 +103,7 @@ struct TopicPublish {
 struct TopicRead {
     /// Exact topic UUID, not a name. Omitted/null bridge_id means local; nonlocal is unsupported.
     topic: TopicRef,
-    /// Omit for latest posts; empty starts a full scan. Reuse next_cursor for forward reads.
+    /// Omit for latest posts; "start" (or empty) starts a full scan. Reuse next_cursor for forward reads.
     cursor: Option<String>,
     /// Pass previous_cursor for older posts; mutually exclusive with cursor.
     before: Option<String>,
@@ -153,7 +153,7 @@ fn max_age_days() -> u32 {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Messages {
-    /// Omit for recent history; use an empty string to start incremental reads, then reuse the returned cursor. Creation-only; use get_message for delivery updates.
+    /// Omit for recent history; use an empty string or start to begin incremental reads, then reuse the returned cursor. Creation-only; use get_message for delivery updates.
     cursor: Option<String>,
     agent: Option<String>,
     #[serde(default = "history_limit")]
@@ -622,7 +622,7 @@ impl Bridge {
     }
 
     #[tool(
-        description = "Read local topic posts on demand, default 50, maximum 100. Omit cursor for the latest window, empty cursor scans from the start, next_cursor moves forward, previous_cursor as before loads older. cursor and before are exclusive. Returns both cursors, has_more, has_older and high_water unchanged. Oversized pages fail without truncation; reduce limit. No receipt or delivery bookkeeping.",
+        description = "Read local topic posts on demand, default 50, maximum 100. Omit cursor for the latest window, cursor start (or empty) scans from the start, next_cursor moves forward, previous_cursor as before loads older. cursor and before are exclusive. Returns both cursors, has_more, has_older and high_water unchanged. Oversized pages fail without truncation; reduce limit. No receipt or delivery bookkeeping.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -902,7 +902,7 @@ impl Bridge {
         .await
     }
     #[tool(
-        description = "Read 1–100 messages. Omit cursor for recent history; cursor=empty starts oldest-first incremental pages. Reuse the returned cursor for new messages.",
+        description = "Read 1–100 messages. Omit cursor for recent history; cursor=empty or start begins oldest-first incremental pages. Reuse the returned cursor for new messages.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

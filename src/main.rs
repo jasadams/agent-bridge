@@ -632,7 +632,7 @@ enum TopicAction {
         #[arg(long, default_value = "[]")]
         mentions: String,
     },
-    /// Read chronological bounded pages; no cursor means latest, --cursor '' starts at zero.
+    /// Read chronological bounded pages; no cursor means latest, --cursor start (or '') starts at zero.
     Read {
         #[command(flatten)]
         target: TopicTarget,
