@@ -664,6 +664,8 @@ async fn topic_action(request: Request<Incoming>, app: App) -> Response<Body> {
                     &Default::default())?),
             })
         })();
+        // A publish queues push messages; the idle delivery loop has no timer.
+        broker.wake.notify_one();
         match result {
             Ok(value) => json_response(value),
             Err(problem) if problem.to_string().starts_with("topic_") =>

@@ -861,11 +861,11 @@ fn outbound_remote_uuid_collision_never_uses_local_codex_slots_or_concurrency() 
 fn status_polling_is_needed_only_while_a_sent_message_awaits_a_final_state() {
     let p = Pair::new();
     assert!(!p.a.has_open_transfers(&p.bid).unwrap());
-    assert!(!p.a.has_unfinished_delivery().unwrap());
+    assert!(!p.a.has_claimable().unwrap());
     let env = p.send("hello");
     assert!(p.a.has_open_transfers(&p.bid).unwrap());
     assert!(
-        !p.a.has_unfinished_delivery().unwrap(),
+        !p.a.has_claimable().unwrap(),
         "a queued message awaiting a remote transfer is not claimable locally"
     );
     p.a.transfer_result(
@@ -900,14 +900,15 @@ fn status_polling_is_needed_only_while_a_sent_message_awaits_a_final_state() {
     p.a.apply_events(&p.bid, &[event(3, "acknowledged")])
         .unwrap();
     assert!(!p.a.has_open_transfers(&p.bid).unwrap());
-    assert!(!p.a.has_unfinished_delivery().unwrap());
+    assert!(!p.a.has_claimable().unwrap());
     assert!(!p.a.has_open_transfers(&peer_id()).unwrap());
 }
 
 #[test]
 fn delivery_polling_covers_only_work_the_loop_can_act_on() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Db::open(&dir.path().join("messages.sqlite3")).unwrap();
+    let path = dir.path().join("messages.sqlite3");
+    let mut db = Db::open(&path).unwrap();
     let agent = |name: &str| Agent {
         name: name.into(),
         provider: Provider::Inbox,
@@ -917,15 +918,41 @@ fn delivery_polling_covers_only_work_the_loop_can_act_on() {
     let (alice, bob) = (agent("alice"), agent("bob"));
     db.register(&alice, false).unwrap();
     db.register(&bob, false).unwrap();
-    assert!(!db.has_unfinished_delivery().unwrap());
+    assert!(!db.has_claimable().unwrap());
+    assert!(db.next_reconcile_in().unwrap().is_none());
     let message = db.send(&id(), &alice, &bob, "hello", &None).unwrap();
-    assert!(db.has_unfinished_delivery().unwrap(), "queued is claimable");
+    assert!(db.has_claimable().unwrap(), "queued is claimable");
     let (claimed, _) = db.claim().unwrap().unwrap();
     assert_eq!(claimed.id, message.id);
     db.finish(&message.id, "uncertain", "ambiguous native attempt")
         .unwrap();
     assert!(
-        !db.has_unfinished_delivery().unwrap(),
-        "an uncertain message without an OpenCode reconcile phase waits for a manual retry"
+        !db.has_claimable().unwrap() && db.next_reconcile_in().unwrap().is_none(),
+        "an uncertain message without an OpenCode receipt waits for a manual retry"
+    );
+    // An unresolved OpenCode receipt is swept when its backoff is due: sleep
+    // until then (here ~2 minutes) instead of polling every second.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let insert = |due: i64| {
+        conn.execute("DELETE FROM opencode_deliveries", []).unwrap();
+        conn.execute(
+            "INSERT INTO opencode_deliveries(id,session,namespace,native_id,phase,deadline,reconcile_at) VALUES(?1,'bob','n','pending','uncertain',0,?2)",
+            rusqlite::params![message.id, due],
+        )
+        .unwrap();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    insert(now + 120_000);
+    let wait = db.next_reconcile_in().unwrap().unwrap();
+    assert!(wait.as_secs() > 100 && wait.as_secs() <= 120, "{wait:?}");
+    assert!(!db.has_claimable().unwrap());
+    insert(now - 1);
+    assert_eq!(
+        db.next_reconcile_in().unwrap(),
+        Some(std::time::Duration::from_secs(1)),
+        "a due receipt is swept on the next pass"
     );
 }

@@ -60,15 +60,15 @@ impl PluginSocket {
                 };
                 let bytes = format!("{response}\n");
                 if let Err(error) = stream.write_all(bytes.as_bytes()) {
-                    // Oversized-receipt tests intentionally make the client close
-                    // at its frame bound, before the fixture finishes writing.
+                    // The client may legitimately be gone: oversized-receipt tests
+                    // make it close at its frame bound, and a test that has seen
+                    // its outcome aborts the broker while a follow-up reconcile
+                    // attempt is still in flight. Anything else is a real failure.
                     assert!(
-                        bytes.len() > agent_bridge::protocol::MAX_FRAME
-                            && matches!(
-                                error.kind(),
-                                std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::ConnectionReset
-                            ),
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ),
                         "Unexpected fixture write failure: {error}"
                     );
                 }
