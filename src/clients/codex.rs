@@ -308,7 +308,6 @@ pub fn validate_session(session: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Agent;
     use std::os::unix::fs::PermissionsExt;
     async fn fixture(
         mode: &str,
@@ -563,44 +562,6 @@ mod tests {
                 .iter()
                 .any(|r| r["method"] == "thread/queue/add" || r["method"] == "turn/steer")
         );
-    }
-
-    #[tokio::test]
-    async fn topic_epoch_is_checked_after_codex_metadata_before_native_write() {
-        for revoke in [true, false] {
-            let (root, path, home, task, _ready) = fixture("ok").await;
-            let agent = Agent {
-                name: "codex-race".into(),
-                provider: crate::protocol::Provider::Codex,
-                session: "123e4567-e89b-12d3-a456-426614174000".into(),
-                endpoint: String::new(),
-            };
-            let topic =
-                super::super::topic_race_fixture::Fixture::new(&root.path().join("state"), agent);
-            let outcome = deliver_until_guarded(
-                vec![path],
-                &home,
-                &topic.message,
-                "topic notice",
-                tokio::time::sleep(Duration::from_secs(5)),
-                Some(topic.guard(revoke)),
-            )
-            .await;
-            let requests = task.await.unwrap();
-            assert!(requests.iter().any(|r| r["method"] == "thread/read"));
-            let writes = requests
-                .iter()
-                .filter(|r| r["method"] == "thread/queue/add" || r["method"] == "turn/steer")
-                .count();
-            if revoke {
-                assert_eq!(outcome.state, "failed");
-                assert_eq!(writes, 0);
-            } else {
-                assert_eq!(outcome.state, "submitted");
-                assert_eq!(writes, 1);
-                topic.unsubscribe(); // Accepted native work is not retracted.
-            }
-        }
     }
 
     #[tokio::test]

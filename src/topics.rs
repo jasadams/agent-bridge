@@ -444,12 +444,7 @@ fn schedule_topic_pushes(tx: &Transaction<'_>, post: &TopicPost) -> Result<()> {
                                 message_id
                             ],
                         )?;
-                        tx.execute("UPDATE message_context SET source=json_object('kind','topic_push','peer_id',NULL,'machine_name',(SELECT value FROM settings WHERE key='machine_name'),'agent',NULL,'provider',NULL,'session',NULL,'topic_author',?1,'topic_bridge',?2),destination=json_set(destination,'$.control_notice',1,'$.topic_push',1) WHERE id=?3",params![post.author.agent_id,local,message_id])?;
-                        if provider == Provider::Codex {
-                            tx.execute("INSERT INTO codex_notices VALUES(?)", [&message_id])?;
-                        } else if provider == Provider::OpenCode {
-                            tx.execute("UPDATE opencode_deliveries SET content=? WHERE id=? AND phase='queued'",params![text,message_id])?;
-                        }
+                        tx.execute("UPDATE message_context SET source=json_object('kind','topic_push','peer_id',NULL,'machine_name',(SELECT value FROM settings WHERE key='machine_name'),'agent',NULL,'provider',NULL,'session',NULL,'topic_author',?1,'topic_bridge',?2),destination=json_set(destination,'$.control_notice',1) WHERE id=?3",params![post.author.agent_id,local,message_id])?;
                         tx.execute_batch("RELEASE topic_push_enqueue")?;
                     }
                     Err(error) => {

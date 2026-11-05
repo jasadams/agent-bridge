@@ -2257,24 +2257,6 @@ impl Broker {
             broker.authorize_event_locked(&db, &agent, &token)
         })
     }
-    pub(crate) fn topic_push_guard(
-        &self,
-        agent: &crate::protocol::Agent,
-        id: &str,
-    ) -> crate::clients::NoticeGuard {
-        let broker = self.clone();
-        let agent = agent.clone();
-        let id = id.to_owned();
-        Arc::new(move || {
-            let db = broker.db.lock().unwrap();
-            ensure!(!db.paused()?, "Topic delivery paused");
-            ensure!(
-                db.topic_push_authorize(&id, &agent)?,
-                "Topic work is missing"
-            );
-            Ok(())
-        })
-    }
     fn authorize_event_locked(
         &self,
         db: &Db,
@@ -2681,31 +2663,17 @@ impl Broker {
                         } else { None };
                         let raw_codex_notice = agent.provider == Provider::Codex && db.codex_is_notice(&msg.id)?;
                         let event_token = db.event_control_token(&msg.id)?;
-                        let topic_push: bool = db.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_push_work WHERE message_id=?)",[&msg.id],|row|row.get(0))?;
-                        Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch, raw_codex_notice, event_token, topic_push)))
+                        Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch, raw_codex_notice, event_token)))
                     }).transpose()?.flatten())
                 }).await?;
-                let Some((
-                    msg,
-                    agent,
-                    machines,
-                    dispatch,
-                    raw_codex_notice,
-                    event_token,
-                    topic_push,
-                )) = next
+                let Some((msg, agent, machines, dispatch, raw_codex_notice, event_token)) = next
                 else {
                     break;
                 };
                 let this = self.clone();
                 let worker_agent = agent.clone();
                 let worker = workers.spawn(async move {
-                    let mut outcome = if topic_push && agent.provider == Provider::Claude {
-                        let guard = this.topic_push_guard(&agent, &msg.id);
-                        crate::clients::claude::deliver_guarded(&agent, &msg, &msg.body, Some(&guard)).await
-                    } else if topic_push && agent.provider == Provider::Codex {
-                        crate::clients::codex::deliver_guarded(&msg, &msg.body, Some(this.topic_push_guard(&agent, &msg.id))).await
-                    } else if raw_codex_notice {
+                    let mut outcome = if raw_codex_notice {
                         if let Some(token) = &event_token {
                             crate::clients::codex::deliver_guarded(
                                 &msg,
@@ -3030,6 +2998,79 @@ mod request_scheduling_tests {
             elapsed < Duration::from_millis(200),
             "database contention blocked the async runtime for {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn claude_topic_notification_uses_the_direct_message_frame() {
+        use crate::topics::{AgentRef, TopicLimits, TopicPublication};
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncReadExt;
+        let root = tempfile::Builder::new()
+            .prefix("ab-topic-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.path().join("native.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let agent = crate::protocol::Agent {
+            name: "claude-topic".into(),
+            provider: Provider::Claude,
+            session: uuid::Uuid::new_v4().to_string(),
+            endpoint: socket.to_string_lossy().into_owned(),
+        };
+        let bound = Broker::bind(root.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = bound.broker.clone();
+        {
+            let mut db = broker.db.lock().unwrap();
+            db.claude_bind(&agent.session, &agent.endpoint).unwrap();
+            db.register(&agent, false).unwrap();
+            let local = libp2p_identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id()
+                .to_string();
+            let topic = db
+                .topic_create(&local, "Parity", &TopicLimits::default())
+                .unwrap()
+                .reference;
+            let identity = AgentRef {
+                bridge_id: None,
+                agent_id: format!("claude-{}", agent.session),
+            };
+            db.topic_push_set(&local, &topic, &identity, "all").unwrap();
+            db.topic_publish(
+                &local,
+                &TopicPublication {
+                    topic,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    author: AgentRef {
+                        bridge_id: None,
+                        agent_id: "inbox-user".into(),
+                    },
+                    body: "hello topic".into(),
+                    parent: None,
+                    mentions: vec![],
+                },
+                &TopicLimits::default(),
+            )
+            .unwrap();
+        }
+        let dispatcher = tokio::spawn(async move { broker.dispatch().await });
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        dispatcher.abort();
+        let frame: Value = serde_json::from_slice(&bytes).unwrap();
+        let content = frame["message"]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("<cross-session-message from-name=\"@topic\">"),
+            "topic notification must use the DM renderer, got: {content}"
+        );
+        assert!(content.contains("Agent Bridge topic notification"));
+        assert!(content.contains("Reply to: @topic"));
     }
 
     #[tokio::test(flavor = "current_thread")]
