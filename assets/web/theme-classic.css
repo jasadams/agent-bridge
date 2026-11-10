@@ -1,0 +1,5 @@
+/* Classic: the look the interface shipped with in v0.5.0 (dark teal, lime accent, system fonts,
+   rounded panels). It is the base look defined by the tokens in style.css, so this sheet only
+   exists so that every theme is a file the theme picker can load. Classic keeps the lime "ab"
+   brand mark; the Sticker Bomb mark is hidden by default in style.css. */
+:root[data-theme="classic"] { color-scheme: dark; }

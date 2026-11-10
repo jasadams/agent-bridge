@@ -1,6 +1,6 @@
 "use strict";
 // No credentials, private drafts or board snapshots leave this tab's memory.
-window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) => {
+window.createBoardMonitor = ({ request, connect, authenticated, onViewChange, onCatalog }) => {
   const $ = id => document.getElementById(id);
   const tags = new Set("p h1 h2 h3 h4 h5 h6 blockquote ul ol li pre code em strong del table thead tbody tr th td hr br a span".split(" "));
   let active = false, authEpoch = 0, boardEpoch = 0, sequence = 0;
@@ -124,6 +124,11 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     while (selector.options.length > desired.length) selector.lastElementChild.remove();
     // Setting the same value needlessly can close native selector popups.
     if (selector.value !== board) selector.value = board;
+    publishCatalog();
+  }
+  // The sidebar mirrors this list. The hidden selector remains the single source of truth.
+  function publishCatalog() {
+    if (onCatalog) onCatalog(Array.from($("board-selector").options, option => option.value), board);
   }
   function validateCatalog(data) {
     if (!data || !Array.isArray(data.boards) || data.boards.length > 256) throw new Error("Invalid board list");
@@ -335,7 +340,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     text($("board-raw"), view.markdown);
     let document;
     try { document = renderNodes(view.nodes, !view.render_notice); }
-    catch { document = window.document.createDocumentFragment(); document.append(node("pre", typeof view.display_markdown === "string" ? view.display_markdown : "This document exceeds the rendering limit. Use Raw Markdown to inspect its exact source.", "board-render-fallback")); }
+    catch { document = window.document.createDocumentFragment(); document.append(node("pre", typeof view.display_markdown === "string" ? view.display_markdown : "This document exceeds the rendering limit. It is too large to show here.", "board-render-fallback")); }
     if (!view.markdown) document.append(node("p", view.exists ? "This board is empty." : "main has not been written yet.", "help"));
     if (view.control_notice) document.prepend(node("p", view.control_notice, "help notice"));
     if (view.render_notice) document.prepend(node("p", view.render_notice, "help notice"));
@@ -679,7 +684,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     stop(); renderTimestamp(null); copySequence++; text($("board-copy-feedback"), ""); boardEpoch++; authorityEpoch++; authority = null; messageLabels = {}; board = name; shown = null; latest = null; draft = null; backoff = 1000;
     for (const m of messageDrafts.values()) m.row.hidden = true;
     $("board-messages").hidden = true;
-    $("selected-board-name").textContent = board; $("board-selector").value = board;
+    $("selected-board-name").textContent = board; $("board-selector").value = board; publishCatalog();
     $("board-controls").append($("response-editor")); $("board-document").replaceChildren(); $("board-raw").textContent = ""; controlRows.clear(); renderEditor(); error(""); status("Loading board…");
     const selected = capture();
     await refresh();
@@ -704,7 +709,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     board = "main"; shown = null; latest = null; draft = null; saving = false; raw = false; backoff = 1000;
     $("board-controls").append($("response-editor")); $("board-document").replaceChildren(); $("board-raw").textContent = ""; controlRows.clear(); $("board-selector").replaceChildren();
     $("selected-board-name").textContent = "main"; $("response-heading").textContent = "Edit response"; $("response-intent").textContent = "";
-    $("board-newer").hidden = true; $("board-raw-toggle").setAttribute("aria-pressed", "false"); renderEditor(); lifecycleUI(); text($("board-lifecycle-status"), ""); error(""); status("Choose Boards to load main.");
+    $("board-newer").hidden = true; renderEditor(); lifecycleUI(); text($("board-lifecycle-status"), ""); error(""); status("Choose Boards to load main.");
   }
   function closeArchives() {
     archivedEpoch++; archivedAbort?.abort(); archivedAbort = null;
@@ -749,7 +754,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
       }
       $("archived-list").replaceChildren(...rows);
       text($("archived-feedback"), archivedActionFeedback || (rows.length ? "" : "No archived boards.")); lifecycleUI();
-    } catch (e) { if (live() && e.name !== "AbortError") text($("archived-feedback"), "Archived boards unavailable. Refresh to try again; no operation was retried."); }
+    } catch (e) { if (live() && e.name !== "AbortError") text($("archived-feedback"), "Archived boards unavailable. Try again; no operation was retried."); }
     finally { clearTimeout(deadline); if (live()) archivedAbort = null; }
   }
   async function prepareArchive() {
@@ -890,9 +895,7 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
     }
   });
   $("board-selector").addEventListener("change", e => { const name = e.target.value; e.target.value = board; void choose(name); });
-  $("board-refresh").addEventListener("click", () => { catchUpCatalog(); if (draft || selectionHeld()) void review(); else void readSnapshot(true); });
   $("board-review-refresh").addEventListener("click", () => { void review(); });
-  $("board-raw-toggle").addEventListener("click", () => { raw = !raw; $("board-raw-toggle").setAttribute("aria-pressed", String(raw)); $("board-document").hidden = raw; $("board-raw").hidden = !raw; renderEditor(); });
   $("response-text").addEventListener("input", e => { if (draft && !saving && draft.kind === "text") draft.value = e.target.value; });
   $("response-save").addEventListener("click", () => { void saveDraft(); });
   $("response-cancel").addEventListener("click", () => { if (!saving) { discard(); status("Response cancelled; nothing was saved by Cancel."); } });
@@ -909,5 +912,5 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange }) 
   window.addEventListener("online", catchUpCatalog);
   window.addEventListener("focus", catchUpCatalog);
   window.addEventListener("beforeunload", e => { if (dirty() || saving || messageDirty() || messagePending() || lifecycleOperation) { e.preventDefault(); e.returnValue = ""; } });
-  return { open, leave, clear, hasDraft: () => dirty() || messageDirty() || !!lifecycleOperation };
+  return { open, leave, clear, select: name => choose(name), current: () => board, hasDraft: () => dirty() || messageDirty() || !!lifecycleOperation };
 };

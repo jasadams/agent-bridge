@@ -27,14 +27,14 @@ setups can choose binary-only mode and run `serve` under their own supervisor.
 
 ```sh
 agent-bridge status
-agent-bridge monitor enable
+agent-bridge web enable
 ```
 
-Open the monitor's private `access_url` to unlock automatically, or open the plain
+Open the web interface's private `access_url` to unlock automatically, or open the plain
 loopback `url` and paste its separate access token. The private link uses a fragment
 that the page immediately removes; treat the complete link like a password. See
-[monitor access](local-monitor.md#browser-access). Peer networking and monitor
-access remain independently controlled. A fresh installation enables neither peer networking nor the monitor.
+[web access](web.md#browser-access). Peer networking and web
+access remain independently controlled. A fresh installation enables neither peer networking nor the web interface.
 Open an existing Codex or Claude session to use native delivery. Claude registration
 hooks can be installed separately with `agent-bridge hooks install`; hook trust and
 native permissions remain your choices.

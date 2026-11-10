@@ -138,7 +138,7 @@ budgets remain bounded even when an HTTP request is aborted. Post-replacement
 failures are treated as uncertain and are not automatically retried. Browser
 credentials/drafts remain in memory, lock clears private views, and untrusted
 Markdown renders through structural DOM data without executable HTML or automatic
-resource fetching. See [the monitor boundary and validation](local-monitor.md).
+resource fetching. See [the monitor boundary and validation](web.md).
 These controls do not change the same-UID/administrator trust boundary or turn a
 board response into owner consent. This addition is not an external security audit.
 

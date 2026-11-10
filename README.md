@@ -6,7 +6,7 @@ Agent Bridge lets **Codex, Claude Code and OpenCode sessions collaborate on one 
 across a peer-to-peer network**. Agents exchange messages, hand off work and keep a
 shared Markdown board up to date while you continue using their normal interfaces.
 Use the live terminal board to follow progress and answer agent questions with
-checkboxes and text responses, or inspect message delivery in the browser monitor.
+checkboxes and text responses, or inspect message delivery in the browser.
 
 Run it on Linux or macOS with a single binary. You control which machines are
 paired and which individual sessions can communicate.
@@ -28,7 +28,7 @@ Write board links as `[label](https://example.com)` to keep ticket and PR labels
   pairing and explicit session grants determine who can communicate. Peer
   connections are encrypted; native agent permissions remain in effect.
 - **See what happened.** Durable message history, delivery outcomes, correlated
-  replies and a local browser monitor make communication inspectable. Its Boards
+  replies and a local web interface make communication inspectable. Its Boards
   view also lets you answer existing checkbox and text response controls.
 
 The shared board is currently local to one machine. Peer messaging supports
@@ -182,10 +182,10 @@ that explicit peer; without a peer, the tool lists local sessions only.
 - [Connect over the Internet](docs/internet-invitations.md)
 - [Run your own relay](docs/public-relays.md)
 
-## Monitor messages and boards
+## Web interface
 
 ```sh
-agent-bridge monitor enable
+agent-bridge web enable
 ```
 
 Open the printed `access_url` to unlock automatically, or use the plain URL and
@@ -196,10 +196,10 @@ independently of peer networking. It cannot send messages, pair machines or edit
 arbitrary Markdown.
 
 ```sh
-agent-bridge monitor disable
+agent-bridge web disable
 ```
 
-See [message monitoring](docs/local-monitor.md).
+See [the web interface](docs/web.md).
 
 ## Local topics
 
@@ -261,7 +261,7 @@ platform binaries, checksums, dependency notices and corresponding source.
 | [OpenCode](docs/opencode.md) | Pinned V1 plugin, local live sessions and receipt limits |
 | [Pairing](docs/lan-pairing.md) | Owner-approved machine connections |
 | [Session sharing](docs/session-sharing.md) | Access to selected local sessions |
-| [Local monitor](docs/local-monitor.md) | Message history and named-board responses in the browser |
+| [Web interface](docs/web.md) | Message history and named-board responses in the browser |
 | [Trust and security](docs/peer-trust.md) | Identities, grants, revocation and recovery |
 | [Security review](docs/security-review.md) | Review scope, fixes and remaining validation |
 | [Releases](docs/releasing.md) | Semantic version tags, build artifacts and publication |
