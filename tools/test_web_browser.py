@@ -311,6 +311,11 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     page.locator("#dm-messages .msg__actions button").first.click(force=True)
     page.wait_for_selector("#panel:not([hidden]) .detail-grid", timeout=10000)
     report.check(f"{tag} delivery details open in the side panel", page.locator("#panel-title").inner_text() == "Delivery details")
+    cases = page.evaluate("""() => ["claude-bridge", "codex-kyomi", "reviewer", "claude-3f9a1c2e-5b7d-4e90-8a11-c0ffee123456", "opencode-ses_2f8a91c3bd4eFg7Hk", "codex-abcdefgh-ijkl", "codex-release2024-final", "user"].map(n => window.AB.friendlyAgent(n))""")
+    report.check(f"{tag} chosen names stay as they are and generated ids become 'Provider xxxx'", cases == ["claude-bridge", "codex-kyomi", "reviewer", "Claude 3456", "OpenCode g7hk", "codex-abcdefgh-ijkl", "codex-release2024-final", "user"], str(cases))
+    # time-ordered ids (UUIDv7, opencode) share their start, so the label must come from the random end
+    close = page.evaluate("""() => ["codex-019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b", "codex-019a1b2c-3d4e-7f80-9a1b-2c3d4e5f0c9d", "opencode-ses_2f8a91c3bd4eAAAA1111", "opencode-ses_2f8a91c3bd4eBBBB2222"].map(n => window.AB.friendlyAgent(n))""")
+    report.check(f"{tag} agents created close together get different labels", close[0] != close[1] and close[2] != close[3], str(close))
     page.screenshot(path=str(out / f"{theme}-dm.png"))
     page.click("#panel-close")
     report.check(f"{tag} panel closes", page.locator("#panel").is_hidden())

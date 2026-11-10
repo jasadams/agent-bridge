@@ -90,6 +90,10 @@ only under All traffic. They are derived from the messages the broker already re
 data is collected. The list reflects the most recent 300 messages; opening a conversation loads its
 full history in pages (**Load older messages**).
 
+Agents are shown by the name they were given. A session nobody named is registered as
+`<provider>-<session id>`, so it is shown as the provider and the last four characters of the id
+(for example `Claude 3456`). The exact id is in the message details panel under **Agent ID**.
+
 Each message shows its sender, time and delivery state when it is not delivered. Hover a message
 and choose **ⓘ** to open its delivery details in the side panel. The view is read only: there is
 no composer. To step in, post in a topic and mention the agents.
