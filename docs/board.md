@@ -91,7 +91,7 @@ snapshots. Never modify board files directly through a shell or editor. If the
 tools are unavailable, report the blocker and restore the broker/MCP connection;
 do not bypass it with direct file writes. There is no extra server or binary.
 
-The existing [local web monitor](local-monitor.md) also has a Boards view. It
+The existing [web interface](web.md) also has a Boards view. It
 lists named boards, renders their Markdown and lets you answer the same existing
 checkbox and marked text controls inline, beside their questions. Valid text
 fields offer multiline editing with Save and Cancel; Raw Markdown keeps every
@@ -146,7 +146,7 @@ If an archive/restore outcome is uncertain, inspect the originating board rather
 than automatically repeating it. In the TUI, Ctrl-D explicitly releases uncertain
 tracking; it does not cancel an operation that may already have committed.
 
-The [web viewer](local-monitor.md#archive-and-restore) has the same Archive,
+The [web viewer](web.md#archive-and-restore) has the same Archive,
 Archived boards and Restore operations. Agents and scripts use the same broker
 through CLI or [MCP lifecycle tools](mcp.md#archive-and-restore):
 

@@ -159,6 +159,91 @@ impl App {
 fn body(bytes: impl Into<Bytes>) -> Body {
     Full::new(bytes.into()).boxed_unsync()
 }
+/// Static files for the web interface. Everything is embedded in the executable: there is no asset
+/// directory, download or CDN at runtime. Theme sheets are separate files so only the selected
+/// theme (and its fonts) is ever requested.
+struct Asset {
+    path: &'static str,
+    content_type: &'static str,
+    bytes: &'static [u8],
+}
+const HTML: &str = "text/html; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+const JS: &str = "text/javascript; charset=utf-8";
+const SVG: &str = "image/svg+xml";
+const WOFF2: &str = "font/woff2";
+const ASSETS: &[Asset] = &[
+    Asset {
+        path: "/",
+        content_type: HTML,
+        bytes: include_bytes!("../assets/web/index.html"),
+    },
+    Asset {
+        path: "/style.css",
+        content_type: CSS,
+        bytes: include_bytes!("../assets/web/style.css"),
+    },
+    Asset {
+        path: "/theme.js",
+        content_type: JS,
+        bytes: include_bytes!("../assets/web/theme.js"),
+    },
+    Asset {
+        path: "/theme-classic.css",
+        content_type: CSS,
+        bytes: include_bytes!("../assets/web/theme-classic.css"),
+    },
+    Asset {
+        path: "/theme-sticker.css",
+        content_type: CSS,
+        bytes: include_bytes!("../assets/web/theme-sticker.css"),
+    },
+    Asset {
+        path: "/util.js",
+        content_type: JS,
+        bytes: include_bytes!("../assets/web/util.js"),
+    },
+    Asset {
+        path: "/markdown.js",
+        content_type: JS,
+        bytes: include_bytes!("../assets/web/markdown.js"),
+    },
+    Asset {
+        path: "/boards.js",
+        content_type: JS,
+        bytes: include_bytes!("../assets/web/boards.js"),
+    },
+    Asset {
+        path: "/topics.js",
+        content_type: JS,
+        bytes: include_bytes!("../assets/web/topics.js"),
+    },
+    Asset {
+        path: "/app.js",
+        content_type: JS,
+        bytes: include_bytes!("../assets/web/app.js"),
+    },
+    Asset {
+        path: "/favicon.svg",
+        content_type: SVG,
+        bytes: include_bytes!("../assets/web/favicon.svg"),
+    },
+    Asset {
+        path: "/fonts/bricolage-var.woff2",
+        content_type: WOFF2,
+        bytes: include_bytes!("../assets/web/fonts/bricolage-var.woff2"),
+    },
+    Asset {
+        path: "/fonts/space-mono-400.woff2",
+        content_type: WOFF2,
+        bytes: include_bytes!("../assets/web/fonts/space-mono-400.woff2"),
+    },
+    Asset {
+        path: "/fonts/space-mono-700.woff2",
+        content_type: WOFF2,
+        bytes: include_bytes!("../assets/web/fonts/space-mono-700.woff2"),
+    },
+];
 fn response(
     status: StatusCode,
     content_type: &'static str,
@@ -178,7 +263,7 @@ fn response(
         "cross-origin-resource-policy",
         "same-origin".parse().unwrap(),
     );
-    headers.insert("content-security-policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'".parse().unwrap());
+    headers.insert("content-security-policy", "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'".parse().unwrap());
     response
 }
 fn error(status: StatusCode, message: &'static str) -> Response<Body> {
@@ -235,7 +320,7 @@ fn authorized(request: &Request<Incoming>, expected: &str) -> bool {
 }
 async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, Infallible> {
     if !app.current() {
-        return Ok(error(StatusCode::UNAUTHORIZED, "Monitor access expired"));
+        return Ok(error(StatusCode::UNAUTHORIZED, "Web access expired"));
     }
     if !safe_context(&request, &app) {
         return Ok(error(
@@ -246,7 +331,7 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
     if !app.rate.lock().unwrap().allow() {
         return Ok(error(
             StatusCode::TOO_MANY_REQUESTS,
-            "Monitor request limit reached",
+            "Web request limit reached",
         ));
     }
     let path = request.uri().path().to_owned();
@@ -308,38 +393,13 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
     {
         return Ok(error(StatusCode::BAD_REQUEST, "Unexpected query"));
     }
+    if let Some(asset) = ASSETS.iter().find(|asset| asset.path == path) {
+        return Ok(response(StatusCode::OK, asset.content_type, asset.bytes));
+    }
     let response = match path.as_str() {
-        "/" => response(
-            StatusCode::OK,
-            "text/html; charset=utf-8",
-            include_str!("../assets/monitor/index.html"),
-        ),
-        "/style.css" => response(
-            StatusCode::OK,
-            "text/css; charset=utf-8",
-            include_str!("../assets/monitor/style.css"),
-        ),
-        "/boards.js" => response(
-            StatusCode::OK,
-            "text/javascript; charset=utf-8",
-            include_str!("../assets/monitor/boards.js"),
-        ),
-        "/topics.js" => response(
-            StatusCode::OK,
-            "text/javascript; charset=utf-8",
-            include_str!("../assets/monitor/topics.js"),
-        ),
-        "/app.js" => response(
-            StatusCode::OK,
-            "text/javascript; charset=utf-8",
-            include_str!("../assets/monitor/app.js"),
-        ),
         "/api/status" => match app.broker.monitor_metadata() {
             Ok(value) => json_response(value),
-            Err(_) => error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Monitor data unavailable",
-            ),
+            Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Web data unavailable"),
         },
         "/api/messages" => {
             match serde_urlencoded::from_str::<MonitorQuery>(query.as_deref().unwrap_or("")) {
@@ -366,12 +426,14 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                     let generation = app.generation;
                     match tokio::task::spawn_blocking(move || {
                         let _permit = permit;
-                        let mut db = broker.db.lock().unwrap();
-                        let access = broker.monitor_control.lock().unwrap();
-                        if !access.current(generation) {
-                            return error(StatusCode::UNAUTHORIZED, "Monitor access expired");
-                        }
-                        let result =
+                        // Hold the broker locks only for the read itself. Parsing post bodies
+                        // below is CPU-bound and must not extend the shared DB lock.
+                        let result = {
+                            let mut db = broker.db.lock().unwrap();
+                            let access = broker.monitor_control.lock().unwrap();
+                            if !access.current(generation) {
+                                return error(StatusCode::UNAUTHORIZED, "Web access expired");
+                            }
                             crate::network::identity::Identity::load_or_create(&broker.state_dir)
                                 .and_then(|identity| {
                                     db.topic_read(
@@ -384,9 +446,14 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                                         parameters.before.as_deref(),
                                         parameters.limit.unwrap_or(50),
                                     )
-                                });
+                                })
+                        };
                         match result {
-                            Ok(page) => json_response(json!(page)),
+                            Ok(page) => {
+                                let mut value = json!(page);
+                                crate::monitor_board::annotate_topic_page(&mut value);
+                                json_response(value)
+                            }
                             Err(_) => error(StatusCode::BAD_REQUEST, "Invalid topic or cursor"),
                         }
                     })
@@ -414,7 +481,7 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                 let db = broker.db.lock().unwrap();
                 let access = broker.monitor_control.lock().unwrap();
                 if !access.current(generation) {
-                    return error(StatusCode::UNAUTHORIZED, "Monitor access expired");
+                    return error(StatusCode::UNAUTHORIZED, "Web access expired");
                 }
                 let result = crate::network::identity::Identity::load_or_create(&broker.state_dir)
                     .and_then(|identity| {
@@ -523,7 +590,7 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
         _ => error(StatusCode::NOT_FOUND, "Not found"),
     };
     if path.starts_with("/api/") && !app.current() {
-        return Ok(error(StatusCode::UNAUTHORIZED, "Monitor access expired"));
+        return Ok(error(StatusCode::UNAUTHORIZED, "Web access expired"));
     }
     Ok(response)
 }
@@ -648,7 +715,7 @@ async fn topic_action(request: Request<Incoming>, app: App) -> Response<Body> {
         let mut db = broker.db.lock().unwrap();
         let access = broker.monitor_control.lock().unwrap();
         if !access.current(generation) {
-            return error(StatusCode::UNAUTHORIZED, "Monitor access expired");
+            return error(StatusCode::UNAUTHORIZED, "Web access expired");
         }
         let result: anyhow::Result<Value> = (|| {
             let local = crate::network::identity::Identity::load_or_create(&broker.state_dir)?.info().peer_id;
@@ -675,7 +742,7 @@ async fn topic_action(request: Request<Incoming>, app: App) -> Response<Body> {
         }
     }).await {
         Ok(reply) if app.current() => reply,
-        Ok(_) => error(StatusCode::UNAUTHORIZED, "Monitor access expired"),
+        Ok(_) => error(StatusCode::UNAUTHORIZED, "Web access expired"),
         Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "application/json; charset=utf-8",
             json!({"code":"uncertain","uncertain":true,"error":"Outcome uncertain; retain the exact request for inspection or retry"}).to_string()),
     }
@@ -832,7 +899,7 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         }
     }).await {
         Ok(reply) if app.current()=>board_reply(reply),
-        Ok(_)=>error(StatusCode::UNAUTHORIZED, "Monitor access expired"),
+        Ok(_)=>error(StatusCode::UNAUTHORIZED, "Web access expired"),
         Err(_)=>response(StatusCode::INTERNAL_SERVER_ERROR,"application/json; charset=utf-8",json!({"code":"uncertain","uncertain":true,"error":"Submission outcome is uncertain; retain the exact message ID and payload for retry"}).to_string()),
     }
 }
@@ -868,7 +935,7 @@ async fn read_board_revision(
         Ok(Ok(revision)) if app.current() => Ok(revision),
         Ok(Ok(_)) => Err(Box::new(error(
             StatusCode::UNAUTHORIZED,
-            "Monitor access expired",
+            "Web access expired",
         ))),
         Ok(Err(reply)) => Err(Box::new(board_reply(reply))),
         Err(_) => Err(Box::new(error(
@@ -889,7 +956,7 @@ async fn board_events(app: App, name: crate::board::Name) -> Response<Body> {
     let Ok(permit) = app.events.clone().try_acquire_owned() else {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
-            "Live monitor connection limit reached",
+            "Live web connection limit reached",
         );
     };
     let Ok(read_permit) = app.reads.clone().try_acquire_owned() else {
@@ -959,7 +1026,7 @@ fn events(app: App) -> Response<Body> {
     let Ok(permit) = app.events.clone().try_acquire_owned() else {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
-            "Live monitor connection limit reached",
+            "Live web connection limit reached",
         );
     };
     let state = EventState {
@@ -1033,7 +1100,7 @@ pub async fn run(broker: Broker) {
                     let mut control = broker.monitor_control.lock().unwrap();
                     if control.current(generation) {
                         control.url = None;
-                        control.last_error = Some("Could not bind local monitor port".into());
+                        control.last_error = Some("Could not bind local web port".into());
                     }
                 }
                 loop {

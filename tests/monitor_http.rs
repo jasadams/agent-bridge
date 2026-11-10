@@ -1274,3 +1274,234 @@ async fn chunked_body_without_length_is_still_bounded() {
     );
     assert!(!root.path().join("boards").exists());
 }
+
+async fn get_bytes(access: &Value, path: &str, headers: &str) -> Vec<u8> {
+    let mut stream = connect(access, path, headers).await;
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    bytes
+}
+fn split_response(bytes: &[u8]) -> (String, &[u8]) {
+    let at = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("complete response head");
+    (
+        String::from_utf8(bytes[..at].to_vec()).unwrap(),
+        &bytes[at + 4..],
+    )
+}
+
+#[tokio::test]
+async fn web_assets_are_served_with_exact_types_and_a_tight_policy() {
+    const HTML: &str = "text/html; charset=utf-8";
+    const CSS: &str = "text/css; charset=utf-8";
+    const JS: &str = "text/javascript; charset=utf-8";
+    const WOFF2: &str = "font/woff2";
+    // Fonts and images from this server only. Scripts and styles stay same-origin with no inline
+    // allowance, which is what keeps injected agent-authored content inert.
+    let policy = "content-security-policy: default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    let root = tempfile::Builder::new()
+        .prefix("ab-assets-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let assets = [
+        ("/", HTML),
+        ("/style.css", CSS),
+        ("/theme-classic.css", CSS),
+        ("/theme-sticker.css", CSS),
+        ("/theme.js", JS),
+        ("/util.js", JS),
+        ("/markdown.js", JS),
+        ("/boards.js", JS),
+        ("/topics.js", JS),
+        ("/app.js", JS),
+        ("/favicon.svg", "image/svg+xml"),
+        ("/fonts/bricolage-var.woff2", WOFF2),
+        ("/fonts/space-mono-400.woff2", WOFF2),
+        ("/fonts/space-mono-700.woff2", WOFF2),
+    ];
+    for (path, kind) in assets {
+        let bytes = get_bytes(&access, path, "").await;
+        let (head, body) = split_response(&bytes);
+        assert!(head.starts_with("HTTP/1.1 200"), "{path}: {head}");
+        assert!(
+            head.contains(&format!("content-type: {kind}")),
+            "{path}: {head}"
+        );
+        assert!(head.contains(policy), "{path}: {head}");
+        assert!(head.contains("x-content-type-options: nosniff"), "{path}");
+        assert!(head.contains("cache-control: no-store"), "{path}");
+        assert!(!body.is_empty(), "{path} is empty");
+        assert!(
+            !String::from_utf8_lossy(body).contains(key(&access)),
+            "{path} must never embed the access token"
+        );
+        if kind == WOFF2 {
+            assert_eq!(&body[..4], b"wOF2", "{path} is not a WOFF2 file");
+        }
+        // Cross-site and cross-origin loads are refused for every asset, as for the API.
+        for extra in [
+            "Sec-Fetch-Site: cross-site\r\n",
+            "Origin: https://evil.example\r\n",
+        ] {
+            let refused = get_bytes(&access, path, extra).await;
+            assert!(refused.starts_with(b"HTTP/1.1 403"), "{path} {extra}");
+        }
+    }
+    assert!(
+        !policy.contains("unsafe-") && !policy.contains("http:") && !policy.contains("data:"),
+        "the policy must not allow inline code or remote hosts"
+    );
+    // Only listed files exist: no theme or font name is interpreted as a path.
+    for path in [
+        "/fonts/missing.woff2",
+        "/theme-missing.css",
+        "/theme-../style.css",
+        "/fonts/../app.js",
+        "/assets/web/app.js",
+        "/assets/monitor/app.js",
+    ] {
+        let bytes = get_bytes(&access, path, "").await;
+        assert!(
+            bytes.starts_with(b"HTTP/1.1 404") || bytes.starts_with(b"HTTP/1.1 400"),
+            "{path}: {}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(80)])
+        );
+    }
+}
+
+/// The policy forbids inline scripts and styles, so the interface must never depend on them. A page
+/// or script that did would work in no browser, but only a test notices before a release does.
+#[tokio::test]
+async fn web_interface_never_relies_on_inline_code_or_styles() {
+    let root = tempfile::Builder::new()
+        .prefix("ab-inline-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let page_bytes = get_bytes(&access, "/", "").await;
+    let (_, page) = split_response(&page_bytes);
+    let html = String::from_utf8(page.to_vec()).unwrap();
+    assert!(
+        !html.contains("<style"),
+        "inline <style> is blocked by the policy"
+    );
+    assert!(
+        !html.contains(" style=\""),
+        "style attributes are blocked by the policy"
+    );
+    for handler in [
+        " onclick=",
+        " onload=",
+        " onerror=",
+        " oninput=",
+        " onsubmit=",
+        "javascript:",
+    ] {
+        assert!(!html.contains(handler), "inline handler {handler}");
+    }
+    assert_eq!(
+        html.matches("<script").count(),
+        html.matches("<script src=\"/").count(),
+        "every script must be an external same-origin file"
+    );
+    for script in [
+        "/theme.js",
+        "/util.js",
+        "/markdown.js",
+        "/boards.js",
+        "/topics.js",
+        "/app.js",
+    ] {
+        let bytes = get_bytes(&access, script, "").await;
+        let (_, body) = split_response(&bytes);
+        let code = String::from_utf8(body.to_vec()).unwrap();
+        for forbidden in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+            "new Function",
+            "setAttribute(\"style\"",
+            "setAttribute('style'",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "{script} uses {forbidden}, which the policy or the untrusted-text rule forbids"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn topic_posts_carry_parsed_body_nodes_and_degrade_to_plain_text() {
+    let root = tempfile::Builder::new()
+        .prefix("ab-topic-md-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    let headers = post_headers(&access);
+    let created = post(
+        &access,
+        "/api/topic-actions",
+        &headers,
+        r#"{"action":"create","name":"Docs"}"#,
+    )
+    .await;
+    let topic = json_body(&created)["reference"]["topic_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rich = "# Title\n\n- a\n- b\n\n```sh\nls\n```\n\n[ok](https://example.com) [bad](javascript:alert(1)) <script>alert(1)</script>\n";
+    let complex = "a\n\n".repeat(5000);
+    for body in [rich.to_owned(), complex.clone()] {
+        let payload = serde_json::json!({
+            "action": "publish", "topic_id": topic, "id": uuid::Uuid::new_v4().to_string(),
+            "body": body, "parent": null, "mentions": []
+        })
+        .to_string();
+        let published = post(&access, "/api/topic-actions", &headers, &payload).await;
+        assert!(published.starts_with("HTTP/1.1 200"), "{published}");
+    }
+    let read = get(
+        &access,
+        &format!("/api/topics/{topic}/posts"),
+        &auth(&access),
+    )
+    .await;
+    assert!(read.starts_with("HTTP/1.1 200"), "{read}");
+    let page = json_body(&read);
+    let posts = page["posts"].as_array().unwrap();
+    assert_eq!(posts.len(), 2);
+    // The stored body is unchanged and nodes are additive.
+    assert_eq!(posts[0]["body"], rich);
+    let nodes = posts[0]["body_nodes"].to_string();
+    for tag in ["h1", "ul", "li", "pre", "a"] {
+        assert!(
+            nodes.contains(&format!("\"tag\":\"{tag}\"")),
+            "{tag}: {nodes}"
+        );
+    }
+    assert!(nodes.contains("https://example.com"));
+    assert!(
+        !nodes.contains("javascript:"),
+        "unsafe link survived: {nodes}"
+    );
+    assert!(!nodes.contains("\"tag\":\"script\""), "{nodes}");
+    assert!(
+        nodes.contains("\"text\":\"<script>\""),
+        "raw HTML must be text: {nodes}"
+    );
+    // Too complex to render safely: plain text only, and the stored body is still delivered.
+    assert!(posts[1]["body_nodes"].is_null());
+    assert_eq!(posts[1]["body"], complex);
+}

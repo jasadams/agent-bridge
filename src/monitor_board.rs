@@ -143,22 +143,42 @@ fn structure(snapshot: &Snapshot, controls: &[board_interaction::Control]) -> Op
         }
     }
     let markdown = String::from_utf8(bytes).ok()?;
+    markdown_nodes(
+        &markdown,
+        Some(ControlHooks {
+            snapshot,
+            controls,
+            fields: &fields,
+        }),
+    )
+}
+/// Board-only context: lets the shared parser place interactive controls into the tree.
+struct ControlHooks<'a> {
+    snapshot: &'a Snapshot,
+    controls: &'a [board_interaction::Control],
+    fields: &'a [(usize, &'a board_interaction::Control)],
+}
+/// Safe, bounded Markdown structure shared by boards and topic posts. Raw HTML is downgraded to
+/// text, links must be http(s), and the tree is capped in size and depth. `hooks` is `Some` only
+/// for boards; topic posts have no controls.
+fn markdown_nodes(markdown: &str, hooks: Option<ControlHooks<'_>>) -> Option<Vec<Node>> {
     const MAX_NODES: usize = 4096;
     const MAX_DEPTH: usize = 48;
     let mut stack = vec![Container::plain("span")];
     let mut count = 0;
     for (event, range) in Parser::new_ext(
-        &markdown,
+        markdown,
         Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH,
     )
     .into_offset_iter()
     {
         count += 1;
         if matches!(event, Event::Html(_))
-            && let Some((_, control)) = fields.iter().find(|(start, _)| *start == range.start)
+            && let Some(hooks) = hooks.as_ref()
+            && let Some((_, control)) = hooks.fields.iter().find(|(start, _)| *start == range.start)
         {
             stack.last_mut()?.children.push(Node::Control {
-                id: control_id(snapshot, control),
+                id: control_id(hooks.snapshot, control),
             });
             continue;
         }
@@ -246,14 +266,20 @@ fn structure(snapshot: &Snapshot, controls: &[board_interaction::Control]) -> Op
                 start: None,
             }),
             Event::TaskListMarker(checked) => {
-                let control = controls.iter().find(|control| {
-                    matches!(control.kind, Kind::Checkbox { .. })
-                        && range.contains(&control.range.start)
+                let control = hooks.as_ref().and_then(|hooks| {
+                    hooks
+                        .controls
+                        .iter()
+                        .find(|control| {
+                            matches!(control.kind, Kind::Checkbox { .. })
+                                && range.contains(&control.range.start)
+                        })
+                        .map(|control| (hooks.snapshot, control))
                 });
                 stack
                     .last_mut()?
                     .children
-                    .push(if let Some(control) = control {
+                    .push(if let Some((snapshot, control)) = control {
                         Node::Control {
                             id: control_id(snapshot, control),
                         }
@@ -269,6 +295,39 @@ fn structure(snapshot: &Snapshot, controls: &[board_interaction::Control]) -> Op
         return None;
     }
     Some(stack.pop()?.children)
+}
+/// Parsed nodes for a topic post body. `None` when the body exceeds the render bounds, in which
+/// case readers show the plain text. Topic posts carry no board controls.
+pub(crate) fn topic_nodes(markdown: &str) -> Option<Value> {
+    markdown_nodes(markdown, None).map(|nodes| json!(nodes))
+}
+/// Total node JSON allowed in one topic page. Bounded so a page of maximum-size posts cannot
+/// multiply the response well past the stored bodies.
+const TOPIC_NODES_BUDGET: usize = 2 * 1024 * 1024;
+/// Adds `body_nodes` to every post of a serialized topic page. A post whose body is too complex,
+/// or that would exceed the page budget, gets `null` and is shown as plain text.
+pub(crate) fn annotate_topic_page(page: &mut Value) {
+    annotate_topic_page_within(page, TOPIC_NODES_BUDGET);
+}
+fn annotate_topic_page_within(page: &mut Value, budget: usize) {
+    let Some(posts) = page.get_mut("posts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut used = 0usize;
+    for post in posts {
+        let Some(post) = post.as_object_mut() else {
+            continue;
+        };
+        let nodes = post
+            .get("body")
+            .and_then(Value::as_str)
+            .and_then(topic_nodes)
+            .filter(|nodes| {
+                used = used.saturating_add(nodes.to_string().len());
+                used <= budget
+            });
+        post.insert("body_nodes".into(), nodes.unwrap_or(Value::Null));
+    }
 }
 fn nodes_text_contains_input(nodes: &[Node]) -> bool {
     nodes.iter().any(|node| match node {
@@ -308,8 +367,7 @@ pub(crate) fn view(snapshot: &Snapshot) -> Value {
         );
     }
     if notice {
-        result["render_notice"] =
-            json!("This document is complex; showing plain text. Raw Markdown remains available.");
+        result["render_notice"] = json!("This document is complex; showing plain text.");
     }
     lifecycle_metadata(&mut result, snapshot);
     result
@@ -365,7 +423,7 @@ impl Broker {
         let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
-            return Err(reply(401, "unauthorized", "Monitor access expired"));
+            return Err(reply(401, "unauthorized", "Web access expired"));
         }
         crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now())
             .and_then(|snapshot| {
@@ -391,7 +449,7 @@ impl Broker {
         let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
-            return reply(401, "unauthorized", "Monitor access expired");
+            return reply(401, "unauthorized", "Web access expired");
         }
         match self.list_boards_locked(&db) {
             Ok(boards) => Reply {
@@ -405,7 +463,7 @@ impl Broker {
         let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
-            return reply(401, "unauthorized", "Monitor access expired");
+            return reply(401, "unauthorized", "Web access expired");
         }
         match crate::board_lifecycle::archived(&db, &self.state_dir, crate::db::now()) {
             Ok(boards) => Reply {
@@ -426,7 +484,7 @@ impl Broker {
         let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
-            return reply(401, "unauthorized", "Monitor access expired");
+            return reply(401, "unauthorized", "Web access expired");
         }
         if !request.valid(name) {
             return reply(400, "invalid", "Invalid board lifecycle request");
@@ -510,7 +568,7 @@ impl Broker {
         let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
-            return reply(401, "unauthorized", "Monitor access expired");
+            return reply(401, "unauthorized", "Web access expired");
         }
         match crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now()) {
             Ok(snapshot) => {
@@ -544,7 +602,7 @@ impl Broker {
         let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
-            return reply(401, "unauthorized", "Monitor access expired");
+            return reply(401, "unauthorized", "Web access expired");
         }
         if &request.board != name || !request.valid() {
             return reply(400, "invalid", "Invalid board message submission");
@@ -571,7 +629,7 @@ impl Broker {
         let db = self.db.lock().unwrap();
         let access = self.monitor_control.lock().unwrap();
         if !access.current(generation) {
-            return reply(401, "unauthorized", "Monitor access expired");
+            return reply(401, "unauthorized", "Web access expired");
         }
         if !request.valid(name) {
             return reply(400, "invalid_response", "Invalid board response");
@@ -686,6 +744,71 @@ mod tests {
             markdown: "# 世界\r\n- [X] same\r\n- [ ] same\r\n\r\n<!-- board-input: answer -->\r\n> old\r\n<!-- /board-input -->\r\nTail\r\n".into(),
         }]).unwrap();
         (root, bound, snapshot)
+    }
+    #[test]
+    fn topic_nodes_render_structure_and_stay_inert() {
+        let source = "# Title\n\n- a\n- b\n\n| h |\n|---|\n| c |\n\n```sh\nls\n```\n\n[ok](https://example.com/x) [bad](javascript:alert(1)) <script>alert(1)</script>\n";
+        let nodes = topic_nodes(source).unwrap().to_string();
+        for tag in ["h1", "ul", "li", "table", "thead", "th", "td", "pre", "a"] {
+            assert!(
+                nodes.contains(&format!("\"tag\":\"{tag}\"")),
+                "missing {tag}: {nodes}"
+            );
+        }
+        assert!(nodes.contains("\"href\":\"https://example.com/x\""));
+        assert!(!nodes.contains("javascript:"), "unsafe link kept: {nodes}");
+        assert!(!nodes.contains("\"tag\":\"script\""));
+        assert!(
+            nodes.contains("\"text\":\"<script>\""),
+            "raw HTML must survive only as text: {nodes}"
+        );
+    }
+    #[test]
+    fn topic_nodes_have_no_board_controls() {
+        let nodes = topic_nodes(
+            "- [x] done\n- [ ] todo\n\n<!-- board-input: a -->\n> x\n<!-- /board-input -->\n",
+        )
+        .unwrap()
+        .to_string();
+        assert!(!nodes.contains("\"kind\":\"control\""), "{nodes}");
+        assert!(nodes.contains('☑') && nodes.contains('☐'), "{nodes}");
+        assert!(nodes.contains("board-input: a"), "{nodes}");
+    }
+    #[test]
+    fn topic_nodes_are_bounded() {
+        assert!(topic_nodes(&format!("{}x", "> ".repeat(60))).is_none());
+        assert!(topic_nodes(&"a\n\n".repeat(5000)).is_none());
+        assert!(topic_nodes("").unwrap().as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn topic_pages_get_nodes_within_a_budget() {
+        let page = || json!({"posts":[{"id":"a","body":"**one**"},{"id":"b","body":"two"},{"id":"c","body":"three"}],"high_water":3});
+        let mut full = page();
+        annotate_topic_page(&mut full);
+        assert!(
+            full["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|post| post["body_nodes"].is_array())
+        );
+        assert_eq!(full["high_water"], 3);
+        assert_eq!(full["posts"][0]["body"], "**one**");
+        // A tight budget keeps earlier posts and degrades later ones to plain text.
+        let first = topic_nodes("**one**").unwrap().to_string().len();
+        let mut small = page();
+        annotate_topic_page_within(&mut small, first);
+        assert!(small["posts"][0]["body_nodes"].is_array());
+        assert!(small["posts"][1]["body_nodes"].is_null());
+        assert!(small["posts"][2]["body_nodes"].is_null());
+        // Pages without posts, and malformed posts, are left alone or degrade safely.
+        let mut none = json!({"other":1});
+        annotate_topic_page(&mut none);
+        assert_eq!(none, json!({"other":1}));
+        let mut odd = json!({"posts":[1,{"body":7}]});
+        annotate_topic_page(&mut odd);
+        assert_eq!(odd["posts"][0], 1);
+        assert!(odd["posts"][1]["body_nodes"].is_null());
     }
     fn request(snapshot: &Snapshot, index: usize, value: Desired) -> ResponseRequest {
         ResponseRequest {

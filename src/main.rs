@@ -160,10 +160,13 @@ enum Commands {
         #[arg(long)]
         enable_checks: bool,
     },
-    /// Read-only browser monitor, embedded in this broker.
-    Monitor {
+    /// Browser interface for boards, topics and agent conversations, embedded in this broker.
+    // `monitor` is the name this command had through v0.5.0. It stays as a hidden alias (not shown
+    // in --help) so existing habits and scripts keep working.
+    #[command(alias = "monitor")]
+    Web {
         #[command(subcommand)]
-        action: MonitorAction,
+        action: WebAction,
     },
     /// Enable or disable peer networking and optional LAN discovery.
     Network {
@@ -283,8 +286,9 @@ enum MachineAction {
 }
 
 #[derive(Subcommand)]
-enum MonitorAction {
+enum WebAction {
     /// Enable loopback HTTP; prints URL and a separate browser access token.
+    #[command(alias = "enabled")]
     Enable {
         #[arg(long, default_value_t = 0)]
         port: u16,
@@ -990,11 +994,13 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Status => Request::Status,
-        Commands::Monitor { action } => match action {
-            MonitorAction::Enable { port } => Request::MonitorEnable { port },
-            MonitorAction::Disable => Request::MonitorDisable,
-            MonitorAction::Status => Request::MonitorStatus,
-            MonitorAction::Access => Request::MonitorAccess,
+        // IPC request names are intentionally unchanged: an older running broker must still
+        // understand a freshly upgraded CLI.
+        Commands::Web { action } => match action {
+            WebAction::Enable { port } => Request::MonitorEnable { port },
+            WebAction::Disable => Request::MonitorDisable,
+            WebAction::Status => Request::MonitorStatus,
+            WebAction::Access => Request::MonitorAccess,
         },
         Commands::Relay { action } => match action {
             RelayAction::Serve {
@@ -1403,5 +1409,49 @@ mod update_cli_tests {
                 enable_checks: false,
             }
         ));
+    }
+
+    #[test]
+    fn web_command_accepts_enable_enabled_and_the_old_monitor_name() {
+        for args in [
+            vec!["agent-bridge", "web", "enable"],
+            vec!["agent-bridge", "web", "enabled"],
+            vec!["agent-bridge", "web", "enable", "--port", "8123"],
+            vec!["agent-bridge", "web", "disable"],
+            vec!["agent-bridge", "web", "status"],
+            vec!["agent-bridge", "web", "access"],
+            vec!["agent-bridge", "monitor", "enable"],
+            vec!["agent-bridge", "monitor", "status"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
+        }
+        let cli =
+            Cli::try_parse_from(["agent-bridge", "web", "enabled", "--port", "8123"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Web {
+                action: WebAction::Enable { port: 8123 }
+            }
+        ));
+        let old = Cli::try_parse_from(["agent-bridge", "monitor", "enable"]).unwrap();
+        assert!(matches!(
+            old.command,
+            Commands::Web {
+                action: WebAction::Enable { port: 0 }
+            }
+        ));
+        assert!(Cli::try_parse_from(["agent-bridge", "web"]).is_err());
+        assert!(Cli::try_parse_from(["agent-bridge", "web", "enable", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn help_lists_web_and_hides_the_old_monitor_alias() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("web"), "{help}");
+        assert!(
+            !help.to_lowercase().contains("monitor"),
+            "hidden alias leaked into --help: {help}"
+        );
     }
 }

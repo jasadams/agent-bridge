@@ -865,23 +865,23 @@ impl Broker {
                         let value = self.monitor_control.lock().unwrap().credentials();
                         ensure!(
                             value["requested_port"].as_u64() == Some(port as u64),
-                            "Monitor enable was superseded"
+                            "Web enable was superseded"
                         );
                         if value["url"].is_string() {
                             return Ok(value);
                         }
                         if let Some(error) = value["last_error"].as_str() {
-                            anyhow::bail!("Monitor could not start: {error}");
+                            anyhow::bail!("Web interface could not start: {error}");
                         }
                         ensure!(
                             value["enabled"] == true,
-                            "Monitor was disabled while starting"
+                            "Web interface was disabled while starting"
                         );
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                 })
                 .await
-                .context("Monitor did not start in time; inspect monitor status")?
+                .context("Web interface did not start in time; run `agent-bridge web status`")?
             }
             Request::RemoteList => self.remote_directory(None).await,
             Request::RemoteListPeer { peer } => self.remote_directory(Some(&peer)).await,

@@ -1,11 +1,21 @@
-# Local monitor
+# Web interface
 
-The same `agent-bridge` executable contains the HTTP server and all HTML, CSS and
-JavaScript. It reads the running broker's existing message database; there is no
-separate web process, Node.js runtime, CDN, asset download or model call. Messages
-shows delivery history; Boards displays local named boards, accepts responses and
-agent-directed messages through their existing controls, and provides explicit
-Archive and Restore for named boards.
+Earlier releases called this command `agent-bridge monitor`; that name still works as an
+alias, and `agent-bridge web enabled` is accepted as a spelling of `agent-bridge web enable`.
+
+The same `agent-bridge` executable contains the HTTP server and all HTML, CSS, JavaScript and
+fonts. It reads the running broker's existing message database; there is no separate web process,
+Node.js runtime, CDN, asset download or model call.
+
+The interface is a workspace with a sidebar, in the manner of a chat application:
+
+- **Boards** lists your named boards. Open one to read it, answer its response fields, send
+  agent-directed messages through its existing controls, and archive or restore it.
+- **Topics** are shared channels. Follow a timeline, read agents' Markdown, and publish as your
+  local inbox with `@mentions`.
+- **Direct messages** show the conversations your agents have with each other. They are read only:
+  you are watching, not taking part.
+- **All traffic** (marked `debug`) is the raw delivery feed with filters, for diagnosing delivery.
 
 Each board has a **Last Updated** footer outside both rendered and raw Markdown.
 It presents the broker's nullable UTC Unix millisecond `last_updated` metadata in
@@ -23,86 +33,111 @@ external-file observations and their limits. No timestamp is added to Markdown.
 With the broker running, enable it:
 
 ```sh
-agent-bridge monitor enable
+agent-bridge web enable
 ```
 
-The command returns a clickable `access_url` that opens Boards and unlocks the
-monitor automatically. The link carries the access token in a URL fragment
+The command returns a clickable `access_url` that opens the web interface and unlocks it
+automatically. The link carries the access token in a URL fragment
 (`#access_token=…`), which is not sent in HTTP requests. The page immediately
 removes it from the address bar and current history entry before authenticating.
 A plain loopback `url` and separate `access_token` remain available for manual
 entry. Treat the complete access link like a password: anyone with it can read
 messages, edit board responses, send through board message inputs, and archive or
-restore named boards while the monitor is enabled. Browser
+restore named boards while the web interface is enabled. Browser
 extensions, copied links, bookmarks and browser history/sync may expose it; removing
 the current entry cannot guarantee erasure from browser records. The default chooses an
-available port; use `monitor enable --port 44002` for a fixed one. It binds only
+available port; use `web enable --port 44002` for a fixed one. It binds only
 `127.0.0.1`, including when a fixed port is chosen. There is no remote bind option.
 
 ```sh
-agent-bridge monitor status  # Listener state; no token
-agent-bridge monitor access  # Retrieve URL/token via the private local socket
-agent-bridge monitor disable
+agent-bridge web status  # Listener state; no token
+agent-bridge web access  # Retrieve URL/token via the private local socket
+agent-bridge web disable
 ```
 
-The monitor starts disabled after every broker restart. It can operate with peer
+The web interface starts disabled after every broker restart. It can operate with peer
 networking disabled. Repeating enable with the same requested port preserves the
 current access; disabling it or choosing another port invalidates credentials and
 closes existing browser streams. A port conflict reports an error without stopping
-the broker. Enabling/disabling the monitor changes no machine pairing, session
+the broker. Enabling or disabling the web interface changes no machine pairing, session
 sharing, delivery or network listener settings.
 
-## Inspect messages
+## Layout and navigation
 
-The feed shows local, inbound and outbound messages with machine, agent/session,
-delivery state and timestamps. Filter by machine name/peer ID, agent/session,
-state and creation-time range. Load older pages, select a message for its full
-body/detail, and follow its parent or direct replies. Message previews are bounded;
-the selected detail retains the full stored body. Live server-sent invalidations
-refresh the current view, including state changes and correlated replies.
+The sidebar lists Boards, Topics and Direct messages, with All traffic pinned at the bottom.
+Every view has an address (`#/board/name`, `#/topic/id`, `#/dm/…`, `#/traffic`), so links and the
+browser's Back and Forward buttons work. Navigating away from a board with an unsaved response or
+message draft asks whether to save, discard or stay, exactly as before; choosing to stay leaves the
+address unchanged.
 
-New local messages snapshot the source and destination session metadata when
-created. Network transfers use their saved envelopes, preserving the actual pinned
-sessions even after registrations change. Earlier local messages retain their saved
-destination session, but historical source sessions were not recorded and appear
-as unknown. Remote machine aliases/names are display labels, not proof of human
-identity. The monitor never creates a peer identity just to display local messages.
+- **Collapse the sidebar** with the button in the top bar or **Ctrl/⌘+B**. It becomes a narrow icon
+  rail with tooltips and unread badges, and the choice is remembered. On a phone the sidebar is a
+  drawer.
+- **Jump anywhere** with **Ctrl/⌘+K**: the quick switcher searches boards, topics and
+  conversations.
+- **The side panel** shows a topic thread or a message's delivery details. **Esc** closes it.
+- Nothing scrolls except the lists themselves: the page, sidebar, timeline and panel each scroll
+  independently, and the composer stays pinned under the timeline.
 
-Message views remain read-only. There are no browser send, retry,
-cancel, pairing or grant controls. Receipt/submission states have their existing meaning;
-monitoring does not establish that a model ran or completed a task.
+Unread badges count topic posts and agent messages that arrived while this page was open. They are
+not stored.
+
+## Agent conversations
+
+**Direct messages** lists conversations between two agents, newest first. A conversation is a pair
+of agent identities in either direction; messages involving your own inbox (the agent `user`) appear
+only under All traffic. They are derived from the messages the broker already records, so no new
+data is collected. The list reflects the most recent 300 messages; opening a conversation loads its
+full history in pages (**Load older messages**).
+
+Each message shows its sender, time and delivery state when it is not delivered. Hover a message
+and choose **ⓘ** to open its delivery details in the side panel. The view is read only: there is
+no composer. To step in, post in a topic and mention the agents.
+
+New local messages snapshot the source and destination session metadata when created. Network
+transfers use their saved envelopes, preserving the actual pinned sessions even after registrations
+change. Earlier local messages retain their saved destination session, but historical source
+sessions were not recorded and appear as unknown. Remote machine aliases and names are display
+labels, not proof of human identity. The web interface never creates a peer identity just to display
+local messages. Receipt and submission states have their existing meaning; viewing a conversation
+does not establish that a model ran or completed a task.
+
+## All traffic
+
+The debug feed shows every local, inbound and outbound message with machine, agent/session,
+delivery state and timestamps. Filter by machine name or peer ID, agent or session, state and
+creation-time range. Load older pages, select a message for its full body and detail in the side
+panel, and follow its parent or direct replies. Message previews are bounded; the selected detail
+retains the full stored body. Live server-sent invalidations refresh the current view, including
+state changes and correlated replies. All traffic is read only.
 
 ## Browse and answer boards
 
-Unlocking opens Boards first. Select a board from the compact toolbar, or switch
-to Messages using the navigation. The document fills the available width; response
-controls appear inline beside their questions. The first selection
-is `main`, including its empty virtual entry before a file exists. Lists are in
-name order. Board names, existence and revisions come from the same broker used
-by CLI/MCP; unknown names never fall back or create documents. Create boards and
-perform general edits through [the CLI/MCP board tools](board.md).
+Unlocking opens the `main` board. Select a board in the sidebar; the first board is `main`,
+including its empty virtual entry before a file exists. Lists are in name order. Board names,
+existence and revisions come from the same broker used by CLI/MCP; unknown names never fall back or
+create documents. Create boards and perform general edits through
+[the CLI/MCP board tools](board.md). The document fills the available width and response controls
+appear inline beside their questions.
 
-While Boards is open, its dropdown discovers new local boards automatically within
-five seconds on a healthy connection. Discovery reads only the board catalog and
-keeps the selected document, focus, selection and response/message drafts in place;
-it never switches boards automatically. Returning to the foreground or reconnecting
-catches up immediately. Refresh checks both the catalog and the selected document,
-while retaining the existing draft-review protections. If discovery fails, known
-options stay available while it retries with bounded backoff. A selected board
-missing from the catalog keeps its identity visible with an availability notice.
-Leaving Boards or locking stops catalog requests and rejects late responses.
+While a board is open, the sidebar discovers new local boards automatically within five seconds on a
+healthy connection (and every ten seconds from other views). Discovery reads only the board catalog
+and keeps the selected document, focus, selection and response/message drafts in place; it never
+switches boards automatically. Returning to the foreground or reconnecting catches up immediately.
+If discovery fails, known boards stay listed while it retries with bounded backoff. A selected board
+missing from the catalog keeps its identity visible with an availability notice. Leaving Boards or
+locking stops catalog requests and rejects late responses. There is no Refresh button: the open board
+updates live.
 
 The view renders headings, tables, lists and code, with bounded wrapping/overflow
-and a readable source fallback for complex Markdown. Raw Markdown shows the exact
-source. HTML and scripts do not execute, images do not fetch resources, and safe
+and a readable plain-text fallback for complex Markdown. HTML and scripts do not execute, images do not fetch resources, and safe
 external links require an explicit click. Board layout is user-authored; no task
 table schema is required.
 
 Ordinary response controls use the terminal's Rust control parser and validated
 source mapping. Supported task markers become native checkboxes in the document;
 valid ordinary `board-input` blocks become multiline text areas with **Save** and
-**Cancel** in place of their marker comments and quoted response. Raw Markdown
-retains the exact source. Code examples, ordinary bracket text, arbitrary HTML and
+**Cancel** in place of their marker comments and quoted response. Code examples, ordinary bracket text, arbitrary HTML and
 malformed/nested/duplicate marked fields remain readable and noninteractive.
 A checkbox save sends its intended checked state. Save updates only the selected
 response; Cancel restores its last confirmed value without writing. Changes preserve bytes
@@ -136,8 +171,7 @@ duplicate submissions are disabled while one is in flight.
 Only the selected board has a persistent authenticated event stream. The server
 checks its revision about twice per second, including external file edits, and
 pushes a small board-name/revision event only when it changes. The browser reads
-the document on connection/reconnection, on change, or on explicit Refresh; an
-idle board does not poll for snapshots. Reads coalesce while another read or save
+the document on connection/reconnection and on change; an idle board does not poll for snapshots. Reads coalesce while another read or save
 is in flight. Unchanged content keeps its DOM nodes; changed table cells and text
 are patched in place, preserving unaffected content and response controls.
 A temporary failure keeps the last content with a stale/reconnecting indicator;
@@ -145,21 +179,21 @@ reconnections back off to at most 30 seconds. Leaving Boards or locking closes
 that board's stream and cancels pending reads. Selection in the browser never
 changes terminal/MCP board selection.
 
-Messages also uses a persistent event stream. Live refresh retains existing rows
-and selected message content, updates changed fields in place, and preserves
-selection instead of flashing a loading placeholder. Message refresh work pauses
-while Boards is visible and catches up when switching back.
+The message views share one persistent event stream. Live refresh retains existing rows and
+selected message content, updates changed fields in place, and preserves selection instead of
+flashing a loading placeholder. Message refresh work pauses while another view is visible and
+catches up when switching back.
 
 ## Archive and restore
 
-Use **Archive** in the board toolbar for the selected named board. The action
+Use **Archive board** in the board's **⋯** menu for the selected named board. The action
 first applies the existing draft and pending-operation protections, then asks for
 confirmation that the archive will be permanently deleted after **30 days
 (30 × 24 hours)** unless restored. Cancel keeps the board unchanged. Archive is
 disabled for `main`, with an explanation; active boards are never removed solely
 because they have been idle.
 
-**Archived boards** opens the explicit archive list. Each record shows its archive
+**Archived boards…** (also in the **⋯** menu) opens the explicit archive list. Each record shows its archive
 date, scheduled permanent-deletion date and current state. **View archived board**
 opens its read-only content; **Restore** is available only before expiry. Restoration
 returns the exact Markdown to the active catalog and preserves its Last Updated
@@ -191,46 +225,73 @@ external backups. See [retention and recovery details](board.md#archive-and-rest
 
 ## Local topics
 
-The Topics view shows local topics and their durable history. Select a topic by
-its displayed ID, create or rename one, and archive or restore it without changing
-its ID. Archived topics remain readable but reject new posts. The composer publishes
-as the local human inbox; the browser cannot select another author. Replies and
-mentions use exact IDs, with display names as labels only. Publication means durable
-acceptance, not that any agent received or completed a task.
+Topics are listed in the sidebar; choose **+ New** to create one. Select a topic to read its
+durable history, rename it, and archive or restore it without changing its ID. Archived topics
+remain readable but reject new posts. The composer publishes as the local human inbox; the browser
+cannot select another author. Publication means durable acceptance, not that any agent received or
+completed a task.
 
-The timeline loads a bounded recent page and can load older posts. While Topics is
-visible, bounded incremental reads discover new posts; background polling pauses
-when the document is hidden. Drafts are kept in this tab's memory while switching
-topics or views, and are cleared on lock or reload. If a publication's response is
-lost, retry uses its original ID and exact payload; discarding an uncertain draft
-does not cancel a publication that may already have been accepted. Topic names and
-message bodies are rendered as text, not executable HTML.
+Posts render as **Markdown**: headings, lists, tables, task markers, links and code blocks with a
+**Copy** button. The server parses each post into a safe, bounded node tree, using the same parser
+and limits as boards: raw HTML is shown as text, only `http` and `https` links are clickable,
+and a post that is too complex to render safely is shown as plain text. The stored body is never
+changed. Choose **‹›** on a post to view its exact Markdown source. Long posts collapse behind
+**Show more**. Consecutive posts by the same author are grouped, and the timeline starts at the
+latest post.
 
-Authentication loss or rejection locks the monitor and clears topic drafts and
-pending retry IDs. If a publication was accepted just before access was revoked,
-its outcome may be uncertain and its exact retry payload cannot be recovered after
-locking. After regaining access, inspect the topic history before composing another
-message. No retry is automatic.
+Type **@** in the composer to pick an agent; the picker accepts arrows, Enter or Tab and Esc.
+Mentions use exact agent IDs, which are inserted for you; any `@id` in the message that matches a
+registered agent is delivered as a mention. **Enter** publishes and **Shift+Enter** adds a line.
+Choose **↩** on a post to reply to it; a post with replies shows a link that opens its thread in the
+side panel.
 
-Topic reads and writes use the same loopback monitor token, origin checks, request
-limits and revocation boundary described below. Topics do not add a web permission,
-membership, federation or native delivery subsystem.
+The timeline loads a bounded recent page and can load older posts. New posts are discovered by
+bounded incremental reads that pause while the document is hidden; a **New messages** button appears
+when posts arrive while you are reading earlier ones. Drafts are kept in this tab's memory while
+switching topics or views, and are cleared on lock or reload. If a publication's response is lost,
+retry uses its original ID and exact payload; discarding an uncertain draft does not cancel a
+publication that may already have been accepted. Topic names and message bodies are never rendered
+as executable HTML.
+
+Authentication loss or rejection locks the web interface and clears topic drafts and pending retry
+IDs. If a publication was accepted just before access was revoked, its outcome may be uncertain and
+its exact retry payload cannot be recovered after locking. After regaining access, inspect the topic
+history before composing another message. No retry is automatic.
+
+Topic reads and writes use the same loopback token, origin checks, request limits and revocation
+boundary described below. Topics do not add a web permission, membership, federation or native
+delivery subsystem.
+
+## Themes
+
+The interface ships with two themes, chosen from **Theme** in the top bar. **Classic** (the default)
+is the look of earlier releases: dark teal with a lime accent and system fonts. **Sticker Bomb** is a
+bold, high-contrast light theme with thick outlines, flat colour and its own typefaces (Bricolage
+Grotesque and Space Mono, served from the executable under the SIL Open Font License; see
+[the third-party notices](../THIRD_PARTY_NOTICES.md)). Only the selected theme's stylesheet and
+fonts are requested. Switching applies immediately without a reload. Every agent gets a stable
+colour derived from its name. [DESIGN.md](../DESIGN.md) describes the design system.
+
+The browser remembers only two preferences: the theme, and whether the sidebar is collapsed. Neither
+is a credential or a draft.
 
 ## Browser access
 
 API requests carry a random access token in an Authorization header. The page
-keeps it only in memory; locking the monitor clears message/board views, raw source,
+keeps it only in memory; locking the web interface clears message/board views, raw source,
 controls, drafts, pending requests and the token,
 and closing/reloading the cleaned page requires access again. Reopening the private
 access link unlocks it again while that credential remains valid. Tokens in access
 links use only the fragment, never the query string. After consuming the fragment,
 requests use only Authorization headers. Tokens are not stored in cookies,
-referrers or browser storage. Static login assets contain no message history or
+referrers or browser storage; the page stores only the theme and sidebar preferences described above. Static login assets contain no message history or
 credentials.
 
 Exact Host validation, Origin and browser fetch-metadata checks reject DNS rebinding
 and cross-origin requests. The server supplies no CORS permission, uses restrictive
-content-security/frame/referrer policies and disables caching. Message text
+content-security/frame/referrer policies and disables caching. The content-security policy
+allows scripts, styles, fonts, images and network calls from this server only: no inline scripts or
+styles, no `eval`, and no other host. Message text
 renders as text, including HTML-like content. The write routes are authenticated
 `POST /api/boards/{name}/responses`, `POST /api/boards/{name}/messages`,
 `POST /api/boards/{name}/archive` and `POST /api/boards/{name}/restore`.
@@ -256,7 +317,7 @@ permissions.
 This boundary does not protect against another process running as your OS user,
 an administrator, or a privileged browser extension. Such processes may already
 access the broker's private local socket or state. Keep the browser token private;
-disable/re-enable the monitor to invalidate a copied token.
+disable and re-enable the web interface to invalidate a copied token.
 
 ## Upgrade and validation
 
@@ -267,23 +328,29 @@ automatically; existing Markdown remains active without manual file moves.
 Reads share the broker's existing
 connection and never open a second database through startup recovery.
 
-Automated HTTP tests check authentication, origins/Host, read-only methods, bounded
-filters, port errors and stream/key revocation. Data tests check historical session
-pinning, pagination, preview/full body, migration and reads without delivery writes.
-The disposable acceptance harness can exercise local and real peer messages and
-an already installed Playwright browser without starting native model sessions:
+Automated HTTP tests check authentication, origins and Host, read-only methods, bounded filters,
+port errors, stream and key revocation, the content-security policy, the type and presence of every
+embedded asset, that the page contains no inline script or style, and that topic posts carry safe
+parsed Markdown. Data tests check historical session pinning, pagination, preview and full body,
+migration and reads without delivery writes.
+
+The disposable browser acceptance starts a private broker with seeded boards, topics and agent
+conversations and drives both themes with an already installed Playwright and Chromium. It checks
+unlocking, the sidebar, Markdown topics, mentions and publishing, read-only conversations and the
+details panel, the board view, All traffic, the collapsible sidebar, the quick switcher, theme
+switching, contrast, that the page never scrolls or overflows at desktop and phone widths, and that
+no content-security violation occurs:
 
 ```sh
 cargo build --locked
-python3 tools/test_monitor.py --binary ./target/debug/agent-bridge --browser
+python3 tools/test_web_browser.py --binary ./target/debug/agent-bridge
 ```
 
-Omit `--browser` when Playwright and its matching browser are unavailable; that run
-has no browser acceptance claim. No browser is downloaded by the harness.
-The extended harness also exercises named-board navigation, response writes,
-conflicts/drafts, live refresh, untrusted Markdown and late-callback/lock behavior
-against the built executable. Its private brokers/browser contexts are disposable;
-do not point it at a running owner service or saved profile.
+No browser is downloaded by the harness, and its private brokers and browser contexts are
+disposable; do not point it at a running owner service or saved profile. The older harnesses in
+`tools/` (`test_monitor.py --browser`, `monitor_board_qa.py` and related scripts) drive the element
+ids of the tabbed interface of earlier releases and have not yet been ported to this one; their
+HTTP and API checks still apply.
 
 ## Message agents from the board
 
