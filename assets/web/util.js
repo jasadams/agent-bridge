@@ -21,19 +21,22 @@ window.AB = (() => {
     const text = parts.length > 1 ? parts[0][0] + parts[1][0] : (parts[0] || "?").slice(0, 2);
     return text.toUpperCase();
   };
-  // An agent the person has not named is registered as `<provider>-<session id>`. That is an identifier,
-  // not a name, so show "Claude 9f3c": the provider and the LAST four characters of the session id. Ids
-  // from Codex and OpenCode are time-ordered, so their start is shared by sessions created close together
-  // while their end is random. The exact id stays in the details panel ("Agent ID") and the topic
-  // byline. Anything the person or the agent chose is shown unchanged.
-  const PROVIDERS = { claude: "Claude", codex: "Codex", opencode: "OpenCode" };
-  function friendlyAgent(name) {
-    if (typeof name !== "string" || !name) return "Unknown agent";
-    const uuid = /^(claude|codex|opencode)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{8}([0-9a-f]{4})$/i.exec(name);
-    const native = /^(opencode)-ses_[0-9a-z]{6,}([0-9a-z]{4})$/i.exec(name);
-    const match = uuid || native;
-    return match ? `${PROVIDERS[match[1].toLowerCase()]} ${match[2].toLowerCase()}` : name;
-  }
+  // Names the clients give their own sessions (Claude, Codex, OpenCode), keyed by the exact routing name
+  // such as `claude-<uuid>`. They are labels only: an agent with no known name shows its routing name.
+  // When two sessions report the same name, the end of the routing name tells them apart.
+  const agentNames = new Map();
+  let sharedNames = new Set();
+  const setAgentNames = entries => {
+    agentNames.clear();
+    for (const [name, display] of entries) agentNames.set(name, display);
+    const seen = new Set(); sharedNames = new Set();
+    for (const display of agentNames.values()) (seen.has(display) ? sharedNames : seen).add(display);
+  };
+  const agentName = name => {
+    const display = agentNames.get(name);
+    if (!display) return name;
+    return sharedNames.has(display) ? `${display} · ${name.slice(-4)}` : display;
+  };
   const valid = ms => Number.isFinite(new Date(Number(ms)).getTime());
   const hhmm = ms => valid(ms) ? new Date(Number(ms)).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "Unknown";
   const dayKey = ms => valid(ms) ? new Date(Number(ms)).toDateString() : "unknown";
@@ -55,5 +58,5 @@ window.AB = (() => {
     for (const d of paths) { const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", d); icon.append(path); }
     return icon;
   };
-  return { el, hash, colorClass, initials, friendlyAgent, hhmm, dayKey, dayLabel, fullTime, svg };
+  return { el, hash, colorClass, initials, agentNames, setAgentNames, agentName, hhmm, dayKey, dayLabel, fullTime, svg };
 })();

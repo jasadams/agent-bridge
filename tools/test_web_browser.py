@@ -198,6 +198,7 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     tag = f"[{theme}]"
 
     page.add_init_script(f"try {{ if (!localStorage.getItem('agent-bridge-theme')) localStorage.setItem('agent-bridge-theme', '{theme}') }} catch (e) {{}}")
+    page.route("**/api/agents", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps({"agents": [{"name": "claude-bridge", "provider": "claude", "session": "9a374eae-798c-4ca0-9ebf-b954fb368c50", "display_name": "Release Captain"}, {"name": "codex-twin-a", "provider": "codex", "session": "twin-a", "display_name": "Twin"}, {"name": "codex-twin-b", "provider": "codex", "session": "twin-b", "display_name": "Twin"}]})))
     page.goto(url_for)
     page.wait_for_selector("#sidebar .nav-item", timeout=15000)
     report.check(f"{tag} unlocks from the access link and clears the token from the URL", "access_token" not in page.url)
@@ -210,7 +211,7 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     report.check(f"{tag} sidebar lists boards", "main" in labels and "release-checklist" in labels, str(labels))
     report.check(f"{tag} sidebar lists the topic", "release" in labels, str(labels))
     pairs = [l for l in labels if "·" in l]
-    report.check(f"{tag} sidebar lists agent conversations, not the human's", any("claude-bridge" in l and "codex-kyomi" in l for l in pairs) and not any(l.startswith("user") or " user" in l for l in pairs), str(pairs))
+    report.check(f"{tag} sidebar lists agent conversations, not the human's", any("Release Captain" in l and "codex-kyomi" in l for l in pairs) and not any(l.startswith("user") or " user" in l for l in pairs), str(pairs))
     report.check(f"{tag} All traffic is pinned last", labels[-1] == "All traffic", str(labels))
 
     # board view
@@ -311,11 +312,14 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     page.locator("#dm-messages .msg__actions button").first.click(force=True)
     page.wait_for_selector("#panel:not([hidden]) .detail-grid", timeout=10000)
     report.check(f"{tag} delivery details open in the side panel", page.locator("#panel-title").inner_text() == "Delivery details")
-    cases = page.evaluate("""() => ["claude-bridge", "codex-kyomi", "reviewer", "claude-3f9a1c2e-5b7d-4e90-8a11-c0ffee123456", "opencode-ses_2f8a91c3bd4eFg7Hk", "codex-abcdefgh-ijkl", "codex-release2024-final", "user"].map(n => window.AB.friendlyAgent(n))""")
-    report.check(f"{tag} chosen names stay as they are and generated ids become 'Provider xxxx'", cases == ["claude-bridge", "codex-kyomi", "reviewer", "Claude 3456", "OpenCode g7hk", "codex-abcdefgh-ijkl", "codex-release2024-final", "user"], str(cases))
-    # time-ordered ids (UUIDv7, opencode) share their start, so the label must come from the random end
-    close = page.evaluate("""() => ["codex-019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b", "codex-019a1b2c-3d4e-7f80-9a1b-2c3d4e5f0c9d", "opencode-ses_2f8a91c3bd4eAAAA1111", "opencode-ses_2f8a91c3bd4eBBBB2222"].map(n => window.AB.friendlyAgent(n))""")
-    report.check(f"{tag} agents created close together get different labels", close[0] != close[1] and close[2] != close[3], str(close))
+    # Names the clients give their sessions come from /api/agents; the exact id stays in the details.
+    sidebar_text = page.locator("#sidebar").inner_text()
+    report.check(f"{tag} the sidebar shows the session's own name, not its routing name", "Release Captain" in sidebar_text and "claude-bridge" not in sidebar_text, sidebar_text[:300])
+    report.check(f"{tag} an agent with no known name keeps its routing name", "codex-kyomi" in sidebar_text, sidebar_text[:300])
+    detail_text = page.locator("#panel-body").inner_text()
+    report.check(f"{tag} delivery details show the name and the exact Agent ID", "Release Captain" in detail_text and "claude-bridge" in detail_text, detail_text[:400])
+    shared = page.evaluate("""() => [window.AB.agentName("codex-twin-a"), window.AB.agentName("codex-twin-b"), window.AB.agentName("claude-bridge")]""")
+    report.check(f"{tag} two sessions with the same name are told apart by their id", shared == ["Twin · in-a", "Twin · in-b", "Release Captain"], str(shared))
     page.screenshot(path=str(out / f"{theme}-dm.png"))
     page.click("#panel-close")
     report.check(f"{tag} panel closes", page.locator("#panel").is_hidden())
