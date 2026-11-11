@@ -4,7 +4,7 @@
 // Publication, retry and discard semantics are unchanged from the previous interface.
 window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
   const $ = id => document.getElementById(id);
-  const { el, colorClass, initials, hhmm, dayKey, dayLabel, fullTime } = window.AB;
+  const { el, colorClass, initials, hhmm, dayKey, dayLabel, fullTime, friendlyAgent } = window.AB;
   const drafts = new Map();
   const seen = new Map();
   let running = false, viewing = false, epoch = 0, timer = null, selected = null, topics = [], agents = [];
@@ -19,7 +19,7 @@ window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
   // Topics are local; the human publishes as the reserved inbox identity "inbox-user".
   const isHuman = post => post.author.agent_id === "inbox-user";
   const plainId = id => id.replace(/^inbox-/, "");
-  const authorName = post => isHuman(post) ? "You" : (post.author_display_name && post.author_display_name !== post.author.agent_id ? post.author_display_name : plainId(post.author.agent_id));
+  const authorName = post => isHuman(post) ? "You" : (post.author_display_name && post.author_display_name !== post.author.agent_id ? post.author_display_name : friendlyAgent(plainId(post.author.agent_id)));
 
   function unread(topic) {
     const id = topic.reference.topic_id;
@@ -250,7 +250,8 @@ window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
       const option = el("button", "mention-option", undefined); option.type = "button"; option.id = `mention-option-${index}`; option.setAttribute("role", "option");
       option.setAttribute("aria-selected", String(index === mentionIndex));
       option.append(el("strong", "", `@${agent.reference.agent_id}`));
-      if (agent.display_name && agent.display_name !== agent.reference.agent_id) option.append(el("small", "", agent.display_name));
+      const shown = agent.display_name && agent.display_name !== agent.reference.agent_id ? agent.display_name : friendlyAgent(plainId(agent.reference.agent_id));
+      if (shown !== agent.reference.agent_id) option.append(el("small", "", shown));
       option.addEventListener("mousedown", event => { event.preventDefault(); pickMention(agent); });
       pop.append(option);
     });
