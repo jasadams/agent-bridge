@@ -26,6 +26,7 @@ pub use clients::codex_discovery as discovery;
 pub use clients::lifecycle as hook;
 pub mod mcp;
 pub mod migrations;
+pub mod naming;
 pub mod network;
 pub mod protocol;
 pub mod service;

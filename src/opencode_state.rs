@@ -1380,6 +1380,7 @@ PRAGMA user_version=12;").unwrap();
                     provider: Provider::Inbox,
                     session: "source".into(),
                 },
+                source_label: None,
                 destination_peer: local.clone(),
                 destination: RemoteAgent {
                     name: agent.name.clone(),
