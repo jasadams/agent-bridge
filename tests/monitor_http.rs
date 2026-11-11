@@ -145,6 +145,35 @@ async fn topic_catalog_requires_monitor_access_and_respects_browser_origin() {
     assert_eq!(value["topics"], serde_json::json!([]));
 }
 
+#[tokio::test]
+async fn agent_names_require_monitor_access_and_respect_browser_origin() {
+    let root = tempfile::Builder::new()
+        .prefix("ab-agent-names-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let running = Running::start(root.path());
+    let access = running.enable(0).await;
+    assert!(
+        get(&access, "/api/agents", "")
+            .await
+            .starts_with("HTTP/1.1 401")
+    );
+    assert!(
+        get(
+            &access,
+            "/api/agents",
+            &format!("{}Origin: https://evil.example\r\n", auth(&access))
+        )
+        .await
+        .starts_with("HTTP/1.1 403")
+    );
+    assert!(
+        get(&access, "/api/agents?agent=x", &auth(&access))
+            .await
+            .starts_with("HTTP/1.1 400")
+    );
+}
+
 async fn first_event(stream: &mut TcpStream) -> String {
     timeout(Duration::from_secs(3), async {
         let mut bytes = Vec::new();

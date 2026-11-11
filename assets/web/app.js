@@ -4,7 +4,7 @@
 // modules (boards.js, topics.js). Everything is built with createElement/textContent: agent
 // text is untrusted, and the page's Content-Security-Policy forbids inline scripts and styles.
 (() => {
-  const { el, colorClass, initials, hhmm, dayKey, dayLabel, fullTime, svg, friendlyAgent } = window.AB;
+  const { el, colorClass, initials, hhmm, dayKey, dayLabel, fullTime, svg, agentNames, setAgentNames, agentName } = window.AB;
 
   // Consume the private link before making requests or displaying the workspace.
   // Fragments never travel in HTTP requests; replace this history entry as well.
@@ -87,7 +87,7 @@
     reconnectTimer = refreshTimer = catalog.boardPoll = scanTimer = null;
     route = null; navigating = false; queuedRoute = null; reconnectDelay = 1000; lastScan = 0;
     Object.assign(catalog, { boardNames: [], currentBoard: "main", topics: [] });
-    traffic.reset(); dm.reset(); localPeer = null;
+    traffic.reset(); dm.reset(); localPeer = null; clearInterval(agentTimer); agentTimer = null; setAgentNames([]);
     closePanel();
     document.body.dataset.view = "locked";
     $("sidebar").replaceChildren(); $("sidebar").hidden = true; body.classList.remove("has-sidebar");
@@ -138,11 +138,13 @@
   // id that differs from this machine's own.
   let localPeer = null;
   const isRemote = endpoint => !!endpoint?.peer_id && !!localPeer && endpoint.peer_id !== localPeer;
-  const endpointLabel = endpoint => endpoint?.agent ? (isRemote(endpoint) ? `${endpoint.machine_name || String(endpoint.peer_id).slice(0, 8)}/${friendlyAgent(endpoint.agent)}` : friendlyAgent(endpoint.agent)) : "unknown";
+  // Another machine's agent names are not known here, so remote agents keep the name they were sent as.
+  const nameOf = endpoint => isRemote(endpoint) ? endpoint.agent : agentName(endpoint.agent);
+  const endpointLabel = endpoint => endpoint?.agent ? (isRemote(endpoint) ? `${endpoint.machine_name || String(endpoint.peer_id).slice(0, 8)}/${nameOf(endpoint)}` : nameOf(endpoint)) : "unknown";
   function endpointName(endpoint) {
     if (!endpoint) return "Unknown agent";
     const machine = endpoint.machine_name || (endpoint.peer_id ? String(endpoint.peer_id).slice(0, 12) + "…" : "Local");
-    return `${machine} / ${friendlyAgent(endpoint.agent)}`;
+    return `${machine} / ${nameOf(endpoint)}`;
   }
   // An agent-to-agent conversation is a pair of agent identities, independent of direction.
   function pairOf(row) {
@@ -187,7 +189,7 @@
   function detailSection(title) { const section = el("section", "detail-section"); section.append(el("h3", "", title)); return section; }
   function endpointSection(title, endpoint = {}) {
     const section = detailSection(title);
-    section.append(infoGrid([["Machine", endpoint.machine_name || (endpoint.peer_id ? "Unknown remote machine" : "Local bridge")], ["Agent", friendlyAgent(endpoint.agent)], ["Agent ID", endpoint.agent, true], ["Provider", endpoint.provider], ["Session", endpoint.session, true], ["Peer ID", endpoint.peer_id || "Local", true]]));
+    section.append(infoGrid([["Machine", endpoint.machine_name || (endpoint.peer_id ? "Unknown remote machine" : "Local bridge")], ["Agent", nameOf(endpoint)], ["Agent ID", endpoint.agent, true], ["Provider", endpoint.provider], ["Session", endpoint.session, true], ["Peer ID", endpoint.peer_id || "Local", true]]));
     return section;
   }
   function relationButton(label, id) {
@@ -329,6 +331,26 @@
   };
   // Conversations are derived from recent messages. A bounded scan keeps this cheap and needs no
   // server change: messages already carry both endpoints.
+  let agentTimer = null;
+  async function loadAgentNames() {
+    if (!token) return;
+    const current = generation;
+    try {
+      const data = await api("/api/agents", current);
+      if (current !== generation) return;
+      const next = Array.isArray(data.agents) ? data.agents.filter(a => typeof a.name === "string" && typeof a.display_name === "string").map(a => [a.name, a.display_name]) : [];
+      const same = next.length === agentNames.size && next.every(([key, value]) => agentNames.get(key) === value);
+      if (same) return;
+      setAgentNames(next);
+      traffic.nodes.clear(); // cached rows were built with the old names
+      renderSidebar();
+      if (route?.kind === "dm" && dm.current) {
+        const { a, b } = dm.current;
+        $("dm-heading").textContent = `${endpointLabel(a)} ↔ ${endpointLabel(b)}`;
+        renderDm(true);
+      } else if (route?.kind === "traffic") renderRows();
+    } catch (error) { /* names are cosmetic: keep showing routing names */ }
+  }
   async function scanPairs() {
     if (!token) return;
     const current = generation, request = ++dm.scanRequest;
@@ -395,7 +417,7 @@
       const endpoint = row.source, name = endpointLabel(endpoint), tone = colorClass(endpointKey(endpoint));
       const grouped = !!before && before.source && endpointKey(before.source) === endpointKey(endpoint) && dayKey(before.created) === dayKey(row.created) && Number(row.created) - Number(before.created) < 5 * 60000;
       const item = el("li", `msg${grouped ? " is-grouped" : ""}${row.id === dm.selectedId ? " is-selected" : ""}`);
-      const avatar = el("div", `avatar ${tone}`, initials(friendlyAgent(endpoint.agent))); avatar.setAttribute("aria-hidden", "true");
+      const avatar = el("div", `avatar ${tone}`, initials(nameOf(endpoint))); avatar.setAttribute("aria-hidden", "true");
       const main = el("div", "msg__main");
       const meta = el("div", "msg__meta");
       meta.append(el("strong", `author ${tone}`, name), el("time", "time", hhmm(row.created)));
@@ -424,7 +446,7 @@
     const [a, b] = [dm.current.a, dm.current.b];
     $("dm-heading").textContent = `${endpointLabel(a)} ↔ ${endpointLabel(b)}`;
     $("dm-sub").textContent = `${a.provider ? a.provider + " · " : ""}${b.provider || ""}`.replace(/ · $/, "") || "agent conversation";
-    $("dm-avatars").replaceChildren(...[a, b].map(endpoint => { const tone = colorClass(endpointKey(endpoint)); const av = el("div", `avatar ${tone}`, initials(friendlyAgent(endpoint.agent))); return av; }));
+    $("dm-avatars").replaceChildren(...[a, b].map(endpoint => { const tone = colorClass(endpointKey(endpoint)); const av = el("div", `avatar ${tone}`, initials(nameOf(endpoint))); return av; }));
     if (pair) dm.seen.set(key, pair.latest);
     void loadDm();
     renderSidebar();
@@ -538,7 +560,7 @@
     create.addEventListener("click", async () => { const id = await topics.create(); if (id) void navigate({ kind: "topic", id }); });
     const pairItems = dm.pairs.map(pair => {
       const tile = el("span", "short short--pair");
-      for (const endpoint of [pair.a, pair.b]) { const dot = el("i", colorClass(endpointKey(endpoint)), initials(friendlyAgent(endpoint.agent))); tile.append(dot); }
+      for (const endpoint of [pair.a, pair.b]) { const dot = el("i", colorClass(endpointKey(endpoint)), initials(nameOf(endpoint))); tile.append(dot); }
       return navItem({ glyph: "⇄", label: `${endpointLabel(pair.a)} · ${endpointLabel(pair.b)}`, short: tile, target: { kind: "dm", id: pair.key }, unread: dmUnread(pair), title: `${endpointName(pair.a)} ⇄ ${endpointName(pair.b)}` });
     });
     const scroll = el("div", "sidebar__scroll");
@@ -722,6 +744,7 @@
       $("sidebar").hidden = false; body.classList.add("has-sidebar");
       for (const id of ["sidebar-toggle", "open-switcher", "lock-button"]) $(id).hidden = false;
       topics.start();
+      void loadAgentNames(); clearInterval(agentTimer); agentTimer = setInterval(() => { if (!document.hidden) void loadAgentNames(); }, 60000);
       void scanPairs(); void pollBoardNames();
       const first = parseRoute(location.hash) || defaultRoute();
       route = null;

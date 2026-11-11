@@ -90,9 +90,14 @@ only under All traffic. They are derived from the messages the broker already re
 data is collected. The list reflects the most recent 300 messages; opening a conversation loads its
 full history in pages (**Load older messages**).
 
-Agents are shown by the name they were given. A session nobody named is registered as
-`<provider>-<session id>`, so it is shown as the provider and the last four characters of the id
-(for example `Claude 3456`). The exact id is in the message details panel under **Agent ID**.
+Agents are shown by the name their client gives the session: Claude's session name, a Codex thread
+name or an OpenCode title, the same `display_name` that `agent-bridge list` reports. The page reads
+them from `GET /api/agents` when it opens and once a minute. An agent with no known name, and any
+agent on another machine, is shown by its routing name (for example `claude-<session id>`). The exact
+routing name is in the message details panel under **Agent ID**. If two sessions report the same name,
+the last four characters of each routing name are added to tell them apart. A renamed session appears
+under its new name on the next refresh, and open conversations update when it arrives. Names are labels
+only and never choose a destination.
 
 Each message shows its sender, time and delivery state when it is not delivered. Hover a message
 and choose **ⓘ** to open its delivery details in the side panel. The view is read only: there is

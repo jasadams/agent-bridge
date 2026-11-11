@@ -503,6 +503,38 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                 Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Topics unavailable"),
             }
         }
+        "/api/agents" => {
+            // The names the clients themselves give their sessions (Claude, Codex thread, OpenCode
+            // title), from the same catalogue `agent-bridge list` uses. Only exact identity and the
+            // name are returned; nothing here selects a destination.
+            let Ok(permit) = app.reads.clone().try_acquire_owned() else {
+                return Ok(error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Agent read limit reached",
+                ));
+            };
+            let _permit = permit;
+            if !app
+                .broker
+                .monitor_control
+                .lock()
+                .unwrap()
+                .current(app.generation)
+            {
+                return Ok(error(StatusCode::UNAUTHORIZED, "Web access expired"));
+            }
+            match app
+                .broker
+                .request_async(crate::protocol::Request::List {
+                    all: false,
+                    max_age_days: 30,
+                })
+                .await
+            {
+                Ok(listing) => json_response(json!({"agents": agent_names(&listing)})),
+                Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Agents unavailable"),
+            }
+        }
         "/api/boards" | "/api/archived-boards" => {
             let Ok(permit) = app.reads.clone().try_acquire_owned() else {
                 return Ok(error(
@@ -903,6 +935,44 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         Err(_)=>response(StatusCode::INTERNAL_SERVER_ERROR,"application/json; charset=utf-8",json!({"code":"uncertain","uncertain":true,"error":"Submission outcome is uncertain; retain the exact message ID and payload for retry"}).to_string()),
     }
 }
+/// Reduces a session listing to the fields the page needs to label an agent. Names are bounded and
+/// stripped of control characters because they come from other programs; the page renders them as text.
+fn agent_names(listing: &Value) -> Vec<Value> {
+    listing["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|agent| {
+            let name = agent["name"].as_str()?;
+            let display: String = agent["display_name"]
+                .as_str()?
+                .chars()
+                .filter(|c| {
+                    !c.is_control()
+                        && !matches!(
+                            c,
+                            '\u{200b}'..='\u{200f}'
+                                | '\u{2028}'..='\u{202e}'
+                                | '\u{2060}'..='\u{206f}'
+                                | '\u{feff}'
+                        )
+                })
+                .take(80)
+                .collect();
+            let display = display.trim();
+            (!display.is_empty() && display != name).then(|| {
+                json!({
+                    "name": name,
+                    "provider": agent["provider"],
+                    "session": agent["session"],
+                    "display_name": display,
+                })
+            })
+        })
+        .take(1000)
+        .collect()
+}
+
 fn json_response(value: Value) -> Response<Body> {
     response(
         StatusCode::OK,
@@ -1221,6 +1291,32 @@ mod control_tests {
         let disabled = control.credentials();
         assert!(disabled["access_token"].is_null());
         assert!(disabled["access_url"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod agent_name_tests {
+    use super::*;
+
+    #[test]
+    fn agent_names_keep_only_real_names_and_bound_them() {
+        let listing = json!({"agents":[
+            {"name":"claude-1","provider":"claude","session":"1","display_name":"  CDP-911  "},
+            {"name":"codex-2","provider":"codex","session":"2","display_name":null},
+            {"name":"codex-3","provider":"codex","session":"3","display_name":"codex-3"},
+            {"name":"claude-4","provider":"claude","session":"4","display_name":"\u{202e}\n\t"},
+            {"name":"opencode-5","provider":"opencode","session":"5","display_name":"x".repeat(200)},
+            {"provider":"claude","session":"6","display_name":"nameless"},
+        ]});
+        let rows = agent_names(&listing);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["name"], "claude-1");
+        assert_eq!(rows[0]["display_name"], "CDP-911");
+        assert_eq!(
+            rows[1]["display_name"].as_str().unwrap().chars().count(),
+            80
+        );
+        assert!(agent_names(&json!({})).is_empty());
     }
 }
 
