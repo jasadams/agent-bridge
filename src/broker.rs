@@ -173,8 +173,9 @@ impl Broker {
                 .lock()
                 .unwrap()
                 .peer(peer_id)
-                .map(|p| p.display_name)
-                .unwrap_or_else(|_| peer_id.to_owned());
+                .ok()
+                .and_then(|p| sanitize_label(&p.display_name))
+                .unwrap_or_else(|| peer_id.to_owned());
             let route = crate::db::canonical_route(name).ok().flatten();
             let label = remote_label
                 .and_then(sanitize_label)
