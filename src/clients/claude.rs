@@ -144,19 +144,11 @@ pub(crate) fn claude_content(msg: &Message, machines: &serde_json::Value) -> Str
 }
 
 fn claude_display_name(name: &str) -> String {
-    use unicode_general_category::{GeneralCategory as Category, get_general_category};
-    let name: String = name
+    // Control and format characters go through the shared sanitizer; the attribute also cannot hold these.
+    let name: String = crate::naming::sanitize_label(name)
+        .unwrap_or_default()
         .chars()
-        .filter(|c| {
-            !matches!(c, '"' | '<' | '>')
-                && !matches!(
-                    get_general_category(*c),
-                    Category::Control
-                        | Category::Format
-                        | Category::LineSeparator
-                        | Category::ParagraphSeparator
-                )
-        })
+        .filter(|c| !matches!(c, '"' | '<' | '>'))
         .collect();
     let mut chars = name.trim().chars();
     let mut result: String = chars.by_ref().take(64).collect();

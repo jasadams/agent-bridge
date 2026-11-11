@@ -19,6 +19,9 @@ An agent has an **ID** and a **name**. They are not interchangeable.
   `Claude 9f3c`. `naming::fallback_label` defines it once; no other code may reimplement it.
 - Every name is passed through `naming::sanitize_label` (control, format and separator characters removed,
   80 characters, empty means no name). Names come from other programs and machines.
+- `remote_label` is the untrusted label a remote sender attached to one message (read with
+  `Db::inbound_source_label`); callers resolving a route that is not tied to a message pass `None`.
+- A Claude name lookup runs a bounded `claude agents --json` (5 s deadline) per delivery.
 - `AgentRef::label()` is what recipients see: `name` for a local agent, `machine/name` for a remote one.
 
 ## Envelopes
