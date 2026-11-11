@@ -216,6 +216,20 @@ impl Broker {
         }
     }
 
+    /// Machine and sender-name context for one delivery; resolves the sender once, with no DB lock held.
+    fn delivery_machines(&self, msg: &crate::protocol::Message) -> Result<Value> {
+        let label = if msg.sender.contains('/') {
+            self.db.lock().unwrap().inbound_source_label(&msg.id)
+        } else {
+            None
+        };
+        let sender = self.resolve_agent(&msg.sender, label.as_deref());
+        let db = self.db.lock().unwrap();
+        Ok(
+            json!({"source_machine":self.message_machine(&db, &msg.sender)?,"destination_machine":self.message_machine(&db, &msg.recipient)?,"sender_name":sender.label()}),
+        )
+    }
+
     fn message_value(&self, db: &Db, message: &crate::protocol::Message) -> Result<Value> {
         let mut value = json!(message);
         value["state"] = json!(db.delivery_state(message)?);
@@ -2536,39 +2550,55 @@ impl Broker {
             notified.as_mut().enable();
             while workers.len() < 16 {
                 let busy_codex = codex_workers.sessions();
-                let next = self.blocking(move |broker| -> Result<_> {
-                    // Readiness and housekeeping only matter for a claimable message.
-                    if !broker.db.lock().unwrap().has_claimable()? {
-                        return Ok(None);
-                    }
-                    let readiness = broker.native_readiness();
-                    let claimed = {
-                        let mut db = broker.db.lock().unwrap();
-                        broker.revoke_event_controls_locked(&db)?;
-                        db.topic_push_revoke_obsolete()?;
-                        db.claim_excluding_codex(&busy_codex, Some(&readiness))?
-                    };
-                    Ok(claimed.map(|(msg, agent)| {
-                        // Resolve the sender once for this delivery, outside the DB lock.
-                        let label = if msg.sender.contains('/') { broker.db.lock().unwrap().inbound_source_label(&msg.id) } else { None };
-                        let sender = broker.resolve_agent(&msg.sender, label.as_deref());
-                        let db = broker.db.lock().unwrap();
-                        let machines = json!({"source_machine":broker.message_machine(&db, &msg.sender)?,"destination_machine":broker.message_machine(&db, &msg.recipient)?,"sender_name":sender.label()});
-                        let dispatch = if agent.provider==Provider::OpenCode {
-                            let content = crate::clients::Adapter::OpenCode.message_content(&msg,&broker.state_dir,&machines);
-                            match db.opencode_dispatch(&msg,&agent,&content) {
-                                Ok(dispatch) => Some(dispatch),
-                                Err(error) => {
-                                    db.opencode_dispatch_failed(&msg.id,&error.to_string())?;
-                                    return Ok(None);
-                                }
-                            }
-                        } else { None };
-                        let raw_codex_notice = agent.provider == Provider::Codex && db.codex_is_notice(&msg.id)?;
-                        let event_token = db.event_control_token(&msg.id)?;
-                        Ok::<_, anyhow::Error>(Some((msg, agent, machines, dispatch, raw_codex_notice, event_token)))
-                    }).transpose()?.flatten())
-                }).await?;
+                let next = self
+                    .blocking(move |broker| -> Result<_> {
+                        // Readiness and housekeeping only matter for a claimable message.
+                        if !broker.db.lock().unwrap().has_claimable()? {
+                            return Ok(None);
+                        }
+                        let readiness = broker.native_readiness();
+                        let claimed = {
+                            let mut db = broker.db.lock().unwrap();
+                            broker.revoke_event_controls_locked(&db)?;
+                            db.topic_push_revoke_obsolete()?;
+                            db.claim_excluding_codex(&busy_codex, Some(&readiness))?
+                        };
+                        Ok(claimed
+                            .map(|(msg, agent)| {
+                                let machines = broker.delivery_machines(&msg)?;
+                                let db = broker.db.lock().unwrap();
+                                let dispatch = if agent.provider == Provider::OpenCode {
+                                    let content = crate::clients::Adapter::OpenCode
+                                        .message_content(&msg, &broker.state_dir, &machines);
+                                    match db.opencode_dispatch(&msg, &agent, &content) {
+                                        Ok(dispatch) => Some(dispatch),
+                                        Err(error) => {
+                                            db.opencode_dispatch_failed(
+                                                &msg.id,
+                                                &error.to_string(),
+                                            )?;
+                                            return Ok(None);
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                let raw_codex_notice = agent.provider == Provider::Codex
+                                    && db.codex_is_notice(&msg.id)?;
+                                let event_token = db.event_control_token(&msg.id)?;
+                                Ok::<_, anyhow::Error>(Some((
+                                    msg,
+                                    agent,
+                                    machines,
+                                    dispatch,
+                                    raw_codex_notice,
+                                    event_token,
+                                )))
+                            })
+                            .transpose()?
+                            .flatten())
+                    })
+                    .await?;
                 let Some((msg, agent, machines, dispatch, raw_codex_notice, event_token)) = next
                 else {
                     break;
@@ -3098,6 +3128,60 @@ mod machine_tests {
                 .name,
             "Claude b3b8"
         );
+    }
+
+    #[tokio::test]
+    async fn every_provider_envelope_shows_the_sender_name_not_the_route() {
+        use crate::clients::Adapter;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bound =
+            Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let named = "97e8d81e-073d-4cde-a017-4a8255b7b3b8";
+        let unnamed = "11111111-2222-4333-8444-555555555555";
+        let script = directory.path().join("claude");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '[{{\"sessionId\":\"{named}\",\"name\":\"Planner\"}},{{\"sessionId\":\"{unnamed}\"}}]'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        bound.broker.claude_state = Arc::new(crate::clients::claude_discovery::State::new(script));
+        let broker = &bound.broker;
+        for (session, shown) in [(named, "Planner"), (unnamed, "Claude 5555")] {
+            let route = format!("claude-{session}");
+            let msg = crate::protocol::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                sender: route.clone(),
+                recipient: "reviewer".into(),
+                recipient_session: "s".into(),
+                body: "hello".into(),
+                parent: None,
+                hops: 0,
+                state: "sending".into(),
+                detail: None,
+                created: 0,
+                updated: 0,
+            };
+            let machines = broker.delivery_machines(&msg).unwrap();
+            for adapter in [Adapter::Claude, Adapter::OpenCode, Adapter::Codex] {
+                let text = adapter.message_content(&msg, &broker.state_dir, &machines);
+                assert!(text.contains(shown), "{text}");
+                // The route stays only in the exact routing fields, never as the shown name.
+                match adapter {
+                    Adapter::Claude => {
+                        assert!(text.contains(&format!("from-name=\"{shown}\"")), "{text}")
+                    }
+                    Adapter::OpenCode => {
+                        assert!(text.starts_with(&format!("{shown}:\n")), "{text}")
+                    }
+                    Adapter::Codex => assert!(
+                        text.contains(&format!("\"from_name\":\"{shown}\"")),
+                        "{text}"
+                    ),
+                }
+            }
+        }
     }
 
     #[tokio::test]
