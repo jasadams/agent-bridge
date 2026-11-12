@@ -72,7 +72,9 @@ Every API/MCP reply that names an agent also carries its resolved `{id, name, pr
 - Topics already carry the author's name (`author_display_name`, see the exception above).
 
 The broker resolves these after releasing the database lock, once per distinct agent (and, for a remote sender, per message label) per request. Each provider's native names are read at most once per request (one `claude agents --json`, one Codex,
-one OpenCode read) and every agent in the response resolves from that request-local snapshot.
+one OpenCode read) and every agent in the response resolves from that request-local snapshot. If a
+provider's read fails or is incomplete, that provider's agents show the generated fallback name for that
+request.
 
 ## Still to come
 
