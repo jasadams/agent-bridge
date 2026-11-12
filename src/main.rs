@@ -200,8 +200,10 @@ enum Commands {
     },
     /// Persist a message, then return its ID. Native delivery happens asynchronously.
     Send {
+        /// Sender ID or unique agent name.
         #[arg(long, default_value = "user")]
         from: String,
+        /// Recipient ID or unique agent name; an ambiguous or unknown name is an error.
         #[arg(long)]
         to: String,
         /// Omit to read stdin, keeping sensitive bodies out of process listings.

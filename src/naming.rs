@@ -60,9 +60,77 @@ pub fn fallback_label(provider: &Provider, session: &str) -> String {
     format!("{kind} {tail}")
 }
 
+/// A person typed `input` where an ID was expected and it is not an exact ID. `candidates` are
+/// `(id, name)` for every reachable local agent; `unavailable` lists providers that could not be
+/// read. A unique name yields its ID; anything else is an error and never a guess.
+pub fn match_name(
+    input: &str,
+    candidates: &[(String, String)],
+    unavailable: &[String],
+) -> Result<String, String> {
+    let wanted = sanitize_label(input).unwrap_or_default();
+    let shown = input.trim();
+    let mut ids: Vec<&str> = candidates
+        .iter()
+        .filter(|(_, name)| !wanted.is_empty() && *name == wanted)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let gaps = if unavailable.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} could not be read)", unavailable.join(", "))
+    };
+    match ids.as_slice() {
+        [] => Err(format!(
+            "Unknown agent {shown:?}{gaps}; use an exact ID or a unique name from list_agents"
+        )),
+        [id] => Ok((*id).to_owned()),
+        many => Err(format!(
+            "Agent name {shown:?} is ambiguous; use one exact ID: {}",
+            many.join(", ")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn c(id: &str, name: &str) -> (String, String) {
+        (id.into(), name.into())
+    }
+
+    #[test]
+    fn unique_name_resolves_and_ambiguity_lists_ids() {
+        let all = [
+            c("claude-a", "Planner"),
+            c("codex-b", "Planner"),
+            c("claude-c", "Coder"),
+        ];
+        assert_eq!(match_name(" Coder ", &all, &[]), Ok("claude-c".into()));
+        let err = match_name("Planner", &all, &[]).unwrap_err();
+        assert!(err.contains("ambiguous") && err.contains("claude-a") && err.contains("codex-b"));
+        assert!(
+            match_name("Nobody", &all, &[])
+                .unwrap_err()
+                .contains("Unknown agent")
+        );
+        assert!(match_name("\n", &all, &[]).is_err());
+    }
+
+    #[test]
+    fn unreadable_provider_is_reported_for_unknown_names_only() {
+        let all = [c("claude-c", "Coder")];
+        let gap = ["codex".to_string()];
+        assert_eq!(match_name("Coder", &all, &gap), Ok("claude-c".into()));
+        assert!(
+            match_name("Nobody", &all, &gap)
+                .unwrap_err()
+                .contains("codex could not be read")
+        );
+    }
 
     #[test]
     fn fallback_is_provider_and_session_tail() {
