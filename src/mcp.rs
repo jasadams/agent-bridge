@@ -180,9 +180,9 @@ struct SendArgs {
     /// Include the full broker result. Defaults to false.
     #[serde(default)]
     verbose: bool,
-    /// Registered local sender, never inferred from remote input.
+    /// Your registered ID, or your unique agent name. Never inferred from remote input.
     from: String,
-    /// Exact destination route. For a reply, use the received from / Reply to field.
+    /// Destination ID or a unique agent name (an ambiguous or unknown name is an error). For a reply, use the received from / Reply to field.
     to: String,
     body: String,
     /// Reuse the returned UUID after an ambiguous timeout to prevent duplication.
@@ -934,7 +934,7 @@ impl Bridge {
             .await
     }
     #[tool(
-        description = "Send under existing grants, then continue your work. Use your exact registered from identity. To reply, use received to / Delivered to as from, exact received from / Reply to as to, and received id / Message reference as parent. After a timeout or uncertain error, retry the same request using its id or returned request_id as id. verbose includes the full record."
+        description = "Send under existing grants, then continue your work. Use your exact registered from identity (or unique name). To reply, use received to / Delivered to as from, exact received from / Reply to as to, and received id / Message reference as parent. After a timeout or uncertain error, retry the same request using its id or returned request_id as id. verbose includes the full record."
     )]
     async fn send_message(&self, Parameters(args): Parameters<SendArgs>) -> CallToolResult {
         let id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());

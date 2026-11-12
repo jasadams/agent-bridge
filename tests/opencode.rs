@@ -1117,6 +1117,65 @@ async fn refused_socket_is_ignored_and_unlinked_and_a_hung_plugin_is_bounded() {
 }
 
 #[tokio::test]
+async fn send_accepts_a_unique_name_and_stores_the_id() {
+    let plugin = PluginSocket::start(receipt);
+    let state = plugin.root.path().join("state");
+    let bound = Broker::bind(state.clone(), "/missing/codex".into()).unwrap();
+    let server = tokio::spawn(broker::serve(bound));
+    plugin.publish(&state);
+    let send = |recipient: &str, id: &str| {
+        let state = state.clone();
+        let request = Request::Send {
+            id: id.into(),
+            sender: "user".into(),
+            recipient: recipient.into(),
+            body: "hello".into(),
+            parent: None,
+        };
+        async move { broker::rpc(&state, &request).await }
+    };
+    let route = format!("opencode-{SESSION}");
+    let by_name = send("same title", ID).await.unwrap();
+    assert_eq!(by_name["recipient"], route);
+    // The same send by ID is the same message, not a conflicting duplicate.
+    let by_id = send(&route, ID).await.unwrap();
+    assert_eq!(by_id["id"], ID);
+    let unknown = send("nobody", "223e4567-e89b-12d3-a456-426614174000")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(unknown.contains("Unknown agent"), "{unknown}");
+    // A second agent with the same title makes the name ambiguous: an error listing both IDs.
+    let twin = PluginSocket::start(|frame, instance| {
+        let row = state_row(OTHER, Value::Null);
+        state_reply(
+            &frame,
+            instance,
+            if frame["op"] == "state_get" {
+                row
+            } else {
+                json!([row])
+            },
+        )
+    });
+    twin.publish(&state);
+    let ambiguous = send("same title", "323e4567-e89b-12d3-a456-426614174000")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        ambiguous.contains("ambiguous") && ambiguous.contains(SESSION) && ambiguous.contains(OTHER),
+        "{ambiguous}"
+    );
+    // Retrying the already-stored send by name must say it was stored, not "not persisted".
+    let retried = send("same title", ID).await.unwrap_err().to_string();
+    assert!(retried.contains("already stored"), "{retried}");
+    server.abort();
+    twin.finish();
+    plugin.finish();
+}
+
+#[tokio::test]
 async fn failed_send_names_the_unreachable_side() {
     let plugin = PluginSocket::start(receipt);
     let state = plugin.root.path().join("state");

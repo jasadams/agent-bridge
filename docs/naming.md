@@ -39,6 +39,20 @@ without it (and routes with no label) fall back as above.
 Compatibility: an `Envelope` with `source_label` is rejected by peers that predate it (strict fields), so
 both brokers of a pair need this version for messages to flow. Envelopes without the field are unchanged.
 
+## Input by name
+
+`send --from/--to` and MCP `send_message` accept an ID or a name. `Broker::resolve_input` turns what was typed
+into an ID before the duplicate check or any storage, so a name and its ID are the same send. An exact ID (a
+registered alias, `claude-<session>`, or `<peer>/<route>`) always wins over a name. Otherwise the name is matched
+exactly (after `sanitize_label`) against the names of reachable local agents, read on demand from the native
+clients with `list_agents`' source; the no-name fallback (`Claude 9f3c`) is accepted too. Zero matches, several
+matches (the error lists their IDs) are errors: it never guesses. A provider that cannot be read contributes no
+candidates, exactly as in `list_agents`, and is named in the unknown-name error.
+Replies keep using the exact `from` / `Reply to` ID. Remote agents are addressed by ID (`peer/route`) only, and only sessions seen in the last 7 days are
+candidates. Names are accepted by `send` alone; `history`, topics, boards and grants still take IDs. If a send
+was already stored and its name no longer resolves on a retry, the error says so (the outcome stays
+uncertain, never "not persisted"): retry with the exact ID.
+
 ## Exception
 
 Topic posts keep their `author_display_name` snapshot: a topic is a historical record and shows the name the
@@ -46,5 +60,5 @@ author had when posting.
 
 ## Still to come
 
-Payloads carrying agents as `{id, name, provider, machine}` (AGB-59), removing the web UI's name heuristics
-(AGB-60) and accepting names as input (AGB-61).
+Payloads carrying agents as `{id, name, provider, machine}` (AGB-59) and removing the web UI's name heuristics
+(AGB-60).

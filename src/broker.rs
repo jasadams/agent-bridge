@@ -216,6 +216,43 @@ impl Broker {
         }
     }
 
+    /// Turn what a person typed (a name or an ID) into the exact ID before anything is stored.
+    /// An exact ID always wins; `peer/agent` stays an ID. Reads native clients on demand, with no
+    /// DB lock held and nothing kept afterwards.
+    fn resolve_input(&self, input: &str) -> Result<String> {
+        {
+            let db = self.db.lock().unwrap();
+            let remote = input
+                .split_once('/')
+                .is_some_and(|(peer, _)| db.peer(peer).is_ok());
+            if remote || db.agent(input).is_ok() {
+                return Ok(input.into());
+            }
+        }
+        let mut candidates = Vec::new();
+        let mut unavailable = Vec::new();
+        for provider in [Provider::Claude, Provider::Codex, Provider::OpenCode] {
+            match self.native_list(&provider, 7) {
+                Ok(states) => candidates.extend(states.into_iter().map(|state| {
+                    let name = state
+                        .display_name
+                        .as_deref()
+                        .and_then(crate::naming::sanitize_label)
+                        .unwrap_or_else(|| {
+                            crate::naming::fallback_label(&provider, &state.session)
+                        });
+                    (
+                        crate::clients::lifecycle::routing_name(&provider, &state.session),
+                        name,
+                    )
+                })),
+                Err(_) => unavailable.push(provider.label().to_owned()),
+            }
+        }
+        crate::naming::match_name(input, &candidates, &unavailable)
+            .map_err(|message| crate::protocol::SendNotPersisted(message).into())
+    }
+
     /// Machine and sender-name context for one delivery; resolves the sender once, with no DB lock held.
     fn delivery_machines(&self, msg: &crate::protocol::Message) -> Result<Value> {
         let label = if msg.sender.contains('/') {
@@ -1017,9 +1054,33 @@ impl Broker {
         }
     }
 
-    pub fn request(&self, req: Request) -> Result<Value> {
+    pub fn request(&self, mut req: Request) -> Result<Value> {
         // Complete all native/provider I/O before taking the DB administration
         // lock. These snapshots are request-local and discarded on return.
+        if let Request::Send {
+            id,
+            sender,
+            recipient,
+            ..
+        } = &mut req
+        {
+            // Names become IDs here, before duplicate detection or storage see them. A failed
+            // resolution proves nothing was stored only if this ID is new: a retry of a stored
+            // send must stay uncertain, never "not persisted".
+            for side in [&mut *sender, &mut *recipient] {
+                *side = match self.resolve_input(side) {
+                    Ok(resolved) => resolved,
+                    Err(error)
+                        if matches!(self.db.lock().unwrap().get_optional(id), Ok(Some(_))) =>
+                    {
+                        anyhow::bail!(
+                            "Message {id} was already stored, but {error:#}. Retry with the exact IDs"
+                        )
+                    }
+                    Err(error) => return Err(error),
+                };
+            }
+        }
         let prepared_send = match &req {
             Request::Send {
                 id,
