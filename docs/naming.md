@@ -58,7 +58,24 @@ uncertain, never "not persisted"): retry with the exact ID.
 Topic posts keep their `author_display_name` snapshot: a topic is a historical record and shows the name the
 author had when posting.
 
+## Payloads
+
+Every API/MCP reply that names an agent also carries its resolved `{id, name, provider, machine}`
+(`naming::AgentRef`; `local` is internal and not serialized), so clients never have to render a bare route:
+
+- Message records (`send_message`, `get_message`, `list_messages`, history, retry/cancel, and the MCP/CLI
+  board-input receipt): `sender_agent` and `recipient_agent`.
+- Web `/api/messages` and `/api/messages/{id}`: `source_agent` and `destination_agent` on each message.
+- `list_agents` rows: `id` (the route; `name` remains the route for compatibility) and a non-empty
+  `display_name` (the client name, else the fallback). Remote directory rows add `id` (`<peer>/<route>`) and
+  `display_name`.
+- Topics already carry the author's name (`author_display_name`, see the exception above).
+
+The broker resolves these after releasing the database lock, once per distinct agent (and, for a remote sender, per message label) per request. Each provider's native names are read at most once per request (one `claude agents --json`, one Codex,
+one OpenCode read) and every agent in the response resolves from that request-local snapshot. If a
+provider's read fails or is incomplete, that provider's agents show the generated fallback name for that
+request.
+
 ## Still to come
 
-Payloads carrying agents as `{id, name, provider, machine}` (AGB-59) and removing the web UI's name heuristics
-(AGB-60).
+Removing the web UI's name heuristics (AGB-60).
