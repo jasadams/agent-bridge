@@ -26,6 +26,9 @@ pub struct Envelope {
     pub origin_peer: String,
     pub id: String,
     pub source: RemoteAgent,
+    /// The sender's display name: untrusted, informational, never used for routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
     pub destination_peer: String,
     pub destination: RemoteAgent,
     pub body: String,
@@ -147,6 +150,12 @@ mod tests {
                 r#"{"name":"x","provider":"future","session":"unvalidated"}"#
             )
             .is_err()
+        );
+        // Envelopes from senders that predate the optional name label still parse.
+        let old = r#"{"origin_peer":"a","id":"i","source":{"name":"x","provider":"inbox","session":"x"},"destination_peer":"b","destination":{"name":"y","provider":"inbox","session":"y"},"body":"b","parent":null,"hops":0}"#;
+        assert_eq!(
+            serde_json::from_str::<Envelope>(old).unwrap().source_label,
+            None
         );
         assert_eq!(
             serde_json::to_value(WireRequest::new(Operation::Directory)).unwrap(),

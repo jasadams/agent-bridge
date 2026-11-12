@@ -21,6 +21,9 @@ pub(crate) fn envelope_with_machines(
     if machines.is_object() {
         data["source_machine"] = machines["source_machine"].clone();
         data["destination_machine"] = machines["destination_machine"].clone();
+        if let Some(name) = machines["sender_name"].as_str() {
+            data["from_name"] = json!(name);
+        }
     }
     let provenance = if msg.sender.contains('/') {
         "remote peer message"

@@ -1099,6 +1099,7 @@ mod tests {
                 origin_peer: peer.to_string(),
                 id: uuid::Uuid::new_v4().to_string(),
                 source: agent.clone(),
+                source_label: None,
                 destination_peer: local.clone(),
                 destination: agent,
                 body: "already queued by transport".into(),

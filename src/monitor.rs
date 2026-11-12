@@ -944,22 +944,8 @@ fn agent_names(listing: &Value) -> Vec<Value> {
         .flatten()
         .filter_map(|agent| {
             let name = agent["name"].as_str()?;
-            let display: String = agent["display_name"]
-                .as_str()?
-                .chars()
-                .filter(|c| {
-                    !c.is_control()
-                        && !matches!(
-                            c,
-                            '\u{200b}'..='\u{200f}'
-                                | '\u{2028}'..='\u{202e}'
-                                | '\u{2060}'..='\u{206f}'
-                                | '\u{feff}'
-                        )
-                })
-                .take(80)
-                .collect();
-            let display = display.trim();
+            let display = crate::naming::sanitize_label(agent["display_name"].as_str()?)?;
+            let display = display.as_str();
             (!display.is_empty() && display != name).then(|| {
                 json!({
                     "name": name,

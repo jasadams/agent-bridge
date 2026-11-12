@@ -243,6 +243,7 @@ impl Db {
             body,
             parent,
             Some(&destination),
+            None,
         )
     }
 
@@ -267,6 +268,7 @@ impl Db {
             body,
             parent,
             Some(destination),
+            None,
         )
     }
 
@@ -280,6 +282,7 @@ impl Db {
         body: &str,
         parent: &Option<String>,
         destination: Option<&RemoteAgent>,
+        source_label: Option<String>,
     ) -> Result<Message> {
         canonical_peer(local_peer)?;
         uuid::Uuid::parse_str(id).context("Message ID must be a UUID")?;
@@ -368,6 +371,7 @@ impl Db {
             origin_peer: local_peer.into(),
             id: id.into(),
             source: remote(source),
+            source_label: source_label.and_then(|label| crate::naming::sanitize_label(&label)),
             destination_peer: peer.peer_id.clone(),
             destination,
             body: body.into(),
@@ -521,6 +525,21 @@ impl Db {
     ) -> Result<()> {
         let destination = self.agent(&envelope.destination.name)?;
         self.accept_remote(local_peer, authenticated_peer, envelope, &destination)
+    }
+
+    /// The sender's label as stored with the accepted envelope; none for older senders.
+    pub(crate) fn inbound_source_label(&self, local_id: &str) -> Option<String> {
+        let encoded: String = self
+            .conn
+            .query_row(
+                "SELECT envelope FROM inbound_transfers WHERE local_id=?",
+                [local_id],
+                |row| row.get(0),
+            )
+            .ok()?;
+        serde_json::from_str::<Envelope>(&encoded)
+            .ok()?
+            .source_label
     }
 
     /// Duplicate envelope readback before any native lookup.

@@ -379,8 +379,7 @@ async fn shared_opencode_sessions_submit_once_and_exchange_exact_delivered_reply
     assert_eq!(
         content,
         format!(
-            "alice/{}:\n{body}\n\n[peer id={local} from={}/{} to={}]",
-            na.name(),
+            "alice/Native:\n{body}\n\n[peer id={local} from={}/{} to={}]",
             a.identity(),
             na.name(),
             nb.name()
