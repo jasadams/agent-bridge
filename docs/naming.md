@@ -86,8 +86,13 @@ topic reads resolve after releasing the database lock, and the mention list is r
 remote end) shows "Unknown agent", never its ID. The IDs the page still shows are in the message details panel,
 the hover title of a topic author and the `@<id>` mention token it inserts.
 
+Board message controls in the web interface are labelled with the owner's resolved name: `GET /api/boards/{name}`
+returns `message_labels` (control key to name) from the same resolver, after the database lock is released. The
+live board events carry no labels (their identity is polled every 500 ms and must not read native clients), so
+a rename shows on the next board load.
+
 The old `/api/agents` name list, the page's name polling and its ID-pattern heuristics are gone.
 `tests/web/labels.js` (run by `tests/web_labels.rs`, needs Node) exercises the label helpers with ID-bearing
-payloads, and `tests/monitor_http.rs` fails if the removed heuristics return. Not yet unified: board message
-controls are labelled by the broker's `message_labels`, which still come from `board_messages::fallback_label`
-(a separate fallback) until that is moved onto this resolver.
+payloads, and `tests/monitor_http.rs` fails if the removed heuristics return. The terminal board composer
+(`board_tui`, `board inspect`) still labels owners with `board_messages::fallback_label`, a separate fallback
+that is not part of the web interface and remains to be moved onto this resolver.

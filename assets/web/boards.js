@@ -233,7 +233,6 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange, on
               !(data.last_updated === null || Number.isSafeInteger(data.last_updated) && Math.abs(data.last_updated) <= 8640000000000000) ||
               !["file_mtime", "unknown"].includes(data.last_updated_source))) throw new Error("Invalid board metadata event");
           observeAuthority(data);
-          receiveMessageLabels(data);
           backoff = 1000;
           const currentView = latest || shown;
           if (data.revision !== currentView?.revision || metadata &&

@@ -54,7 +54,6 @@ fn board_metadata(running: &Running, name: &agent_bridge::board::Name) -> Value 
     value["last_updated"] = serde_json::json!(board.last_updated);
     value["last_updated_source"] = serde_json::json!(board.last_updated_source);
     value["read_only"] = serde_json::json!(!board.writable());
-    value["message_labels"] = serde_json::json!({});
     value
 }
 
@@ -1525,6 +1524,8 @@ fn web_assets_do_not_derive_agent_names_from_ids() {
             "(claude|codex|opencode)",
             "author_display_name !==",
             "agent.display_name",
+            "generated(",
+            "compactMessageLabel(owner",
         ] {
             assert!(
                 !source.contains(forbidden),
