@@ -114,6 +114,33 @@ available sessions:
 agent-bridge list
 ```
 
+**Claude desktop app (Code tab)**
+
+Code tab sessions run Claude Code, so they use the same MCP server and hooks
+as the terminal. Complete the Claude Code steps above, then allow inbound
+messages from other sessions. The desktop app cannot show Claude Code's approval
+dialog, so by default it holds such messages and drops them unseen after a few
+minutes, even though the broker's send succeeds and reports an Unknown outcome.
+Add this key to the top-level object in `~/.claude/settings.json`; see
+[Claude Code's inbound message controls](https://code.claude.com/docs/en/cross-session-messaging#control-inbound-messages)
+for the setting:
+
+```json
+"crossSessionInbound": "accept"
+```
+
+The app's `/config` screen does not offer this setting. Start new Code tab
+sessions afterwards, since existing sessions are not bound until their start
+hook runs, and confirm they appear in `agent-bridge list`. Remove the key, or set
+it to `hold`, to revert.
+
+This setting removes the approval step for messages from every Claude Code
+session on this machine, so enable it only if you trust all of them. Messages
+from paired peers are still untrusted data, never owner approval. Only Code tab
+sessions are supported; Chat conversations are not Claude Code sessions and are
+not expected to receive messages. This was verified with the Claude Code 2.1.325
+build bundled in desktop app 5.11492.5.
+
 Agent Bridge uses your existing agent sessions and makes no model API calls.
 [Native session setup](docs/native-sessions.md) explains registration, names and
 permission troubleshooting for all three clients. OpenCode also supports explicit
