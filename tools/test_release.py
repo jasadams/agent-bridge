@@ -172,7 +172,14 @@ class WorkflowTests(unittest.TestCase):
         # A tags-only push filter excludes every branch push. Removing the tag
         # filter instead would accidentally enable pushes for all branches.
         self.assertEqual(events['push'].strip(), "tags: ['v*']")
-        self.assertEqual(events['pull_request'].strip(), '')
+        # Prose-only pull requests skip validation. LICENSE (embedded in the
+        # binary) and docs/releases/ (read by release packaging) must not be
+        # listed, so they keep running it.
+        pull_request = [line.strip() for line in events['pull_request'].splitlines()
+                        if line.strip() and not line.strip().startswith('#')]
+        self.assertEqual(pull_request, [
+            'paths-ignore:', '- README.md', '- AGENTS.md', '- CLAUDE.md',
+            '- .claude/*.md', '- docs/*.md'])
         self.assertEqual(events['workflow_dispatch'].strip(), '')
 
     def test_four_platform_source_validation_is_unconditional(self):
