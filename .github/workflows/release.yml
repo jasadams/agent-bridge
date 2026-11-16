@@ -4,6 +4,14 @@ on:
   push:
     tags: ['v*']
   pull_request:
+    # Skip pull requests that change only prose. LICENSE, docs/releases/ (read by
+    # release packaging), sources, tools and workflows are deliberately not listed.
+    paths-ignore:
+      - README.md
+      - AGENTS.md
+      - CLAUDE.md
+      - .claude/*.md
+      - docs/*.md
   workflow_dispatch:
 
 permissions:

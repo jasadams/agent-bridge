@@ -61,13 +61,19 @@ Never modify the user's running service or private state for validation.
 manual dispatch, not plain main pushes (which would duplicate PR/tag validation).
 Its four-platform matrix validates formatting, package tests and Clippy, vendor
 relay tests/formatting/Clippy, installer and release Python checks, and release
-binary builds. Only semantic version tag pushes can publish. See
-`docs/releasing.md` for the release process. Do not add a duplicate PR pipeline.
+binary builds. Only semantic version tag pushes can publish. Pull requests that
+change only `README.md`, `AGENTS.md`, `CLAUDE.md`, `.claude/*.md` or top-level
+`docs/*.md` do not run it, so such a PR reports no checks. A PR that touches
+anything else, including `docs/releases/` or `LICENSE`, runs the full matrix.
+See `docs/releasing.md` for the release process. Do not add a duplicate PR
+pipeline.
 
 Backlog-fast runs selected local checks and independent review, then waits within
 the same turn for all current-head PR checks. Empty, pending, cancelled, or failed
-checks are not green. Leave a successful PR open for merge-sweeper and record any
-runtime or manual QA not exercised. Signing is retired.
+checks are not green, except that a PR changing only files the workflow's path
+filter ignores correctly has none; confirm that with `gh pr diff --name-only`.
+Leave a successful PR open for merge-sweeper and record any runtime or manual QA
+not exercised. Signing is retired.
 
 All builds, tests, and Clippy commands must run in the foreground; consume the
 actual exit before continuing or ending the turn. Do not use `&`, `nohup`, detached

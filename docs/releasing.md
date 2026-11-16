@@ -28,7 +28,12 @@ and macOS Apple Silicon binaries, checks their reported versions, then
 publishes a GitHub release after all platforms succeed. Pull requests and
 manual runs on branches run the same three-platform source,
 test, lint, installer and packaging checks. They skip optimized executable builds,
-macOS signing, release-binary version checks and release artifact uploads.
+macOS signing, release-binary version checks and release artifact uploads. Pull
+requests whose changed files all match `README.md`, `AGENTS.md`, `CLAUDE.md`,
+`.claude/*.md` or `docs/*.md` skip the workflow; release notes under
+`docs/releases/` and `LICENSE` still run it. If branch protection later requires
+these checks, a skipped docs-only PR would wait for a check that never runs, so add
+an always-running path before requiring them.
 
 Ordinary main pushes do not trigger the workflow, avoiding a redundant validation
 run when a reviewed PR is merged and tagged. Direct main changes can be validated
