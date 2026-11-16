@@ -174,6 +174,41 @@ impl Broker {
             message[format!("{side}_agent")] = json!(resolved);
         }
     }
+    /// Adds the resolved `author_agent` ({id, name, provider, machine}) and the display `author_name` to each
+    /// topic post, and `agent` to each topic-agent row. A post keeps the name its author had when posting
+    /// (`author_display_name`, a historical snapshot) unless that is only the ID, then the resolved name.
+    /// Topic ids are `inbox-<route>`; the human's `inbox-user`
+    /// is not an agent. Call it without the database lock: the resolver reads native clients.
+    pub(crate) fn attach_topic_agents(&self, value: &mut Value) {
+        let mut seen = AgentRefs::default();
+        let mut attach = |holder: &mut Value, reference: &str, key: &str| {
+            let id = reference.strip_prefix("inbox-").unwrap_or(reference);
+            if id == "user" {
+                return;
+            }
+            holder[key] = json!(self.agent_ref_once(id, None, &mut seen));
+        };
+        for post in value["posts"].as_array_mut().into_iter().flatten() {
+            if let Some(id) = post["author"]["agent_id"].as_str().map(str::to_owned) {
+                attach(post, &id, "author_agent");
+                let plain = id.strip_prefix("inbox-").unwrap_or(&id).to_owned();
+                let snapshot = post["author_display_name"]
+                    .as_str()
+                    .filter(|name| name.strip_prefix("inbox-").unwrap_or(name) != plain);
+                let name = snapshot
+                    .map(str::to_owned)
+                    .or_else(|| post["author_agent"]["name"].as_str().map(str::to_owned));
+                if let Some(name) = name {
+                    post["author_name"] = json!(name);
+                }
+            }
+        }
+        for row in value["agents"].as_array_mut().into_iter().flatten() {
+            if let Some(id) = row["reference"]["agent_id"].as_str().map(str::to_owned) {
+                attach(row, &id, "agent");
+            }
+        }
+    }
     pub(crate) fn monitor_message(&self, id: &str) -> Result<Value> {
         let mut detail = {
             let db = self.db.lock().unwrap();
@@ -498,5 +533,34 @@ mod tests {
             message["message"]["destination"]["session"],
             "saved-destination"
         );
+    }
+
+    #[tokio::test]
+    async fn topic_posts_and_agents_carry_the_resolved_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let session = "97e8d81e-073d-4cde-a017-4a8255b7b3b8";
+        let mut page = json!({
+            "posts": [
+                {"author": {"agent_id": format!("inbox-claude-{session}")}, "author_display_name": format!("inbox-claude-{session}")},
+                {"author": {"agent_id": "inbox-user"}, "author_display_name": "user"},
+            ],
+            "agents": [{"reference": {"agent_id": format!("inbox-claude-{session}")}, "display_name": "x"}],
+        });
+        bound.broker.attach_topic_agents(&mut page);
+        // No client can be read here, so the one Rust fallback names the agent.
+        assert_eq!(page["posts"][0]["author_agent"]["name"], "Claude b3b8");
+        assert_eq!(
+            page["posts"][0]["author_agent"]["id"],
+            format!("claude-{session}")
+        );
+        assert!(page["posts"][1].get("author_agent").is_none());
+        assert_eq!(page["agents"][0]["agent"]["name"], "Claude b3b8");
+        // The snapshot wins only when it is a real name; the ID as a "name" is replaced.
+        assert_eq!(page["posts"][0]["author_name"], "Claude b3b8");
+        let mut named = json!({"posts": [{"author": {"agent_id": format!("inbox-claude-{session}")}, "author_display_name": "Planner"}]});
+        bound.broker.attach_topic_agents(&mut named);
+        assert_eq!(named["posts"][0]["author_name"], "Planner");
+        assert!(page["posts"][1].get("author_name").is_none());
     }
 }

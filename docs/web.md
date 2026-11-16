@@ -90,14 +90,15 @@ only under All traffic. They are derived from the messages the broker already re
 data is collected. The list reflects the most recent 300 messages; opening a conversation loads its
 full history in pages (**Load older messages**).
 
-Agents are shown by the name their client gives the session: Claude's session name, a Codex thread
-name or an OpenCode title, the same `display_name` that `agent-bridge list` reports. The page reads
-them from `GET /api/agents` when it opens and once a minute. An agent with no known name, and any
-agent on another machine, is shown by its routing name (for example `claude-<session id>`). The exact
-routing name is in the message details panel under **Agent ID**. If two sessions report the same name,
-the last four characters of each routing name are added to tell them apart. A renamed session appears
-under its new name on the next refresh, and open conversations update when it arrives. Names are labels
-only and never choose a destination.
+Agents are shown by name. The broker resolves each agent's name when it answers a request (Claude's session
+name, a Codex thread name or an OpenCode title, else a generated name such as `Claude 9f3c`) and sends it with
+every message as `source_agent` / `destination_agent`, and with topic posts and the mention list as
+`author_agent` / `agent` ({id, name, provider, machine}). The page only displays these references; it never
+builds a name from an ID and no longer polls for names. The exact routing ID is in the message details panel
+under **Agent ID** and in a hover title on topic authors. A renamed session appears under its new name the next
+time its messages are loaded; a topic post already on screen keeps the name it was loaded with. Two sessions may share a name; the details panel tells them apart by ID. Topic
+posts keep the name the author had when posting (see `docs/naming.md`). Names are labels only and never
+choose a destination.
 
 Each message shows its sender, time and delivery state when it is not delivered. Hover a message
 and choose **ⓘ** to open its delivery details in the side panel. The view is read only: there is

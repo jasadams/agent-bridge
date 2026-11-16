@@ -136,7 +136,7 @@ body[data-view="locked"] .main { overflow: auto; }
 .msg__main { min-width: 0; }
 .msg__meta { display: flex; align-items: baseline; gap: var(--s-2); flex-wrap: wrap; }
 .author { font-weight: 650; color: var(--agent, var(--text)); }
-.time, .via { color: var(--text-3); font-size: var(--t-xs); font-family: var(--mono); }
+.time { color: var(--text-3); font-size: var(--t-xs); font-family: var(--mono); }
 .avatar { width: 36px; height: 36px; border-radius: 9px; display: grid; place-items: center; font-weight: 700; font-size: var(--t-sm); flex: none; background: color-mix(in srgb, var(--agent, var(--accent)) 22%, var(--surface)); color: var(--agent, var(--accent)); }
 .agent-c0 { --agent: var(--agent-0); } .agent-c1 { --agent: var(--agent-1); } .agent-c2 { --agent: var(--agent-2); }
 .agent-c3 { --agent: var(--agent-3); } .agent-c4 { --agent: var(--agent-4); } .agent-c5 { --agent: var(--agent-5); }

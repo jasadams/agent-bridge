@@ -404,7 +404,6 @@ fn conflict(snapshot: &Snapshot) -> Reply {
 /// Content identity plus authoritative metadata observed by the live board feed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct BoardIdentity {
-    pub message_labels: crate::board_messages::DisplayLabels,
     pub revision: String,
     pub exists: bool,
     pub last_updated: Option<i64>,
@@ -412,6 +411,28 @@ pub(crate) struct BoardIdentity {
     pub read_only: bool,
     #[serde(flatten)]
     pub lifecycle: board::Lifecycle,
+}
+
+/// Different agents may share a name: number them so their controls stay distinguishable.
+fn number_shared_names(
+    owners: Vec<(String, String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut labels = std::collections::BTreeMap::new();
+    for (key, owner, name) in &owners {
+        let mut same: Vec<&String> = owners
+            .iter()
+            .filter(|o| &o.2 == name)
+            .map(|o| &o.1)
+            .collect();
+        same.sort();
+        same.dedup();
+        let label = match same.iter().position(|o| *o == owner) {
+            Some(index) if same.len() > 1 => format!("{name} ({})", index + 1),
+            _ => name.clone(),
+        };
+        labels.insert(key.clone(), label);
+    }
+    labels
 }
 
 impl Broker {
@@ -426,16 +447,13 @@ impl Broker {
             return Err(reply(401, "unauthorized", "Web access expired"));
         }
         crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now())
-            .and_then(|snapshot| {
-                Ok(BoardIdentity {
-                    message_labels: crate::board_messages::display_labels(&db, &snapshot)?,
-                    revision: snapshot.revision,
-                    exists: snapshot.exists,
-                    last_updated: snapshot.last_updated,
-                    last_updated_source: snapshot.last_updated_source,
-                    read_only: snapshot.lifecycle.state != board::LifecycleState::Active,
-                    lifecycle: snapshot.lifecycle,
-                })
+            .map(|snapshot| BoardIdentity {
+                revision: snapshot.revision,
+                exists: snapshot.exists,
+                last_updated: snapshot.last_updated,
+                last_updated_source: snapshot.last_updated_source,
+                read_only: snapshot.lifecycle.state != board::LifecycleState::Active,
+                lifecycle: snapshot.lifecycle,
             })
             .map_err(|_| {
                 reply(
@@ -565,17 +583,21 @@ impl Broker {
         name: &Name,
         conditional: Option<&str>,
     ) -> Reply {
-        let db = self.db.lock().unwrap();
-        let access = self.monitor_control.lock().unwrap();
-        if !access.current(generation) {
-            return reply(401, "unauthorized", "Web access expired");
-        }
-        match crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now()) {
+        let inspected = {
+            let db = self.db.lock().unwrap();
+            let access = self.monitor_control.lock().unwrap();
+            if !access.current(generation) {
+                return reply(401, "unauthorized", "Web access expired");
+            }
+            crate::board_lifecycle::inspect(&db, &self.state_dir, name, crate::db::now())
+        };
+        match inspected {
             Ok(snapshot) => {
-                let labels = match crate::board_messages::display_labels(&db, &snapshot) {
-                    Ok(labels) => labels,
-                    Err(_) => return reply(500, "unavailable", "Agent labels could not be read"),
-                };
+                // Names are resolved without holding the database lock: the resolver reads native clients.
+                let labels = self.board_message_labels(&snapshot);
+                if !self.monitor_control.lock().unwrap().current(generation) {
+                    return reply(401, "unauthorized", "Web access expired");
+                }
                 let mut body = if conditional == Some(snapshot.revision.as_str()) {
                     let mut value = json!({"name":snapshot.name,"revision":snapshot.revision,"exists":snapshot.exists,"last_updated":snapshot.last_updated,"last_updated_source":snapshot.last_updated_source,"unchanged":true});
                     lifecycle_metadata(&mut value, &snapshot);
@@ -592,6 +614,30 @@ impl Broker {
                 "Board unavailable; select an existing board",
             ),
         }
+    }
+    /// The resolved name of each message control's owner, by control key (AGB-57). Labels are the broker
+    /// resolver's names, never derived from the owner's ID; call without the database lock.
+    fn board_message_labels(
+        &self,
+        snapshot: &Snapshot,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut seen = crate::broker::AgentRefs::default();
+        // (control key, owner ID, name) in board order.
+        let mut owners = Vec::new();
+        for control in crate::board_interaction::controls(&snapshot.markdown) {
+            let crate::board_interaction::Kind::Message { owner, .. } = &control.kind else {
+                continue;
+            };
+            if let Some(key) = control.message_key(&snapshot.control_scope()) {
+                // An unresolvable owner is board-file text: bound it like any other name.
+                let name = crate::naming::sanitize_label(
+                    &self.agent_ref_once(&owner.name, None, &mut seen).name,
+                )
+                .unwrap_or_else(|| "Agent".into());
+                owners.push((key, owner.name.clone(), name));
+            }
+        }
+        number_shared_names(owners)
     }
     pub(crate) fn monitor_board_message(
         &self,
@@ -821,6 +867,25 @@ mod tests {
             value,
         }
     }
+    #[test]
+    fn agents_sharing_a_name_are_numbered_per_owner() {
+        let rows = |items: &[(&str, &str, &str)]| {
+            items
+                .iter()
+                .map(|(k, o, n)| (k.to_string(), o.to_string(), n.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let labels = number_shared_names(rows(&[
+            ("a", "o1", "planner"),
+            ("b", "o2", "planner"),
+            ("c", "o1", "planner"),
+            ("d", "o3", "solo"),
+        ]));
+        assert_eq!(labels["a"], "planner (1)");
+        assert_eq!(labels["b"], "planner (2)");
+        assert_eq!(labels["c"], "planner (1)");
+        assert_eq!(labels["d"], "solo");
+    }
     #[tokio::test]
     async fn main_cosmetic_labels_do_not_change_board_identity() {
         let (root, bound, old) = setup();
@@ -838,14 +903,28 @@ mod tests {
             label: "Message coordinator".into(),
             owner: owner.clone(),
         };
+        // An owner known only by its generated route: it is named by the single Rust fallback.
+        let other = "11111111-2222-4333-8444-555555555555";
+        let generated = crate::board_messages::Marker {
+            id: "main-generated".into(),
+            instance: uuid::Uuid::new_v4().to_string(),
+            label: format!("Message claude-{other}"),
+            owner: crate::board_messages::Owner {
+                name: format!("claude-{other}"),
+                provider: crate::protocol::Provider::Claude,
+                session: other.into(),
+                endpoint: "/tmp/generated.sock".into(),
+            },
+        };
         let before = board::update_named(
             root.path(),
             &Name::default(),
             &old.revision,
             &[board::Edit::Append {
                 text: format!(
-                    "\n<!-- board-message: {} -->\n",
-                    serde_json::to_string(&marker).unwrap()
+                    "\n<!-- board-message: {} -->\n\n<!-- board-message: {} -->\n",
+                    serde_json::to_string(&marker).unwrap(),
+                    serde_json::to_string(&generated).unwrap()
                 ),
             }],
         )
@@ -874,6 +953,15 @@ mod tests {
                 .values()
                 .any(|value| value == "coordinator")
         );
+        // The web label is the resolved name: the fallback, never the generated route.
+        assert!(
+            first.body["message_labels"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|value| value == "Claude 5555")
+        );
+        assert!(!first.body["message_labels"].to_string().contains(other));
         let identity = broker
             .monitor_board_revision(1, &Name::default())
             .unwrap_or_else(|reply| {
@@ -890,7 +978,6 @@ mod tests {
                     reply.status, reply.body
                 )
             });
-        assert_eq!(identity.message_labels, updated.message_labels);
         assert_eq!(identity.revision, updated.revision);
         let after = board::read(root.path()).unwrap();
         assert_eq!(

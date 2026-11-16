@@ -76,6 +76,23 @@ one OpenCode read) and every agent in the response resolves from that request-lo
 provider's read fails or is incomplete, that provider's agents show the generated fallback name for that
 request.
 
-## Still to come
+## Web interface
 
-Removing the web UI's name heuristics (AGB-60).
+The web page labels agents only with names the broker resolved; it never builds a name from an ID. Message rows
+use `source_agent`/`destination_agent`; topic posts use `author_name` (the author's snapshot name, else the
+resolved `author_agent`, decided in Rust by `attach_topic_agents`) and the mention list uses `agent`. The web
+topic reads resolve after releasing the database lock, and the mention list is read when the picker is used
+(at most every 30 seconds), not on the topic refresh timer. A message end with no reference (an unresolvable
+remote end) shows "Unknown agent", never its ID. The IDs the page still shows are in the message details panel,
+the hover title of a topic author and the `@<id>` mention token it inserts.
+
+Board message controls in the web interface are labelled with the owner's resolved name: `GET /api/boards/{name}`
+returns `message_labels` (control key to name) from the same resolver, after the database lock is released. The
+live board events carry no labels (their identity is polled every 500 ms and must not read native clients), so
+a rename shows on the next board load.
+
+The old `/api/agents` name list, the page's name polling and its ID-pattern heuristics are gone.
+`tests/web/labels.js` (run by `tests/web_labels.rs`, needs Node) exercises the label helpers with ID-bearing
+payloads, and `tests/monitor_http.rs` fails if the removed heuristics return. The terminal board composer
+(`board_tui`, `board inspect`) still labels owners with `board_messages::fallback_label`, a separate fallback
+that is not part of the web interface and remains to be moved onto this resolver.
