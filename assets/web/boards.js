@@ -361,11 +361,8 @@ window.createBoardMonitor = ({ request, connect, authenticated, onViewChange, on
   const messageLabel = control => {
     const known = messageLabels[control.rebase_key];
     if (typeof known === "string" && compactMessageLabel(known)) return compactMessageLabel(known);
-    const owner = control.owner;
-    const generated = value => /(claude|codex|opencode)-[0-9a-f-]{36}|opencode-ses_/i.test(value);
-    if (!generated(owner.name) && owner.name !== `${owner.provider}-${owner.session}`) return compactMessageLabel(owner.name);
-    if (control.label && !control.label.includes(owner.name) && !generated(control.label) && compactMessageLabel(control.label)) return compactMessageLabel(control.label);
-    return ({claude:"Claude", codex:"Codex", opencode:"OpenCode", inbox:"Agent"})[owner.provider] || "Agent";
+    // The broker labels every message control (`message_labels`); the page never inspects the owner's ID.
+    return "Agent";
   };
   function receiveMessageLabels(value) {
     if (!value.message_labels || typeof value.message_labels !== "object" || Array.isArray(value.message_labels)) return;

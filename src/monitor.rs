@@ -452,6 +452,11 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                             Ok(page) => {
                                 let mut value = json!(page);
                                 crate::monitor_board::annotate_topic_page(&mut value);
+                                broker.attach_topic_agents(&mut value);
+                                // Resolving names can be slow: access may have been revoked meanwhile.
+                                if !broker.monitor_control.lock().unwrap().current(generation) {
+                                    return error(StatusCode::UNAUTHORIZED, "Web access expired");
+                                }
                                 json_response(value)
                             }
                             Err(_) => error(StatusCode::BAD_REQUEST, "Invalid topic or cursor"),
@@ -478,22 +483,34 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
             let agents = path == "/api/topic-agents";
             match tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let db = broker.db.lock().unwrap();
-                let access = broker.monitor_control.lock().unwrap();
-                if !access.current(generation) {
-                    return error(StatusCode::UNAUTHORIZED, "Web access expired");
-                }
-                let result = crate::network::identity::Identity::load_or_create(&broker.state_dir)
-                    .and_then(|identity| {
-                        let local = identity.info().peer_id;
-                        if agents {
-                            Ok(json!({"agents": db.topic_agents(&local)?}))
-                        } else {
-                            Ok(json!({"topics": db.topic_list(&local, true)?}))
-                        }
-                    });
+                // Release the locks before resolving names: the resolver reads native clients.
+                let result = {
+                    let db = broker.db.lock().unwrap();
+                    let access = broker.monitor_control.lock().unwrap();
+                    if !access.current(generation) {
+                        return error(StatusCode::UNAUTHORIZED, "Web access expired");
+                    }
+                    crate::network::identity::Identity::load_or_create(&broker.state_dir).and_then(
+                        |identity| {
+                            let local = identity.info().peer_id;
+                            if agents {
+                                Ok(json!({"agents": db.topic_agents(&local)?}))
+                            } else {
+                                Ok(json!({"topics": db.topic_list(&local, true)?}))
+                            }
+                        },
+                    )
+                };
                 match result {
-                    Ok(value) => json_response(value),
+                    Ok(mut value) => {
+                        if agents {
+                            broker.attach_topic_agents(&mut value);
+                            if !broker.monitor_control.lock().unwrap().current(generation) {
+                                return error(StatusCode::UNAUTHORIZED, "Web access expired");
+                            }
+                        }
+                        json_response(value)
+                    }
                     Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Topics unavailable"),
                 }
             })
@@ -501,38 +518,6 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
             {
                 Ok(reply) => reply,
                 Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Topics unavailable"),
-            }
-        }
-        "/api/agents" => {
-            // The names the clients themselves give their sessions (Claude, Codex thread, OpenCode
-            // title), from the same catalogue `agent-bridge list` uses. Only exact identity and the
-            // name are returned; nothing here selects a destination.
-            let Ok(permit) = app.reads.clone().try_acquire_owned() else {
-                return Ok(error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Agent read limit reached",
-                ));
-            };
-            let _permit = permit;
-            if !app
-                .broker
-                .monitor_control
-                .lock()
-                .unwrap()
-                .current(app.generation)
-            {
-                return Ok(error(StatusCode::UNAUTHORIZED, "Web access expired"));
-            }
-            match app
-                .broker
-                .request_async(crate::protocol::Request::List {
-                    all: false,
-                    max_age_days: 30,
-                })
-                .await
-            {
-                Ok(listing) => json_response(json!({"agents": agent_names(&listing)})),
-                Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Agents unavailable"),
             }
         }
         "/api/boards" | "/api/archived-boards" => {
@@ -935,31 +920,6 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         Err(_)=>response(StatusCode::INTERNAL_SERVER_ERROR,"application/json; charset=utf-8",json!({"code":"uncertain","uncertain":true,"error":"Submission outcome is uncertain; retain the exact message ID and payload for retry"}).to_string()),
     }
 }
-/// Reduces a session listing to the fields the page needs to label an agent (rows whose name is just the
-/// route are dropped). Names are bounded and
-/// stripped of control characters because they come from other programs; the page renders them as text.
-fn agent_names(listing: &Value) -> Vec<Value> {
-    listing["agents"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|agent| {
-            let name = agent["name"].as_str()?;
-            let display = crate::naming::sanitize_label(agent["display_name"].as_str()?)?;
-            let display = display.as_str();
-            (!display.is_empty() && display != name).then(|| {
-                json!({
-                    "name": name,
-                    "provider": agent["provider"],
-                    "session": agent["session"],
-                    "display_name": display,
-                })
-            })
-        })
-        .take(1000)
-        .collect()
-}
-
 fn json_response(value: Value) -> Response<Body> {
     response(
         StatusCode::OK,
@@ -1278,32 +1238,6 @@ mod control_tests {
         let disabled = control.credentials();
         assert!(disabled["access_token"].is_null());
         assert!(disabled["access_url"].is_null());
-    }
-}
-
-#[cfg(test)]
-mod agent_name_tests {
-    use super::*;
-
-    #[test]
-    fn agent_names_keep_only_real_names_and_bound_them() {
-        let listing = json!({"agents":[
-            {"name":"claude-1","provider":"claude","session":"1","display_name":"  CDP-911  "},
-            {"name":"codex-2","provider":"codex","session":"2","display_name":null},
-            {"name":"codex-3","provider":"codex","session":"3","display_name":"codex-3"},
-            {"name":"claude-4","provider":"claude","session":"4","display_name":"\u{202e}\n\t"},
-            {"name":"opencode-5","provider":"opencode","session":"5","display_name":"x".repeat(200)},
-            {"provider":"claude","session":"6","display_name":"nameless"},
-        ]});
-        let rows = agent_names(&listing);
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0]["name"], "claude-1");
-        assert_eq!(rows[0]["display_name"], "CDP-911");
-        assert_eq!(
-            rows[1]["display_name"].as_str().unwrap().chars().count(),
-            80
-        );
-        assert!(agent_names(&json!({})).is_empty());
     }
 }
 

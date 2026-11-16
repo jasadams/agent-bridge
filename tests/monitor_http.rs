@@ -145,35 +145,6 @@ async fn topic_catalog_requires_monitor_access_and_respects_browser_origin() {
     assert_eq!(value["topics"], serde_json::json!([]));
 }
 
-#[tokio::test]
-async fn agent_names_require_monitor_access_and_respect_browser_origin() {
-    let root = tempfile::Builder::new()
-        .prefix("ab-agent-names-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let running = Running::start(root.path());
-    let access = running.enable(0).await;
-    assert!(
-        get(&access, "/api/agents", "")
-            .await
-            .starts_with("HTTP/1.1 401")
-    );
-    assert!(
-        get(
-            &access,
-            "/api/agents",
-            &format!("{}Origin: https://evil.example\r\n", auth(&access))
-        )
-        .await
-        .starts_with("HTTP/1.1 403")
-    );
-    assert!(
-        get(&access, "/api/agents?agent=x", &auth(&access))
-            .await
-            .starts_with("HTTP/1.1 400")
-    );
-}
-
 async fn first_event(stream: &mut TcpStream) -> String {
     timeout(Duration::from_secs(3), async {
         let mut bytes = Vec::new();
@@ -1533,4 +1504,37 @@ async fn topic_posts_carry_parsed_body_nodes_and_degrade_to_plain_text() {
     // Too complex to render safely: plain text only, and the stored body is still delivered.
     assert!(posts[1]["body_nodes"].is_null());
     assert_eq!(posts[1]["body"], complex);
+}
+
+/// AGB-60: the page shows names the broker resolved and never derives one from an ID. These guard the
+/// shipped assets against the old client-side name heuristics returning.
+#[test]
+fn web_assets_do_not_derive_agent_names_from_ids() {
+    for (file, source) in [
+        ("app.js", include_str!("../assets/web/app.js")),
+        ("boards.js", include_str!("../assets/web/boards.js")),
+        ("topics.js", include_str!("../assets/web/topics.js")),
+        ("util.js", include_str!("../assets/web/util.js")),
+    ] {
+        for forbidden in [
+            "agentName",
+            "setAgentNames",
+            "/api/agents",
+            "plainId",
+            "opencode-ses_",
+            "(claude|codex|opencode)",
+            "author_display_name !==",
+            "agent.display_name",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{file} must not contain {forbidden}"
+            );
+        }
+    }
+    let app = include_str!("../assets/web/app.js");
+    assert!(
+        app.contains("endpointLabelName"),
+        "endpoint names come from the resolved reference"
+    );
 }

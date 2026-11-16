@@ -4,13 +4,13 @@
 // Publication, retry and discard semantics are unchanged from the previous interface.
 window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
   const $ = id => document.getElementById(id);
-  const { el, colorClass, initials, hhmm, dayKey, dayLabel, fullTime, agentName } = window.AB;
+  const { el, colorClass, initials, hhmm, dayKey, dayLabel, fullTime, postAuthorLabel } = window.AB;
   const drafts = new Map();
   const seen = new Map();
   let running = false, viewing = false, epoch = 0, timer = null, selected = null, topics = [], agents = [];
   let next = null, previous = null, hasOlder = false, posts = new Map(), busy = null, loadedOnce = false;
   let refreshing = null, olderRequest = null, retryDelay = 5000, catalogSignature = "", renderedSignature = "", renderedIds = [];
-  let mentionIndex = 0, mentionMatches = [];
+  let mentionIndex = 0, mentionMatches = [], agentsAt = 0;
   const draft = () => { if (!drafts.has(selected)) drafts.set(selected, { body: "", parent: null, pending: null, feedback: "" }); return drafts.get(selected); };
   const action = payload => request("/api/topic-actions", { method: "POST", body: JSON.stringify(payload) });
   const status = text => { $("topic-status").textContent = text; $("topic-status").hidden = !text; };
@@ -18,8 +18,8 @@ window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
   const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   // Topics are local; the human publishes as the reserved inbox identity "inbox-user".
   const isHuman = post => post.author.agent_id === "inbox-user";
-  const plainId = id => id.replace(/^inbox-/, "");
-  const authorName = post => isHuman(post) ? "You" : (post.author_display_name && post.author_display_name !== post.author.agent_id ? post.author_display_name : agentName(plainId(post.author.agent_id)));
+  // The broker decides the name (`author_name`): the snapshot the author had when posting, else the resolved name.
+  const authorName = postAuthorLabel;
 
   function unread(topic) {
     const id = topic.reference.topic_id;
@@ -86,7 +86,7 @@ window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
     const main = el("div", "msg__main");
     const meta = el("div", "msg__meta");
     meta.append(el("strong", `author ${tone}`, name), (() => { const t = el("time", "time", hhmm(post.created)); t.dateTime = new Date(post.created).toISOString(); t.title = fullTime(post.created); return t; })());
-    if (!human && post.author.agent_id !== name && plainId(post.author.agent_id) !== name) meta.append(el("span", "via", post.author.agent_id));
+    if (!human) meta.firstChild.title = post.author.agent_id; // the ID is a hover detail, not the label
     main.append(meta);
     if (post.parent) {
       const parent = posts.get(post.parent);
@@ -199,10 +199,10 @@ window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
     let catchUp = false;
     refreshing = current;
     try {
-      const [catalog, registry] = await Promise.all([request("/api/topics"), request("/api/topic-agents")]);
+      const catalog = await request("/api/topics");
       if (!running || current !== epoch) return;
       const nextCatalog = JSON.stringify(catalog.topics);
-      topics = catalog.topics; agents = registry.agents;
+      topics = catalog.topics;
       if (nextCatalog !== catalogSignature) catalogSignature = nextCatalog;
       publishCatalog(); renderHeader();
       if (id) {
@@ -239,19 +239,43 @@ window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
     return match ? match[2].toLowerCase() : null;
   }
   function closeMentions() { $("topic-mention-pop").hidden = true; $("topic-mention-pop").replaceChildren(); mentionMatches = []; $("topic-body").removeAttribute("aria-activedescendant"); $("topic-body").setAttribute("aria-expanded", "false"); }
+  // The agent list (with its resolved names) is read when the picker is used, not on the topic refresh timer:
+  // resolving names reads the native clients, so it happens on demand and at most once every 30 seconds.
+  let agentsRequest = null, agentsSession = 0;
+  // `force` (publishing) waits for a fresh list so a typed or pasted @mention is never dropped. Resolves to
+  // whether the list is usable. The list is not topic-specific, so only a lock (`clear`) discards a response.
+  function loadAgents(force = false) {
+    if (agentsRequest) return agentsRequest;
+    if (!running) return Promise.resolve(false);
+    if (!force && Date.now() - agentsAt < 30000) return Promise.resolve(true);
+    const session = agentsSession;
+    const pending = (async () => {
+      try {
+        const registry = await request("/api/topic-agents");
+        if (session !== agentsSession) return false;
+        agents = registry.agents.filter(agent => agent.agent); // the human's own inbox has no agent reference
+        agentsAt = Date.now();
+        if (mentionQuery() !== null) showMentions();
+        return true;
+      } catch (error) { if (session === agentsSession) agentsAt = Date.now(); return false; } // the picker retries after the throttle
+      finally { if (agentsRequest === pending) agentsRequest = null; }
+    })();
+    agentsRequest = pending;
+    return pending;
+  }
   function showMentions() {
     const query = mentionQuery();
     if (query === null) return closeMentions();
-    mentionMatches = agents.filter(agent => `${agent.display_name} ${agent.reference.agent_id}`.toLowerCase().includes(query)).slice(0, 6);
+    void loadAgents();
+    mentionMatches = agents.filter(agent => `${agent.agent.name} ${agent.reference.agent_id}`.toLowerCase().includes(query)).slice(0, 6);
     if (!mentionMatches.length) return closeMentions();
     mentionIndex = Math.min(mentionIndex, mentionMatches.length - 1);
     const pop = $("topic-mention-pop"); pop.replaceChildren();
     mentionMatches.forEach((agent, index) => {
       const option = el("button", "mention-option", undefined); option.type = "button"; option.id = `mention-option-${index}`; option.setAttribute("role", "option");
       option.setAttribute("aria-selected", String(index === mentionIndex));
-      option.append(el("strong", "", `@${agent.reference.agent_id}`));
-      const shown = agent.display_name && agent.display_name !== agent.reference.agent_id ? agent.display_name : agentName(plainId(agent.reference.agent_id));
-      if (shown !== agent.reference.agent_id) option.append(el("small", "", shown));
+      option.append(el("strong", "", agent.agent.name));
+      option.append(el("small", "", `@${agent.reference.agent_id}`)); // the mention token that is inserted
       option.addEventListener("mousedown", event => { event.preventDefault(); pickMention(agent); });
       pop.append(option);
     });
@@ -309,10 +333,16 @@ window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
   $("topic-composer").addEventListener("submit", async event => {
     event.preventDefault(); if (!selected || busy) return;
     const id = selected, d = draft();
-    const payload = d.pending || { action: "publish", topic_id: id, id: crypto.randomUUID(), body: d.body, parent: d.parent, mentions: mentionsIn(d.body).map(agent_id => ({ agent_id })) };
-    if (!payload.body.trim()) return;
+    if (!(d.pending?.body ?? d.body).trim()) return;
+    let payload = d.pending;
     const operation = {}; busy = operation; closeMentions(); renderDraft();
-    try { await action(payload); if (drafts.get(id) === d) { d.body = ""; d.parent = null; d.pending = null; d.feedback = ""; } }
+    try {
+      if (!payload) {
+        // Mentions are matched against the resolved agent list: without it the post would silently lose them.
+        if (d.body.includes("@") && !(await loadAgents(true)) && !agents.length) { d.feedback = "Could not load the agents to mention. Your draft is kept; try again."; return; }
+        payload = { action: "publish", topic_id: id, id: crypto.randomUUID(), body: d.body, parent: d.parent, mentions: mentionsIn(d.body).map(agent_id => ({ agent_id })) };
+      }
+      await action(payload); if (drafts.get(id) === d) { d.body = ""; d.parent = null; d.pending = null; d.feedback = ""; } }
     catch (error) { if (error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429 && !d.pending) { d.feedback = "Message rejected; your draft is kept."; } else { d.pending = payload; } }
     finally {
       if (busy !== operation) return;
@@ -342,7 +372,7 @@ window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
     },
     selected: () => selected,
     clear() {
-      running = viewing = false; epoch++; clearTimeout(timer); busy = olderRequest = null; selected = null; topics = []; agents = [];
+      running = viewing = false; epoch++; clearTimeout(timer); busy = olderRequest = null; selected = null; topics = []; agents = []; agentsAt = 0; agentsRequest = null; agentsSession++;
       drafts.clear(); seen.clear(); catalogSignature = ""; resetPosts();
       $("topic-body").value = ""; autosize(); closeMentions(); closePanel();
       for (const id of ["topic-id", "topic-feedback", "topic-status", "topic-reply"]) $(id).textContent = "";

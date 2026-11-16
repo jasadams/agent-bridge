@@ -21,22 +21,10 @@ window.AB = (() => {
     const text = parts.length > 1 ? parts[0][0] + parts[1][0] : (parts[0] || "?").slice(0, 2);
     return text.toUpperCase();
   };
-  // Names the clients give their own sessions (Claude, Codex, OpenCode), keyed by the exact routing name
-  // such as `claude-<uuid>`. They are labels only: an agent with no known name shows its routing name.
-  // When two sessions report the same name, the end of the routing name tells them apart.
-  const agentNames = new Map();
-  let sharedNames = new Set();
-  const setAgentNames = entries => {
-    agentNames.clear();
-    for (const [name, display] of entries) agentNames.set(name, display);
-    const seen = new Set(); sharedNames = new Set();
-    for (const display of agentNames.values()) (seen.has(display) ? sharedNames : seen).add(display);
-  };
-  const agentName = name => {
-    const display = agentNames.get(name);
-    if (!display) return name;
-    return sharedNames.has(display) ? `${display} · ${name.slice(-4)}` : display;
-  };
+  // The only places the page turns agent data into a label. The broker resolved the names (AGB-57); an ID is
+  // never a label, and these have no ID-derived fallback. `user` is the human's own inbox.
+  const endpointLabelName = endpoint => endpoint?.agent === "user" ? "You" : (endpoint?.ref?.name ?? "Unknown agent");
+  const postAuthorLabel = post => post.author?.agent_id === "inbox-user" ? "You" : (post.author_name || "Unknown agent");
   const valid = ms => Number.isFinite(new Date(Number(ms)).getTime());
   const hhmm = ms => valid(ms) ? new Date(Number(ms)).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "Unknown";
   const dayKey = ms => valid(ms) ? new Date(Number(ms)).toDateString() : "unknown";
@@ -58,5 +46,5 @@ window.AB = (() => {
     for (const d of paths) { const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", d); icon.append(path); }
     return icon;
   };
-  return { el, hash, colorClass, initials, agentNames, setAgentNames, agentName, hhmm, dayKey, dayLabel, fullTime, svg };
+  return { el, hash, colorClass, initials, endpointLabelName, postAuthorLabel, hhmm, dayKey, dayLabel, fullTime, svg };
 })();
