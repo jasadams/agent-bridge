@@ -1,6 +1,10 @@
 //! Read-only monitor views use the broker's existing connection. Opening a second
 //! Db would run delivery recovery and must never be done by a browser read.
-use crate::{broker::Broker, db::Db, monitor::MonitorQuery};
+use crate::{
+    broker::{AgentRefs, Broker},
+    db::Db,
+    monitor::MonitorQuery,
+};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, named_params};
 use serde_json::{Value, json};
@@ -133,14 +137,55 @@ impl Db {
 
 impl Broker {
     pub(crate) fn monitor_messages(&self, query: MonitorQuery) -> Result<Value> {
-        let db = self.db.lock().unwrap();
-        let machine = self.local_machine(&db)?;
-        db.monitor_page(&query, &machine)
+        let mut page = {
+            let db = self.db.lock().unwrap();
+            let machine = self.local_machine(&db)?;
+            db.monitor_page(&query, &machine)?
+        };
+        let mut seen = AgentRefs::default();
+        for message in page["messages"].as_array_mut().into_iter().flatten() {
+            self.attach_monitor_agents(message, &mut seen);
+        }
+        Ok(page)
+    }
+    /// Adds the resolved `source_agent`/`destination_agent` to one monitor row. `seen` only dedupes
+    /// the agents of this request; it is dropped with it.
+    fn attach_monitor_agents(&self, message: &mut Value, seen: &mut AgentRefs) {
+        let direction = message["direction"].as_str().unwrap_or("local").to_owned();
+        let id = message["id"].as_str().unwrap_or_default().to_owned();
+        for (side, remote) in [
+            ("source", direction == "inbound"),
+            ("destination", direction == "outbound"),
+        ] {
+            let end = &message[side];
+            let Some(agent) = end["agent"].as_str() else {
+                continue;
+            };
+            let route = match end["peer_id"].as_str() {
+                Some(peer) if remote => format!("{peer}/{agent}"),
+                // A remote end without its peer cannot be resolved as a local agent.
+                _ if remote => continue,
+                _ => agent.to_owned(),
+            };
+            let label = (remote && side == "source")
+                .then(|| self.db.lock().unwrap().inbound_source_label(&id))
+                .flatten();
+            let resolved = self.agent_ref_once(&route, label.as_deref(), seen);
+            message[format!("{side}_agent")] = json!(resolved);
+        }
     }
     pub(crate) fn monitor_message(&self, id: &str) -> Result<Value> {
-        let db = self.db.lock().unwrap();
-        let machine = self.local_machine(&db)?;
-        db.monitor_detail(id, &machine)
+        let mut detail = {
+            let db = self.db.lock().unwrap();
+            let machine = self.local_machine(&db)?;
+            db.monitor_detail(id, &machine)?
+        };
+        let mut seen = AgentRefs::default();
+        self.attach_monitor_agents(&mut detail["message"], &mut seen);
+        for message in detail["related"].as_array_mut().into_iter().flatten() {
+            self.attach_monitor_agents(message, &mut seen);
+        }
+        Ok(detail)
     }
     pub(crate) fn monitor_metadata(&self) -> Result<Value> {
         let db = self.db.lock().unwrap();

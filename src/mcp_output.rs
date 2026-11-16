@@ -107,6 +107,7 @@ pub(super) fn agents(value: Value, verbose: bool) -> Value {
                     fields(
                         row,
                         &[
+                            "id",
                             "name",
                             "provider",
                             "display_name",
@@ -134,8 +135,10 @@ pub(super) fn agents(value: Value, verbose: bool) -> Value {
                     fields(
                         row,
                         &[
+                            "id",
                             "name",
                             "provider",
+                            "display_name",
                             "qualified_name",
                             "peer_id",
                             "peer_alias",
@@ -143,7 +146,7 @@ pub(super) fn agents(value: Value, verbose: bool) -> Value {
                         ],
                     )
                 } else {
-                    fields(row, &["name", "provider", "display_name", "status"])
+                    fields(row, &["id", "name", "provider", "display_name", "status"])
                 }
             })
             .collect(),

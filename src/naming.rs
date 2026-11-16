@@ -7,12 +7,13 @@ use unicode_general_category::{GeneralCategory as Category, get_general_category
 const MAX_LABEL_CHARS: usize = 80;
 
 /// An agent as people should see it. `id` is the exact route; never derive routing from `name`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct AgentRef {
     pub id: String,
     pub name: String,
     pub provider: Option<Provider>,
     pub machine: String,
+    #[serde(skip)]
     pub local: bool,
 }
 
@@ -45,6 +46,14 @@ pub fn sanitize_label(name: &str) -> Option<String> {
         .collect();
     let name = name.trim();
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// A native client's name for a session, sanitized, else the fallback. The one derivation shared by
+/// `resolve_agent` and the `list_agents` rows.
+pub fn client_label(provider: &Provider, session: &str, native: Option<&str>) -> String {
+    native
+        .and_then(sanitize_label)
+        .unwrap_or_else(|| fallback_label(provider, session))
 }
 
 /// The single no-name fallback: provider plus the last four characters of the session, e.g. "Claude 9f3c".

@@ -935,7 +935,8 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         Err(_)=>response(StatusCode::INTERNAL_SERVER_ERROR,"application/json; charset=utf-8",json!({"code":"uncertain","uncertain":true,"error":"Submission outcome is uncertain; retain the exact message ID and payload for retry"}).to_string()),
     }
 }
-/// Reduces a session listing to the fields the page needs to label an agent. Names are bounded and
+/// Reduces a session listing to the fields the page needs to label an agent (rows whose name is just the
+/// route are dropped). Names are bounded and
 /// stripped of control characters because they come from other programs; the page renders them as text.
 fn agent_names(listing: &Value) -> Vec<Value> {
     listing["agents"]

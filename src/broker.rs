@@ -65,6 +65,15 @@ pub(crate) struct NetworkSnapshot {
     pub handle: crate::network::transport::Handle,
 }
 
+/// Request-local resolution state, dropped with the request: the agents already resolved, and each
+/// provider's native names read at most once (`None` when that read failed).
+#[derive(Default)]
+pub(crate) struct AgentRefs {
+    refs: std::collections::HashMap<(String, Option<String>), crate::naming::AgentRef>,
+    natives:
+        std::collections::HashMap<&'static str, Option<std::collections::HashMap<String, String>>>,
+}
+
 #[derive(Clone)]
 pub struct Broker {
     service_lock: std::sync::Weak<File>,
@@ -166,6 +175,22 @@ impl Broker {
         id: &str,
         remote_label: Option<&str>,
     ) -> crate::naming::AgentRef {
+        self.resolve_agent_with(id, remote_label, &mut |provider, session| {
+            self.native_get(provider, session)
+                .ok()
+                .flatten()
+                .and_then(|state| state.display_name)
+        })
+    }
+
+    /// `resolve_agent` with the native-name lookup supplied, so one request can resolve many agents from a
+    /// single read per provider.
+    fn resolve_agent_with(
+        &self,
+        id: &str,
+        remote_label: Option<&str>,
+        native_name: &mut dyn FnMut(&Provider, &str) -> Option<String>,
+    ) -> crate::naming::AgentRef {
         use crate::naming::{AgentRef, fallback_label, sanitize_label};
         if let Some((peer_id, name)) = id.split_once('/') {
             let machine = self
@@ -200,12 +225,12 @@ impl Broker {
                 // An explicit registration alias is already the agent's chosen name.
                 return sanitize_label(id);
             }
-            self.native_get(&agent.provider, &agent.session)
-                .ok()
-                .flatten()
-                .and_then(|state| state.display_name)
-                .and_then(|name| sanitize_label(&name))
-                .or_else(|| Some(fallback_label(&agent.provider, &agent.session)))
+            let native = native_name(&agent.provider, &agent.session);
+            Some(crate::naming::client_label(
+                &agent.provider,
+                &agent.session,
+                native.as_deref(),
+            ))
         });
         AgentRef {
             id: id.into(),
@@ -548,10 +573,11 @@ impl Broker {
                         rows.entry((name.clone(), provider.label().into(), state.session.clone()))
                             .or_insert_with(|| {
                                 json!({
+                                    "id":name,
                                     "name":name,
                                     "provider":provider,
                                     "session":state.session,
-                                    "display_name":state.display_name,
+                                    "display_name":crate::naming::client_label(&provider, &state.session, state.display_name.as_deref()),
                                     "status":state.status,
                                     "directory":state.directory,
                                     "updated_ms":state.updated_ms,
@@ -585,10 +611,11 @@ impl Broker {
                     .unwrap()
                     .inbox_enabled(&agent.name, &agent.session)?;
                 let mut row = json!({
+                    "id":agent.name,
                     "name":agent.name,
                     "provider":"inbox",
                     "session":agent.session,
-                    "display_name":Value::Null,
+                    "display_name":crate::naming::sanitize_label(&agent.name).unwrap_or_else(|| agent.name.clone()),
                     "status":Value::Null,
                     "directory":Value::Null,
                     "updated_ms":Value::Null,
@@ -614,10 +641,11 @@ impl Broker {
                 ))
                 .or_insert_with(|| {
                     json!({
+                        "id":agent.name,
                         "name":agent.name,
                         "provider":agent.provider,
                         "session":agent.session,
-                        "display_name":Value::Null,
+                        "display_name":crate::naming::sanitize_label(&agent.name).unwrap_or_else(|| agent.name.clone()),
                         "status":Value::Null,
                         "directory":Value::Null,
                         "updated_ms":Value::Null,
@@ -815,7 +843,11 @@ impl Broker {
                 "Directory contains an unadvertised provider"
             );
             for agent in agents {
+                let id = format!("{}/{}", peer.peer_id, agent.name);
+                let resolved = self.resolve_agent(&id, None);
                 rows.push(json!({
+                    "id":id,
+                    "display_name":resolved.name,
                     "peer_id":peer.peer_id,
                     "peer_alias":peer.alias,
                     "machine_name":peer.machine_name,
@@ -1054,7 +1086,84 @@ impl Broker {
         }
     }
 
-    pub fn request(&self, mut req: Request) -> Result<Value> {
+    pub fn request(&self, req: Request) -> Result<Value> {
+        let mut value = self.request_locked(req)?;
+        // Resolved after the database lock is released: native name reads block.
+        self.attach_message_agents(&mut value, &mut AgentRefs::default());
+        Ok(value)
+    }
+
+    /// `resolve_agent` once per distinct (route, remote label) within one request. `seen` is request-local
+    /// and dropped with it; the label is per message, so it is part of the key. Cost is one native read per
+    /// distinct local agent, as for `list_agents`.
+    pub(crate) fn agent_ref_once(
+        &self,
+        route: &str,
+        label: Option<&str>,
+        seen: &mut AgentRefs,
+    ) -> crate::naming::AgentRef {
+        let key = (route.to_owned(), label.map(str::to_owned));
+        if let Some(found) = seen.refs.get(&key) {
+            return found.clone();
+        }
+        let AgentRefs { refs, natives } = seen;
+        let resolved = self.resolve_agent_with(route, label, &mut |provider, session| {
+            natives
+                .entry(provider.label())
+                .or_insert_with(|| {
+                    // Native lookups that failed simply fall back to the generated name.
+                    self.native_list(provider, 36_500).ok().map(|states| {
+                        states
+                            .into_iter()
+                            .filter_map(|s| Some((s.session, s.display_name?)))
+                            .collect()
+                    })
+                })
+                .as_ref()?
+                .get(session)
+                .cloned()
+        });
+        refs.insert(key, resolved.clone());
+        resolved
+    }
+
+    /// Adds `sender_agent`/`recipient_agent` ({id, name, provider, machine}) to every message record in a
+    /// reply: records are the objects with string `sender` and `recipient`, found at the top level, in
+    /// arrays and under `message`/`messages`. `seen` only dedupes this request's agents.
+    fn attach_message_agents(&self, value: &mut Value, seen: &mut AgentRefs) {
+        match value {
+            Value::Array(items) => items
+                .iter_mut()
+                .for_each(|item| self.attach_message_agents(item, seen)),
+            Value::Object(map) => {
+                if let (Some(Value::String(sender)), Some(Value::String(recipient))) =
+                    (map.get("sender"), map.get("recipient"))
+                {
+                    let (sender, recipient) = (sender.clone(), recipient.clone());
+                    let label = map
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|_| sender.contains('/'))
+                        .and_then(|id| self.db.lock().unwrap().inbound_source_label(id));
+                    for (key, route, label) in [
+                        ("sender_agent", sender, label),
+                        ("recipient_agent", recipient, None),
+                    ] {
+                        let resolved = self.agent_ref_once(&route, label.as_deref(), seen);
+                        map.insert(key.into(), json!(resolved));
+                    }
+                }
+                for key in ["message", "messages"] {
+                    if let Some(inner) = map.get_mut(key) {
+                        self.attach_message_agents(inner, seen);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn request_locked(&self, mut req: Request) -> Result<Value> {
         // Complete all native/provider I/O before taking the DB administration
         // lock. These snapshots are request-local and discarded on return.
         if let Request::Send {
@@ -3189,6 +3298,177 @@ mod machine_tests {
                 .name,
             "Claude b3b8"
         );
+    }
+
+    #[tokio::test]
+    async fn many_distinct_claude_agents_cost_one_native_read_per_request() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bound =
+            Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let sessions = [
+            "97e8d81e-073d-4cde-a017-4a8255b7b3b1",
+            "97e8d81e-073d-4cde-a017-4a8255b7b3b2",
+            "97e8d81e-073d-4cde-a017-4a8255b7b3b3",
+            "97e8d81e-073d-4cde-a017-4a8255b7b3b4",
+        ];
+        let calls = directory.path().join("calls");
+        let script = directory.path().join("claude");
+        let rows: Vec<String> = sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{{\"sessionId\":\"{s}\",\"name\":\"Agent {i}\"}}"))
+            .collect();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho x >> {}\nprintf '[{}]'\n",
+                calls.display(),
+                rows.join(",")
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        bound.broker.claude_state = Arc::new(crate::clients::claude_discovery::State::new(script));
+        let broker = &bound.broker;
+        let routes: Vec<String> = sessions.iter().map(|s| format!("claude-{s}")).collect();
+        {
+            let db = broker.db.lock().unwrap();
+            for pair in routes.windows(2) {
+                db.send_names(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &pair[0],
+                    &pair[1],
+                    "hi",
+                    &None,
+                )
+                .unwrap();
+            }
+        }
+        let reads = || std::fs::read_to_string(&calls).map_or(0, |c| c.lines().count());
+        let history = broker
+            .request(Request::History {
+                agent: None,
+                limit: 10,
+            })
+            .unwrap();
+        let mut names: Vec<_> = history
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| [&m["sender_agent"]["name"], &m["recipient_agent"]["name"]])
+            .map(|n| n.as_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names, ["Agent 0", "Agent 1", "Agent 2", "Agent 3"]);
+        assert_eq!(
+            reads(),
+            1,
+            "history resolves every agent from one Claude read"
+        );
+        let query: crate::monitor::MonitorQuery = serde_urlencoded::from_str("").unwrap();
+        let page = broker.monitor_messages(query).unwrap();
+        assert_eq!(page["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(reads(), 2, "a monitor page is one more Claude read");
+    }
+
+    #[tokio::test]
+    async fn a_remote_sender_label_is_per_message_within_one_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let route = "unknown-peer/reviewer";
+        let mut seen = AgentRefs::default();
+        let names: Vec<String> = [Some("First"), None, Some("Second\u{202e}")]
+            .into_iter()
+            .map(|label| broker.agent_ref_once(route, label, &mut seen).name)
+            .collect();
+        assert_eq!(names, ["First", "reviewer", "Second"]);
+    }
+
+    #[tokio::test]
+    async fn every_payload_with_an_agent_also_carries_its_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        for name in ["alpha", "beta"] {
+            broker
+                .request(Request::Register {
+                    name: name.into(),
+                    provider: Provider::Inbox,
+                    session: name.into(),
+                    replace: false,
+                })
+                .unwrap();
+        }
+        let sent = broker
+            .request(Request::Send {
+                id: uuid::Uuid::new_v4().to_string(),
+                sender: "alpha".into(),
+                recipient: "beta".into(),
+                body: "hello".into(),
+                parent: None,
+            })
+            .unwrap();
+        let id = sent["id"].as_str().unwrap().to_owned();
+        let assert_named = |message: &Value| {
+            for (key, route) in [("sender_agent", "alpha"), ("recipient_agent", "beta")] {
+                let agent = &message[key];
+                assert_eq!(agent["id"], route, "{key} in {message}");
+                assert_eq!(agent["name"], route);
+                assert_eq!(agent["provider"], "inbox");
+                assert!(agent["machine"].is_string());
+            }
+        };
+        assert_named(&sent);
+        assert_named(&broker.request(Request::Get { id: id.clone() }).unwrap());
+        let history = broker
+            .request(Request::History {
+                agent: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_named(&history[0]);
+        let since = broker
+            .request(Request::HistorySince {
+                agent: None,
+                cursor: Some(String::new()),
+                limit: 10,
+            })
+            .unwrap();
+        assert_named(&since["messages"][0]);
+        let query: crate::monitor::MonitorQuery = serde_urlencoded::from_str("").unwrap();
+        let page = broker.monitor_messages(query).unwrap();
+        let row = &page["messages"][0];
+        assert_eq!(row["source_agent"]["id"], "alpha");
+        assert_eq!(row["source_agent"]["name"], "alpha");
+        assert_eq!(row["destination_agent"]["id"], "beta");
+        broker
+            .request(Request::Send {
+                id: uuid::Uuid::new_v4().to_string(),
+                sender: "beta".into(),
+                recipient: "alpha".into(),
+                body: "reply".into(),
+                parent: Some(id.clone()),
+            })
+            .unwrap();
+        let detail = broker.monitor_message(&id).unwrap();
+        assert_eq!(detail["message"]["destination_agent"]["name"], "beta");
+        assert_eq!(detail["related"][0]["source_agent"]["id"], "beta");
+        assert_eq!(detail["related"][0]["destination_agent"]["id"], "alpha");
+        let listing = broker
+            .request(Request::List {
+                all: false,
+                max_age_days: 30,
+            })
+            .unwrap();
+        for row in listing["agents"].as_array().unwrap() {
+            assert!(
+                row["id"].is_string() && row["display_name"].is_string(),
+                "{row}"
+            );
+        }
     }
 
     #[tokio::test]
