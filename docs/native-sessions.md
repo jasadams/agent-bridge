@@ -54,8 +54,10 @@ agent-bridge hooks install
 
 The startup hook records the session's private inbox socket as a delivery binding.
 The end hook removes only the matching normalized endpoint, so a late end event
-cannot close a replacement. No native membership or enabling flag is stored; sends
-verify native state through the connector boundary when they need it. Hooks run
+cannot close a replacement. No native membership or enabling flag is stored. A send
+to a Claude session checks only that its bound socket file still exists and is a
+private socket, without connecting or starting Claude, and is rejected without being
+stored when the socket is missing or invalid. Hooks run
 through Claude Code's normal workspace trust flow. Check the client session's status
 if it does not expose an inbox socket.
 

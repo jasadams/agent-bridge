@@ -452,9 +452,11 @@ impl Broker {
             }
             return Ok(agent);
         }
-        // OpenCode sockets are resolved per delivery, never pinned to the agent.
+        // OpenCode sockets are resolved per delivery, never pinned to the agent. Claude's
+        // endpoint is the socket its session-start hook bound, and the Claude directory
+        // reports no endpoint, so asking it (a `claude agents --json` process) adds nothing.
         if require_present
-            && agent.provider != Provider::OpenCode
+            && !matches!(agent.provider, Provider::OpenCode | Provider::Claude)
             && let Ok(Some(state)) = self.native_get(&agent.provider, &agent.session)
         {
             // Enrich only this request from the connector observation. Absence
@@ -525,6 +527,28 @@ impl Broker {
         }
         let source = self.prepare_agent(sender, true)?;
         let destination = self.prepare_agent(recipient, true)?;
+        // Inspect the bound socket file only: a connection here would reach the session as an
+        // empty message, and `claude agents --json` is far slower than this check.
+        if destination.provider == Provider::Claude
+            && let Err(error) =
+                crate::clients::claude::validate_socket(Path::new(&destination.endpoint))
+        {
+            let problem = if destination.endpoint.is_empty() {
+                "not bound; start the session with the Agent Bridge hooks installed"
+            } else if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                "missing"
+            } else {
+                "invalid"
+            };
+            return Err(crate::protocol::SendNotPersisted(format!(
+                "Recipient {} is not reachable: its Claude inbox socket is {problem}",
+                destination.name
+            ))
+            .into());
+        }
         for (side, agent) in [("Sender", &source), ("Recipient", &destination)] {
             if agent.provider == Provider::OpenCode
                 && !matches!(
@@ -1087,9 +1111,17 @@ impl Broker {
     }
 
     pub fn request(&self, req: Request) -> Result<Value> {
+        let sending = matches!(req, Request::Send { .. });
         let mut value = self.request_locked(req)?;
         // Resolved after the database lock is released: native name reads block.
-        self.attach_message_agents(&mut value, &mut AgentRefs::default());
+        let mut seen = AgentRefs::default();
+        if sending {
+            // A send's reply names Claude agents from stored identity only. Their client name
+            // costs a `claude agents --json` process, slow on a busy machine, and the compact
+            // MCP receipt omits it. Reads and listings still resolve it.
+            seen.natives.insert(Provider::Claude.label(), None);
+        }
+        self.attach_message_agents(&mut value, &mut seen);
         Ok(value)
     }
 
@@ -3385,6 +3417,138 @@ mod machine_tests {
             .map(|label| broker.agent_ref_once(route, label, &mut seen).name)
             .collect();
         assert_eq!(names, ["First", "reviewer", "Second"]);
+    }
+
+    /// A Claude directory that records every call, so a test can prove a send never starts one.
+    fn counting_claude_directory(
+        directory: &std::path::Path,
+        bound: &mut BoundServer,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let calls = directory.join("calls");
+        let script = directory.join("claude");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho x >> {}\nprintf '[]'\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        bound.broker.claude_state = Arc::new(crate::clients::claude_discovery::State::new(script));
+        calls
+    }
+
+    fn bind_claude(broker: &Broker, session: &str, socket: &std::path::Path) -> String {
+        broker
+            .request(Request::ClaudeBind {
+                session: session.into(),
+                endpoint: socket.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        format!("claude-{session}")
+    }
+
+    #[tokio::test]
+    async fn a_claude_send_uses_the_bound_socket_without_starting_the_claude_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bound =
+            Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let calls = counting_claude_directory(directory.path(), &mut bound);
+        let sockets = directory.path().join("s");
+        std::fs::create_dir(&sockets).unwrap();
+        std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = sockets.join("r.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let broker = &bound.broker;
+        let sender = bind_claude(broker, "97e8d81e-073d-4cde-a017-4a8255b7b3b8", &socket);
+        let recipient = bind_claude(broker, "11111111-2222-4333-8444-555555555555", &socket);
+        let sent = broker
+            .request(Request::Send {
+                id: uuid::Uuid::new_v4().to_string(),
+                sender,
+                recipient,
+                body: "hello".into(),
+                parent: None,
+            })
+            .unwrap();
+        assert!(sent["id"].is_string(), "{sent}");
+        assert!(
+            !calls.exists(),
+            "a send must not run `claude agents --json`"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claude_send_to_a_gone_socket_fails_at_once_without_storing_the_message() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bound =
+            Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let calls = counting_claude_directory(directory.path(), &mut bound);
+        let sockets = directory.path().join("s");
+        std::fs::create_dir(&sockets).unwrap();
+        std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let live = sockets.join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let broker = &bound.broker;
+        let sender = bind_claude(broker, "97e8d81e-073d-4cde-a017-4a8255b7b3b8", &live);
+        let gone = sockets.join("gone.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&gone).unwrap();
+        std::fs::set_permissions(&gone, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let recipient = bind_claude(broker, "11111111-2222-4333-8444-555555555555", &gone);
+        drop(listener);
+        std::fs::remove_file(&gone).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let error = broker
+            .request(Request::Send {
+                id: id.clone(),
+                sender,
+                recipient,
+                body: "hello".into(),
+                parent: None,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::protocol::SendNotPersisted>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("not reachable"), "{error:#}");
+        assert!(broker.request(Request::Get { id }).is_err());
+        assert!(!calls.exists());
+    }
+
+    #[tokio::test]
+    async fn retrying_a_stored_claude_send_after_its_socket_died_returns_the_stored_message() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bound =
+            Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        counting_claude_directory(directory.path(), &mut bound);
+        let sockets = directory.path().join("s");
+        std::fs::create_dir(&sockets).unwrap();
+        std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = sockets.join("r.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let broker = &bound.broker;
+        let sender = bind_claude(broker, "97e8d81e-073d-4cde-a017-4a8255b7b3b8", &socket);
+        let recipient = bind_claude(broker, "11111111-2222-4333-8444-555555555555", &socket);
+        let send = || Request::Send {
+            id: "6f0f6f0e-3b0a-4f2b-9d57-0d1d2c3b4a5f".into(),
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            body: "hello".into(),
+            parent: None,
+        };
+        let first = broker.request(send()).unwrap();
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        let retry = broker.request(send()).unwrap();
+        assert_eq!(retry["id"], first["id"]);
     }
 
     #[tokio::test]
