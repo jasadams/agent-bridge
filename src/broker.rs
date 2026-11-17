@@ -527,14 +527,21 @@ impl Broker {
         }
         let source = self.prepare_agent(sender, true)?;
         let destination = self.prepare_agent(recipient, true)?;
+        // Inspect the bound socket file only: a connection here would reach the session as an
+        // empty message, and `claude agents --json` is far slower than this check.
         if destination.provider == Provider::Claude
-            && let Some(reason) =
-                crate::clients::claude::stale_reason(Path::new(&destination.endpoint))
+            && let Err(error) =
+                crate::clients::claude::validate_socket(Path::new(&destination.endpoint))
         {
             let problem = if destination.endpoint.is_empty() {
-                "not bound; start the session with the Agent Bridge hooks installed".into()
+                "not bound; start the session with the Agent Bridge hooks installed"
+            } else if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                "missing"
             } else {
-                reason.replace('_', " ")
+                "invalid"
             };
             return Err(crate::protocol::SendNotPersisted(format!(
                 "Recipient {} is not reachable: its Claude inbox socket is {problem}",
