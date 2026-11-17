@@ -21,7 +21,8 @@ An agent has an **ID** and a **name**. They are not interchangeable.
   80 characters, empty means no name). Names come from other programs and machines.
 - `remote_label` is the untrusted label a remote sender attached to one message (read with
   `Db::inbound_source_label`); callers resolving a route that is not tied to a message pass `None`.
-- A Claude name lookup runs a bounded `claude agents --json` (5 s deadline) per delivery.
+- A Claude name lookup runs a bounded `claude agents --json` (5 s deadline) per delivery. The send request itself
+  starts none for an exact route: a send's reply shows the stored or fallback label for Claude agents.
 - `AgentRef::label()` is what recipients see: `name` for a local agent, `machine/name` for a remote one.
 
 ## Envelopes
@@ -74,7 +75,7 @@ Every API/MCP reply that names an agent also carries its resolved `{id, name, pr
 The broker resolves these after releasing the database lock, once per distinct agent (and, for a remote sender, per message label) per request. Each provider's native names are read at most once per request (one `claude agents --json`, one Codex,
 one OpenCode read) and every agent in the response resolves from that request-local snapshot. If a
 provider's read fails or is incomplete, that provider's agents show the generated fallback name for that
-request.
+request. The reply to a send does not read Claude names at all, so a send is not slowed by a busy machine.
 
 ## Web interface
 
