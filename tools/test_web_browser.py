@@ -3,7 +3,7 @@
 
 Starts a private broker with seeded boards, topics and agent conversations, enables the web
 interface, and drives it with an already installed Python Playwright and Chromium (nothing is
-downloaded). It checks, for the Classic and Sticker Bomb themes: unlocking from the access link, the
+downloaded). It checks, for the Classic, Sticker Bomb and Orca themes: unlocking from the access link, the
 sidebar (boards, topics, agent conversations), rendered topic Markdown, the @mention picker and
 publishing, read-only agent conversations and the delivery details panel, the board view and its
 overflow menu, the All traffic feed, the collapsible sidebar, the quick switcher, theme switching,
@@ -125,7 +125,7 @@ LONG_POST = "# Findings\n\n" + "\n\n".join(
 ) + "\n\n```rust\nfn main() { println!(\"done\"); }\n```\n"
 
 RICH_POST = ("## Release notes\n\n- topics render **Markdown**\n- `code` and tables work\n\n"
-             "| Theme | Default |\n|---|---|\n| Classic | yes |\n| Sticker Bomb | no |\n\n"
+             "| Theme | Default |\n|---|---|\n| Classic | yes |\n| Sticker Bomb | no |\n| Orca | no |\n\n"
              "```sh\nagent-bridge web enable\n```\n\n[docs](https://example.com/docs) "
              "[bad](javascript:alert(1)) <img src=x onerror=window.pwned=1>")
 
@@ -224,6 +224,62 @@ CONTRAST = """() => {
   const inkOnAccent = ratio(value('--accent-ink'), value('--accent'));
   probe.remove();
   return { fails, inkOnAccent };
+}"""
+
+
+RENDERED_CONTRAST = """() => {
+  // Contrast of what is actually painted, for every visible: text node, input/textarea/select value,
+  // placeholder, and ::before/::after text. Colours are read from the computed style; a translucent
+  // colour is blended over the layers behind it, and the opacity of the element and its ancestors
+  // is applied to the text colour. Disabled controls and fully transparent elements (the message
+  // actions before hover or focus) are skipped. Not covered:
+  // images, icons drawn as SVG/borders, and text inside pseudo-elements that have their own background.
+  const parse = c => { const m = c.match(/[\\d.]+/g).map(Number); return { r: m[0], g: m[1], b: m[2], a: m.length > 3 ? m[3] : 1 }; };
+  const over = (top, under) => ({ r: top.r * top.a + under.r * (1 - top.a), g: top.g * top.a + under.g * (1 - top.a), b: top.b * top.a + under.b * (1 - top.a), a: 1 });
+  const lum = ({ r, g, b }) => { const f = c => { c /= 255; return c <= .03928 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }; return .2126 * f(r) + .7152 * f(g) + .0722 * f(b); };
+  const backdrop = el => { const layers = []; for (let n = el; n; n = n.parentElement) { const c = parse(getComputedStyle(n).backgroundColor); if (c.a > 0) layers.push(c); if (c.a === 1) break; }
+    return layers.reduceRight((under, top) => over(top, under), { r: 0, g: 0, b: 0, a: 1 }); };
+  const opacity = el => { let o = 1; for (let n = el; n; n = n.parentElement) o *= Number(getComputedStyle(n).opacity); return o; };
+  const fails = []; let checked = 0;
+  const check = (el, what, colour) => {
+    const bg = backdrop(el), c = parse(colour), fg = over({ ...c, a: c.a * opacity(el) }, bg);
+    const a = lum(fg) + .05, b = lum(bg) + .05, ratio = Math.max(a, b) / Math.min(a, b);
+    checked += 1; if (ratio < 4.5) fails.push(`${el.tagName.toLowerCase()}.${el.className} ${what}: ${ratio.toFixed(2)}`);
+  };
+  const shown = el => { const box = el.getBoundingClientRect(); return box.width && box.height && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[hidden], [disabled], .sr-only') && opacity(el) > 0; };
+  const seen = new Set(), walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const el = node.parentElement; if (!node.textContent.trim() || !el || seen.has(el) || !shown(el) || el.closest('textarea, select')) continue; seen.add(el);
+    check(el, `"${node.textContent.trim().slice(0, 24)}"`, getComputedStyle(el).color);
+  }
+  for (const el of document.querySelectorAll('input, textarea, select')) {
+    if (!shown(el) || ['checkbox', 'radio', 'hidden'].includes(el.type)) continue;
+    if (el.value) check(el, 'value', getComputedStyle(el).color);
+    else if (el.placeholder) check(el, 'placeholder', getComputedStyle(el, '::placeholder').color);
+  }
+  for (const el of document.querySelectorAll('body *')) {
+    if (!shown(el)) continue;
+    for (const pseudo of ['::before', '::after']) { const s = getComputedStyle(el, pseudo), text = s.content.replace(/^"|"$/g, ''); if (s.content !== 'none' && s.content !== 'normal' && text.trim() && s.display !== 'none') check(el, `${pseudo} "${text.slice(0, 12)}"`, s.color); }
+  }
+  return { checked, fails };
+}"""
+
+THEME_LEAK = """() => {
+  // Elements painted in a colour that only Classic or Sticker Bomb defines (their palettes are
+  // the lists below). Orca must override all of them on every screen.
+  const classic = ['c4ef9d', '10171c', '121c22', '172128', '1c2932', '253941', '2a3a45', '527078', 'e9f0ed', 'a4b3ba', '8fa1aa', 'ffada4', 'f4cc8e', '9fc4d6', '283b25', '7ca65e', 'd4ffb0', '1e3017', '9ccfe0', 'ffb5a8', 'c9b6f2', '8fdcc4', '0d1014'];
+  const sticker = ['fffdf6', 'fff0b8', 'fff4cc', 'ffe27a', '3753f0', '2740d4', '1f36d6', 'ffd93d', 'ff6ec7', '8ecbff', '5be3a4', 'b79cff', 'ff6b5e', '111111', '3b3b3b', '585858', '0a7a4f', '7a5200', 'c4261d', 'ff8fc2', 'ff9c7a', 'c8ff5c', 'fff7d6'];
+  const known = new Map([...classic.map(h => [h, 'Classic']), ...sticker.map(h => [h, 'Sticker Bomb'])]);
+  const hex = c => { const m = c.match(/[\\d.]+/g); if (!m || (m.length > 3 && Number(m[3]) === 0)) return null; return m.slice(0, 3).map(n => Number(n).toString(16).padStart(2, '0')).join(''); };
+  const leaks = [];
+  for (const el of document.querySelectorAll('body, body *, dialog')) {
+    const box = el.getBoundingClientRect(); if (!box.width || !box.height) continue;
+    const s = getComputedStyle(el); if (s.visibility === 'hidden') continue;
+    const props = { color: s.color, background: s.backgroundColor };
+    for (const side of ['Top', 'Right', 'Bottom', 'Left']) if (parseFloat(s[`border${side}Width`]) > 0 && s[`border${side}Style`] !== 'none') props[`border${side}`] = s[`border${side}Color`];
+    for (const [prop, value] of Object.entries(props)) { const h = hex(value); if (h && known.has(h)) leaks.push(`${el.tagName.toLowerCase()}.${el.className || el.id} ${prop} #${h} (${known.get(h)})`); }
+  }
+  return leaks;
 }"""
 
 
@@ -406,6 +462,9 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     if theme == "sticker":
         until(page, "document.fonts.check('15px \"Bricolage Grotesque\"')", 8000)
         report.check(f"{tag} Sticker Bomb loads its self-hosted fonts", any("bricolage" in u for u in font_requests), str(font_requests))
+    elif theme == "orca":
+        until(page, "document.fonts.check('14px Geist')", 8000)
+        report.check(f"{tag} Orca loads its self-hosted Geist font", any("geist" in u for u in font_requests), str(font_requests))
     else:
         report.check(f"{tag} Classic requests no font files (system fonts)", not fonts_before_switch, str(fonts_before_switch))
 
@@ -442,11 +501,163 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     browser.close()
 
 
+def run_orca_section(playwright, url_for, topic_id, report, out):
+    """Checks specific to the Orca theme. Runs before the per-theme sections so that it does not
+    depend on how far they get."""
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    problems = []
+    page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
+    page.on("pageerror", lambda e: problems.append(str(e)))
+    requests = []
+    page.on("request", lambda r: requests.append(r.url))
+    tag = "[orca section]"
+
+    # Classic is the default: with nothing saved, the page opens in Classic and requests no Orca files.
+    page.goto(url_for)
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "document.querySelectorAll('#sidebar .nav-item').length >= 6", 20000)
+    report.check(f"{tag} Classic stays the default theme", page.evaluate("document.documentElement.dataset.theme") == "classic")
+    report.check(f"{tag} Classic does not request the Orca sheet or font", not any("orca" in u or "geist" in u for u in requests), str(requests))
+    choices = page.eval_on_selector_all("#theme-menu [data-theme-choice]", "els => els.map(e => [e.dataset.themeChoice, e.textContent.trim()])")
+    report.check(f"{tag} the Theme menu offers Classic, Sticker Bomb and Orca", choices == [["classic", "Classic"], ["sticker", "Sticker Bomb"], ["orca", "Orca"]], str(choices))
+
+    # Switching applies immediately, without a reload, from the picker.
+    page.evaluate("window.__noReload = true")
+    page.click("#theme-button")
+    page.click("[data-theme-choice=orca]")
+    until(page, "document.documentElement.dataset.theme === 'orca'", 8000)
+    report.check(f"{tag} choosing Orca applies without a reload", page.evaluate("window.__noReload === true"))
+    sheets = page.evaluate("[...document.styleSheets].map(s => s.href || '')")
+    report.check(f"{tag} only the Orca theme sheet is loaded", sum("/theme-" in s for s in sheets) == 1 and any(s.endswith("/theme-orca.css") for s in sheets), str(sheets))
+    stored = page.evaluate("Object.keys(localStorage).sort()")
+    report.check(f"{tag} the browser stores only the theme and sidebar state", set(stored) <= {"agent-bridge-theme", "agent-bridge-sidebar"} and "agent-bridge-theme" in stored, str(stored))
+    until(page, "document.fonts.check('14px Geist')", 8000)
+    fonts = [u for u in requests if "/fonts/" in u]
+    report.check(f"{tag} Orca requests Geist and no other font", fonts and all("geist" in u for u in fonts), str(fonts))
+    report.check(f"{tag} body text is set in Geist", page.evaluate("getComputedStyle(document.body).fontFamily").startswith("Geist"))
+
+    # Switching away drops Orca's sheet and requests nothing of Orca's; switching back restores it.
+    for other, font in [("sticker", "bricolage"), ("classic", None), ("orca", "geist")]:
+        before = len(requests)
+        page.click("#theme-button")
+        page.click(f"[data-theme-choice={other}]")
+        until(page, f"document.documentElement.dataset.theme === '{other}' && document.querySelectorAll('link[rel=stylesheet][href*=\"/theme-\"]').length === 1", 8000)
+        sheets = page.evaluate("[...document.styleSheets].map(s => s.href || '').filter(h => h.includes('/theme-'))")
+        report.check(f"{tag} switching to {other} leaves only its sheet", len(sheets) == 1 and sheets[0].endswith(f"/theme-{other}.css"), str(sheets))
+        if font == "bricolage":
+            until(page, "document.fonts.check('15px \"Bricolage Grotesque\"')", 8000)
+        fonts = [u for u in requests[before:] if "/fonts/" in u]
+        if other == "classic":
+            report.check(f"{tag} switching to Classic requests no font", not fonts, str(fonts))
+        elif other == "sticker":
+            report.check(f"{tag} switching to Sticker Bomb requests no Geist", not any("geist" in u for u in fonts), str(fonts))
+        else:
+            until(page, "document.fonts.check('14px Geist')", 8000)
+            report.check(f"{tag} switching back to Orca restores the loaded Geist font", page.evaluate("document.fonts.check('14px Geist') && getComputedStyle(document.body).fontFamily.startsWith('Geist')"))
+        report.check(f"{tag} switching to {other} applies without a reload and is remembered", page.evaluate("window.__noReload === true && localStorage.getItem('agent-bridge-theme')") == other)
+
+    # Orca's own values on the rendered page (see DESIGN.md: Orca theme).
+    values = page.evaluate("""() => {
+      const css = (sel, prop) => getComputedStyle(document.querySelector(sel))[prop];
+      return { content: css('body', 'backgroundColor'), sidebar: css('#sidebar', 'backgroundColor'), topbar: css('.topbar', 'backgroundColor'),
+               topbarH: css('.topbar', 'height'), text: css('body', 'color'), btnRadius: css('#theme-button', 'borderRadius') };
+    }""")
+    expected = {"content": "rgb(21, 21, 21)", "sidebar": "rgb(42, 42, 42)", "topbar": "rgb(23, 23, 23)", "topbarH": "36px", "text": "rgb(240, 240, 240)", "btnRadius": "8px"}
+    report.check(f"{tag} colours, header height and radius are Orca's", values == expected, str(values))
+
+    # Every screen is styled by Orca and readable: nothing keeps another theme's colours.
+    def screen(name, minimum=3):
+        page.wait_for_timeout(500)
+        rendered = page.evaluate(RENDERED_CONTRAST)
+        report.check(f"{tag} {name}: {rendered['checked']} text runs, values, placeholders and pseudo-element texts meet 4.5:1", rendered["checked"] >= minimum and not rendered["fails"], str(rendered["fails"][:6]))
+        leaks = page.evaluate(THEME_LEAK)
+        report.check(f"{tag} {name}: no Classic or Sticker Bomb colour is used", not leaks, str(leaks[:6]))
+        report.check(f"{tag} {name}: page does not scroll or overflow", not page.evaluate("document.documentElement.scrollHeight > innerHeight + 1 || document.documentElement.scrollWidth > innerWidth + 1"))
+        page.screenshot(path=str(out / f"orca-section-{name.replace(' ', '-')}.png"))
+
+    def go(route):
+        page.evaluate(f"location.hash = {json.dumps(route)}")
+        page.wait_for_timeout(700)
+
+    dm_route = page.evaluate("document.querySelector('#sidebar .nav-item[data-route^=\"#/dm/\"]').dataset.route")
+    go("#/board/release-checklist")
+    screen("board", 20)
+    fonts = page.evaluate("[...document.querySelectorAll('.board-document pre, .board-document code')].map(e => getComputedStyle(e).fontFamily)")
+    report.check(f"{tag} board code blocks use Orca's monospace stack", fonts and all(f.startswith('"SF Mono"') for f in fonts), str(fonts))
+    page.click("#board-menu-button")
+    screen("board overflow menu")
+    page.click("#board-archived-open")
+    page.wait_for_selector("#archived-dialog[open]", timeout=5000)
+    screen("archived boards dialog")
+    page.keyboard.press("Escape")
+    go("#/board/main")
+    page.wait_for_selector("text=main has not been written yet.", timeout=8000)
+    screen("empty board")
+    go(f"#/topic/{topic_id}")
+    screen("topic", 20)
+    page.fill("#topic-body", "@")
+    page.wait_for_selector("#topic-mention-pop:not([hidden]) [role=option]", timeout=5000)
+    screen("mention popover")
+    page.fill("#topic-body", "")
+    page.once("dialog", lambda d: d.accept("empty-qa"))
+    page.click("#sidebar .nav-section__title .btn")
+    page.wait_for_selector("text=No messages yet. Say something below.", timeout=10000)
+    screen("empty topic")
+    go(dm_route)
+    screen("agent conversation")
+    page.locator("#dm-messages .msg").first.hover()
+    page.locator("#dm-messages .msg__actions button").first.click(force=True)
+    page.wait_for_selector("#panel:not([hidden]) .detail-grid", timeout=10000)
+    screen("details panel", 10)
+    # an error inside the panel, then a toast when refreshing the open message fails
+    page.route("**/api/messages/*", lambda route: route.fulfill(status=500, content_type="application/json", body='{"error":"unavailable","code":"unavailable"}'))
+    page.locator("#dm-messages .msg").first.hover()
+    page.locator("#dm-messages .msg__actions button").first.click(force=True)
+    page.wait_for_selector(".toast--danger", timeout=8000)
+    screen("error toast")
+    page.unroute("**/api/messages/*")
+    page.click("#panel-close")
+    go("#/traffic")
+    page.wait_for_selector("#message-list .message-row", timeout=15000)
+    screen("All traffic", 20)
+    page.fill("#machine-filter", "no-such-machine")
+    page.click("#filters button[type=submit]")
+    page.wait_for_selector("#empty-state:not([hidden])", timeout=10000)
+    screen("empty All traffic")
+    page.click("#reset-filters")
+    page.click("#theme-button")
+    screen("Theme menu")
+    page.keyboard.press("Escape")
+    page.keyboard.press("Control+k")
+    page.wait_for_selector("#switcher[open]", timeout=5000)
+    screen("quick switcher")
+    page.keyboard.type("zzzz-no-such")
+    page.wait_for_selector("#switcher .empty", timeout=5000)
+    screen("empty quick switcher")
+    page.keyboard.press("Escape")
+    page.click("#lock-button")
+    page.wait_for_selector("#login:not([hidden])", timeout=5000)
+    screen("locked screen")
+
+    csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
+    report.check(f"{tag} no Content-Security-Policy violations", not csp, str(csp[:3]))
+    # the one 500 is the deliberate failure this section injects to show the toast
+    other_errors = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p]
+    injected = [p for p in other_errors if "status of 500" in p]
+    if injected:
+        other_errors.remove(injected[0])
+    report.check(f"{tag} no console or page errors", not other_errors, str(other_errors[:5]))
+    context.close()
+    browser.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--theme", choices=["classic", "sticker", "both"], default="both")
+    parser.add_argument("--theme", choices=["classic", "sticker", "orca", "all"], default="all")
     args = parser.parse_args()
     try:
         from playwright.sync_api import sync_playwright
@@ -466,8 +677,10 @@ def main():
         bind_sessions(broker, out, listeners)
         topic_id = seed(broker)
         credentials = broker.rpc("monitor_enable", port=0)
-        themes = ["classic", "sticker"] if args.theme == "both" else [args.theme]
+        themes = ["classic", "sticker", "orca"] if args.theme == "all" else [args.theme]
         with sync_playwright() as playwright:
+            if "orca" in themes:
+                run_orca_section(playwright, credentials["access_url"], topic_id, report, out)
             for theme in themes:
                 run_theme(playwright, theme, credentials["access_url"], topic_id, report, out)
     finally:

@@ -1314,6 +1314,7 @@ async fn web_assets_are_served_with_exact_types_and_a_tight_policy() {
         ("/style.css", CSS),
         ("/theme-classic.css", CSS),
         ("/theme-sticker.css", CSS),
+        ("/theme-orca.css", CSS),
         ("/theme.js", JS),
         ("/util.js", JS),
         ("/markdown.js", JS),
@@ -1324,6 +1325,7 @@ async fn web_assets_are_served_with_exact_types_and_a_tight_policy() {
         ("/fonts/bricolage-var.woff2", WOFF2),
         ("/fonts/space-mono-400.woff2", WOFF2),
         ("/fonts/space-mono-700.woff2", WOFF2),
+        ("/fonts/geist-var.woff2", WOFF2),
     ];
     for (path, kind) in assets {
         let bytes = get_bytes(&access, path, "").await;

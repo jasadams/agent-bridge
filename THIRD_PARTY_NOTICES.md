@@ -20,8 +20,8 @@ Redistributors of binaries must preserve the applicable dependency notices.
 
 ## Web interface fonts
 
-The Sticker Bomb theme of the embedded web interface serves two typefaces from the executable
-(see `assets/web/fonts/`). Both are licensed under the SIL Open Font License 1.1; the complete
+The Sticker Bomb and Orca themes of the embedded web interface serve three typefaces from the
+executable (see `assets/web/fonts/`). All are licensed under the SIL Open Font License 1.1; the complete
 license texts ship next to the font files and must be preserved in redistributed binaries and
 source packages:
 
@@ -29,5 +29,8 @@ source packages:
   (`assets/web/fonts/LICENSE-bricolage-grotesque.txt`).
 - Space Mono — copyright 2016 The Space Mono Project Authors
   (`assets/web/fonts/LICENSE-space-mono.txt`).
+- Geist (variable, `geist-var.woff2`, the same file the Orca application ships) — copyright 2023
+  Vercel, in collaboration with basement.studio (`assets/web/fonts/LICENSE-geist.txt`). Used by the
+  Orca theme only.
 
 The default Classic theme uses system fonts and ships no font files.

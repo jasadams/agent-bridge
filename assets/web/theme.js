@@ -7,6 +7,7 @@
   const THEMES = [
     { id: "classic", label: "Classic" },
     { id: "sticker", label: "Sticker Bomb" },
+    { id: "orca", label: "Orca" },
   ];
   const KEY = "agent-bridge-theme", DEFAULT = "classic";
   const known = id => THEMES.some(theme => theme.id === id);

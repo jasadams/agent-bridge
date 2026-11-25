@@ -274,12 +274,15 @@ delivery subsystem.
 
 ## Themes
 
-The interface ships with two themes, chosen from **Theme** in the top bar. **Classic** (the default)
+The interface ships with three themes, chosen from **Theme** in the top bar. **Classic** (the default)
 is the look of earlier releases: dark teal with a lime accent and system fonts. **Sticker Bomb** is a
 bold, high-contrast light theme with thick outlines, flat colour and its own typefaces (Bricolage
 Grotesque and Space Mono, served from the executable under the SIL Open Font License; see
-[the third-party notices](../THIRD_PARTY_NOTICES.md)). Only the selected theme's stylesheet and
-fonts are requested. Switching applies immediately without a reload. Every agent gets a stable
+[the third-party notices](../THIRD_PARTY_NOTICES.md)). **Orca** matches the Orca application's own
+default dark appearance, for a browser tab beside the agent chats in Orca: its neutral greys and
+borders, corner radii, 36px header and the Geist typeface (also served from the executable under the
+SIL Open Font License). It is dark only and does not follow later changes to Orca. Only the selected
+theme's stylesheet and fonts are requested. Switching applies immediately without a reload. Every agent gets a stable
 colour derived from its name. [DESIGN.md](../DESIGN.md) describes the design system.
 
 The browser remembers only two preferences: the theme, and whether the sidebar is collapsed. Neither
@@ -345,11 +348,13 @@ parsed Markdown. Data tests check historical session pinning, pagination, previe
 migration and reads without delivery writes.
 
 The disposable browser acceptance starts a private broker with seeded boards, topics and agent
-conversations and drives both themes with an already installed Playwright and Chromium. It checks
+conversations and drives all three themes with an already installed Playwright and Chromium. It checks
 unlocking, the sidebar, Markdown topics, mentions and publishing, read-only conversations and the
 details panel, the board view, All traffic, the collapsible sidebar, the quick switcher, theme
 switching, contrast, that the page never scrolls or overflows at desktop and phone widths, and that
-no content-security violation occurs:
+no content-security violation occurs. For the Orca theme it also checks contrast, that no Classic or Sticker
+Bomb colour is used, and that nothing scrolls or overflows on every screen, menu, dialog, toast and empty
+state listed in [DESIGN.md](../DESIGN.md) (Orca theme):
 
 ```sh
 cargo build --locked

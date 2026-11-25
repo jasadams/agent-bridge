@@ -1,0 +1,112 @@
+/* ==========================================================================
+   Orca: matches the Orca application's own default (dark) appearance, so this interface looks
+   like part of Orca when it is open in a browser tab beside the agent chats.
+   Values come from Orca's shipped renderer stylesheet (the :root and .dark design tokens) and
+   were checked against pixels of Orca's real window: neutral greys with white-alpha borders, the
+   Geist typeface, a 10px base radius (sm 6, md 8, lg 10, xl 14), a 36px header, flat surfaces and
+   a single monochrome primary. Geist is served from the executable under the SIL Open Font
+   License.
+   See DESIGN.md (Orca theme) for the token table.
+   ========================================================================== */
+@font-face { font-family: "Geist"; src: url("/fonts/geist-var.woff2") format("woff2"); font-weight: 100 900; font-style: normal; font-display: swap; }
+
+:root[data-theme="orca"] {
+  color-scheme: dark;
+  /* Measured in Orca's window: chat canvas #151515 (--bg), worktree sidebar #2a2a2a (--chrome),
+     composer #1e1e1e (--surface), cards #262626 (--surface-2), selected row #3e3e3e (--surface-3) */
+  --bg: #151515; --chrome: #2a2a2a; --surface: #1e1e1e; --surface-2: #262626; --surface-3: #3e3e3e;
+  --topbar-bg: #171717; /* Orca's tab bar */
+  --field: #343434; /* Orca's search field and inputs */
+  --hover: #353535; /* --worktree-sidebar-accent */
+  --ring: #737373; /* Orca --ring */
+  /* Orca --border (white 7%) and --input (white 15%) */
+  --border: #ffffff12; --border-strong: #ffffff26;
+  /* Orca --foreground and --muted-foreground; --text-3 is the one derived step (muted, dimmer) */
+  --text: #f0f0f0; --text-2: #acacac; --text-3: #a0a0a0;
+  /* Orca --primary / --primary-foreground: a monochrome primary, no brand colour */
+  --accent: #e5e5e5; --accent-hover: #d4d4d4; --accent-ink: #171717; --accent-soft: #ffffff0d;
+  /* Orca --color-blue-400 (unread / links), green-500, amber-400, red-400, sky-400 */
+  --link: #54a2ff; --ok: #00c758; --warn: #fcbb00; --danger: #ff6568; --info: #00bcfe;
+  /* Orca palette hues: blue, violet, emerald, amber, rose, sky (400 steps) */
+  --agent-0: #54a2ff; --agent-1: #a685ff; --agent-2: #00d294; --agent-3: #fcbb00; --agent-4: #ff667f; --agent-5: #00bcfe;
+  --you: #e5e5e5;
+  --r-sm: 6px; --r-md: 8px; --r-lg: 10px; --r-xl: 14px;
+  --font: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --display: var(--font);
+  --mono: "SF Mono", SFMono-Regular, ui-monospace, "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
+  --t-xs: 12px; --t-sm: 13px; --t-md: 14px; --t-lg: 16px; --t-xl: 20px;
+  --topbar-h: 36px;
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--ring);
+  /* Orca --shadow-floating */
+  --shadow-pop: 0 10px 24px #0000002e, 0 0 0 1px var(--border-strong);
+  --dur: 150ms; --ease: cubic-bezier(.4, 0, .2, 1);
+}
+[data-theme="orca"] body { font-weight: 400; -webkit-font-smoothing: antialiased; }
+[data-theme="orca"] ::-webkit-scrollbar { width: 8px; height: 8px; }
+[data-theme="orca"] ::-webkit-scrollbar-thumb { background: var(--border-strong); border: 2px solid transparent; background-clip: content-box; border-radius: var(--r-pill); }
+[data-theme="orca"] ::-webkit-scrollbar-thumb:hover { background: #ffffff40; background-clip: content-box; }
+
+/* top bar: Orca's 36px header */
+[data-theme="orca"] .topbar { background: var(--topbar-bg); padding: 0 var(--s-3) 0 var(--s-2); gap: var(--s-2); }
+[data-theme="orca"] .brand { font-size: var(--t-md); font-weight: 600; letter-spacing: 0; margin-left: var(--s-1); gap: var(--s-2); }
+[data-theme="orca"] .brand__mark--classic { width: 22px; height: 22px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 600; letter-spacing: -2px; padding-right: 2px; }
+[data-theme="orca"] .brand__word span { color: var(--text-2); font-weight: 400; }
+[data-theme="orca"] .search-trigger { min-height: 26px; border-radius: var(--r-md); background: var(--field); border-color: var(--field); color: var(--text-2); font-size: var(--t-sm); }
+[data-theme="orca"] .topbar .btn--sm { min-height: 26px; }
+[data-theme="orca"] .conn { font-size: var(--t-xs); }
+[data-theme="orca"] .dot.live { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
+
+/* sidebar: Orca --worktree-sidebar (#2a2a2a); the selected row is a lighter grey with no bar */
+[data-theme="orca"] .nav-section__title { font-family: var(--font); text-transform: none; letter-spacing: 0; font-size: var(--t-xs); font-weight: 500; color: var(--text-2); }
+[data-theme="orca"] .nav-item { min-height: 28px; color: var(--text); border-radius: var(--r-md); font-weight: 400; font-size: var(--t-sm); }
+[data-theme="orca"] .nav-item .grow { font-family: var(--font); font-size: var(--t-sm); }
+[data-theme="orca"] .nav-item:hover { background: var(--hover); }
+[data-theme="orca"] .nav-item[aria-current="page"] { background: var(--surface-3); box-shadow: none; font-weight: 500; }
+[data-theme="orca"] .nav-item.is-unread { font-weight: 600; }
+[data-theme="orca"] .nav-item .glyph { color: var(--text-2); }
+[data-theme="orca"] .short { background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-md); color: var(--text); }
+[data-theme="orca"] .count { background: var(--link); color: var(--accent-ink); font-weight: 600; }
+[data-theme="orca"] .sidebar__foot { border-top: 1px solid var(--border); }
+
+/* headings and controls: Orca (shadcn) buttons, inputs and tags */
+[data-theme="orca"] .main__head { min-height: 48px; }
+[data-theme="orca"] .main__head h1 { font-size: var(--t-lg); font-weight: 600; letter-spacing: -.01em; }
+[data-theme="orca"] .btn, [data-theme="orca"] .primary, [data-theme="orca"] .quiet { min-height: 32px; font-size: var(--t-sm); }
+[data-theme="orca"] .btn:not(.btn--primary):not(.btn--quiet) { background: var(--surface); }
+[data-theme="orca"] .btn:not(.btn--primary):not(.btn--quiet):hover { background: var(--surface-2); }
+[data-theme="orca"] .btn--primary, [data-theme="orca"] .primary { font-weight: 500; }
+[data-theme="orca"] .btn--quiet:hover, [data-theme="orca"] .quiet:hover { border-color: transparent; }
+[data-theme="orca"] .btn--sm { min-height: 26px; }
+[data-theme="orca"] .btn--icon { width: 32px; } [data-theme="orca"] .btn--icon.btn--sm { width: 26px; }
+[data-theme="orca"] input, [data-theme="orca"] select { background: var(--field); border-color: var(--field); min-height: 32px; font-size: var(--t-sm); }
+[data-theme="orca"] input:focus-visible, [data-theme="orca"] select:focus-visible, [data-theme="orca"] textarea:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent); border-color: var(--ring); }
+[data-theme="orca"] .tag { height: 20px; }
+[data-theme="orca"] kbd { border-bottom-width: 1px; border-radius: var(--r-sm); font-family: var(--font); }
+[data-theme="orca"] .state-badge, [data-theme="orca"] .direction { border-radius: var(--r-pill); }
+[data-theme="orca"] .menu, [data-theme="orca"] .switcher, [data-theme="orca"] .mention-pop { background: var(--surface); border-radius: var(--r-lg); box-shadow: var(--shadow-pop); }
+[data-theme="orca"] .menu button { font-size: var(--t-sm); }
+[data-theme="orca"] .menu button:hover:not(:disabled), [data-theme="orca"] .mention-option:hover, [data-theme="orca"] .mention-option[aria-selected="true"] { background: var(--surface-2); }
+[data-theme="orca"] .menu button[aria-checked="true"]::after { color: var(--text); }
+[data-theme="orca"] .switcher li button[aria-selected="true"] { background: var(--surface-2); }
+[data-theme="orca"] .toast { background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--r-lg); box-shadow: var(--shadow-pop); }
+
+/* chat */
+[data-theme="orca"] .avatar { border-radius: var(--r-md); font-weight: 600; background: color-mix(in srgb, var(--agent, var(--accent)) 20%, var(--bg)); color: var(--agent, var(--text)); }
+[data-theme="orca"] .avatar.is-you { background: var(--surface-3); color: var(--text); }
+[data-theme="orca"] .author { font-weight: 600; }
+[data-theme="orca"] .author.is-you { color: var(--text); }
+[data-theme="orca"] .time, [data-theme="orca"] .gutter-time, [data-theme="orca"] .day { font-family: var(--font); }
+[data-theme="orca"] .msg__actions { background: var(--surface); border-color: var(--border-strong); border-radius: var(--r-md); }
+[data-theme="orca"] .mention { background: color-mix(in srgb, var(--link) 18%, transparent); color: var(--link); border-radius: var(--r-sm); }
+[data-theme="orca"] .md code { background: color-mix(in srgb, var(--text) 6%, transparent); border: 1px solid var(--border); border-radius: var(--r-sm); }
+[data-theme="orca"] .md-code, [data-theme="orca"] pre.md-source, [data-theme="orca"] .board-code-block, [data-theme="orca"] .board-document pre, [data-theme="orca"] .board-render-fallback { background: var(--surface); border-radius: var(--r-lg); }
+[data-theme="orca"] .composer, [data-theme="orca"] .message-composer { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-xl); }
+[data-theme="orca"] .composer:focus-within { border-color: var(--ring); }
+[data-theme="orca"] .observer { border-radius: var(--r-lg); border: 1px dashed var(--border-strong); }
+
+/* boards, delivery details, login, dialogs */
+[data-theme="orca"] .board-document pre, [data-theme="orca"] .board-raw, [data-theme="orca"] .board-render-fallback, [data-theme="orca"] .board-document code { font-family: var(--mono); }
+[data-theme="orca"] .board-document-panel, [data-theme="orca"] .board-responses, [data-theme="orca"] .login-card, [data-theme="orca"] .filters { background: var(--surface); border-radius: var(--r-lg); }
+[data-theme="orca"] dialog { background: color-mix(in srgb, var(--topbar-bg) 96%, transparent); border: 1px solid var(--border-strong); border-radius: var(--r-xl); }
+[data-theme="orca"] #switcher { background: transparent; border: 0; }
+[data-theme="orca"] .message-row.selected { background: var(--surface-2); }
+[data-theme="orca"] .eyebrow, [data-theme="orca"] .detail-section h3 { font-family: var(--font); }
