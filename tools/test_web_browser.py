@@ -688,8 +688,7 @@ def run_overlap_section(playwright, url_for, report):
                     route.continue_()
                 held[-1].abort()
                 expected = start
-                until(page, f"AgentBridgeTheme.get() === '{expected}'", 8000)
-                problems = [p for p in problems if "Failed to load resource" not in p]  # the failure this variant injects
+                until(page, f"window.__themeChanges.length === {len(picks) + 1}", 8000)  # the revert
             else:
                 for route in (held if order == "in order" else reversed(held)):
                     route.continue_()
@@ -704,6 +703,8 @@ def run_overlap_section(playwright, url_for, report):
             if order == "last sheet fails":
                 changes = page.evaluate("window.__themeChanges")
                 report.check(f"{tag} the failure is announced once, with the applied theme", changes == picks + [expected], str(changes))
+            if order == "last sheet fails":
+                problems = [p for p in problems if "Failed to load resource" not in p]  # the failure this variant injects
             report.check(f"{tag} no console or page errors", not problems, str(problems[:3]))
             context.close()
     browser.close()
