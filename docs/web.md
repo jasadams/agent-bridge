@@ -357,7 +357,14 @@ python3 tools/test_web_browser.py --binary ./target/debug/agent-bridge
 ```
 
 No browser is downloaded by the harness, and its private brokers and browser contexts are
-disposable; do not point it at a running owner service or saved profile. The older harnesses in
+disposable; do not point it at a running owner service or saved profile. Run it with a Python that has
+Playwright and a matching Chromium already installed (for example a throwaway virtual environment). It
+launches Chromium with `--use-mock-keychain --password-store=basic`, so macOS shows no keychain
+prompt. The broker's agents are Claude sessions bound to private sockets, and a stand-in `claude`
+executable on the broker's PATH names two of the three sessions (the third shows the broker's generated name), so the names the page shows differ from the
+agent IDs; it checks the page shows the names and the IDs only in the details panel. An `--output`
+directory must be new or not yet exist (the run fails if it already holds a previous run's files) and short
+enough for the broker's Unix socket path. It is not run in CI. The older harnesses in
 `tools/` (`test_monitor.py --browser`, `monitor_board_qa.py` and related scripts) drive the element
 ids of the tabbed interface of earlier releases and have not yet been ported to this one; their
 HTTP and API checks still apply.
