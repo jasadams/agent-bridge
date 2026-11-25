@@ -267,8 +267,8 @@ RENDERED_CONTRAST = """() => {
 THEME_LEAK = """() => {
   // Elements painted in a colour that only Classic or Sticker Bomb defines (their palettes are
   // the lists below). Orca must override all of them on every screen.
-  const classic = ['c4ef9d', '10171c', '121c22', '172128', '1c2932', '253941', '2a3a45', '527078', 'e9f0ed', 'a4b3ba', '8fa1aa', 'ffada4', 'f4cc8e', '9fc4d6', '283b25', '7ca65e', 'd4ffb0', '1e3017'];
-  const sticker = ['fffdf6', 'fff0b8', 'fff4cc', 'ffe27a', '3753f0', '2740d4', '1f36d6', 'ffd93d', 'ff6ec7', '8ecbff', '5be3a4', 'b79cff', 'ff6b5e', '111111', '3b3b3b', '585858', '0a7a4f', '7a5200', 'c4261d', 'ff8fc2', 'ff9c7a'];
+  const classic = ['c4ef9d', '10171c', '121c22', '172128', '1c2932', '253941', '2a3a45', '527078', 'e9f0ed', 'a4b3ba', '8fa1aa', 'ffada4', 'f4cc8e', '9fc4d6', '283b25', '7ca65e', 'd4ffb0', '1e3017', '9ccfe0', 'ffb5a8', 'c9b6f2', '8fdcc4', '0d1014'];
+  const sticker = ['fffdf6', 'fff0b8', 'fff4cc', 'ffe27a', '3753f0', '2740d4', '1f36d6', 'ffd93d', 'ff6ec7', '8ecbff', '5be3a4', 'b79cff', 'ff6b5e', '111111', '3b3b3b', '585858', '0a7a4f', '7a5200', 'c4261d', 'ff8fc2', 'ff9c7a', 'c8ff5c', 'fff7d6'];
   const known = new Map([...classic.map(h => [h, 'Classic']), ...sticker.map(h => [h, 'Sticker Bomb'])]);
   const hex = c => { const m = c.match(/[\\d.]+/g); if (!m || (m.length > 3 && Number(m[3]) === 0)) return null; return m.slice(0, 3).map(n => Number(n).toString(16).padStart(2, '0')).join(''); };
   const leaks = [];
