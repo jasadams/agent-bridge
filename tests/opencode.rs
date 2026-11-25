@@ -404,14 +404,81 @@ fn native_state_total_deadline_bounds_a_stalled_native_reply() {
         None
     });
     let start = std::time::Instant::now();
-    assert!(matches!(
-        {
-            let (_dir, state) = state_for(&plugin);
-            state.list(7)
-        },
-        Err(StateError::Unavailable(_))
-    ));
+    let result = {
+        let (_dir, state) = state_for(&plugin);
+        state.list(7)
+    };
+    let Err(StateError::Unavailable(detail)) = result else {
+        panic!("expected an unavailable stalled plugin: {result:?}")
+    };
+    let waited: u64 = detail
+        .strip_prefix("An OpenCode plugin did not answer after ")
+        .and_then(|rest| rest.strip_suffix(" ms"))
+        .unwrap_or_else(|| panic!("detail does not report the wait: {detail}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("detail wait is not a number: {detail}"));
+    assert!(waited >= 400, "{detail}");
     assert!(start.elapsed() < std::time::Duration::from_secs(6));
+    plugin.finish();
+}
+
+#[test]
+fn native_state_later_page_timeout_reports_the_wait() {
+    let plugin = PluginSocket::start_optional(|frame, instance| {
+        if frame["cursor"].is_null() {
+            let mut reply = state_reply(&frame, instance, json!([]));
+            reply["next_cursor"] = json!("page-2");
+            return Some(reply);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5100));
+        None
+    });
+    let result = {
+        let (_dir, state) = state_for(&plugin);
+        state.list(7)
+    };
+    let Err(StateError::Incomplete(detail)) = result else {
+        panic!("expected an incomplete directory: {result:?}")
+    };
+    assert!(
+        detail.starts_with(
+            "OpenCode state page unavailable: An OpenCode plugin did not answer after "
+        ),
+        "{detail}"
+    );
+    assert!(detail.ends_with(" ms"), "{detail}");
+    plugin.finish();
+}
+
+#[test]
+fn native_state_shared_page_deadline_reports_the_whole_wait() {
+    let plugin = PluginSocket::start_optional(|frame, instance| {
+        let page = frame["cursor"].as_str().unwrap_or("p1").to_string();
+        if page == "p3" {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            return None;
+        }
+        if page == "p2" {
+            std::thread::sleep(std::time::Duration::from_millis(4500));
+        }
+        let mut reply = state_reply(&frame, instance, json!([]));
+        reply["next_cursor"] = json!(if page == "p1" { "p2" } else { "p3" });
+        Some(reply)
+    });
+    let result = {
+        let (_dir, state) = state_for(&plugin);
+        state.list(7)
+    };
+    let Err(StateError::Incomplete(detail)) = result else {
+        panic!("expected an incomplete directory: {result:?}")
+    };
+    let waited: u64 = detail
+        .strip_prefix("OpenCode state page unavailable: An OpenCode plugin did not answer after ")
+        .and_then(|rest| rest.strip_suffix(" ms"))
+        .unwrap_or_else(|| panic!("detail does not report the wait: {detail}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("detail wait is not a number: {detail}"));
+    assert!(waited >= 4500, "{detail}");
     plugin.finish();
 }
 

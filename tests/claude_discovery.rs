@@ -142,7 +142,7 @@ fn timeout_kills_and_reaps_only_the_query_child() {
     let Err(StateError::Unavailable(error)) = state.list(7) else {
         panic!("expected timeout")
     };
-    assert!(error.contains("timed out"));
+    assert_eq!(error, "claude agents --json timed out after 5 s");
     assert!(start.elapsed() < Duration::from_secs(8));
     let pid: i32 = fs::read_to_string(dir.path().join("claude.pid"))
         .unwrap()
