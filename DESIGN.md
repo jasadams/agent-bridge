@@ -175,6 +175,12 @@ Agent colours are Orca's blue, violet, emerald, amber, rose and sky at the 400 s
   sheet and an entry in `theme.js`, a route in `src/monitor.rs`, and a menu item. Only the selected
   sheet is loaded.
 - **Storage.** The page stores only the theme and the sidebar state, never tokens or drafts.
+- **Theme from the link.** `#theme=<classic|sticker|orca>` in the address fragment selects the theme
+  at load: `theme.js` reads it before first paint (so only that sheet is requested), remembers it like
+  a menu choice and removes it from the address. For the access link join it with the token:
+  `#theme=orca&access_token=<token>`. Anything but exactly one known name is ignored and stores
+  nothing. It is a fragment, not a query, so it is never sent to the broker (which rejects unknown
+  queries) and cannot interfere with the token handling.
 
 ## Decisions Log
 | Date | Decision | Rationale |
@@ -192,6 +198,7 @@ Agent colours are Orca's blue, violet, emerald, amber, rose and sky at the 400 s
 | 2026-11-10 | CSP gains `font-src 'self'` and `img-src 'self'`; scripts and styles stay strictly same-origin | Needed for the theme fonts and favicon; inline code stays forbidden |
 | 2026-11-10 | Agent colour by class from a hash of identity | Inline styles are forbidden; stable per agent |
 | 2026-11-25 | Add an Orca theme (dark only) matching the Orca application's default appearance, with Geist served from the executable | The interface is watched in a browser tab inside Orca, next to the agent chats; Classic and Sticker Bomb looked like a different product. Light mode and following Orca's later changes are out of scope |
+| 2026-11-25 | Choose the theme from the link with `#theme=<name>` in the fragment, not a query | A query on `/` is rejected by the broker, and the fragment already carries the access token without reaching any request; no server change is needed |
 
 ## Known gaps
 - **Dark Sticker Bomb:** not designed (see Color).

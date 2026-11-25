@@ -288,6 +288,44 @@ colour derived from its name. [DESIGN.md](../DESIGN.md) describes the design sys
 The browser remembers only two preferences: the theme, and whether the sidebar is collapsed. Neither
 is a credential or a draft.
 
+### Choosing the theme from the link
+
+Put `theme=<name>` in the address fragment (`classic`, `sticker` or `orca`) and the page opens in that
+theme from its first paint, with no click and no flash of another theme. The blocking `theme.js`
+applies it before the page is drawn and requests only that theme's stylesheet and fonts. For the
+plain address:
+
+```text
+http://127.0.0.1:<port>/#theme=orca
+```
+
+For the private access link from `agent-bridge web enable` (`<url>#access_token=<token>`), add the
+theme to the same fragment, joined with `&`:
+
+```text
+http://127.0.0.1:<port>/#theme=orca&access_token=<token>
+```
+
+The page still unlocks from the link. The theme travels in the fragment like the token, so it is never
+sent in a request, and the token is consumed and removed exactly as without a theme.
+
+- A theme in the link takes the same effect as choosing it from **Theme**: it is remembered as the
+  saved theme (the page still stores only the theme name and the sidebar state).
+- Only one known, lowercase name counts (after percent-decoding). An unknown, empty, differently cased or repeated
+  `theme` is ignored: the saved theme (or Classic) applies, nothing is stored, and the address is left
+  as it was.
+- After applying it the page removes `theme` from the address, so a later reload keeps whatever you
+  chose from the menu in the meantime. Opening a link that carries a theme (a new tab, a bookmark, a
+  pasted link in a fresh load) selects that theme again; changing only the fragment of a page that is
+  already open does not reload it and does not apply a theme.
+- Supported forms: `#theme=<name>`, `#theme=<name>&access_token=<token>` (either order), and a route
+  with a theme (`#/board/main&theme=orca` or `#theme=orca&/board/main`). The page removes only the
+  `theme=…` part of the fragment, as text; every other character, the route included, stays exactly as
+  typed, so the route opens as it would without a theme. With the access token, the page consumes the
+  whole fragment after unlocking (as it always does), so a route does not survive an access link.
+  With only a theme, the address is empty after it is removed, so once unlocked the page opens the
+  default board, exactly as a reload of the plain address does.
+
 ## Browser access
 
 API requests carry a random access token in an Authorization header. The page
@@ -298,7 +336,9 @@ access link unlocks it again while that credential remains valid. Tokens in acce
 links use only the fragment, never the query string. After consuming the fragment,
 requests use only Authorization headers. Tokens are not stored in cookies,
 referrers or browser storage; the page stores only the theme and sidebar preferences described above. Static login assets contain no message history or
-credentials.
+credentials. A theme can be added to the access link's fragment
+([Choosing the theme from the link](#choosing-the-theme-from-the-link)); the token is still
+removed from the address and never stored.
 
 Exact Host validation, Origin and browser fetch-metadata checks reject DNS rebinding
 and cross-origin requests. The server supplies no CORS permission, uses restrictive
@@ -349,6 +389,9 @@ migration and reads without delivery writes.
 
 The disposable browser acceptance starts a private broker with seeded boards, topics and agent
 conversations and drives all three themes with an already installed Playwright and Chromium. It checks
+choosing each theme from the plain address and from the access link (first paint, only that theme's
+sheet requested, the token and theme removed from the address and absent from storage, cookies and
+requests, a menu choice surviving a reload, and ignored unknown, empty and repeated values),
 unlocking, the sidebar, Markdown topics, mentions and publishing, read-only conversations and the
 details panel, the board view, All traffic, the collapsible sidebar, the quick switcher, theme
 switching (including quick overlapping picks with held sheet responses), contrast, that the page never scrolls or overflows at desktop and phone widths, and that
