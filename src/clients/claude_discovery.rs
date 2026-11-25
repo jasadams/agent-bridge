@@ -86,7 +86,10 @@ impl State {
                     }
                 }
                 if Instant::now() >= deadline {
-                    return Err(unavailable("claude agents --json timed out"));
+                    return Err(unavailable(format!(
+                        "claude agents --json timed out after {} s",
+                        DEADLINE.as_secs()
+                    )));
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }

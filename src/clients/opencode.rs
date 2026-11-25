@@ -159,7 +159,24 @@ impl State {
     }
 }
 
-fn ask(path: &Path, frame: &Value, deadline: Instant) -> Result<Option<StateReply>, StateError> {
+/// The native exchange ran out of its deadline, as opposed to failing outright.
+#[derive(Debug)]
+struct NativeTimeout;
+impl std::fmt::Display for NativeTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Native state transport timed out")
+    }
+}
+impl std::error::Error for NativeTimeout {}
+
+/// `waiting_since` is when the wait budget ending at `deadline` began, so a
+/// timeout reports the whole wait even when pages share one deadline.
+fn ask(
+    path: &Path,
+    frame: &Value,
+    waiting_since: Instant,
+    deadline: Instant,
+) -> Result<Option<StateReply>, StateError> {
     match exchange_sync(path, frame, deadline) {
         Ok(bytes) => decode_state(&bytes, path, frame).map(Some),
         Err(error)
@@ -172,6 +189,12 @@ fn ask(path: &Path, frame: &Value, deadline: Instant) -> Result<Option<StateRepl
         }
         Err(error) if error.downcast_ref::<StateError>().is_some() => {
             Err(incomplete("Invalid OpenCode state frame"))
+        }
+        Err(error) if error.downcast_ref::<NativeTimeout>().is_some() => {
+            Err(StateError::Unavailable(format!(
+                "An OpenCode plugin did not answer after {} ms",
+                waiting_since.elapsed().as_millis()
+            )))
         }
         Err(_) => Err(StateError::Unavailable(
             "An OpenCode plugin did not answer".into(),
@@ -271,10 +294,12 @@ impl ConnectorState for State {
         }
         let pages = self.each(|path| {
             let frame = json!({"op":"state_list","cursor":null});
-            let Some(mut reply) = ask(path, &frame, Instant::now() + PROBE)? else {
+            let probe_started = Instant::now();
+            let Some(mut reply) = ask(path, &frame, probe_started, probe_started + PROBE)? else {
                 return Ok(None);
             };
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let pages_started = Instant::now();
+            let deadline = pages_started + Duration::from_secs(5);
             let (mut rows, mut cursors) = (Vec::new(), HashSet::new());
             for page in 0..64 {
                 let StateReply::List {
@@ -301,10 +326,15 @@ impl ConnectorState for State {
                     return Err(incomplete("OpenCode state pagination incomplete"));
                 }
                 let frame = json!({"op":"state_list","cursor":cursor});
-                reply = ask(path, &frame, deadline)
-                    .ok()
-                    .flatten()
-                    .ok_or_else(|| incomplete("OpenCode state page unavailable"))?;
+                reply = match ask(path, &frame, pages_started, deadline) {
+                    Ok(Some(reply)) => reply,
+                    Err(StateError::Unavailable(detail)) => {
+                        return Err(incomplete(&format!(
+                            "OpenCode state page unavailable: {detail}"
+                        )));
+                    }
+                    _ => return Err(incomplete("OpenCode state page unavailable")),
+                };
             }
             unreachable!("bounded page loop returns at the final page")
         })?;
@@ -330,7 +360,8 @@ impl ConnectorState for State {
             .map_err(|_| incomplete("OpenCode lookup requires an exact session ID"))?;
         let rows = self.each(|path| {
             let frame = json!({"op":"state_get","session":session});
-            let Some(reply) = ask(path, &frame, Instant::now() + PROBE)? else {
+            let probe_started = Instant::now();
+            let Some(reply) = ask(path, &frame, probe_started, probe_started + PROBE)? else {
                 return Ok(None);
             };
             let StateReply::Get {
@@ -414,7 +445,7 @@ fn exchange_sync(path: &Path, frame: &Value, deadline: Instant) -> Result<Vec<u8
         loop {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .context("Native state deadline elapsed")?;
+                .ok_or(NativeTimeout)?;
             let mut descriptor = libc::pollfd {
                 fd,
                 events,
@@ -432,7 +463,10 @@ fn exchange_sync(path: &Path, frame: &Value, deadline: Instant) -> Result<Vec<u8
             {
                 continue;
             }
-            ensure!(ready > 0, "Native state transport unavailable or timed out");
+            ensure!(ready >= 0, "Native state transport unavailable");
+            if ready == 0 {
+                return Err(NativeTimeout.into());
+            }
             return Ok(());
         }
     };
