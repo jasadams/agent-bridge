@@ -169,7 +169,7 @@ installed.
 | Scrollbar | thin, white 15% thumb | thin, `--muted-foreground` at 34% (Orca's `scrollbar-sleek`) | `::-webkit-scrollbar` |
 
 Agent colours are Orca's blue, violet, emerald, amber, rose and sky: the 400 steps on dark and the 700
-steps on light (`--agent-0` to `--agent-5`). Orca's own light "unread" blue is blue-500 `#3080ff`, which
+steps on light, except amber, which is the 800 step there because the 700 is 4.3:1 on the avatar tint (`--agent-0` to `--agent-5`). Orca's own light "unread" blue is blue-500 `#3080ff`, which
 is 3.7:1 on white, so the light theme uses blue-700 for links, as it does for the state colours: the
 700 steps are the ones that reach 4.5:1 on the grey rows too. Where a shipped tone cannot be read on a
 shipped surface the theme does not invent a colour: the light avatar tint is 12% (the dark one is 20%)
@@ -183,15 +183,13 @@ keeps placeholders at 4.5:1 on the `#343434` field; Orca has no third text tone,
 loads (before first paint) and again whenever it changes, loading only the sheet it needs and swapping it
 in without a reload. What the browser reports inside Orca, as probed:
 
-
-**Verified:** with Orca's own Appearance setting on System and macOS in its Light appearance, a page in an Orca browser tab (Orca's Electron 43.8.10) reports `prefers-color-scheme: light`.
-
-**Not verified:** whether the tab mirrors Orca's own setting or only macOS. Orca's main process sets Electron's `nativeTheme.themeSource` from its Theme setting (System, Light or Dark; read in the application's `out/main/index.js`), so a tab is expected to follow Orca's own setting, but this was not tested with Orca set explicitly to Dark or Light, and with System and a Light macOS both explanations predict light. Orca can also override the colour scheme of a single site in a browser tab, which would apply to this page like any other. Orca (system) follows whatever the browser reports, so it behaves correctly either way; both appearances and a live change are covered by emulation in the browser test.
+- **Verified:** with Orca's own Appearance setting on System and macOS in its Light appearance, a page in an Orca browser tab (Orca's Electron 43.8.10) reports `prefers-color-scheme: light`.
+- **Not verified:** whether the tab mirrors Orca's own setting or only macOS. Orca's main process sets Electron's `nativeTheme.themeSource` from its Theme setting (System, Light or Dark; read in the application's `out/main/index.js`), so a tab is expected to follow Orca's own setting, but this was not tested with Orca set explicitly to Dark or Light, and with System and a Light macOS both explanations predict light. Orca can also override the colour scheme of a single site in a browser tab, which would apply to this page like any other. Orca (system) follows whatever the browser reports, so it behaves correctly either way; both appearances and a live change are covered by emulation in the browser test.
 
 
 **Checks.** Contrast and palette are checked by the browser test, for the dark theme, the light theme and
 the system choice (the system choice with the browser in each appearance; an explicit choice is also run
-in the opposite appearance, to show it ignores it), on these screens: the board (with its overflow menu and archived-boards dialog), the empty board, the topic (with the mention popover), the empty topic, an agent conversation, delivery details, an error toast, All traffic and its no-match state, the Theme menu, the quick switcher and its no-match state, and the locked screen. On each it measures every visible text node, input value, placeholder and `::before`/`::after` text against what is painted behind it (translucent colours, including `color-mix()` results, blended, opacity applied) at 4.5:1, and fails if any element uses a Classic or Sticker Bomb palette colour from the lists in the test (the palettes of their sheets, less pure white, which Orca also uses). Not measured: icons drawn as shapes or images, and fully transparent elements (the message actions before hover). Agent conversations have no empty state in the interface, so none is checked.
+in the opposite appearance, to show it ignores it), on these screens: the board (with its overflow menu, archived-boards dialog and archive confirmation dialog), the empty board, the topic (with the mention popover), the empty topic, an agent conversation, delivery details, an error toast, All traffic and its no-match state, the Theme menu, the quick switcher and its no-match state, and the locked screen. On each it measures every visible text node, input value, placeholder and `::before`/`::after` text against what is painted behind it (translucent colours, including `color-mix()` results, blended, opacity applied) at 4.5:1, and fails if any element uses a Classic or Sticker Bomb palette colour from the lists in the test (the palettes of their sheets, less pure white, which Orca also uses). Not measured: icons drawn as shapes or images, and fully transparent elements (the message actions before hover). Agent conversations have no empty state in the interface, so none is checked.
 
 ## Implementation rules (security and structure)
 - **Untrusted text.** Agent-authored text is untrusted. Render it with `createElement` /

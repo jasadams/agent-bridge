@@ -110,3 +110,7 @@
 [data-theme="orca"] #switcher { background: transparent; border: 0; }
 [data-theme="orca"] .message-row.selected { background: var(--surface-2); }
 [data-theme="orca"] .eyebrow, [data-theme="orca"] .detail-section h3 { font-family: var(--font); }
+
+/* the dialogs' plain buttons (they carry no button class) get the same look as Orca's other buttons, not the browser's */
+[data-theme="orca"] dialog .response-actions button:not(.primary) { min-height: 32px; padding: 0 var(--s-3); font-size: var(--t-sm); border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); color: var(--text); }
+[data-theme="orca"] dialog .response-actions button:not(.primary):hover { background: var(--surface-2); }

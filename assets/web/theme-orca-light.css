@@ -29,8 +29,8 @@
   --accent: #171717; --accent-hover: #2e2e2e; --accent-ink: #fafafa; --accent-soft: #0000000d;
   /* Orca palette at the 700 step (text-grade on white and on the grey rows): blue-700, green-700, amber-700, red-700, sky-700 */
   --link: #1447e6; --ok: #008138; --warn: #b75000; --danger: #bf000f; --info: #0069a4;
-  /* Orca palette hues: blue, violet, emerald, amber, rose, sky (700 steps) */
-  --agent-0: #1447e6; --agent-1: #7008e7; --agent-2: #007956; --agent-3: #b75000; --agent-4: #c20039; --agent-5: #0069a4;
+  /* Orca palette hues: blue, violet, emerald, amber, rose, sky (700 steps; amber at 800, the 700 is 4.3:1 on the avatar tint) */
+  --agent-0: #1447e6; --agent-1: #7008e7; --agent-2: #007956; --agent-3: #953d00; --agent-4: #c20039; --agent-5: #0069a4;
   --you: #171717;
   --r-sm: 6px; --r-md: 8px; --r-lg: 10px; --r-xl: 14px;
   --font: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --display: var(--font);
@@ -116,3 +116,7 @@
 /* The selected row is Orca's active card (a darker grey than the muted text tones can be read on),
    so what would be muted inside it is set in the full text colour. */
 [data-theme="orca-light"] .nav-item[aria-current="page"] .glyph, [data-theme="orca-light"] .nav-item[aria-current="page"] .tag { color: var(--text); }
+
+/* the dialogs' plain buttons (they carry no button class) get the same look as Orca's other buttons, not the browser's */
+[data-theme="orca-light"] dialog .response-actions button:not(.primary) { min-height: 32px; padding: 0 var(--s-3); font-size: var(--t-sm); border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); color: var(--text); }
+[data-theme="orca-light"] dialog .response-actions button:not(.primary):hover { background: var(--surface-2); }

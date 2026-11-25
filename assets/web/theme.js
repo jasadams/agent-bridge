@@ -47,8 +47,9 @@
     return link;
   }
   // `applied` is the sheet in the page (also `data-theme` on <html>); `current` is the choice, which
-  // is the same name unless the choice is the system one.
-  let applied = sheetFor(current);
+  // is the same name unless the choice is the system one; `settled` is the last choice whose sheet
+  // loaded, which is what a failed load goes back to.
+  let applied = sheetFor(current), settled = current;
   document.documentElement.dataset.theme = applied;
   document.head.append(sheet(applied));
 
@@ -71,13 +72,15 @@
       document.getElementById("theme-sheet")?.remove();
       next.id = "theme-sheet";
       applied = document.documentElement.dataset.theme = id;
+      settled = current;
     }, { once: true });
     next.addEventListener("error", () => {
       if (pending !== next) return; // a later target already replaced this one
       pending = pendingId = null;
       next.remove();
-      // Back to the theme that is actually applied, which is not always the previous choice.
-      current = applied;
+      // Back to the last choice that is actually applied: a failed sheet never changes what was chosen
+      // before it (so a failed swap while following the system appearance stays on Orca (system)).
+      current = settled;
       try { localStorage.setItem(KEY, current); } catch { /* ignore */ }
       document.dispatchEvent(new CustomEvent("themechange", { detail: current }));
     }, { once: true });

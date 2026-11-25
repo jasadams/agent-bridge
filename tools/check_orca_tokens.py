@@ -88,7 +88,7 @@ LIGHT = {
     "--agent-0": ("palette", "--color-blue-700"),
     "--agent-1": ("palette", "--color-violet-700"),
     "--agent-2": ("palette", "--color-emerald-700"),
-    "--agent-3": ("palette", "--color-amber-700"),
+    "--agent-3": ("palette", "--color-amber-800"),
     "--agent-4": ("palette", "--color-rose-700"),
     "--agent-5": ("palette", "--color-sky-700"),
     "--you": ("token", "--primary"),
@@ -228,7 +228,7 @@ def main():
         checked += 1
         if radius != ".625rem" or ours["--r-lg"] != "10px":
             failures.append(f"{label} --r-lg: theme has {ours['--r-lg']}, Orca ships --radius = {radius}")
-        shadow = declarations(sheet, ":root").get("--shadow-floating") or re.search(r"--shadow-floating:([^;}]+)", sheet).group(1)
+        shadow = re.search(r"--shadow-floating:([^;}]+)", sheet).group(1)
         checked += 1
         if shadow.strip() not in ours["--shadow-pop"]:
             failures.append(f"{label} --shadow-pop: theme has {ours['--shadow-pop']}, Orca ships --shadow-floating = {shadow.strip()}")

@@ -666,6 +666,14 @@ def run_orca_section(playwright, url_for, topic_id, report, out, choice, scheme)
                scheme: getComputedStyle(document.documentElement).colorScheme };
     }""")
     report.check(f"{tag} colours, header height and radius are Orca's", values == ORCA_VALUES[applied], str(values))
+    # Every agent colour, whichever the seeded agents happen to hash to: an avatar of each of the six, and a mention.
+    palette = page.evaluate("""() => {
+      const box = document.createElement('div'); box.id = 'agent-colours-probe';
+      box.innerHTML = [0, 1, 2, 3, 4, 5].map(i => `<div class="avatar agent-c${i}">A${i}</div><span class="author agent-c${i}">name${i}</span>`).join('');
+      document.querySelector('#workspace').append(box); return true; }""")
+    probe = page.evaluate(RENDERED_CONTRAST)
+    page.evaluate("document.getElementById('agent-colours-probe').remove()")
+    report.check(f"{tag} all six agent colours (avatars and names) meet 4.5:1", palette and probe["checked"] >= 12 and not [f for f in probe["fails"] if "avatar" in f or "author" in f], str(probe["fails"][:6]))
 
     # Every screen is styled by Orca and readable: nothing keeps another theme's colours.
     def screen(name, minimum=3):
@@ -681,6 +689,13 @@ def run_orca_section(playwright, url_for, topic_id, report, out, choice, scheme)
         page.evaluate(f"location.hash = {json.dumps(route)}")
         page.wait_for_timeout(700)
 
+    def dialog_buttons(selectors, name):
+        # the dialogs' plain buttons are styled by the theme, not left in the browser's own button look (a 2px outset border)
+        want = {"orca": "rgb(30, 30, 30)", "orca-light": "rgb(255, 255, 255)"}[applied]
+        for selector in selectors:
+            look = page.evaluate("""s => { const c = getComputedStyle(document.querySelector(s)); return [c.borderTopWidth, c.borderTopStyle, c.backgroundColor, c.minHeight, c.borderTopLeftRadius]; }""", selector)
+            report.check(f"{tag} {name}: {selector} is a themed button, not the browser's", look == ["1px", "solid", want, "32px", "8px"], str(look))
+
     dm_route = page.evaluate("document.querySelector('#sidebar .nav-item[data-route^=\"#/dm/\"]').dataset.route")
     go("#/board/release-checklist")
     screen("board", 20)
@@ -691,6 +706,13 @@ def run_orca_section(playwright, url_for, topic_id, report, out, choice, scheme)
     page.click("#board-archived-open")
     page.wait_for_selector("#archived-dialog[open]", timeout=5000)
     screen("archived boards dialog")
+    dialog_buttons(["#archived-refresh", "#archived-close"], "archived boards dialog")
+    page.keyboard.press("Escape")
+    page.click("#board-menu-button")
+    page.get_by_role("menuitem", name="Archive board").click()
+    page.wait_for_selector("#archive-confirm-dialog[open]", timeout=5000)
+    screen("archive confirmation dialog")
+    dialog_buttons(["#archive-confirm-submit", "#archive-confirm-cancel"], "archive confirmation dialog")
     page.keyboard.press("Escape")
     go("#/board/main")
     page.wait_for_selector("text=main has not been written yet.", timeout=8000)
@@ -1116,46 +1138,45 @@ def run_system_section(playwright, url_for, report):
         context.close()
 
     # 4. Overlap: quick appearance changes and picks with the sheet responses held, released in order or reversed, or failing.
+    # (label, release order, events in order: "dark"/"light" is the browser's appearance, anything else is a pick; saved choice at the start; expected sheet and choice at the end)
     cases = [
-        ("flip dark, light, dark", "in order", ["dark", "light", "dark"], [], "orca"),
-        ("flip dark, light, dark", "reversed", ["dark", "light", "dark"], [], "orca"),
-        ("flip dark, light", "in order", ["dark", "light"], [], "orca-light"),
-        ("flip dark, then pick Orca Light", "reversed", ["dark"], ["orca-light"], "orca-light"),
-        ("flip dark, then pick Sticker Bomb", "in order", ["dark"], ["sticker"], "sticker"),
-        ("pick Orca Dark, then flip dark", "in order", [], ["orca", "flip"], "orca"),
-        ("flip dark, then pick Orca (system)", "reversed", ["dark"], ["orca-system"], "orca"),
+        ("flip dark, light, dark", "in order", ["dark", "light", "dark"], "orca-system", "orca", "orca-system"),
+        ("flip dark, light, dark", "reversed", ["dark", "light", "dark"], "orca-system", "orca", "orca-system"),
+        ("flip dark, light", "in order", ["dark", "light"], "orca-system", "orca-light", "orca-system"),
+        ("flip dark, then pick Orca Light", "reversed", ["dark", "orca-light"], "orca-system", "orca-light", "orca-light"),
+        ("flip dark, then pick Sticker Bomb", "in order", ["dark", "sticker"], "orca-system", "sticker", "sticker"),
+        ("pick Orca Dark, then flip dark", "in order", ["orca", "dark"], "orca-system", "orca", "orca"),
+        ("from Orca Dark pick Orca (system), then flip dark", "in order", ["orca-system", "dark"], "orca", "orca", "orca-system"),
+        ("from Orca Dark pick Orca (system), then flip dark and light", "reversed", ["orca-system", "dark", "light"], "orca", "orca-light", "orca-system"),
+        ("from Sticker Bomb pick Orca (system), then pick Orca Dark", "in order", ["orca-system", "orca"], "sticker", "orca", "orca"),
     ]
-    for label, order, flips, picks, expected in cases:
+    for label, order, events, start, expected, choice in cases:
         tag = f"[system overlap {label}, sheets released {order}]"
-        context, page, requests = open_page("light")
+        context, page, requests = open_page("light", saved=start)
         page.goto(f"{base}#access_token={token}")
         page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        first = sheet_for(start, "light")
         held = []
         page.route("**/theme-*.css", lambda route: held.append(route))
         page.evaluate("window.__changes = []; document.addEventListener('themechange', e => window.__changes.push(e.detail))")
-        for flip in flips:
-            page.emulate_media(color_scheme=flip)
-            page.wait_for_timeout(150)
-        for pick in picks:
-            if pick == "flip":
-                page.emulate_media(color_scheme="dark")
-                page.wait_for_timeout(150)
+        for event in events:
+            if event in ("dark", "light"):
+                page.emulate_media(color_scheme=event)
             else:
-                page.evaluate(f"AgentBridgeTheme.set({json.dumps(pick)})")
-                page.wait_for_timeout(150)
-        report.check(f"{tag} the applied theme does not change while the sheets are loading", page.evaluate("document.documentElement.dataset.theme") == "orca-light")
+                page.evaluate(f"AgentBridgeTheme.set({json.dumps(event)})")
+            page.wait_for_timeout(150)
         for _ in range(20):
             page.wait_for_timeout(100)
+        report.check(f"{tag} the applied theme does not change while the sheets are loading", page.evaluate("document.documentElement.dataset.theme") == first)
         for route in (held if order == "in order" else reversed(held)):
             route.continue_()
         until(page, f"document.documentElement.dataset.theme === '{expected}'", 8000)
         page.wait_for_timeout(500)
         report.check(f"{tag} exactly one theme sheet is in the page, {expected}", one_sheet(page, expected), str(sheets_in_page(page)))
-        last_choice = ([p for p in picks if p != "flip"] or ["orca-system"])[-1]
-        report.check(f"{tag} the choice and the saved value are {last_choice}", state(page)[1:] == [last_choice, last_choice], str(state(page)))
+        report.check(f"{tag} the choice and the saved value are {choice}", state(page)[1:] == [choice, choice], str(state(page)))
         context.close()
 
-    # A sheet that fails to load while following the appearance leaves the applied theme, announced once (the existing failure rule).
+    # A sheet that fails to load goes back to the last choice that is applied (the existing failure rule); for a swap made while following the system appearance that is Orca (system).
     tag = "[system overlap failed sheet]"
     context, page, requests = open_page("light")
     page.goto(f"{base}#access_token={token}")
@@ -1171,7 +1192,31 @@ def run_system_section(playwright, url_for, report):
     held[0].abort()
     until(page, "window.__changes.length === 1", 8000)
     page.wait_for_timeout(300)
-    report.check(f"{tag} the applied sheet stays, once, and is the saved choice", state(page) == ["orca-light", "orca-light", "orca-light"] and one_sheet(page, "orca-light") and page.evaluate("window.__changes") == ["orca-light"], f"{state(page)} {page.evaluate('window.__changes')}")
+    report.check(f"{tag} the applied sheet stays, once, and the choice is still Orca (system), saved as such", state(page) == ["orca-light", "orca-system", "orca-system"] and one_sheet(page, "orca-light") and page.evaluate("window.__changes") == ["orca-system"], f"{state(page)} {page.evaluate('window.__changes')}")
+    # the failure was transient: the next appearance change that needs that sheet loads it, and the page follows again
+    page.unroute("**/theme-orca.css")
+    page.emulate_media(color_scheme="light")
+    page.wait_for_timeout(300)
+    page.emulate_media(color_scheme="dark")
+    until(page, "document.documentElement.dataset.theme === 'orca'", 8000)
+    page.wait_for_timeout(300)
+    report.check(f"{tag} after the failure a later flip loads the sheet and the page follows again, still Orca (system)", state(page) == ["orca", "orca-system", "orca-system"] and one_sheet(page, "orca"), str(state(page)))
+    page.emulate_media(color_scheme="light")
+    until(page, "document.documentElement.dataset.theme === 'orca-light'", 8000)
+    page.wait_for_timeout(300)
+    # the failure of an explicit pick made while following the system goes back to Orca (system)
+    held = []
+    page.route("**/theme-sticker.css", lambda route: held.append(route))
+    page.evaluate("window.__changes = []")
+    page.evaluate("AgentBridgeTheme.set('sticker')")
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    held[0].abort()
+    until(page, "window.__changes.length === 2", 8000)  # the pick, then the revert
+    page.wait_for_timeout(300)
+    report.check(f"{tag} a failed pick made while following the system goes back to Orca (system), still applied and saved", state(page) == ["orca-light", "orca-system", "orca-system"] and one_sheet(page, "orca-light") and page.evaluate("window.__changes") == ["sticker", "orca-system"], f"{state(page)} {page.evaluate('window.__changes')}")
     context.close()
 
     # 5. The link: #theme=orca-system opens by the appearance, and the token still never leaves the page.

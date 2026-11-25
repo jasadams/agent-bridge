@@ -285,7 +285,7 @@ served from the executable under the SIL Open Font License), and **Orca (system)
 according to the browser's appearance (`prefers-color-scheme`), switching live, without a reload, when
 that appearance changes. Only the selected theme's stylesheet and fonts are requested (the system choice
 requests only the Orca sheet it currently needs), and exactly one theme stylesheet is in the page. Switching
-applies immediately without a reload. Every agent gets a stable colour derived from its name.
+applies immediately without a reload. If a sheet fails to load, the page goes back to the last choice that is applied (so a failed swap while following the appearance stays on Orca (system)). Every agent gets a stable colour derived from its name.
 [DESIGN.md](../DESIGN.md) describes the design system and lists the Orca values it took from Orca.
 
 The browser remembers only two preferences: the theme, and whether the sidebar is collapsed. Neither
