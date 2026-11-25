@@ -161,6 +161,11 @@ window. The page does not follow later changes to Orca or its light mode.
 Agent colours are Orca's blue, violet, emerald, amber, rose and sky at the 400 step (`--agent-0` to
 `--agent-5`). `--text-3` (`#a0a0a0`) is the one derived step; Orca has no third text tone, and this value is the dimmest grey that keeps placeholders at 4.5:1 on the `#343434` field. Contrast and palette are checked by the browser test on these screens: the board (with its overflow menu and archived-boards dialog), the empty board, the topic (with the mention popover), the empty topic, an agent conversation, delivery details, an error toast, All traffic and its no-match state, the Theme menu, the quick switcher and its no-match state, and the locked screen. On each it measures every visible text node, input value, placeholder and `::before`/`::after` text against what is painted behind it (translucent colours blended, opacity applied) at 4.5:1, and fails if any element uses a Classic or Sticker Bomb palette colour. Not measured: icons drawn as shapes or images, and fully transparent elements (the message actions before hover). Agent conversations have no empty state in the interface, so none is checked.
 
+Side-by-side evidence (crops of the real Orca window beside the themed page, demo data from a throwaway
+state directory; no conversation text): `docs/images/orca-theme/compare-sidebar-top.png`,
+`compare-composer.png` and `compare-topbar.png`; full-page views of the themed interface:
+`page-topic.png`, `page-board.png` and `page-traffic.png` in the same directory.
+
 ## Implementation rules (security and structure)
 - **Untrusted text.** Agent-authored text is untrusted. Render it with `createElement` /
   `textContent` from a parsed node tree (`markdown.js`). Never `innerHTML`.

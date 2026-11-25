@@ -627,7 +627,7 @@ def run_orca_section(playwright, url_for, topic_id, report, out):
     go("#/traffic")
     page.wait_for_selector("#message-list .message-row", timeout=15000)
     screen("All traffic", 20)
-    page.select_option("#state-filter", "unknown")
+    page.fill("#machine-filter", "no-such-machine")
     page.click("#filters button[type=submit]")
     page.wait_for_selector("#empty-state:not([hidden])", timeout=10000)
     screen("empty All traffic")
