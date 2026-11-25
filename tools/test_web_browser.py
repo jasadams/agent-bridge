@@ -511,15 +511,16 @@ def run_orca_section(playwright, url_for, topic_id, report, out):
         until(page, f"document.documentElement.dataset.theme === '{other}' && document.querySelectorAll('link[rel=stylesheet][href*=\"/theme-\"]').length === 1", 8000)
         sheets = page.evaluate("[...document.styleSheets].map(s => s.href || '').filter(h => h.includes('/theme-'))")
         report.check(f"{tag} switching to {other} leaves only its sheet", len(sheets) == 1 and sheets[0].endswith(f"/theme-{other}.css"), str(sheets))
-        if font:
-            until(page, f"performance.getEntriesByType('resource').some(r => r.name.includes('{font}'))", 8000)
+        if font == "bricolage":
+            until(page, "document.fonts.check('15px \"Bricolage Grotesque\"')", 8000)
         fonts = [u for u in requests[before:] if "/fonts/" in u]
         if other == "classic":
             report.check(f"{tag} switching to Classic requests no font", not fonts, str(fonts))
         elif other == "sticker":
             report.check(f"{tag} switching to Sticker Bomb requests no Geist", not any("geist" in u for u in fonts), str(fonts))
         else:
-            report.check(f"{tag} switching back to Orca restores Geist text", page.evaluate("getComputedStyle(document.body).fontFamily").startswith("Geist"))
+            until(page, "document.fonts.check('14px Geist')", 8000)
+            report.check(f"{tag} switching back to Orca restores the loaded Geist font", page.evaluate("document.fonts.check('14px Geist') && getComputedStyle(document.body).fontFamily.startsWith('Geist')"))
         report.check(f"{tag} switching to {other} applies without a reload and is remembered", page.evaluate("window.__noReload === true && localStorage.getItem('agent-bridge-theme')") == other)
 
     # Orca's own values on the rendered page (see DESIGN.md: Orca theme).
