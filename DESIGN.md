@@ -10,7 +10,7 @@ interaction decisions. It ships three themes on one layout:
   the page looks like part of Orca when shown in a browser tab beside agent chats. Implemented in
   `assets/web/theme-orca.css`; see "Orca theme".
 
-Layout, shell and interaction rules apply to both. Colour, type, shape, motion and logo sections
+Layout, shell and interaction rules apply to all three. Colour, type, shape, motion and logo sections
 describe Sticker Bomb unless they say otherwise; the Orca theme is described under "Orca theme". Two other identities (an editorial "paper" theme
 and a teletext theme) were explored and rejected; they are not part of the product.
 
