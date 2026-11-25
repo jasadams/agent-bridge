@@ -1,0 +1,118 @@
+/* ==========================================================================
+   Orca Light: matches the Orca application's own light appearance, so this interface looks like
+   part of Orca when Orca is in light mode. Same shapes, typeface and decoration as the dark Orca
+   theme (theme-orca.css); only the values differ, and they come from Orca's shipped renderer
+   stylesheet (the :root design tokens and the colour palette): neutral greys with a white canvas,
+   #e5e5e5 borders, the Geist typeface, a 10px base radius (sm 6, md 8, lg 10, xl 14), a 36px header,
+   flat surfaces and a single monochrome primary. Geist is served from the executable under the SIL
+   Open Font License; the font rule below is the same file as the dark theme's.
+   See DESIGN.md (Orca theme) for the token table. tools/check_orca_tokens.py compares it with the
+   installed Orca application.
+   ========================================================================== */
+@font-face { font-family: "Geist"; src: url("/fonts/geist-var.woff2") format("woff2"); font-weight: 100 900; font-style: normal; font-display: swap; }
+
+:root[data-theme="orca-light"] {
+  color-scheme: light;
+  /* Orca --background / --editor-surface / --popover (the canvas, composer and popovers), --worktree-sidebar,
+     --secondary (cards), and the selected row: Orca's active sidebar card, --worktree-sidebar-foreground at
+     10% over --worktree-sidebar (the same rule gives the dark theme's measured #3e3e3e) */
+  --bg: #ffffff; --chrome: #f5f5f5; --surface: #ffffff; --surface-2: #f5f5f5; --surface-3: #dedede;
+  --topbar-bg: #ffffff; /* Orca's tab bar is --card */
+  --field: #ffffff; /* Orca inputs are transparent over the canvas with an --input border */
+  --hover: #eaeaea; /* --worktree-sidebar-accent */
+  --ring: #a1a1a1; /* Orca --ring */
+  /* Orca --border and --input */
+  --border: #e5e5e5; --border-strong: #e5e5e5;
+  /* Orca --foreground and --muted-foreground; Orca has no third text tone, so --text-3 is --muted-foreground */
+  --text: #0a0a0a; --text-2: #696969; --text-3: #696969;
+  /* Orca --primary / --primary-foreground (monochrome primary); hover is primary at 90% over the canvas */
+  --accent: #171717; --accent-hover: #2e2e2e; --accent-ink: #fafafa; --accent-soft: #0000000d;
+  /* Orca palette at the 700 step (text-grade on white and on the grey rows): blue-700, green-700, amber-700, red-700, sky-700 */
+  --link: #1447e6; --ok: #008138; --warn: #b75000; --danger: #bf000f; --info: #0069a4;
+  /* Orca palette hues: blue, violet, emerald, amber, rose, sky (700 steps) */
+  --agent-0: #1447e6; --agent-1: #7008e7; --agent-2: #007956; --agent-3: #b75000; --agent-4: #c20039; --agent-5: #0069a4;
+  --you: #171717;
+  --r-sm: 6px; --r-md: 8px; --r-lg: 10px; --r-xl: 14px;
+  --font: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --display: var(--font);
+  --mono: "SF Mono", SFMono-Regular, ui-monospace, "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
+  --t-xs: 12px; --t-sm: 13px; --t-md: 14px; --t-lg: 16px; --t-xl: 20px;
+  --topbar-h: 36px;
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--ring);
+  /* Orca --shadow-floating */
+  --shadow-pop: 0 10px 24px #0000002e, 0 0 0 1px var(--border-strong);
+  --dur: 150ms; --ease: cubic-bezier(.4, 0, .2, 1);
+}
+[data-theme="orca-light"] body { font-weight: 400; -webkit-font-smoothing: antialiased; }
+[data-theme="orca-light"] ::-webkit-scrollbar { width: 8px; height: 8px; }
+[data-theme="orca-light"] ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--text-2) 34%, transparent); border: 2px solid transparent; background-clip: content-box; border-radius: var(--r-pill); }
+[data-theme="orca-light"] ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--text-2) 55%, transparent); background-clip: content-box; }
+
+/* top bar: Orca's 36px header */
+[data-theme="orca-light"] .topbar { background: var(--topbar-bg); padding: 0 var(--s-3) 0 var(--s-2); gap: var(--s-2); }
+[data-theme="orca-light"] .brand { font-size: var(--t-md); font-weight: 600; letter-spacing: 0; margin-left: var(--s-1); gap: var(--s-2); }
+[data-theme="orca-light"] .brand__mark--classic { width: 22px; height: 22px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 600; letter-spacing: -2px; padding-right: 2px; }
+[data-theme="orca-light"] .brand__word span { color: var(--text-2); font-weight: 400; }
+[data-theme="orca-light"] .search-trigger { min-height: 26px; border-radius: var(--r-md); background: var(--field); border-color: var(--border-strong); color: var(--text-2); font-size: var(--t-sm); }
+[data-theme="orca-light"] .topbar .btn--sm { min-height: 26px; }
+[data-theme="orca-light"] .conn { font-size: var(--t-xs); }
+[data-theme="orca-light"] .dot.live { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
+
+/* sidebar: Orca --worktree-sidebar (#2a2a2a); the selected row is a lighter grey with no bar */
+[data-theme="orca-light"] .nav-section__title { font-family: var(--font); text-transform: none; letter-spacing: 0; font-size: var(--t-xs); font-weight: 500; color: var(--text-2); }
+[data-theme="orca-light"] .nav-item { min-height: 28px; color: var(--text); border-radius: var(--r-md); font-weight: 400; font-size: var(--t-sm); }
+[data-theme="orca-light"] .nav-item .grow { font-family: var(--font); font-size: var(--t-sm); }
+[data-theme="orca-light"] .nav-item:hover { background: var(--hover); }
+[data-theme="orca-light"] .nav-item[aria-current="page"] { background: var(--surface-3); box-shadow: none; font-weight: 500; }
+[data-theme="orca-light"] .nav-item.is-unread { font-weight: 600; }
+[data-theme="orca-light"] .nav-item .glyph { color: var(--text-2); }
+[data-theme="orca-light"] .short { background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--r-md); color: var(--text); }
+[data-theme="orca-light"] .count { background: var(--link); color: var(--accent-ink); font-weight: 600; }
+[data-theme="orca-light"] .sidebar__foot { border-top: 1px solid var(--border); }
+
+/* headings and controls: Orca (shadcn) buttons, inputs and tags */
+[data-theme="orca-light"] .main__head { min-height: 48px; }
+[data-theme="orca-light"] .main__head h1 { font-size: var(--t-lg); font-weight: 600; letter-spacing: -.01em; }
+[data-theme="orca-light"] .btn, [data-theme="orca-light"] .primary, [data-theme="orca-light"] .quiet { min-height: 32px; font-size: var(--t-sm); }
+[data-theme="orca-light"] .btn:not(.btn--primary):not(.btn--quiet) { background: var(--surface); }
+[data-theme="orca-light"] .btn:not(.btn--primary):not(.btn--quiet):hover { background: var(--surface-2); }
+[data-theme="orca-light"] .btn--primary, [data-theme="orca-light"] .primary { font-weight: 500; }
+[data-theme="orca-light"] .btn--quiet:hover, [data-theme="orca-light"] .quiet:hover { border-color: transparent; }
+[data-theme="orca-light"] .btn--sm { min-height: 26px; }
+[data-theme="orca-light"] .btn--icon { width: 32px; } [data-theme="orca-light"] .btn--icon.btn--sm { width: 26px; }
+[data-theme="orca-light"] input, [data-theme="orca-light"] select { background: var(--field); border-color: var(--border-strong); min-height: 32px; font-size: var(--t-sm); }
+[data-theme="orca-light"] input:focus-visible, [data-theme="orca-light"] select:focus-visible, [data-theme="orca-light"] textarea:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent); border-color: var(--ring); }
+[data-theme="orca-light"] .tag { height: 20px; }
+[data-theme="orca-light"] kbd { border-bottom-width: 1px; border-radius: var(--r-sm); font-family: var(--font); }
+[data-theme="orca-light"] .state-badge, [data-theme="orca-light"] .direction { border-radius: var(--r-pill); }
+[data-theme="orca-light"] .menu, [data-theme="orca-light"] .switcher, [data-theme="orca-light"] .mention-pop { background: var(--surface); border-radius: var(--r-lg); box-shadow: var(--shadow-pop); }
+[data-theme="orca-light"] .menu button { font-size: var(--t-sm); }
+[data-theme="orca-light"] .menu button:hover:not(:disabled), [data-theme="orca-light"] .mention-option:hover, [data-theme="orca-light"] .mention-option[aria-selected="true"] { background: var(--surface-2); }
+[data-theme="orca-light"] .menu button[aria-checked="true"]::after { color: var(--text); }
+[data-theme="orca-light"] .switcher li button[aria-selected="true"] { background: var(--surface-2); }
+[data-theme="orca-light"] .toast { background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--r-lg); box-shadow: var(--shadow-pop); }
+
+/* chat (the avatar tint is 12%, not the dark theme's 20%: the palette's 700 steps need the lighter ground to reach 4.5:1) */
+[data-theme="orca-light"] .avatar { border-radius: var(--r-md); font-weight: 600; background: color-mix(in srgb, var(--agent, var(--accent)) 12%, var(--bg)); color: var(--agent, var(--text)); }
+[data-theme="orca-light"] .avatar.is-you { background: var(--surface-3); color: var(--text); }
+[data-theme="orca-light"] .author { font-weight: 600; }
+[data-theme="orca-light"] .author.is-you { color: var(--text); }
+[data-theme="orca-light"] .time, [data-theme="orca-light"] .gutter-time, [data-theme="orca-light"] .day { font-family: var(--font); }
+[data-theme="orca-light"] .msg__actions { background: var(--surface); border-color: var(--border-strong); border-radius: var(--r-md); }
+[data-theme="orca-light"] .mention { background: color-mix(in srgb, var(--link) 10%, transparent); color: var(--link); border-radius: var(--r-sm); }
+[data-theme="orca-light"] .md code { background: color-mix(in srgb, var(--text) 6%, transparent); border: 1px solid var(--border); border-radius: var(--r-sm); }
+[data-theme="orca-light"] .md-code, [data-theme="orca-light"] pre.md-source, [data-theme="orca-light"] .board-code-block, [data-theme="orca-light"] .board-document pre, [data-theme="orca-light"] .board-render-fallback { background: var(--surface); border-radius: var(--r-lg); }
+[data-theme="orca-light"] .composer, [data-theme="orca-light"] .message-composer { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-xl); }
+[data-theme="orca-light"] .composer:focus-within { border-color: var(--ring); }
+[data-theme="orca-light"] .observer { border-radius: var(--r-lg); border: 1px dashed var(--border-strong); }
+
+/* boards, delivery details, login, dialogs */
+[data-theme="orca-light"] .board-document pre, [data-theme="orca-light"] .board-raw, [data-theme="orca-light"] .board-render-fallback, [data-theme="orca-light"] .board-document code { font-family: var(--mono); }
+[data-theme="orca-light"] .board-document-panel, [data-theme="orca-light"] .board-responses, [data-theme="orca-light"] .login-card, [data-theme="orca-light"] .filters { background: var(--surface); border-radius: var(--r-lg); }
+[data-theme="orca-light"] dialog { background: color-mix(in srgb, var(--topbar-bg) 96%, transparent); border: 1px solid var(--border-strong); border-radius: var(--r-xl); }
+[data-theme="orca-light"] #switcher { background: transparent; border: 0; }
+[data-theme="orca-light"] .message-row.selected { background: var(--surface-2); }
+[data-theme="orca-light"] .eyebrow, [data-theme="orca-light"] .detail-section h3 { font-family: var(--font); }
+
+/* The selected row is Orca's active card (a darker grey than the muted text tones can be read on),
+   so what would be muted inside it is set in the full text colour. */
+[data-theme="orca-light"] .nav-item[aria-current="page"] .glyph, [data-theme="orca-light"] .nav-item[aria-current="page"] .tag { color: var(--text); }

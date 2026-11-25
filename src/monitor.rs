@@ -204,6 +204,11 @@ const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../assets/web/theme-orca.css"),
     },
     Asset {
+        path: "/theme-orca-light.css",
+        content_type: CSS,
+        bytes: include_bytes!("../assets/web/theme-orca-light.css"),
+    },
+    Asset {
         path: "/util.js",
         content_type: JS,
         bytes: include_bytes!("../assets/web/util.js"),
