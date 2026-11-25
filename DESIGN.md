@@ -1,14 +1,17 @@
 # Design System — Agent Bridge Monitor
 
 The web interface served by `agent-bridge web enable`. Source of truth for its visual and
-interaction decisions. It ships two themes on one layout:
+interaction decisions. It ships three themes on one layout:
 
 - **Classic** (default): the look of v0.5.0, kept as the base tokens in `assets/web/style.css`.
 - **Sticker Bomb** (opt-in, from **Theme** in the top bar): the neo-brutalist identity described
   below, implemented in `assets/web/theme-sticker.css`.
+- **Orca** (opt-in, from **Theme**): matches the Orca application's own default dark appearance, so
+  the page looks like part of Orca when shown in a browser tab beside agent chats. Implemented in
+  `assets/web/theme-orca.css`; see "Orca theme".
 
 Layout, shell and interaction rules apply to both. Colour, type, shape, motion and logo sections
-describe Sticker Bomb unless they say otherwise. Two other identities (an editorial "paper" theme
+describe Sticker Bomb unless they say otherwise; the Orca theme is described under "Orca theme". Two other identities (an editorial "paper" theme
 and a teletext theme) were explored and rejected; they are not part of the product.
 
 ## Product Context
@@ -128,6 +131,35 @@ pavement, on a blue rounded sticker with a black outline and a hard offset shado
 800. Always keep the black outline and the offset shadow; eyes look slightly up and to the right.
 Reads down to 16 px. Also the favicon and the intended loading/empty-state mascot.
 
+## Orca theme
+Dark only, flat, quiet: Orca's own look, not a new identity. No outlines-with-shadows, no per-agent
+stickers; a monochrome primary button, white-alpha borders, system-style controls. Values were read
+from the Orca application's shipped renderer stylesheet and checked against pixels of its real
+window. The page does not follow later changes to Orca or its light mode.
+
+| Surface | Orca value | Agent Bridge (Orca theme) |
+|---|---|---|
+| Content canvas (chat pane) | `#151515` (measured) | `--bg` |
+| Sidebar | `#2a2a2a` (`--worktree-sidebar`, measured) | `--chrome` |
+| Header / tab bar | `#171717`, 36 px high (`--app-header-height`) | `.topbar`, `--topbar-h` |
+| Composer, popovers | `#1e1e1e` (measured) | `--surface` |
+| Cards, hover | `#262626` (`--secondary`) | `--surface-2` |
+| Selected row | `#3e3e3e` (measured) | `--surface-3` |
+| Search field | `#343434` (measured) | `.search-trigger`, inputs |
+| Borders / input borders | white at 7% / 15% (`--border`, `--input`) | `--border` / `--border-strong` |
+| Text / muted text | `#f0f0f0` / `#acacac` (`--foreground`, `--muted-foreground`) | `--text` / `--text-2` |
+| Primary button | `#e5e5e5` on `#171717` (`--primary`) | `--accent` / `--accent-ink` |
+| Links, unread, mentions | blue-400 `#54a2ff` | `--link` |
+| State colours | green-500 `#00c758`, amber-400 `#fcbb00`, red-400 `#ff6568`, sky-400 `#00bcfe` | `--ok` `--warn` `--danger` `--info` |
+| Typeface | Geist (variable) | `--font`; `geist-var.woff2`, same file Orca ships |
+| Machine text | SF Mono stack | `--mono` |
+| Radius | base `0.625rem` = 10 px; sm 6, md 8, xl 14 | `--r-sm` 6 · `--r-md` 8 · `--r-lg` 10 |
+| Scrollbar | thin, white 15% thumb | `::-webkit-scrollbar` |
+
+Agent colours are Orca's blue, violet, emerald, amber, rose and sky at the 400 step (`--agent-0` to
+`--agent-5`). `--text-3` (`#9a9a9a`) is the one derived step; Orca has no third text tone. Contrast:
+every rendered text run on every screen is checked at 4.5:1 or better by the browser test.
+
 ## Implementation rules (security and structure)
 - **Untrusted text.** Agent-authored text is untrusted. Render it with `createElement` /
   `textContent` from a parsed node tree (`markdown.js`). Never `innerHTML`.
@@ -158,6 +190,7 @@ Reads down to 16 px. Also the favicon and the intended loading/empty-state masco
 | 2026-11-10 | The new navigation layout ships for both themes | Layout was approved independently of the visual identity; Classic is the v0.5.0 look on the new layout |
 | 2026-11-10 | CSP gains `font-src 'self'` and `img-src 'self'`; scripts and styles stay strictly same-origin | Needed for the theme fonts and favicon; inline code stays forbidden |
 | 2026-11-10 | Agent colour by class from a hash of identity | Inline styles are forbidden; stable per agent |
+| 2026-11-25 | Add an Orca theme (dark only) matching the Orca application's default appearance, with Geist served from the executable | The interface is watched in a browser tab inside Orca, next to the agent chats; Classic and Sticker Bomb looked like a different product. Light mode and following Orca's later changes are out of scope |
 
 ## Known gaps
 - **Dark Sticker Bomb:** not designed (see Color).

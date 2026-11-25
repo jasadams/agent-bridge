@@ -3,7 +3,7 @@
 
 Starts a private broker with seeded boards, topics and agent conversations, enables the web
 interface, and drives it with an already installed Python Playwright and Chromium (nothing is
-downloaded). It checks, for the Classic and Sticker Bomb themes: unlocking from the access link, the
+downloaded). It checks, for the Classic, Sticker Bomb and Orca themes: unlocking from the access link, the
 sidebar (boards, topics, agent conversations), rendered topic Markdown, the @mention picker and
 publishing, read-only agent conversations and the delivery details panel, the board view and its
 overflow menu, the All traffic feed, the collapsible sidebar, the quick switcher, theme switching,
@@ -125,7 +125,7 @@ LONG_POST = "# Findings\n\n" + "\n\n".join(
 ) + "\n\n```rust\nfn main() { println!(\"done\"); }\n```\n"
 
 RICH_POST = ("## Release notes\n\n- topics render **Markdown**\n- `code` and tables work\n\n"
-             "| Theme | Default |\n|---|---|\n| Classic | yes |\n| Sticker Bomb | no |\n\n"
+             "| Theme | Default |\n|---|---|\n| Classic | yes |\n| Sticker Bomb | no |\n| Orca | no |\n\n"
              "```sh\nagent-bridge web enable\n```\n\n[docs](https://example.com/docs) "
              "[bad](javascript:alert(1)) <img src=x onerror=window.pwned=1>")
 
@@ -224,6 +224,26 @@ CONTRAST = """() => {
   const inkOnAccent = ratio(value('--accent-ink'), value('--accent'));
   probe.remove();
   return { fails, inkOnAccent };
+}"""
+
+
+RENDERED_CONTRAST = """() => {
+  // Contrast of the text actually on screen: each visible text node's colour against the colour
+  // painted behind it (translucent backgrounds are blended over their ancestors).
+  const parse = c => { const m = c.match(/[\\d.]+/g).map(Number); return { r: m[0], g: m[1], b: m[2], a: m.length > 3 ? m[3] : 1 }; };
+  const over = (top, under) => ({ r: top.r * top.a + under.r * (1 - top.a), g: top.g * top.a + under.g * (1 - top.a), b: top.b * top.a + under.b * (1 - top.a), a: 1 });
+  const lum = ({ r, g, b }) => { const f = c => { c /= 255; return c <= .03928 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }; return .2126 * f(r) + .7152 * f(g) + .0722 * f(b); };
+  const backdrop = el => { const layers = []; for (let n = el; n; n = n.parentElement) { const c = parse(getComputedStyle(n).backgroundColor); if (c.a > 0) layers.push(c); if (c.a === 1) break; }
+    return layers.reduceRight((under, top) => over(top, under), { r: 0, g: 0, b: 0, a: 1 }); };
+  const seen = new Set(), fails = [], walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let checked = 0;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const el = node.parentElement; if (!node.textContent.trim() || !el || seen.has(el)) continue; seen.add(el);
+    const box = el.getBoundingClientRect(); if (!box.width || !box.height || getComputedStyle(el).visibility === 'hidden' || el.closest('[hidden], [disabled], .sr-only')) continue;
+    const bg = backdrop(el), fg = over(parse(getComputedStyle(el).color), bg), a = lum(fg) + .05, b = lum(bg) + .05, ratio = Math.max(a, b) / Math.min(a, b);
+    checked += 1; if (ratio < 4.5) fails.push(`${el.tagName.toLowerCase()}.${el.className} "${node.textContent.trim().slice(0, 24)}": ${ratio.toFixed(2)}`);
+  }
+  return { checked, fails };
 }"""
 
 
@@ -406,6 +426,9 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     if theme == "sticker":
         until(page, "document.fonts.check('15px \"Bricolage Grotesque\"')", 8000)
         report.check(f"{tag} Sticker Bomb loads its self-hosted fonts", any("bricolage" in u for u in font_requests), str(font_requests))
+    elif theme == "orca":
+        until(page, "document.fonts.check('14px Geist')", 8000)
+        report.check(f"{tag} Orca loads its self-hosted Geist font", any("geist" in u for u in font_requests), str(font_requests))
     else:
         report.check(f"{tag} Classic requests no font files (system fonts)", not fonts_before_switch, str(fonts_before_switch))
 
@@ -442,11 +465,104 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     browser.close()
 
 
+def run_orca_section(playwright, url_for, topic_id, report, out):
+    """Checks specific to the Orca theme. Runs before the per-theme sections so that it does not
+    depend on how far they get."""
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    problems = []
+    page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
+    page.on("pageerror", lambda e: problems.append(str(e)))
+    requests = []
+    page.on("request", lambda r: requests.append(r.url))
+    tag = "[orca section]"
+
+    # Classic is the default: with nothing saved, the page opens in Classic and requests no Orca files.
+    page.goto(url_for)
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "document.querySelectorAll('#sidebar .nav-item').length >= 6", 20000)
+    report.check(f"{tag} Classic stays the default theme", page.evaluate("document.documentElement.dataset.theme") == "classic")
+    report.check(f"{tag} Classic does not request the Orca sheet or font", not any("orca" in u or "geist" in u for u in requests), str(requests))
+    choices = page.eval_on_selector_all("#theme-menu [data-theme-choice]", "els => els.map(e => [e.dataset.themeChoice, e.textContent.trim()])")
+    report.check(f"{tag} the Theme menu offers Classic, Sticker Bomb and Orca", choices == [["classic", "Classic"], ["sticker", "Sticker Bomb"], ["orca", "Orca"]], str(choices))
+
+    # Switching applies immediately, without a reload, from the picker.
+    page.evaluate("window.__noReload = true")
+    page.click("#theme-button")
+    page.click("[data-theme-choice=orca]")
+    until(page, "document.documentElement.dataset.theme === 'orca'", 8000)
+    report.check(f"{tag} choosing Orca applies without a reload", page.evaluate("window.__noReload === true"))
+    sheets = page.evaluate("[...document.styleSheets].map(s => s.href || '')")
+    report.check(f"{tag} only the Orca theme sheet is loaded", sum("/theme-" in s for s in sheets) == 1 and any(s.endswith("/theme-orca.css") for s in sheets), str(sheets))
+    report.check(f"{tag} the choice is remembered", page.evaluate("localStorage.getItem('agent-bridge-theme')") == "orca")
+    stored = page.evaluate("Object.keys(localStorage).sort()")
+    report.check(f"{tag} the browser stores only the theme and sidebar state", set(stored) <= {"agent-bridge-theme", "agent-bridge-sidebar"} and "agent-bridge-theme" in stored, str(stored))
+    until(page, "document.fonts.check('14px Geist')", 8000)
+    fonts = [u for u in requests if "/fonts/" in u]
+    report.check(f"{tag} Orca requests Geist and no other font", fonts and all("geist" in u for u in fonts), str(fonts))
+    report.check(f"{tag} body text is set in Geist", page.evaluate("getComputedStyle(document.body).fontFamily").startswith("Geist"))
+
+    # Orca's own values on the rendered page (see DESIGN.md: Orca theme).
+    values = page.evaluate("""() => {
+      const css = (sel, prop) => getComputedStyle(document.querySelector(sel))[prop];
+      return { content: css('body', 'backgroundColor'), sidebar: css('#sidebar', 'backgroundColor'), topbar: css('.topbar', 'backgroundColor'),
+               topbarH: css('.topbar', 'height'), text: css('body', 'color'), btnRadius: css('#theme-button', 'borderRadius') };
+    }""")
+    expected = {"content": "rgb(21, 21, 21)", "sidebar": "rgb(42, 42, 42)", "topbar": "rgb(23, 23, 23)", "topbarH": "36px", "text": "rgb(240, 240, 240)", "btnRadius": "8px"}
+    report.check(f"{tag} colours, header height and radius are Orca's", values == expected, str(values))
+
+    # Every screen is styled by Orca and readable: nothing keeps another theme's colours.
+    dm_route = page.evaluate("document.querySelector('#sidebar .nav-item[data-route^=\"#/dm/\"]').dataset.route")
+    for name, route in [("board", "#/board/release-checklist"), ("topic", f"#/topic/{topic_id}"), ("agent conversation", dm_route), ("All traffic", "#/traffic")]:
+        page.evaluate(f"location.hash = {json.dumps(route)}")
+        page.wait_for_timeout(700)
+        result = page.evaluate(CONTRAST)
+        report.check(f"{tag} {name}: text colours meet 4.5:1 on their surfaces", not result["fails"], str(result["fails"]))
+        report.check(f"{tag} {name}: button text meets 4.5:1 on the accent", result["inkOnAccent"] >= 4.5, str(result["inkOnAccent"]))
+        rendered = page.evaluate(RENDERED_CONTRAST)
+        report.check(f"{tag} {name}: all {rendered['checked']} rendered text runs meet 4.5:1 on what is behind them", rendered["checked"] > 5 and not rendered["fails"], str(rendered["fails"][:6]))
+        report.check(f"{tag} {name}: page does not scroll or overflow", not page.evaluate("document.documentElement.scrollHeight > innerHeight + 1 || document.documentElement.scrollWidth > innerWidth + 1"))
+        page.screenshot(path=str(out / f"orca-section-{name.replace(' ', '-')}.png"))
+        if name == "agent conversation":
+            page.locator("#dm-messages .msg").first.hover()
+            page.locator("#dm-messages .msg__actions button").first.click(force=True)
+            page.wait_for_selector("#panel:not([hidden]) .detail-grid", timeout=10000)
+            rendered = page.evaluate(RENDERED_CONTRAST)
+            report.check(f"{tag} details panel: all {rendered['checked']} rendered text runs meet 4.5:1 on what is behind them", rendered["checked"] > 10 and not rendered["fails"], str(rendered["fails"][:6]))
+            page.screenshot(path=str(out / "orca-section-details-panel.png"))
+            page.click("#panel-close")
+    # empty state: a filter nothing matches
+    page.evaluate("location.hash = '#/traffic'")
+    page.wait_for_selector("#message-list .message-row", timeout=15000)
+    page.select_option("#state-filter", "unknown")
+    page.click("#filters button[type=submit]")
+    page.wait_for_selector("#empty-state:not([hidden])", timeout=10000)
+    rendered = page.evaluate(RENDERED_CONTRAST)
+    report.check(f"{tag} empty state: all {rendered['checked']} rendered text runs meet 4.5:1 on what is behind them", rendered["checked"] > 5 and not rendered["fails"], str(rendered["fails"][:6]))
+    page.screenshot(path=str(out / "orca-section-empty-state.png"))
+    page.keyboard.press("Control+k")
+    page.wait_for_selector("#switcher[open]", timeout=5000)
+    result = page.evaluate(CONTRAST)
+    report.check(f"{tag} quick switcher: text colours meet 4.5:1", not result["fails"], str(result["fails"]))
+    rendered = page.evaluate(RENDERED_CONTRAST)
+    report.check(f"{tag} quick switcher: all {rendered['checked']} rendered text runs meet 4.5:1 on what is behind them", rendered["checked"] > 2 and not rendered["fails"], str(rendered["fails"][:6]))
+    page.screenshot(path=str(out / "orca-section-switcher.png"))
+    page.keyboard.press("Escape")
+
+    csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
+    report.check(f"{tag} no Content-Security-Policy violations", not csp, str(csp[:3]))
+    other_errors = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p]
+    report.check(f"{tag} no console or page errors", not other_errors, str(other_errors[:5]))
+    context.close()
+    browser.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--theme", choices=["classic", "sticker", "both"], default="both")
+    parser.add_argument("--theme", choices=["classic", "sticker", "orca", "both"], default="both")
     args = parser.parse_args()
     try:
         from playwright.sync_api import sync_playwright
@@ -466,8 +582,10 @@ def main():
         bind_sessions(broker, out, listeners)
         topic_id = seed(broker)
         credentials = broker.rpc("monitor_enable", port=0)
-        themes = ["classic", "sticker"] if args.theme == "both" else [args.theme]
+        themes = ["classic", "sticker", "orca"] if args.theme == "both" else [args.theme]
         with sync_playwright() as playwright:
+            if "orca" in themes:
+                run_orca_section(playwright, credentials["access_url"], topic_id, report, out)
             for theme in themes:
                 run_theme(playwright, theme, credentials["access_url"], topic_id, report, out)
     finally:

@@ -199,6 +199,11 @@ const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../assets/web/theme-sticker.css"),
     },
     Asset {
+        path: "/theme-orca.css",
+        content_type: CSS,
+        bytes: include_bytes!("../assets/web/theme-orca.css"),
+    },
+    Asset {
         path: "/util.js",
         content_type: JS,
         bytes: include_bytes!("../assets/web/util.js"),
@@ -242,6 +247,11 @@ const ASSETS: &[Asset] = &[
         path: "/fonts/space-mono-700.woff2",
         content_type: WOFF2,
         bytes: include_bytes!("../assets/web/fonts/space-mono-700.woff2"),
+    },
+    Asset {
+        path: "/fonts/geist-var.woff2",
+        content_type: WOFF2,
+        bytes: include_bytes!("../assets/web/fonts/geist-var.woff2"),
     },
 ];
 fn response(
