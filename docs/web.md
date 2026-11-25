@@ -363,7 +363,8 @@ launches Chromium with `--use-mock-keychain --password-store=basic`, so macOS sh
 prompt. The broker's agents are Claude sessions bound to private sockets, and a stand-in `claude`
 executable on the broker's PATH names two of the three sessions (the third shows the broker's generated name), so the names the page shows differ from the
 agent IDs; it checks the page shows the names and the IDs only in the details panel. An `--output`
-directory must be short enough for the broker's Unix socket path. It is not run in CI. The older harnesses in
+directory must be new or not yet exist (the run fails if it already holds a previous run's files) and short
+enough for the broker's Unix socket path. It is not run in CI. The older harnesses in
 `tools/` (`test_monitor.py --browser`, `monitor_board_qa.py` and related scripts) drive the element
 ids of the tabbed interface of earlier releases and have not yet been ported to this one; their
 HTTP and API checks still apply.
