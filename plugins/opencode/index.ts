@@ -13,7 +13,23 @@ type Delivery = Identity & { op: "deliver" | "reconcile"; attempt: string };
 type Reply = { ok: boolean; instance: string; protocol: number; session: string; id?: string; namespace?: string; attempt?: string; native_message_id?: string; status?: "inserted" | "deferred" | "uncertain"; error?: string };
 type Frame = Delivery;
 type StateFrame = { op: "state_list"; cursor: string | null } | { op: "state_get"; session: string };
-type Data = { buffer: Buffer; handled: boolean; timer?: ReturnType<typeof setTimeout> };
+type Data = { buffer: Buffer; handled: boolean; outgoing?: Buffer; timer?: ReturnType<typeof setTimeout> };
+// A unix socket accepts only part of a large write (about 8 KB on macOS) and Bun
+// drops the rest of `socket.end(bytes)`. Keep writing from `drain` until the reply
+// is out, then end; the connection timer bounds a reader that never drains.
+function sendAndEnd(socket: Bun.Socket<Data>, reply: string | Buffer): void {
+  const data = socket.data;
+  if (data) data.outgoing = Buffer.from(reply);
+  flush(socket);
+}
+function flush(socket: Bun.Socket<Data>): void {
+  const data = socket.data;
+  if (!data?.outgoing) return;
+  const written = socket.write(data.outgoing);
+  if (written < 0) { socket.terminate(); return; }
+  data.outgoing = data.outgoing.subarray(written);
+  if (data.outgoing.length === 0) { data.outgoing = undefined; socket.end(); }
+}
 class InvalidNativeSession extends Error {}
 class IncompleteState extends Error {}
 const isState = (frame: Frame | StateFrame): frame is StateFrame => frame.op === "state_list" || frame.op === "state_get";
@@ -284,7 +300,7 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
           const data = socket.data;
           if (!data || data.handled) { socket.terminate(); return; }
           data.buffer = Buffer.concat([data.buffer, chunk]);
-          if (data.buffer.length > MAX_FRAME) { socket.end(JSON.stringify({ ok: false, instance, protocol: 2, error: "Frame exceeds limit" }) + "\n"); return; }
+          if (data.buffer.length > MAX_FRAME) { sendAndEnd(socket, JSON.stringify({ ok: false, instance, protocol: 2, error: "Frame exceeds limit" }) + "\n"); return; }
           const newline = data.buffer.indexOf(10);
           if (newline < 0) return;
           data.handled = true;
@@ -292,17 +308,18 @@ For ${identity}, preserve relevant peer message IDs, exact routes and reply pare
           try {
             if (newline !== data.buffer.length - 1) throw new Error("Expected exactly one frame");
             frame = parseFrame(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data.buffer.subarray(0, newline))));
-          } catch { socket.end(JSON.stringify({ ok: false, instance, protocol: 2, error: "Invalid frame" }) + "\n"); return; }
+          } catch { sendAndEnd(socket, JSON.stringify({ ok: false, instance, protocol: 2, error: "Invalid frame" }) + "\n"); return; }
           const pending = dispatch(frame).then(
             result => {
               const bytes = JSON.stringify(result) + "\n";
-              socket.end(isState(frame) && Buffer.byteLength(bytes) > MAX_FRAME ? JSON.stringify(stateFailure(frame, new IncompleteState())) + "\n" : bytes);
+              sendAndEnd(socket, isState(frame) && Buffer.byteLength(bytes) > MAX_FRAME ? JSON.stringify(stateFailure(frame, new IncompleteState())) + "\n" : bytes);
             },
-            error => socket.end(JSON.stringify(isState(frame) ? stateFailure(frame, error) : { ...response(frame, "uncertain"), ok: false, error: error instanceof JournalCapacityError ? "Receipt journal capacity reached; existing native insertion requires reconciliation" : "Native session or insertion unconfirmed" }) + "\n"),
+            error => sendAndEnd(socket, JSON.stringify(isState(frame) ? stateFailure(frame, error) : { ...response(frame, "uncertain"), ok: false, error: error instanceof JournalCapacityError ? "Receipt journal capacity reached; existing native insertion requires reconciliation" : "Native session or insertion unconfirmed" }) + "\n"),
           );
           active.add(pending); void pending.finally(() => active.delete(pending));
         },
         close(socket) { if (socket.data?.timer) clearTimeout(socket.data.timer); connections.delete(socket); },
+        drain(socket) { flush(socket); },
         error(socket) { socket.terminate(); },
       }});
       await chmod(endpoint, 0o600);

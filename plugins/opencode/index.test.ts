@@ -301,6 +301,22 @@ test("native state paging validates cursors, rows and bounded responses without 
   }
 });
 
+test("a state list larger than one socket buffer arrives complete", async () => {
+  // A unix socket accepts only a few KB per write (about 8 KB on macOS). The
+  // plugin must keep writing as the socket drains, or the broker sees a truncated
+  // frame and reports "An OpenCode plugin did not answer".
+  const rows = Array.from({ length: 60 }, (_, i) => ({
+    id: `ses_${String(i).padStart(26, "0")}`, projectID: "project", location: { directory: "/x" },
+    title: `${String(i).padStart(2, "0")}-${"t".repeat(1500)}`, version: "2.2.5", time: { created: 1, updated: 1 },
+  }));
+  const s = await setup([], undefined, async () => ({ data: rows, cursor: {} }));
+  await s.created();
+  const page = await frame(s.endpoint(), { op: "state_list", cursor: null });
+  expect(page.ok).toBe(true);
+  expect(page.sessions).toHaveLength(60);
+  expect(page.sessions[59].display_name.endsWith("t")).toBe(true);
+});
+
 test("native state lookup errors are not absence", async () => {
   const s = await setup(); await s.created(); const endpoint = s.endpoint();
   const gate = s.blockNext("get", 0, true);
