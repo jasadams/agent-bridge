@@ -79,6 +79,8 @@
 [data-theme="orca"] .btn--icon { width: 32px; } [data-theme="orca"] .btn--icon.btn--sm { width: 26px; }
 [data-theme="orca"] input, [data-theme="orca"] select { background: var(--field); border-color: var(--field); min-height: 32px; font-size: var(--t-sm); }
 [data-theme="orca"] input:focus-visible, [data-theme="orca"] select:focus-visible, [data-theme="orca"] textarea:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent); border-color: var(--ring); }
+[data-theme="orca"] .tag { height: 20px; }
+[data-theme="orca"] kbd { border-bottom-width: 1px; border-radius: var(--r-sm); font-family: var(--font); }
 [data-theme="orca"] .state-badge, [data-theme="orca"] .direction { border-radius: var(--r-pill); }
 [data-theme="orca"] .menu, [data-theme="orca"] .switcher, [data-theme="orca"] .mention-pop { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-lg); box-shadow: var(--shadow-pop); }
 [data-theme="orca"] .menu button { font-size: var(--t-sm); }

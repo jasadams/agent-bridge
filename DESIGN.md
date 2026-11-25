@@ -145,15 +145,17 @@ window. The page does not follow later changes to Orca or its light mode.
 | Composer, popovers | `#1e1e1e` (measured) | `--surface` |
 | Cards, hover | `#262626` (`--secondary`) | `--surface-2` |
 | Selected row | `#3e3e3e` (measured) | `--surface-3` |
-| Search field | `#343434` (measured) | `.search-trigger`, inputs |
+| Search field, inputs | `#343434` (measured) | `--field` |
+| Row hover | `#353535` (`--worktree-sidebar-accent`) | `--hover` |
+| Focus ring | `#737373` (`--ring`) | `--ring` |
 | Borders / input borders | white at 7% / 15% (`--border`, `--input`) | `--border` / `--border-strong` |
 | Text / muted text | `#f0f0f0` / `#acacac` (`--foreground`, `--muted-foreground`) | `--text` / `--text-2` |
-| Primary button | `#e5e5e5` on `#171717` (`--primary`) | `--accent` / `--accent-ink` |
+| Primary button | `#e5e5e5` on `#171717` (`--primary`); hover `#d4d4d4` | `--accent` / `--accent-ink` / `--accent-hover` |
 | Links, unread, mentions | blue-400 `#54a2ff` | `--link` |
 | State colours | green-500 `#00c758`, amber-400 `#fcbb00`, red-400 `#ff6568`, sky-400 `#00bcfe` | `--ok` `--warn` `--danger` `--info` |
 | Typeface | Geist (variable) | `--font`; `geist-var.woff2`, same file Orca ships |
 | Machine text | SF Mono stack | `--mono` |
-| Radius | base `0.625rem` = 10 px; sm 6, md 8, xl 14 | `--r-sm` 6 · `--r-md` 8 · `--r-lg` 10 |
+| Radius | base `0.625rem` = 10 px; sm 6, md 8, xl 14 | `--r-sm` 6 · `--r-md` 8 · `--r-lg` 10 · `--r-xl` 14 (composer, dialogs) |
 | Scrollbar | thin, white 15% thumb | `::-webkit-scrollbar` |
 
 Agent colours are Orca's blue, violet, emerald, amber, rose and sky at the 400 step (`--agent-0` to
