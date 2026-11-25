@@ -351,7 +351,7 @@ The disposable browser acceptance starts a private broker with seeded boards, to
 conversations and drives all three themes with an already installed Playwright and Chromium. It checks
 unlocking, the sidebar, Markdown topics, mentions and publishing, read-only conversations and the
 details panel, the board view, All traffic, the collapsible sidebar, the quick switcher, theme
-switching, contrast, that the page never scrolls or overflows at desktop and phone widths, and that
+switching (including quick overlapping picks with held sheet responses), contrast, that the page never scrolls or overflows at desktop and phone widths, and that
 no content-security violation occurs. For the Orca theme it also checks contrast, that no Classic or Sticker
 Bomb colour is used, and that nothing scrolls or overflows on every screen, menu, dialog, toast and empty
 state listed in [DESIGN.md](../DESIGN.md) (Orca theme):

@@ -22,22 +22,34 @@
   document.documentElement.dataset.theme = current;
   document.head.append(sheet(current));
 
+  // The one sheet that is loading, if any. A new choice cancels it, so at most one sheet is ever
+  // pending and the loaded one is the last choice's.
+  let pending = null;
+
   window.AgentBridgeTheme = {
     themes: THEMES,
     get: () => current,
     set(id) {
       if (!known(id) || id === current) return false;
-      const old = document.getElementById("theme-sheet"), next = sheet(id);
+      pending?.remove();
+      const next = pending = sheet(id);
       next.id = "theme-sheet-next";
       // Load the new sheet before dropping the old one, so switching never flashes unstyled content.
-      next.addEventListener("load", () => { old?.remove(); next.id = "theme-sheet"; document.documentElement.dataset.theme = id; }, { once: true });
-      const previous = current;
+      next.addEventListener("load", () => {
+        if (pending !== next) return; // a later choice already replaced this one
+        pending = null;
+        document.getElementById("theme-sheet")?.remove();
+        next.id = "theme-sheet";
+        document.documentElement.dataset.theme = id;
+      }, { once: true });
       next.addEventListener("error", () => {
+        if (pending !== next) return; // a later choice already replaced this one
+        pending = null;
         next.remove();
-        if (current !== id) return; // a later choice already replaced this one
-        current = previous;
-        try { localStorage.setItem(KEY, previous); } catch { /* ignore */ }
-        document.dispatchEvent(new CustomEvent("themechange", { detail: previous }));
+        // Back to the theme that is actually applied, which is not always the previous choice.
+        current = document.documentElement.dataset.theme;
+        try { localStorage.setItem(KEY, current); } catch { /* ignore */ }
+        document.dispatchEvent(new CustomEvent("themechange", { detail: current }));
       }, { once: true });
       document.head.append(next);
       current = id;
