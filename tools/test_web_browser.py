@@ -72,10 +72,16 @@ class Broker:
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             env[variable] = str(directory)
         self.log = (root / "broker.log").open("wb")
-        self.process = subprocess.Popen(
-            [str(binary), "--state-dir", str(self.state), "serve", "--no-discovery", "--codex-bin", "/missing/codex"],
-            cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log)
-        wait("broker", lambda: self.rpc("status"))
+        self.process = None
+        try:
+            self.process = subprocess.Popen(
+                [str(binary), "--state-dir", str(self.state), "serve", "--no-discovery", "--codex-bin", "/missing/codex"],
+                cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log)
+            wait("broker", lambda: self.rpc("status"))
+        except BaseException:
+            # The caller never receives the object, so a broker that fails to start is stopped here.
+            self.close()
+            raise
 
     def rpc(self, op, **fields):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -89,11 +95,13 @@ class Broker:
         return value.get("result")
 
     def close(self):
-        self.process.terminate()
-        try:
-            self.process.wait(10)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
+        if self.process:
+            self.process.terminate()
+            try:
+                self.process.wait(10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
         self.log.close()
 
 
@@ -144,6 +152,52 @@ AGENT_IDS = (BRIDGE_ID, KYOMI_ID, UI_ID)
 BRIDGE_NAME, KYOMI_NAME, UI_NAME = "Release Captain", "Claude c2d2", "UI Builder"
 CLAUDE_DIRECTORY = json.dumps([{"sessionId": CAPTAIN_SESSION, "name": BRIDGE_NAME},
                                {"sessionId": THIRD_SESSION, "name": UI_NAME}])
+
+
+# What a run creates directly in the output directory. A run starts by removing these from an earlier run
+# (or from a run that crashed), so the same directory can be used again. The copied binary and the screenshots
+# are overwritten by name; anything else in the directory, and everything outside it, is left alone.
+RUN_FILES = ("broker.log", "state", "home", "bin", "s")
+# The first thing a run puts in its output directory. Only a directory that is new, empty or holds this marker
+# is cleared, so a directory someone else uses (their home, a project) is refused and never touched.
+MARKER = ".agb-web-browser-test"
+COPIED_BINARY = "frozen-agent-bridge"
+
+
+class OutputDirectoryError(Exception):
+    pass
+
+
+def prepare_output(requested, binary=None):
+    """Return the output directory, ready for a run: created, or cleared of an earlier run's files.
+    `binary` is the resolved --binary, which must not be something the run is about to clear."""
+    if requested is None:
+        directory = Path(tempfile.mkdtemp(prefix="ab-web-qa-", dir="/tmp")).resolve()
+    elif requested.is_symlink():
+        raise OutputDirectoryError(f"{requested} is a symbolic link; pass the directory itself")
+    else:
+        directory = requested.resolve()
+    if directory.exists() and not directory.is_dir():
+        raise OutputDirectoryError(f"{directory} exists and is not a directory")
+    if binary and binary.is_relative_to(directory) and binary != directory / COPIED_BINARY:
+        raise OutputDirectoryError(f"--binary {binary} is inside the output directory {directory}; pass a binary outside it")
+    marker = directory / MARKER
+    if directory.exists() and not (marker.is_file() and not marker.is_symlink()) and any(directory.iterdir()):
+        raise OutputDirectoryError(
+            f"{directory} is not empty and was not made by this test (it has no {MARKER} file), so nothing "
+            "in it was touched; pass a new or empty directory")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker.touch()
+    for entry in directory.iterdir():
+        if entry.is_symlink():  # the copied binary and the screenshots are written by name, never through a link
+            entry.unlink()
+    for name in RUN_FILES:
+        path = directory / name
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    return directory
 
 
 def stand_in_claude(directory):
@@ -902,16 +956,22 @@ def main():
     except ImportError:
         print("Playwright for Python is not installed; this browser acceptance cannot run.", file=sys.stderr)
         return 2
-    out = (args.output or Path(tempfile.mkdtemp(prefix="ab-web-qa-", dir="/tmp"))).resolve()
-    out.mkdir(mode=0o700, parents=True, exist_ok=True)
-    binary = out / "frozen-agent-bridge"
-    shutil.copy2(args.binary.resolve(strict=True), binary)
+    source = args.binary.resolve(strict=True)
+    try:
+        out = prepare_output(args.output, source)
+    except OutputDirectoryError as error:
+        print(error, file=sys.stderr)
+        return 2
+    binary = out / COPIED_BINARY
+    if source != binary:  # --binary may be the copy an earlier run left here
+        shutil.copy2(source, binary)
     binary.chmod(0o700)
     report = Report()
     stand_in_claude(out)
-    broker = Broker(binary, out)
+    broker = None
     listeners = []
     try:
+        broker = Broker(binary, out)
         bind_sessions(broker, out, listeners)
         topic_id = seed(broker)
         credentials = broker.rpc("monitor_enable", port=0)
@@ -924,7 +984,8 @@ def main():
             for theme in themes:
                 run_theme(playwright, theme, credentials["access_url"], topic_id, report, out)
     finally:
-        broker.close()
+        if broker:
+            broker.close()
         for listener in listeners:
             listener.close()
     print(f"\nScreenshots and logs: {out}")
