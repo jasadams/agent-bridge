@@ -352,7 +352,12 @@ conversations and drives all three themes with an already installed Playwright a
 unlocking, the sidebar, Markdown topics, mentions and publishing, read-only conversations and the
 details panel, the board view, All traffic, the collapsible sidebar, the quick switcher, theme
 switching, contrast, that the page never scrolls or overflows at desktop and phone widths, and that
-no content-security violation occurs:
+no content-security violation occurs. For the Orca theme it also checks, on the board (with its overflow
+menu and archived-boards dialog), the empty board, the topic (with the mention popover), the empty topic,
+an agent conversation, delivery details, an error toast, All traffic and its no-match state, the Theme
+menu, the quick switcher and its no-match state, and the locked screen, that every visible text node, input
+value, placeholder and pseudo-element text reaches 4.5:1 against what is painted behind it, that no
+Classic or Sticker Bomb colour is used, and that nothing scrolls or overflows:
 
 ```sh
 cargo build --locked

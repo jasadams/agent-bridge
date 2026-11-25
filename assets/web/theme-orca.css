@@ -22,7 +22,7 @@
   /* Orca --border (white 7%) and --input (white 15%) */
   --border: #ffffff12; --border-strong: #ffffff26;
   /* Orca --foreground and --muted-foreground; --text-3 is the one derived step (muted, dimmer) */
-  --text: #f0f0f0; --text-2: #acacac; --text-3: #9a9a9a;
+  --text: #f0f0f0; --text-2: #acacac; --text-3: #a0a0a0;
   /* Orca --primary / --primary-foreground: a monochrome primary, no brand colour */
   --accent: #e5e5e5; --accent-hover: #d4d4d4; --accent-ink: #171717; --accent-soft: #ffffff0d;
   /* Orca --color-blue-400 (unread / links), green-500, amber-400, red-400, sky-400 */
@@ -55,7 +55,7 @@
 [data-theme="orca"] .conn { font-size: var(--t-xs); }
 [data-theme="orca"] .dot.live { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
 
-/* sidebar: Orca --sidebar, selected row is --sidebar-accent with no bar */
+/* sidebar: Orca --worktree-sidebar (#2a2a2a); the selected row is a lighter grey with no bar */
 [data-theme="orca"] .nav-section__title { font-family: var(--font); text-transform: none; letter-spacing: 0; font-size: var(--t-xs); font-weight: 500; color: var(--text-2); }
 [data-theme="orca"] .nav-item { min-height: 28px; color: var(--text); border-radius: var(--r-md); font-weight: 400; font-size: var(--t-sm); }
 [data-theme="orca"] .nav-item .grow { font-family: var(--font); font-size: var(--t-sm); }
@@ -104,6 +104,7 @@
 [data-theme="orca"] .observer { border-radius: var(--r-lg); border: 1px dashed var(--border-strong); }
 
 /* boards, delivery details, login, dialogs */
+[data-theme="orca"] .board-document pre, [data-theme="orca"] .board-raw, [data-theme="orca"] .board-render-fallback, [data-theme="orca"] .board-document code { font-family: var(--mono); }
 [data-theme="orca"] .board-document-panel, [data-theme="orca"] .board-responses, [data-theme="orca"] .login-card, [data-theme="orca"] .filters { background: var(--surface); border-radius: var(--r-lg); }
 [data-theme="orca"] dialog { background: color-mix(in srgb, var(--topbar-bg) 96%, transparent); border: 1px solid var(--border-strong); border-radius: var(--r-xl); }
 [data-theme="orca"] #switcher { background: transparent; border: 0; }

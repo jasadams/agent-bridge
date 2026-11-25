@@ -228,22 +228,58 @@ CONTRAST = """() => {
 
 
 RENDERED_CONTRAST = """() => {
-  // Contrast of the text actually on screen: each visible text node's colour against the colour
-  // painted behind it (translucent backgrounds are blended over their ancestors).
+  // Contrast of what is actually painted, for every visible: text node, input/textarea/select value,
+  // placeholder, and ::before/::after text. Colours are read from the computed style; a translucent
+  // colour is blended over the layers behind it, and the opacity of the element and its ancestors
+  // is applied to the text colour. Disabled controls and fully transparent elements (the message
+  // actions before hover or focus) are skipped. Not covered:
+  // images, icons drawn as SVG/borders, and text inside pseudo-elements that have their own background.
   const parse = c => { const m = c.match(/[\\d.]+/g).map(Number); return { r: m[0], g: m[1], b: m[2], a: m.length > 3 ? m[3] : 1 }; };
   const over = (top, under) => ({ r: top.r * top.a + under.r * (1 - top.a), g: top.g * top.a + under.g * (1 - top.a), b: top.b * top.a + under.b * (1 - top.a), a: 1 });
   const lum = ({ r, g, b }) => { const f = c => { c /= 255; return c <= .03928 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }; return .2126 * f(r) + .7152 * f(g) + .0722 * f(b); };
   const backdrop = el => { const layers = []; for (let n = el; n; n = n.parentElement) { const c = parse(getComputedStyle(n).backgroundColor); if (c.a > 0) layers.push(c); if (c.a === 1) break; }
     return layers.reduceRight((under, top) => over(top, under), { r: 0, g: 0, b: 0, a: 1 }); };
-  const seen = new Set(), fails = [], walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let checked = 0;
+  const opacity = el => { let o = 1; for (let n = el; n; n = n.parentElement) o *= Number(getComputedStyle(n).opacity); return o; };
+  const fails = []; let checked = 0;
+  const check = (el, what, colour) => {
+    const bg = backdrop(el), c = parse(colour), fg = over({ ...c, a: c.a * opacity(el) }, bg);
+    const a = lum(fg) + .05, b = lum(bg) + .05, ratio = Math.max(a, b) / Math.min(a, b);
+    checked += 1; if (ratio < 4.5) fails.push(`${el.tagName.toLowerCase()}.${el.className} ${what}: ${ratio.toFixed(2)}`);
+  };
+  const shown = el => { const box = el.getBoundingClientRect(); return box.width && box.height && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[hidden], [disabled], .sr-only') && opacity(el) > 0; };
+  const seen = new Set(), walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    const el = node.parentElement; if (!node.textContent.trim() || !el || seen.has(el)) continue; seen.add(el);
-    const box = el.getBoundingClientRect(); if (!box.width || !box.height || getComputedStyle(el).visibility === 'hidden' || el.closest('[hidden], [disabled], .sr-only')) continue;
-    const bg = backdrop(el), fg = over(parse(getComputedStyle(el).color), bg), a = lum(fg) + .05, b = lum(bg) + .05, ratio = Math.max(a, b) / Math.min(a, b);
-    checked += 1; if (ratio < 4.5) fails.push(`${el.tagName.toLowerCase()}.${el.className} "${node.textContent.trim().slice(0, 24)}": ${ratio.toFixed(2)}`);
+    const el = node.parentElement; if (!node.textContent.trim() || !el || seen.has(el) || !shown(el) || el.closest('textarea, select')) continue; seen.add(el);
+    check(el, `"${node.textContent.trim().slice(0, 24)}"`, getComputedStyle(el).color);
+  }
+  for (const el of document.querySelectorAll('input, textarea, select')) {
+    if (!shown(el) || ['checkbox', 'radio', 'hidden'].includes(el.type)) continue;
+    if (el.value) check(el, 'value', getComputedStyle(el).color);
+    else if (el.placeholder) check(el, 'placeholder', getComputedStyle(el, '::placeholder').color);
+  }
+  for (const el of document.querySelectorAll('body *')) {
+    if (!shown(el)) continue;
+    for (const pseudo of ['::before', '::after']) { const s = getComputedStyle(el, pseudo), text = s.content.replace(/^"|"$/g, ''); if (s.content !== 'none' && s.content !== 'normal' && text.trim() && s.display !== 'none') check(el, `${pseudo} "${text.slice(0, 12)}"`, s.color); }
   }
   return { checked, fails };
+}"""
+
+THEME_LEAK = """() => {
+  // Elements painted in a colour that only Classic or Sticker Bomb defines (their palettes are
+  // the lists below). Orca must override all of them on every screen.
+  const classic = ['c4ef9d', '10171c', '121c22', '172128', '1c2932', '253941', '2a3a45', '527078', 'e9f0ed', 'a4b3ba', '8fa1aa', 'ffada4', 'f4cc8e', '9fc4d6', '283b25', '7ca65e', 'd4ffb0', '1e3017'];
+  const sticker = ['fffdf6', 'fff0b8', 'fff4cc', 'ffe27a', '3753f0', '2740d4', '1f36d6', 'ffd93d', 'ff6ec7', '8ecbff', '5be3a4', 'b79cff', 'ff6b5e', '111111', '3b3b3b', '585858', '0a7a4f', '7a5200', 'c4261d', 'ff8fc2', 'ff9c7a'];
+  const known = new Map([...classic.map(h => [h, 'Classic']), ...sticker.map(h => [h, 'Sticker Bomb'])]);
+  const hex = c => { const m = c.match(/[\\d.]+/g); if (!m || (m.length > 3 && Number(m[3]) === 0)) return null; return m.slice(0, 3).map(n => Number(n).toString(16).padStart(2, '0')).join(''); };
+  const leaks = [];
+  for (const el of document.querySelectorAll('body, body *, dialog')) {
+    const box = el.getBoundingClientRect(); if (!box.width || !box.height) continue;
+    const s = getComputedStyle(el); if (s.visibility === 'hidden') continue;
+    const props = { color: s.color, background: s.backgroundColor };
+    for (const side of ['Top', 'Right', 'Bottom', 'Left']) if (parseFloat(s[`border${side}Width`]) > 0 && s[`border${side}Style`] !== 'none') props[`border${side}`] = s[`border${side}Color`];
+    for (const [prop, value] of Object.entries(props)) { const h = hex(value); if (h && known.has(h)) leaks.push(`${el.tagName.toLowerCase()}.${el.className || el.id} ${prop} #${h} (${known.get(h)})`); }
+  }
+  return leaks;
 }"""
 
 
@@ -533,46 +569,87 @@ def run_orca_section(playwright, url_for, topic_id, report, out):
     report.check(f"{tag} colours, header height and radius are Orca's", values == expected, str(values))
 
     # Every screen is styled by Orca and readable: nothing keeps another theme's colours.
-    dm_route = page.evaluate("document.querySelector('#sidebar .nav-item[data-route^=\"#/dm/\"]').dataset.route")
-    for name, route in [("board", "#/board/release-checklist"), ("topic", f"#/topic/{topic_id}"), ("agent conversation", dm_route), ("All traffic", "#/traffic")]:
-        page.evaluate(f"location.hash = {json.dumps(route)}")
-        page.wait_for_timeout(700)
-        result = page.evaluate(CONTRAST)
-        report.check(f"{tag} {name}: text colours meet 4.5:1 on their surfaces", not result["fails"], str(result["fails"]))
-        report.check(f"{tag} {name}: button text meets 4.5:1 on the accent", result["inkOnAccent"] >= 4.5, str(result["inkOnAccent"]))
+    result = page.evaluate(CONTRAST)
+    report.check(f"{tag} colour tokens meet 4.5:1 on every surface", not result["fails"], str(result["fails"]))
+    report.check(f"{tag} button text meets 4.5:1 on the accent", result["inkOnAccent"] >= 4.5, str(result["inkOnAccent"]))
+
+    def screen(name, minimum=3):
+        page.wait_for_timeout(500)
         rendered = page.evaluate(RENDERED_CONTRAST)
-        report.check(f"{tag} {name}: all {rendered['checked']} rendered text runs meet 4.5:1 on what is behind them", rendered["checked"] > 5 and not rendered["fails"], str(rendered["fails"][:6]))
+        report.check(f"{tag} {name}: {rendered['checked']} text runs, values, placeholders and pseudo-element texts meet 4.5:1", rendered["checked"] >= minimum and not rendered["fails"], str(rendered["fails"][:6]))
+        leaks = page.evaluate(THEME_LEAK)
+        report.check(f"{tag} {name}: no Classic or Sticker Bomb colour is used", not leaks, str(leaks[:6]))
         report.check(f"{tag} {name}: page does not scroll or overflow", not page.evaluate("document.documentElement.scrollHeight > innerHeight + 1 || document.documentElement.scrollWidth > innerWidth + 1"))
         page.screenshot(path=str(out / f"orca-section-{name.replace(' ', '-')}.png"))
-        if name == "agent conversation":
-            page.locator("#dm-messages .msg").first.hover()
-            page.locator("#dm-messages .msg__actions button").first.click(force=True)
-            page.wait_for_selector("#panel:not([hidden]) .detail-grid", timeout=10000)
-            rendered = page.evaluate(RENDERED_CONTRAST)
-            report.check(f"{tag} details panel: all {rendered['checked']} rendered text runs meet 4.5:1 on what is behind them", rendered["checked"] > 10 and not rendered["fails"], str(rendered["fails"][:6]))
-            page.screenshot(path=str(out / "orca-section-details-panel.png"))
-            page.click("#panel-close")
-    # empty state: a filter nothing matches
-    page.evaluate("location.hash = '#/traffic'")
+
+    def go(route):
+        page.evaluate(f"location.hash = {json.dumps(route)}")
+        page.wait_for_timeout(700)
+
+    dm_route = page.evaluate("document.querySelector('#sidebar .nav-item[data-route^=\"#/dm/\"]').dataset.route")
+    go("#/board/release-checklist")
+    screen("board", 20)
+    fonts = page.evaluate("[...document.querySelectorAll('.board-document pre, .board-document code')].map(e => getComputedStyle(e).fontFamily)")
+    report.check(f"{tag} board code blocks use Orca's monospace stack", fonts and all(f.startswith('"SF Mono"') for f in fonts), str(fonts))
+    page.click("#board-menu-button")
+    screen("board overflow menu")
+    page.click("#board-archived-open")
+    page.wait_for_selector("#archived-dialog[open]", timeout=5000)
+    screen("archived boards dialog")
+    page.keyboard.press("Escape")
+    go("#/board/main")
+    page.wait_for_selector("text=main has not been written yet.", timeout=8000)
+    screen("empty board")
+    go(f"#/topic/{topic_id}")
+    screen("topic", 20)
+    page.fill("#topic-body", "@")
+    page.wait_for_selector("#topic-mention-pop:not([hidden]) [role=option]", timeout=5000)
+    screen("mention popover")
+    page.fill("#topic-body", "")
+    page.once("dialog", lambda d: d.accept("empty-qa"))
+    page.click("#sidebar .nav-section__title .btn")
+    page.wait_for_selector("text=No messages yet. Say something below.", timeout=10000)
+    screen("empty topic")
+    go(dm_route)
+    screen("agent conversation")
+    page.locator("#dm-messages .msg").first.hover()
+    page.locator("#dm-messages .msg__actions button").first.click(force=True)
+    page.wait_for_selector("#panel:not([hidden]) .detail-grid", timeout=10000)
+    screen("details panel", 10)
+    # an error inside the panel, then a toast when refreshing the open message fails
+    page.route("**/api/messages/*", lambda route: route.fulfill(status=500, content_type="application/json", body='{"error":"unavailable","code":"unavailable"}'))
+    page.locator("#dm-messages .msg").first.hover()
+    page.locator("#dm-messages .msg__actions button").first.click(force=True)
+    page.wait_for_selector(".toast--danger", timeout=8000)
+    screen("error toast")
+    page.unroute("**/api/messages/*")
+    page.click("#panel-close")
+    go("#/traffic")
     page.wait_for_selector("#message-list .message-row", timeout=15000)
+    screen("All traffic", 20)
     page.select_option("#state-filter", "unknown")
     page.click("#filters button[type=submit]")
     page.wait_for_selector("#empty-state:not([hidden])", timeout=10000)
-    rendered = page.evaluate(RENDERED_CONTRAST)
-    report.check(f"{tag} empty state: all {rendered['checked']} rendered text runs meet 4.5:1 on what is behind them", rendered["checked"] > 5 and not rendered["fails"], str(rendered["fails"][:6]))
-    page.screenshot(path=str(out / "orca-section-empty-state.png"))
+    screen("empty All traffic")
+    page.click("#reset-filters")
+    page.click("#theme-button")
+    screen("Theme menu")
+    page.keyboard.press("Escape")
     page.keyboard.press("Control+k")
     page.wait_for_selector("#switcher[open]", timeout=5000)
-    result = page.evaluate(CONTRAST)
-    report.check(f"{tag} quick switcher: text colours meet 4.5:1", not result["fails"], str(result["fails"]))
-    rendered = page.evaluate(RENDERED_CONTRAST)
-    report.check(f"{tag} quick switcher: all {rendered['checked']} rendered text runs meet 4.5:1 on what is behind them", rendered["checked"] > 2 and not rendered["fails"], str(rendered["fails"][:6]))
-    page.screenshot(path=str(out / "orca-section-switcher.png"))
+    screen("quick switcher")
+    page.keyboard.type("zzzz-no-such")
+    page.wait_for_selector("#switcher .empty", timeout=5000)
+    screen("empty quick switcher")
     page.keyboard.press("Escape")
+    page.click("#lock-button")
+    page.wait_for_selector("#login:not([hidden])", timeout=5000)
+    screen("locked screen")
 
     csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
     report.check(f"{tag} no Content-Security-Policy violations", not csp, str(csp[:3]))
-    other_errors = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p]
+    # the one 500 is the deliberate failure this section injects to show the toast
+    other_errors = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p and "status of 500" not in p]
     report.check(f"{tag} no console or page errors", not other_errors, str(other_errors[:5]))
     context.close()
     browser.close()
