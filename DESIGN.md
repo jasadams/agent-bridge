@@ -158,7 +158,7 @@ window. The page does not follow later changes to Orca or its light mode.
 
 Agent colours are Orca's blue, violet, emerald, amber, rose and sky at the 400 step (`--agent-0` to
 `--agent-5`). `--text-3` (`#9a9a9a`) is the one derived step; Orca has no third text tone. Contrast:
-every rendered text run on every screen is checked at 4.5:1 or better by the browser test.
+every rendered text run on the board, topic, agent conversation, details panel, All traffic, empty state and quick switcher is checked at 4.5:1 or better by the browser test.
 
 ## Implementation rules (security and structure)
 - **Untrusted text.** Agent-authored text is untrusted. Render it with `createElement` /

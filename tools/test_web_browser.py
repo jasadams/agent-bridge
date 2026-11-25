@@ -503,6 +503,25 @@ def run_orca_section(playwright, url_for, topic_id, report, out):
     report.check(f"{tag} Orca requests Geist and no other font", fonts and all("geist" in u for u in fonts), str(fonts))
     report.check(f"{tag} body text is set in Geist", page.evaluate("getComputedStyle(document.body).fontFamily").startswith("Geist"))
 
+    # Switching away drops Orca's sheet and requests nothing of Orca's; switching back restores it.
+    for other, font in [("sticker", "bricolage"), ("classic", None), ("orca", "geist")]:
+        before = len(requests)
+        page.click("#theme-button")
+        page.click(f"[data-theme-choice={other}]")
+        until(page, f"document.documentElement.dataset.theme === '{other}' && document.querySelectorAll('link[rel=stylesheet][href*=\"/theme-\"]').length === 1", 8000)
+        sheets = page.evaluate("[...document.styleSheets].map(s => s.href || '').filter(h => h.includes('/theme-'))")
+        report.check(f"{tag} switching to {other} leaves only its sheet", len(sheets) == 1 and sheets[0].endswith(f"/theme-{other}.css"), str(sheets))
+        if font:
+            until(page, f"performance.getEntriesByType('resource').some(r => r.name.includes('{font}'))", 8000)
+        fonts = [u for u in requests[before:] if "/fonts/" in u]
+        if other == "classic":
+            report.check(f"{tag} switching to Classic requests no font", not fonts, str(fonts))
+        elif other == "sticker":
+            report.check(f"{tag} switching to Sticker Bomb requests no Geist", not any("geist" in u for u in fonts), str(fonts))
+        else:
+            report.check(f"{tag} switching back to Orca restores Geist text", page.evaluate("getComputedStyle(document.body).fontFamily").startswith("Geist"))
+        report.check(f"{tag} switching to {other} applies without a reload and is remembered", page.evaluate("window.__noReload === true && localStorage.getItem('agent-bridge-theme')") == other)
+
     # Orca's own values on the rendered page (see DESIGN.md: Orca theme).
     values = page.evaluate("""() => {
       const css = (sel, prop) => getComputedStyle(document.querySelector(sel))[prop];
