@@ -10,6 +10,9 @@ overflow menu, the All traffic feed, the collapsible sidebar, the quick switcher
 fonts, that the page never scrolls and never overflows horizontally at desktop and phone widths, and
 that no Content-Security-Policy violation or console error occurs.
 
+Agent names are the broker's (AGB-60): the seeded Claude sessions are named by a stand-in `claude`
+executable on the broker's PATH, and the page must show those names, never the IDs.
+
 Only private temporary state is used: no native sessions, model calls, service changes or browser
 profiles.
 """
@@ -25,7 +28,7 @@ import tempfile
 import time
 import uuid
 
-CHROMIUM_ARGS = ["--no-sandbox"]
+CHROMIUM_ARGS = ["--no-sandbox", "--use-mock-keychain", "--password-store=basic"]
 
 
 def wait(label, check, seconds=30):
@@ -60,7 +63,7 @@ class Broker:
         self.state.mkdir(mode=0o700)
         home = root / "home"
         home.mkdir(mode=0o700)
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home), "LANG": "C.UTF-8"}
+        env = {"PATH": f"{root / 'bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}", "HOME": str(home), "LANG": "C.UTF-8"}
         for variable, relative in [("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/share"),
                                    ("XDG_CACHE_HOME", ".cache"), ("XDG_STATE_HOME", ".local/state"),
                                    ("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude"),
@@ -127,8 +130,46 @@ RICH_POST = ("## Release notes\n\n- topics render **Markdown**\n- `code` and tab
              "[bad](javascript:alert(1)) <img src=x onerror=window.pwned=1>")
 
 
+# Native Claude sessions (AGB-57): the ID is the routing name `claude-<session>`, and the broker resolves the
+# name from the client's own directory. A stand-in `claude` executable on the broker's PATH answers
+# `claude agents --json`, as the repository's own broker tests do: it names the first and third sessions and has no
+# name for the second, which therefore shows the generated "Claude" plus the last four characters of its session.
+# The page must show these names and never the IDs, which belong only in the details panel.
+CAPTAIN_SESSION = "9a374eae-798c-4ca0-9ebf-b954fb368c50"
+UNNAMED_SESSION = "6c8d2f1b-4e55-4a7f-8b32-1d9e8f70c2d2"
+THIRD_SESSION = "7d9e3a2c-5f66-4b80-9c43-2eaf9081d3f3"
+SESSIONS = (CAPTAIN_SESSION, UNNAMED_SESSION, THIRD_SESSION)
+BRIDGE_ID, KYOMI_ID, UI_ID = (f"claude-{session}" for session in SESSIONS)
+AGENT_IDS = (BRIDGE_ID, KYOMI_ID, UI_ID)
+BRIDGE_NAME, KYOMI_NAME, UI_NAME = "Release Captain", "Claude c2d2", "UI Builder"
+CLAUDE_DIRECTORY = json.dumps([{"sessionId": CAPTAIN_SESSION, "name": BRIDGE_NAME},
+                               {"sessionId": THIRD_SESSION, "name": UI_NAME}])
+
+
+def stand_in_claude(directory):
+    """A `claude` executable that prints the directory above, and Unix sockets for the sessions to bind."""
+    (directory / "bin").mkdir(mode=0o700)
+    script = directory / "bin" / "claude"
+    script.write_text(f"#!/bin/sh\nprintf '%s' '{CLAUDE_DIRECTORY}'\n")
+    script.chmod(0o700)
+
+
+def bind_sessions(broker, directory, listeners):
+    sockets = directory / "s"
+    sockets.mkdir(mode=0o700)
+    for session in SESSIONS:
+        path = sockets / f"{session[:8]}.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        path.chmod(0o600)
+        listener.listen()
+        listeners.append(listener)
+        broker.rpc("claude_bind", session=session, endpoint=str(path))
+
+
 def seed(broker):
     broker.rpc("machine_set_name", name="web-qa")
+    # Inbox agents: the authors of the topic posts, and the recipient that makes the human's message deliver.
     for name in ["claude-bridge", "codex-kyomi", "opencode-ui"]:
         broker.rpc("register", name=name, provider="inbox", session=name, replace=False)
 
@@ -137,10 +178,10 @@ def seed(broker):
         broker.rpc("send", id=message_id, sender=sender, recipient=recipient, body=body, parent=None)
         return message_id
 
-    send("claude-bridge", "codex-kyomi", "Can you confirm the macOS runner is free?")
-    send("codex-kyomi", "claude-bridge", "Free now. Use label macos-14.")
-    send("claude-bridge", "codex-kyomi", "Queued the release build.")
-    send("opencode-ui", "claude-bridge", "Heads up: the old layout is still shipping.")
+    send(BRIDGE_ID, KYOMI_ID, "Can you confirm the macOS runner is free?")
+    send(KYOMI_ID, BRIDGE_ID, "Free now. Use label macos-14.")
+    send(BRIDGE_ID, KYOMI_ID, "Queued the release build.")
+    send(UI_ID, BRIDGE_ID, "Heads up: the old layout is still shipping.")
     send("user", "claude-bridge", "Please also run the installer smoke test.")
     broker.rpc("board_create", board="release-checklist")
     snapshot = broker.rpc("named_board_read", board="release-checklist")
@@ -198,7 +239,6 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     tag = f"[{theme}]"
 
     page.add_init_script(f"try {{ if (!localStorage.getItem('agent-bridge-theme')) localStorage.setItem('agent-bridge-theme', '{theme}') }} catch (e) {{}}")
-    page.route("**/api/agents", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps({"agents": [{"name": "claude-bridge", "provider": "claude", "session": "9a374eae-798c-4ca0-9ebf-b954fb368c50", "display_name": "Release Captain"}, {"name": "codex-twin-a", "provider": "codex", "session": "twin-a", "display_name": "Twin"}, {"name": "codex-twin-b", "provider": "codex", "session": "twin-b", "display_name": "Twin"}]})))
     page.goto(url_for)
     page.wait_for_selector("#sidebar .nav-item", timeout=15000)
     report.check(f"{tag} unlocks from the access link and clears the token from the URL", "access_token" not in page.url)
@@ -211,7 +251,9 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     report.check(f"{tag} sidebar lists boards", "main" in labels and "release-checklist" in labels, str(labels))
     report.check(f"{tag} sidebar lists the topic", "release" in labels, str(labels))
     pairs = [l for l in labels if "·" in l]
-    report.check(f"{tag} sidebar lists agent conversations, not the human's", any("Release Captain" in l and "codex-kyomi" in l for l in pairs) and not any(l.startswith("user") or " user" in l for l in pairs), str(pairs))
+    report.check(f"{tag} sidebar lists agent conversations by the broker's names, not the human's",
+                 any(BRIDGE_NAME in l and KYOMI_NAME in l for l in pairs)
+                 and not any("You" in l.split(" · ") or "user" in l for l in pairs), str(pairs))
     report.check(f"{tag} All traffic is pinned last", labels[-1] == "All traffic", str(labels))
 
     # board view
@@ -312,14 +354,16 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     page.locator("#dm-messages .msg__actions button").first.click(force=True)
     page.wait_for_selector("#panel:not([hidden]) .detail-grid", timeout=10000)
     report.check(f"{tag} delivery details open in the side panel", page.locator("#panel-title").inner_text() == "Delivery details")
-    # Names the clients give their sessions come from /api/agents; the exact id stays in the details.
+    # AGB-60: the page shows the names the broker resolved and never an ID where a name exists; the exact
+    # Agent ID is only in the details panel.
     sidebar_text = page.locator("#sidebar").inner_text()
-    report.check(f"{tag} the sidebar shows the session's own name, not its routing name", "Release Captain" in sidebar_text and "claude-bridge" not in sidebar_text, sidebar_text[:300])
-    report.check(f"{tag} an agent with no known name keeps its routing name", "codex-kyomi" in sidebar_text, sidebar_text[:300])
+    report.check(f"{tag} the sidebar shows the broker's name, not the routing ID", BRIDGE_NAME in sidebar_text and BRIDGE_ID not in sidebar_text, sidebar_text[:300])
+    report.check(f"{tag} an agent the client has no name for shows the generated name, not its ID", KYOMI_NAME in sidebar_text and KYOMI_ID not in sidebar_text, sidebar_text[:300])
+    authors = page.eval_on_selector_all("#dm-messages .author", "els => els.map(e => e.textContent)")
+    thread_text = page.locator("#dm-view").inner_text()
+    report.check(f"{tag} the conversation shows the agents' names, never an agent ID", bool(authors) and set(authors) <= {BRIDGE_NAME, KYOMI_NAME, UI_NAME} and not any(agent_id in thread_text for agent_id in AGENT_IDS), f"{authors} {thread_text[:300]}")
     detail_text = page.locator("#panel-body").inner_text()
-    report.check(f"{tag} delivery details show the name and the exact Agent ID", "Release Captain" in detail_text and "claude-bridge" in detail_text, detail_text[:400])
-    shared = page.evaluate("""() => [window.AB.agentName("codex-twin-a"), window.AB.agentName("codex-twin-b"), window.AB.agentName("claude-bridge")]""")
-    report.check(f"{tag} two sessions with the same name are told apart by their id", shared == ["Twin · in-a", "Twin · in-b", "Release Captain"], str(shared))
+    report.check(f"{tag} delivery details show the name and the exact Agent ID", BRIDGE_NAME in detail_text and BRIDGE_ID in detail_text, detail_text[:400])
     page.screenshot(path=str(out / f"{theme}-dm.png"))
     page.click("#panel-close")
     report.check(f"{tag} panel closes", page.locator("#panel").is_hidden())
@@ -415,8 +459,11 @@ def main():
     shutil.copy2(args.binary.resolve(strict=True), binary)
     binary.chmod(0o700)
     report = Report()
+    stand_in_claude(out)
     broker = Broker(binary, out)
+    listeners = []
     try:
+        bind_sessions(broker, out, listeners)
         topic_id = seed(broker)
         credentials = broker.rpc("monitor_enable", port=0)
         themes = ["classic", "sticker"] if args.theme == "both" else [args.theme]
@@ -425,6 +472,8 @@ def main():
                 run_theme(playwright, theme, credentials["access_url"], topic_id, report, out)
     finally:
         broker.close()
+        for listener in listeners:
+            listener.close()
     print(f"\nScreenshots and logs: {out}")
     if report.failures:
         print(f"\n{len(report.failures)} check(s) failed:", *report.failures, sep="\n  - ")
