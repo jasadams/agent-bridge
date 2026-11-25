@@ -655,14 +655,14 @@ def run_orca_section(playwright, url_for, topic_id, report, out):
 
 def run_overlap_section(playwright, url_for, report):
     """Quick theme picks that overlap (AGB-66). The theme sheet responses are held by the test and
-    released afterwards, in the order the picks were made and in the reverse order, so the picks are
-    certain to overlap. Whatever happens, exactly one theme sheet may remain and it must be the last
-    pick's."""
+    released afterwards: in the order the picks were made, in the reverse order, and with the last
+    pick's sheet failing. After the first two exactly one theme sheet may remain and it must be the
+    last pick's. After a failure the page must be left with the theme that was applied, once."""
     browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
     sequences = [("classic", ["sticker", "orca"]), ("classic", ["sticker", "classic"]),
                  ("orca", ["classic", "sticker"]), ("sticker", ["orca", "sticker"])]
     for start, picks in sequences:
-        for order in ("in order", "reversed"):
+        for order in ("in order", "reversed", "last sheet fails"):
             tag = f"[overlap {start} > {' > '.join(picks)}, sheets released {order}]"
             context = browser.new_context(viewport={"width": 1440, "height": 900})
             page = context.new_page()
@@ -674,20 +674,36 @@ def run_overlap_section(playwright, url_for, report):
             page.wait_for_selector("#sidebar .nav-item", timeout=15000)
             held = []
             page.route("**/theme-*.css", lambda route: held.append(route))
+            page.evaluate("window.__themeChanges = []; document.addEventListener('themechange', e => window.__themeChanges.push(e.detail))")
             for pick in picks:
                 page.evaluate(f"AgentBridgeTheme.set({json.dumps(pick)})")
-            wait(f"{tag} the sheet requests are held", lambda: len(held) >= 1)
+            for _ in range(100):  # the page must be pumped for Playwright to deliver the held requests
+                if len(held) == len(picks):
+                    break
+                page.wait_for_timeout(100)
+            report.check(f"{tag} every pick's sheet request is held", len(held) == len(picks), str(len(held)))
             report.check(f"{tag} the applied theme does not change while the sheets are loading", page.evaluate("document.documentElement.dataset.theme") == start)
-            for route in (held if order == "in order" else reversed(held)):
-                route.continue_()
-            last = picks[-1]
-            until(page, f"document.documentElement.dataset.theme === '{last}'", 8000)
+            if order == "last sheet fails":
+                for route in held[:-1]:
+                    route.continue_()
+                held[-1].abort()
+                expected = start
+                until(page, f"AgentBridgeTheme.get() === '{expected}'", 8000)
+                problems = [p for p in problems if "Failed to load resource" not in p]  # the failure this variant injects
+            else:
+                for route in (held if order == "in order" else reversed(held)):
+                    route.continue_()
+                expected = picks[-1]
+                until(page, f"document.documentElement.dataset.theme === '{expected}'", 8000)
             page.wait_for_timeout(500)  # a leftover sheet or a late handler would show by now
             links = page.evaluate("[...document.querySelectorAll('link[rel=stylesheet]')].map(l => [l.id, new URL(l.href).pathname])")
             themed = [link for link in links if link[1].startswith("/theme-")]
-            report.check(f"{tag} exactly one theme sheet is in the page, the last pick's", themed == [["theme-sheet", f"/theme-{last}.css"]], str(links))
+            report.check(f"{tag} exactly one theme sheet is in the page, the expected one", themed == [["theme-sheet", f"/theme-{expected}.css"]], str(links))
             applied = page.evaluate("[document.documentElement.dataset.theme, AgentBridgeTheme.get(), localStorage.getItem('agent-bridge-theme')]")
-            report.check(f"{tag} the applied theme, the chosen theme and the saved theme are the last pick", applied == [last, last, last], str(applied))
+            report.check(f"{tag} the applied theme, the chosen theme and the saved theme are {expected}", applied == [expected, expected, expected], str(applied))
+            if order == "last sheet fails":
+                changes = page.evaluate("window.__themeChanges")
+                report.check(f"{tag} the failure is announced once, with the applied theme", changes == picks + [expected], str(changes))
             report.check(f"{tag} no console or page errors", not problems, str(problems[:3]))
             context.close()
     browser.close()
