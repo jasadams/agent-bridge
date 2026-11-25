@@ -1315,6 +1315,7 @@ async fn web_assets_are_served_with_exact_types_and_a_tight_policy() {
         ("/theme-classic.css", CSS),
         ("/theme-sticker.css", CSS),
         ("/theme-orca.css", CSS),
+        ("/theme-orca-light.css", CSS),
         ("/theme.js", JS),
         ("/util.js", JS),
         ("/markdown.js", JS),

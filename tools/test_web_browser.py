@@ -29,6 +29,15 @@ import time
 import uuid
 
 CHROMIUM_ARGS = ["--no-sandbox", "--use-mock-keychain", "--password-store=basic"]
+ORCA_THEMES = ["orca", "orca-light", "orca-system"]
+ALL_THEMES = ["classic", "sticker"] + ORCA_THEMES
+THEME_FONTS = {"classic": set(), "sticker": {"bricolage-var.woff2", "space-mono-400.woff2", "space-mono-700.woff2"},
+               "orca": {"geist-var.woff2"}, "orca-light": {"geist-var.woff2"}, "orca-system": {"geist-var.woff2"}}
+
+
+def sheet_for(theme, scheme):
+    """The sheet a choice shows when the browser's appearance is `scheme` ("light" or "dark")."""
+    return ("orca" if scheme == "dark" else "orca-light") if theme == "orca-system" else theme
 
 
 def wait(label, check, seconds=30):
@@ -288,7 +297,8 @@ RENDERED_CONTRAST = """() => {
   // is applied to the text colour. Disabled controls and fully transparent elements (the message
   // actions before hover or focus) are skipped. Not covered:
   // images, icons drawn as SVG/borders, and text inside pseudo-elements that have their own background.
-  const parse = c => { const m = c.match(/[\\d.]+/g).map(Number); return { r: m[0], g: m[1], b: m[2], a: m.length > 3 ? m[3] : 1 }; };
+  // rgb()/rgba() are 0-255; color-mix() computes to color(srgb r g b / a) with 0-1 channels.
+  const parse = c => { const m = c.match(/[\\d.]+/g).map(Number), k = c.startsWith('color(srgb') ? 255 : 1; return { r: m[0] * k, g: m[1] * k, b: m[2] * k, a: m.length > 3 ? m[3] : 1 }; };
   const over = (top, under) => ({ r: top.r * top.a + under.r * (1 - top.a), g: top.g * top.a + under.g * (1 - top.a), b: top.b * top.a + under.b * (1 - top.a), a: 1 });
   const lum = ({ r, g, b }) => { const f = c => { c /= 255; return c <= .03928 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }; return .2126 * f(r) + .7152 * f(g) + .0722 * f(b); };
   const backdrop = el => { const layers = []; for (let n = el; n; n = n.parentElement) { const c = parse(getComputedStyle(n).backgroundColor); if (c.a > 0) layers.push(c); if (c.a === 1) break; }
@@ -324,7 +334,7 @@ THEME_LEAK = """() => {
   const classic = ['c4ef9d', '10171c', '121c22', '172128', '1c2932', '253941', '2a3a45', '527078', 'e9f0ed', 'a4b3ba', '8fa1aa', 'ffada4', 'f4cc8e', '9fc4d6', '283b25', '7ca65e', 'd4ffb0', '1e3017', '9ccfe0', 'ffb5a8', 'c9b6f2', '8fdcc4', '0d1014'];
   const sticker = ['fffdf6', 'fff0b8', 'fff4cc', 'ffe27a', '3753f0', '2740d4', '1f36d6', 'ffd93d', 'ff6ec7', '8ecbff', '5be3a4', 'b79cff', 'ff6b5e', '111111', '3b3b3b', '585858', '0a7a4f', '7a5200', 'c4261d', 'ff8fc2', 'ff9c7a', 'c8ff5c', 'fff7d6'];
   const known = new Map([...classic.map(h => [h, 'Classic']), ...sticker.map(h => [h, 'Sticker Bomb'])]);
-  const hex = c => { const m = c.match(/[\\d.]+/g); if (!m || (m.length > 3 && Number(m[3]) === 0)) return null; return m.slice(0, 3).map(n => Number(n).toString(16).padStart(2, '0')).join(''); };
+  const hex = c => { const m = c.match(/[\\d.]+/g); if (!m || (m.length > 3 && Number(m[3]) === 0)) return null; const k = c.startsWith('color(srgb') ? 255 : 1; return m.slice(0, 3).map(n => Math.round(Number(n) * k).toString(16).padStart(2, '0')).join(''); };
   const leaks = [];
   for (const el of document.querySelectorAll('body, body *, dialog')) {
     const box = el.getBoundingClientRect(); if (!box.width || !box.height) continue;
@@ -337,24 +347,26 @@ THEME_LEAK = """() => {
 }"""
 
 
-def run_theme(playwright, theme, url_for, topic_id, report, out):
+def run_theme(playwright, theme, url_for, topic_id, report, out, scheme="light"):
     browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
-    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    context = browser.new_context(viewport={"width": 1440, "height": 900}, color_scheme=scheme)
     page = context.new_page()
     problems = []
     page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
     page.on("pageerror", lambda e: problems.append(str(e)))
     font_requests = []
     page.on("request", lambda r: font_requests.append(r.url) if "/fonts/" in r.url else None)
-    tag = f"[{theme}]"
+    tag = f"[{theme}]" if theme != "orca-system" else f"[{theme}, browser {scheme}]"
+    applied = sheet_for(theme, scheme)  # the sheet this choice shows
 
     page.add_init_script(f"try {{ if (!localStorage.getItem('agent-bridge-theme')) localStorage.setItem('agent-bridge-theme', '{theme}') }} catch (e) {{}}")
     page.goto(url_for)
     page.wait_for_selector("#sidebar .nav-item", timeout=15000)
     report.check(f"{tag} unlocks from the access link and clears the token from the URL", "access_token" not in page.url)
-    report.check(f"{tag} theme applied", page.evaluate("document.documentElement.dataset.theme") == theme)
+    report.check(f"{tag} theme applied", page.evaluate("document.documentElement.dataset.theme") == applied)
     sheets = page.evaluate("[...document.styleSheets].map(s => s.href)")
-    report.check(f"{tag} exactly one theme sheet loaded", sum("/theme-" in (s or "") for s in sheets) == 1, str(sheets))
+    report.check(f"{tag} exactly one theme sheet loaded, the one for this choice", [s for s in sheets if "/theme-" in (s or "")] == [f"{url_for.split('#')[0]}theme-{applied}.css"], str(sheets))
+    report.check(f"{tag} the choice is saved by its own name", page.evaluate("localStorage.getItem('agent-bridge-theme')") == theme)
     until(page, "document.querySelectorAll('#sidebar .nav-item').length >= 6", 20000)
 
     labels = page.eval_on_selector_all("#sidebar .nav-item .grow", "els => els.map(e => e.textContent)")
@@ -510,15 +522,15 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     report.check(f"{tag} the picker switches theme live and remembers it", page.evaluate("localStorage.getItem('agent-bridge-theme')") == other)
     page.click("#theme-button")
     page.click(f"[data-theme-choice={theme}]")
-    until(page, f"document.documentElement.dataset.theme === '{theme}'", 8000)
+    until(page, f"document.documentElement.dataset.theme === '{applied}' && AgentBridgeTheme.get() === '{theme}'", 8000)
 
     # fonts
     if theme == "sticker":
         until(page, "document.fonts.check('15px \"Bricolage Grotesque\"')", 8000)
         report.check(f"{tag} Sticker Bomb loads its self-hosted fonts", any("bricolage" in u for u in font_requests), str(font_requests))
-    elif theme == "orca":
+    elif theme in ORCA_THEMES:
         until(page, "document.fonts.check('14px Geist')", 8000)
-        report.check(f"{tag} Orca loads its self-hosted Geist font", any("geist" in u for u in font_requests), str(font_requests))
+        report.check(f"{tag} Orca loads its self-hosted Geist font and no other", any("geist" in u for u in font_requests) and all("geist" in u for u in font_requests), str(font_requests))
     else:
         report.check(f"{tag} Classic requests no font files (system fonts)", not fonts_before_switch, str(fonts_before_switch))
 
@@ -544,7 +556,7 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     page.wait_for_selector("#login:not([hidden])", timeout=5000)
     page.goto(url_for.split("#")[0])
     page.wait_for_selector("#login:not([hidden])", timeout=8000)
-    report.check(f"{tag} the saved theme is applied on the login page with a single sheet", page.evaluate("document.documentElement.dataset.theme") == theme and sum("/theme-" in (h or "") for h in page.evaluate("[...document.styleSheets].map(s => s.href)")) == 1)
+    report.check(f"{tag} the saved theme is applied on the login page with a single sheet", page.evaluate("document.documentElement.dataset.theme") == applied and sum("/theme-" in (h or "") for h in page.evaluate("[...document.styleSheets].map(s => s.href)")) == 1)
     report.check(f"{tag} Lock clears the workspace and shows the login again", page.locator("#workspace").is_hidden() and page.locator("#sidebar .nav-item").count() == 0)
 
     csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
@@ -555,71 +567,114 @@ def run_theme(playwright, theme, url_for, topic_id, report, out):
     browser.close()
 
 
-def run_orca_section(playwright, url_for, topic_id, report, out):
-    """Checks specific to the Orca theme. Runs before the per-theme sections so that it does not
-    depend on how far they get."""
+ORCA_VALUES = {  # what the rendered page must paint, by sheet (DESIGN.md: Orca theme; tools/check_orca_tokens.py compares them with Orca itself)
+    "orca": {"content": "rgb(21, 21, 21)", "sidebar": "rgb(42, 42, 42)", "topbar": "rgb(23, 23, 23)", "topbarH": "36px", "text": "rgb(240, 240, 240)", "btnRadius": "8px", "scheme": "dark"},
+    "orca-light": {"content": "rgb(255, 255, 255)", "sidebar": "rgb(245, 245, 245)", "topbar": "rgb(255, 255, 255)", "topbarH": "36px", "text": "rgb(10, 10, 10)", "btnRadius": "8px", "scheme": "light"},
+}
+
+
+def run_theme_menu_section(playwright, url_for, report):
+    """The Theme menu and live switching between all five choices with the browser in light mode:
+    Classic is the default, nothing but the chosen sheet and its fonts is ever requested, and no pick reloads."""
     browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
-    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    context = browser.new_context(viewport={"width": 1440, "height": 900}, color_scheme="light")
     page = context.new_page()
     problems = []
     page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
     page.on("pageerror", lambda e: problems.append(str(e)))
     requests = []
     page.on("request", lambda r: requests.append(r.url))
-    tag = "[orca section]"
+    tag = "[theme menu]"
 
     # Classic is the default: with nothing saved, the page opens in Classic and requests no Orca files.
     page.goto(url_for)
     page.wait_for_selector("#sidebar .nav-item", timeout=15000)
     until(page, "document.querySelectorAll('#sidebar .nav-item').length >= 6", 20000)
     report.check(f"{tag} Classic stays the default theme", page.evaluate("document.documentElement.dataset.theme") == "classic")
-    report.check(f"{tag} Classic does not request the Orca sheet or font", not any("orca" in u or "geist" in u for u in requests), str(requests))
+    report.check(f"{tag} Classic does not request any Orca sheet or the font", not any("orca" in u or "geist" in u for u in requests), str(requests))
     choices = page.eval_on_selector_all("#theme-menu [data-theme-choice]", "els => els.map(e => [e.dataset.themeChoice, e.textContent.trim()])")
-    report.check(f"{tag} the Theme menu offers Classic, Sticker Bomb and Orca", choices == [["classic", "Classic"], ["sticker", "Sticker Bomb"], ["orca", "Orca"]], str(choices))
-
-    # Switching applies immediately, without a reload, from the picker.
+    report.check(f"{tag} the Theme menu offers Classic, Sticker Bomb, Orca Dark, Orca Light and Orca (system)",
+                 choices == [["classic", "Classic"], ["sticker", "Sticker Bomb"], ["orca", "Orca Dark"], ["orca-light", "Orca Light"], ["orca-system", "Orca (system)"]], str(choices))
     page.evaluate("window.__noReload = true")
-    page.click("#theme-button")
-    page.click("[data-theme-choice=orca]")
-    until(page, "document.documentElement.dataset.theme === 'orca'", 8000)
-    report.check(f"{tag} choosing Orca applies without a reload", page.evaluate("window.__noReload === true"))
+    previous = "classic"
+    for pick in ["orca", "orca-light", "orca-system", "sticker", "classic", "orca-system", "orca-light", "orca", "orca-system"]:
+        before = len(requests)
+        wanted = sheet_for(pick, "light")
+        page.click("#theme-button")
+        page.click(f"[data-theme-choice={pick}]")
+        until(page, f"document.documentElement.dataset.theme === '{wanted}' && document.querySelectorAll('link[rel=stylesheet][href*=\"/theme-\"]').length === 1", 8000)
+        if wanted in THEME_FONTS and THEME_FONTS[wanted]:
+            until(page, "document.fonts.check('14px Geist')" if "geist-var.woff2" in THEME_FONTS[wanted] else "document.fonts.check('15px \"Bricolage Grotesque\"')", 8000)
+        page.wait_for_timeout(150)
+        new = requests[before:]
+        sheets = page.evaluate("[...document.styleSheets].map(s => s.href || '').filter(h => h.includes('/theme-'))")
+        report.check(f"{tag} {previous} > {pick}: exactly one theme sheet, {wanted}", len(sheets) == 1 and sheets[0].endswith(f"/theme-{wanted}.css"), str(sheets))
+        asked = [u.rsplit("/", 1)[1] for u in new if "/theme-" in u]
+        already = wanted == sheet_for(previous, "light")
+        report.check(f"{tag} {previous} > {pick}: " + ("the sheet already applied is not requested again" if already else "only the new sheet is requested"), asked == ([] if already else [f"theme-{wanted}.css"]), str(asked))
+        fonts = {u.rsplit("/", 1)[1] for u in new if "/fonts/" in u}
+        report.check(f"{tag} {previous} > {pick}: only this theme's fonts are requested", fonts <= THEME_FONTS[wanted], str(fonts))
+        report.check(f"{tag} {previous} > {pick}: no reload, the choice is remembered by its own name, the menu shows it",
+                     page.evaluate(f"window.__noReload === true && localStorage.getItem('agent-bridge-theme') === '{pick}' && AgentBridgeTheme.get() === '{pick}' && document.querySelector('[data-theme-choice={pick}]').getAttribute('aria-checked') === 'true' && document.querySelectorAll('#theme-menu [aria-checked=true]').length === 1"))
+        previous = pick
+    stored = page.evaluate("Object.keys(localStorage).sort()")
+    report.check(f"{tag} the browser stores only the theme and sidebar state", set(stored) <= {"agent-bridge-theme", "agent-bridge-sidebar"} and "agent-bridge-theme" in stored, str(stored))
+    csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
+    report.check(f"{tag} no Content-Security-Policy violations and no console or page errors", not problems and not csp, str(problems[:3]))
+    context.close()
+    browser.close()
+
+
+def run_orca_section(playwright, url_for, topic_id, report, out, choice, scheme):
+    """Checks specific to the Orca theme, for one choice (the dark theme, the light theme, or the system
+    choice) with the browser in one appearance. An explicit choice is run in the opposite appearance, to
+    show it ignores it. Runs before the per-theme sections so that it does not depend on how far they get."""
+    applied = sheet_for(choice, scheme)
+    tag = f"[orca section {choice}, browser {scheme}]"
+    shot = f"orca-section-{choice}-{scheme}"
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    context = browser.new_context(viewport={"width": 1440, "height": 900}, color_scheme=scheme)
+    page = context.new_page()
+    problems = []
+    page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
+    page.on("pageerror", lambda e: problems.append(str(e)))
+    requests = []
+    page.on("request", lambda r: requests.append(r.url))
+    page.add_init_script(f"try {{ if (!localStorage.getItem('agent-bridge-theme')) localStorage.setItem('agent-bridge-theme', '{choice}') }} catch (e) {{}}")
+
+    page.goto(url_for)
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "document.querySelectorAll('#sidebar .nav-item').length >= 6", 20000)
+    report.check(f"{tag} the page shows the {applied} sheet", page.evaluate("document.documentElement.dataset.theme") == applied)
     sheets = page.evaluate("[...document.styleSheets].map(s => s.href || '')")
-    report.check(f"{tag} only the Orca theme sheet is loaded", sum("/theme-" in s for s in sheets) == 1 and any(s.endswith("/theme-orca.css") for s in sheets), str(sheets))
+    report.check(f"{tag} only the {applied} theme sheet is loaded", [s for s in sheets if "/theme-" in s] == [f"{url_for.split('#')[0]}theme-{applied}.css"], str(sheets))
+    asked = [u.rsplit("/", 1)[1] for u in requests if "/theme-" in u]
+    report.check(f"{tag} only the {applied} sheet was requested", asked == [f"theme-{applied}.css"], str(asked))
     stored = page.evaluate("Object.keys(localStorage).sort()")
     report.check(f"{tag} the browser stores only the theme and sidebar state", set(stored) <= {"agent-bridge-theme", "agent-bridge-sidebar"} and "agent-bridge-theme" in stored, str(stored))
     until(page, "document.fonts.check('14px Geist')", 8000)
     fonts = [u for u in requests if "/fonts/" in u]
     report.check(f"{tag} Orca requests Geist and no other font", fonts and all("geist" in u for u in fonts), str(fonts))
     report.check(f"{tag} body text is set in Geist", page.evaluate("getComputedStyle(document.body).fontFamily").startswith("Geist"))
-
-    # Switching away drops Orca's sheet and requests nothing of Orca's; switching back restores it.
-    for other, font in [("sticker", "bricolage"), ("classic", None), ("orca", "geist")]:
-        before = len(requests)
-        page.click("#theme-button")
-        page.click(f"[data-theme-choice={other}]")
-        until(page, f"document.documentElement.dataset.theme === '{other}' && document.querySelectorAll('link[rel=stylesheet][href*=\"/theme-\"]').length === 1", 8000)
-        sheets = page.evaluate("[...document.styleSheets].map(s => s.href || '').filter(h => h.includes('/theme-'))")
-        report.check(f"{tag} switching to {other} leaves only its sheet", len(sheets) == 1 and sheets[0].endswith(f"/theme-{other}.css"), str(sheets))
-        if font == "bricolage":
-            until(page, "document.fonts.check('15px \"Bricolage Grotesque\"')", 8000)
-        fonts = [u for u in requests[before:] if "/fonts/" in u]
-        if other == "classic":
-            report.check(f"{tag} switching to Classic requests no font", not fonts, str(fonts))
-        elif other == "sticker":
-            report.check(f"{tag} switching to Sticker Bomb requests no Geist", not any("geist" in u for u in fonts), str(fonts))
-        else:
-            until(page, "document.fonts.check('14px Geist')", 8000)
-            report.check(f"{tag} switching back to Orca restores the loaded Geist font", page.evaluate("document.fonts.check('14px Geist') && getComputedStyle(document.body).fontFamily.startsWith('Geist')"))
-        report.check(f"{tag} switching to {other} applies without a reload and is remembered", page.evaluate("window.__noReload === true && localStorage.getItem('agent-bridge-theme')") == other)
+    report.check(f"{tag} the page tells the browser its colour scheme ({ORCA_VALUES[applied]['scheme']})", page.evaluate("getComputedStyle(document.documentElement).colorScheme") == ORCA_VALUES[applied]["scheme"])
 
     # Orca's own values on the rendered page (see DESIGN.md: Orca theme).
     values = page.evaluate("""() => {
       const css = (sel, prop) => getComputedStyle(document.querySelector(sel))[prop];
       return { content: css('body', 'backgroundColor'), sidebar: css('#sidebar', 'backgroundColor'), topbar: css('.topbar', 'backgroundColor'),
-               topbarH: css('.topbar', 'height'), text: css('body', 'color'), btnRadius: css('#theme-button', 'borderRadius') };
+               topbarH: css('.topbar', 'height'), text: css('body', 'color'), btnRadius: css('#theme-button', 'borderRadius'),
+               scheme: getComputedStyle(document.documentElement).colorScheme };
     }""")
-    expected = {"content": "rgb(21, 21, 21)", "sidebar": "rgb(42, 42, 42)", "topbar": "rgb(23, 23, 23)", "topbarH": "36px", "text": "rgb(240, 240, 240)", "btnRadius": "8px"}
-    report.check(f"{tag} colours, header height and radius are Orca's", values == expected, str(values))
+    report.check(f"{tag} colours, header height and radius are Orca's", values == ORCA_VALUES[applied], str(values))
+    # Every agent colour, whichever the seeded agents happen to hash to: an avatar and a name of each of the six.
+    before = page.evaluate(RENDERED_CONTRAST)["checked"]
+    page.evaluate("""() => {
+      const box = document.createElement('div'); box.id = 'agent-colours-probe';
+      box.innerHTML = [0, 1, 2, 3, 4, 5].map(i => `<div class="avatar agent-c${i}">A${i}</div><span class="author agent-c${i}">name${i}</span>`).join('');
+      document.querySelector('#workspace').append(box); }""")
+    probe = page.evaluate(RENDERED_CONTRAST)
+    page.evaluate("document.getElementById('agent-colours-probe').remove()")
+    report.check(f"{tag} all six agent colours (avatars and names) meet 4.5:1", probe["checked"] - before == 12 and not probe["fails"], f"{probe['checked'] - before} measured, {probe['fails'][:6]}")
 
     # Every screen is styled by Orca and readable: nothing keeps another theme's colours.
     def screen(name, minimum=3):
@@ -629,11 +684,18 @@ def run_orca_section(playwright, url_for, topic_id, report, out):
         leaks = page.evaluate(THEME_LEAK)
         report.check(f"{tag} {name}: no Classic or Sticker Bomb colour is used", not leaks, str(leaks[:6]))
         report.check(f"{tag} {name}: page does not scroll or overflow", not page.evaluate("document.documentElement.scrollHeight > innerHeight + 1 || document.documentElement.scrollWidth > innerWidth + 1"))
-        page.screenshot(path=str(out / f"orca-section-{name.replace(' ', '-')}.png"))
+        page.screenshot(path=str(out / f"{shot}-{name.replace(' ', '-')}.png"))
 
     def go(route):
         page.evaluate(f"location.hash = {json.dumps(route)}")
         page.wait_for_timeout(700)
+
+    def dialog_buttons(selectors, name):
+        # the dialogs' plain buttons are styled by the theme, not left in the browser's own button look (a 2px outset border)
+        want = {"orca": "rgb(30, 30, 30)", "orca-light": "rgb(255, 255, 255)"}[applied]
+        for selector in selectors:
+            look = page.evaluate("""s => { const c = getComputedStyle(document.querySelector(s)); return [c.borderTopWidth, c.borderTopStyle, c.backgroundColor, c.minHeight, c.borderTopLeftRadius]; }""", selector)
+            report.check(f"{tag} {name}: {selector} is a themed button, not the browser's", look == ["1px", "solid", want, "32px", "8px"], str(look))
 
     dm_route = page.evaluate("document.querySelector('#sidebar .nav-item[data-route^=\"#/dm/\"]').dataset.route")
     go("#/board/release-checklist")
@@ -645,6 +707,13 @@ def run_orca_section(playwright, url_for, topic_id, report, out):
     page.click("#board-archived-open")
     page.wait_for_selector("#archived-dialog[open]", timeout=5000)
     screen("archived boards dialog")
+    dialog_buttons(["#archived-refresh", "#archived-close"], "archived boards dialog")
+    page.keyboard.press("Escape")
+    page.click("#board-menu-button")
+    page.get_by_role("menuitem", name="Archive board").click()
+    page.wait_for_selector("#archive-confirm-dialog[open]", timeout=5000)
+    screen("archive confirmation dialog")
+    dialog_buttons(["#archive-confirm-submit", "#archive-confirm-cancel"], "archive confirmation dialog")
     page.keyboard.press("Escape")
     go("#/board/main")
     page.wait_for_selector("text=main has not been written yet.", timeout=8000)
@@ -655,7 +724,7 @@ def run_orca_section(playwright, url_for, topic_id, report, out):
     page.wait_for_selector("#topic-mention-pop:not([hidden]) [role=option]", timeout=5000)
     screen("mention popover")
     page.fill("#topic-body", "")
-    page.once("dialog", lambda d: d.accept("empty-qa"))
+    page.once("dialog", lambda d: d.accept(f"empty-qa-{choice}-{scheme}"))
     page.click("#sidebar .nav-section__title .btn")
     page.wait_for_selector("text=No messages yet. Say something below.", timeout=10000)
     screen("empty topic")
@@ -714,11 +783,14 @@ def run_overlap_section(playwright, url_for, report):
     last pick's. After a failure the page must be left with the theme that was applied, once."""
     browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
     sequences = [("classic", ["sticker", "orca"]), ("classic", ["sticker", "classic"]),
-                 ("orca", ["classic", "sticker"]), ("sticker", ["orca", "sticker"])]
+                 ("orca", ["classic", "sticker"]), ("sticker", ["orca", "sticker"]),
+                 ("classic", ["orca", "orca-light"]), ("orca-light", ["orca", "sticker"]), ("orca", ["orca-light", "orca"])]
     for start, picks in sequences:
         for order in ("in order", "reversed", "last sheet fails"):
+            if order == "last sheet fails" and picks[-1] == start:
+                continue  # the last pick is the sheet already applied: it loads nothing that could fail
             tag = f"[overlap {start} > {' > '.join(picks)}, sheets released {order}]"
-            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            context = browser.new_context(viewport={"width": 1440, "height": 900}, color_scheme="light")
             page = context.new_page()
             problems = []
             page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
@@ -731,11 +803,18 @@ def run_overlap_section(playwright, url_for, report):
             page.evaluate("window.__themeChanges = []; document.addEventListener('themechange', e => window.__themeChanges.push(e.detail))")
             for pick in picks:
                 page.evaluate(f"AgentBridgeTheme.set({json.dumps(pick)})")
+            # A pick of the sheet that is already applied cancels the pending one and loads nothing; a pick of the one already loading loads nothing more.
+            wanted, loading = 0, None
+            for pick in picks:
+                if pick == start:
+                    loading = None
+                elif pick != loading:
+                    wanted, loading = wanted + 1, pick
             for _ in range(100):  # the page must be pumped for Playwright to deliver the held requests
-                if len(held) == len(picks):
+                if len(held) == wanted:
                     break
                 page.wait_for_timeout(100)
-            report.check(f"{tag} every pick's sheet request is held", len(held) == len(picks), str(len(held)))
+            report.check(f"{tag} exactly the sheets that are needed are requested, and are held", len(held) == wanted, f"{len(held)} held, {wanted} needed")
             report.check(f"{tag} the applied theme does not change while the sheets are loading", page.evaluate("document.documentElement.dataset.theme") == start)
             if order == "last sheet fails":
                 for route in held[:-1]:
@@ -773,10 +852,10 @@ def run_url_theme_section(playwright, url_for, report):
     browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
     problems = []
 
-    def open_page(saved=None):
+    def open_page(saved=None, scheme="light"):
         # The broker allows 100 requests a second in all; a page load and its unlock use many, so pace the loads.
         time.sleep(1.1)
-        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context = browser.new_context(viewport={"width": 1440, "height": 900}, color_scheme=scheme)
         page = context.new_page()
         requests = []
         page.on("request", lambda r: requests.append(r.url))
@@ -790,26 +869,25 @@ def run_url_theme_section(playwright, url_for, report):
             page.add_init_script(f"try {{ if (!sessionStorage.getItem('seeded')) {{ sessionStorage.setItem('seeded', '1'); localStorage.setItem('agent-bridge-theme', '{saved}') }} }} catch (e) {{}}")
         return context, page, requests
 
-    theme_fonts = {"classic": set(), "sticker": {"bricolage-var.woff2", "space-mono-400.woff2", "space-mono-700.woff2"}, "orca": {"geist-var.woff2"}}
-
     def sheets_of(requests):
         return [u.rsplit("/", 1)[1] for u in requests if "/theme-" in u]
 
     def stored(page):
         return page.evaluate("Object.fromEntries(Object.keys(localStorage).map(k => [k, localStorage.getItem(k)]))")
 
-    for theme in ["classic", "sticker", "orca"]:
+    for theme in ALL_THEMES:
+        shown = sheet_for(theme, "light")  # the sheet this choice shows with the browser in light mode
         tag = f"[url theme {theme}]"
         # 1. plain loopback URL: the theme is applied by the first paint, and no other theme's sheet is ever requested
         context, page, requests = open_page()
         page.goto(f"{base}#theme={theme}")
         page.wait_for_selector("#login:not([hidden])", timeout=8000)
-        report.check(f"{tag} the plain URL opens in the theme before any input", page.evaluate("document.documentElement.dataset.theme") == theme)
-        report.check(f"{tag} only that theme's sheet was requested", sheets_of(requests) == [f"theme-{theme}.css"], str(sheets_of(requests)))
-        report.check(f"{tag} the loaded sheet is the theme's and it is the only one", [s.rsplit("/", 1)[1] for s in page.evaluate("[...document.styleSheets].map(s => s.href || '').filter(h => h.includes('/theme-'))")] == [f"theme-{theme}.css"])
+        report.check(f"{tag} the plain URL opens in the theme before any input", page.evaluate("document.documentElement.dataset.theme") == shown)
+        report.check(f"{tag} only that theme's sheet was requested", sheets_of(requests) == [f"theme-{shown}.css"], str(sheets_of(requests)))
+        report.check(f"{tag} the loaded sheet is the theme's and it is the only one", [s.rsplit("/", 1)[1] for s in page.evaluate("[...document.styleSheets].map(s => s.href || '').filter(h => h.includes('/theme-'))")] == [f"theme-{shown}.css"])
         page.evaluate("document.fonts.ready.then(() => true)")
         fonts = {u.rsplit("/", 1)[1] for u in requests if "/fonts/" in u}
-        report.check(f"{tag} only that theme's fonts were requested", fonts <= theme_fonts[theme] and (bool(fonts) or theme == "classic"), str(fonts))
+        report.check(f"{tag} only that theme's fonts were requested", fonts <= THEME_FONTS[shown] and (bool(fonts) or theme == "classic"), str(fonts))
         report.check(f"{tag} the choice is remembered and nothing else is stored", stored(page) == {"agent-bridge-theme": theme}, str(stored(page)))
         report.check(f"{tag} the theme is removed from the address", page.evaluate("location.hash") == "" and page.url == base, page.url)
         report.check(f"{tag} the menu shows it as chosen", page.evaluate(f"document.querySelector('[data-theme-choice={theme}]').getAttribute('aria-checked')") == "true")
@@ -819,14 +897,14 @@ def run_url_theme_section(playwright, url_for, report):
         context, page, requests = open_page()
         page.goto(f"{base}#theme={theme}&access_token={token}")
         page.wait_for_selector("#sidebar .nav-item", timeout=15000)
-        report.check(f"{tag} the access link with a theme unlocks the page in that theme", page.evaluate("document.documentElement.dataset.theme") == theme and page.locator("#workspace").is_visible())
+        report.check(f"{tag} the access link with a theme unlocks the page in that theme", page.evaluate("document.documentElement.dataset.theme") == shown and page.locator("#workspace").is_visible())
         report.check(f"{tag} neither the token nor the theme stays in the address", "access_token" not in page.url and token not in page.url and "theme" not in page.url, page.url)
-        report.check(f"{tag} only that theme's sheet was requested with the access link", sheets_of(requests) == [f"theme-{theme}.css"], str(sheets_of(requests)))
+        report.check(f"{tag} only that theme's sheet was requested with the access link", sheets_of(requests) == [f"theme-{shown}.css"], str(sheets_of(requests)))
         report.check(f"{tag} the token is not in browser storage", set(stored(page)) <= {"agent-bridge-theme", "agent-bridge-sidebar"} and token not in json.dumps(stored(page)), str(list(stored(page))))
         report.check(f"{tag} the token is in no request URL, referer or body, and nothing left the page's origin", all(u.startswith(origin + "/") for u in requests) and not page.token_seen, str([u for u in requests if not u.startswith(origin + "/")]))
         report.check(f"{tag} no cookie holds the token", token not in json.dumps(context.cookies()))
         # 4. a menu choice afterwards is remembered, and a reload (the address no longer has the theme) keeps it
-        other = {"classic": "orca", "sticker": "classic", "orca": "sticker"}[theme]
+        other = {"classic": "orca", "sticker": "classic", "orca": "sticker", "orca-light": "orca", "orca-system": "sticker"}[theme]
         page.click("#theme-button")
         page.click(f"[data-theme-choice={other}]")
         until(page, f"document.documentElement.dataset.theme === '{other}'", 8000)
@@ -838,13 +916,15 @@ def run_url_theme_section(playwright, url_for, report):
         page.goto("about:blank")  # a new load: a change of the fragment alone is not one
         page.goto(f"{base}#theme={theme}")
         page.wait_for_selector("#login:not([hidden])", timeout=8000)
-        report.check(f"{tag} reopening the link selects its theme again and remembers it", page.evaluate("document.documentElement.dataset.theme") == theme and stored(page)["agent-bridge-theme"] == theme)
+        report.check(f"{tag} reopening the link selects its theme again and remembers it", page.evaluate("document.documentElement.dataset.theme") == shown and stored(page)["agent-bridge-theme"] == theme)
         context.close()
 
     # 3. unknown, empty, repeated and wrongly cased values are ignored: the saved theme (or Classic) applies, nothing is stored
     for label, fragment in [("unknown", "theme=nope"), ("empty", "theme="), ("repeated", "theme=orca&theme=sticker"),
                             ("repeated same value", "theme=orca&theme=orca"), ("wrong case", "theme=ORCA"),
-                            ("path-like", "theme=../style"), ("malformed escape", "theme=%E0%A4%A")]:
+                            ("path-like", "theme=../style"), ("malformed escape", "theme=%E0%A4%A"),
+                            ("near miss of a new name", "theme=orca-dark"), ("new name, wrong case", "theme=Orca-Light"),
+                            ("repeated new names", "theme=orca-light&theme=orca-system"), ("new name with a suffix", "theme=orca-system%20")]:
         tag = f"[url theme {label}]"
         context, page, requests = open_page()
         page.goto(f"{base}#{fragment}")
@@ -870,6 +950,8 @@ def run_url_theme_section(playwright, url_for, report):
                                       ("empty theme", f"theme=&access_token={token}", "classic"),
                                       ("odd separators", f"theme=orca&&&access_token={token}&", "orca"),
                                       ("percent-encoded theme", f"theme=%6Frca&access_token={token}", "orca"),
+                                      ("orca-light", f"theme=orca-light&access_token={token}", "orca-light"),
+                                      ("percent-encoded orca-light", f"access_token={token}&theme=orca%2Dlight", "orca-light"),
                                       ("repeated access_token", f"theme=orca&access_token={token}&access_token=bad", "orca"),
                                       ("access_token first", f"access_token={token}&theme=sticker", "sticker")]:
         tag = f"[url theme {label}]"
@@ -917,7 +999,9 @@ def run_url_theme_section(playwright, url_for, report):
                                   ("theme=orca&?theme=sticker", "#&?theme=sticker", "orca"),
                                   ("theme=orca&?access_token=not-a-token", "#&?access_token=not-a-token", "orca"),
                                   ("?access_token=x&theme=orca", "", "orca"),
-                                  ("theme=orca", "", "orca")]:
+                                  ("theme=orca", "", "orca"),
+                                  ("/board/release-checklist&theme=orca-light", "#/board/release-checklist", "orca-light"),
+                                  ("theme=orca-light&/board/a&b", "#/board/a&b", "orca-light")]:
         context, page, requests = open_page()
         page.goto(f"{base}#{typed}")
         page.wait_for_selector("#login:not([hidden])", timeout=8000)
@@ -945,11 +1029,251 @@ def run_url_theme_section(playwright, url_for, report):
     browser.close()
 
 
+def run_system_section(playwright, url_for, report):
+    """Orca (system): the dark or light Orca sheet by the browser's appearance (prefers-color-scheme),
+    switching live in both directions without a reload, one sheet at a time. Every sheet response in the
+    overlap checks is held by the test and released afterwards."""
+    base, _, link_fragment = url_for.partition("#")
+    token = dict(part.split("=", 1) for part in link_fragment.split("&"))["access_token"]
+    root = base.rstrip("/")
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    problems = []
+
+    def open_page(scheme, saved="orca-system"):
+        time.sleep(1.1)  # the broker allows 100 requests a second in all
+        context = browser.new_context(viewport={"width": 1440, "height": 900}, color_scheme=scheme)
+        page = context.new_page()
+        requests = []
+        page.on("request", lambda r: requests.append(r.url))
+        page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
+        page.on("pageerror", lambda e: problems.append(str(e)))
+        if saved:
+            page.add_init_script(f"try {{ if (!sessionStorage.getItem('seeded')) {{ sessionStorage.setItem('seeded', '1'); localStorage.setItem('agent-bridge-theme', '{saved}') }} }} catch (e) {{}}")
+        return context, page, requests
+
+    def sheets_in_page(page):
+        return page.evaluate("[...document.querySelectorAll('link[rel=stylesheet]')].map(l => [l.id, new URL(l.href).pathname]).filter(l => l[1].startsWith('/theme-'))")
+
+    def asked(requests):
+        return [u.rsplit("/", 1)[1] for u in requests if "/theme-" in u]
+
+    def one_sheet(page, name):
+        return sheets_in_page(page) == [["theme-sheet", f"/theme-{name}.css"]]
+
+    def state(page):
+        return page.evaluate("[document.documentElement.dataset.theme, AgentBridgeTheme.get(), localStorage.getItem('agent-bridge-theme')]")
+
+    # 1. A saved system choice resolves before first paint, with only the needed sheet requested.
+    for scheme, sheet in [("light", "orca-light"), ("dark", "orca")]:
+        tag = f"[system, browser {scheme}]"
+        context, page, requests = open_page(scheme)
+        page.goto(base)
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"{tag} a saved Orca (system) opens in {sheet} from the first paint, with that sheet only", state(page) == [sheet, "orca-system", "orca-system"] and one_sheet(page, sheet) and asked(requests) == [f"theme-{sheet}.css"], f"{state(page)} {asked(requests)}")
+        report.check(f"{tag} the menu shows Orca (system) as chosen, not {sheet}", page.evaluate("document.querySelector('[data-theme-choice=orca-system]').getAttribute('aria-checked')") == "true" and page.evaluate("document.querySelector(`[data-theme-choice=${AgentBridgeTheme.themes.find(t => t.id === document.documentElement.dataset.theme).id}]`).getAttribute('aria-checked')") == "false")
+        fonts = {u.rsplit("/", 1)[1] for u in requests if "/fonts/" in u}
+        page.evaluate("document.fonts.ready.then(() => true)")
+        report.check(f"{tag} only Geist is requested", {u.rsplit("/", 1)[1] for u in requests if "/fonts/" in u} <= {"geist-var.woff2"}, str(fonts))
+        context.close()
+
+    # 2. Following the appearance live, in both directions, with no reload, and the saved value stays Orca (system).
+    context, page, requests = open_page("light")
+    page.goto(f"{base}#access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    page.evaluate("window.__noReload = true; window.__changes = []; document.addEventListener('themechange', e => window.__changes.push(e.detail))")
+    sequence = [("dark", "orca"), ("light", "orca-light"), ("dark", "orca"), ("light", "orca-light")]
+    for scheme, sheet in sequence:
+        before = len(requests)
+        page.emulate_media(color_scheme=scheme)
+        until(page, f"document.documentElement.dataset.theme === '{sheet}'", 8000)
+        page.wait_for_timeout(300)
+        report.check(f"[system live] the browser turns {scheme}: the page switches to {sheet} without a reload", page.evaluate("window.__noReload === true") and one_sheet(page, sheet), str(sheets_in_page(page)))
+        report.check(f"[system live] after {scheme}: the choice and the saved value are still Orca (system), the menu agrees", state(page)[1:] == ["orca-system", "orca-system"] and page.evaluate("document.querySelector('[data-theme-choice=orca-system]').getAttribute('aria-checked')") == "true", str(state(page)))
+        report.check(f"[system live] after {scheme}: only the new sheet was requested", asked(requests[before:]) in ([f"theme-{sheet}.css"], []), str(asked(requests[before:])))
+    report.check("[system live] changing the appearance announces no theme change (the choice did not change)", page.evaluate("window.__changes") == [], str(page.evaluate("window.__changes")))
+    stored = page.evaluate("Object.fromEntries(Object.keys(localStorage).map(k => [k, localStorage.getItem(k)]))")
+    report.check("[system live] the browser stores only the theme name and the sidebar state", set(stored) <= {"agent-bridge-theme", "agent-bridge-sidebar"} and stored.get("agent-bridge-theme") == "orca-system", str(stored))
+    # the live page is still readable in both appearances
+    for scheme, sheet in [("dark", "orca"), ("light", "orca-light")]:
+        page.emulate_media(color_scheme=scheme)
+        until(page, f"document.documentElement.dataset.theme === '{sheet}'", 8000)
+        page.wait_for_timeout(300)
+        rendered = page.evaluate(RENDERED_CONTRAST)
+        report.check(f"[system live] after the browser turns {scheme} the page meets 4.5:1 ({rendered['checked']} runs)", rendered["checked"] >= 3 and not rendered["fails"], str(rendered["fails"][:5]))
+        report.check(f"[system live] after the browser turns {scheme} the page is painted in {sheet}", page.evaluate("getComputedStyle(document.body).backgroundColor") == ("rgb(21, 21, 21)" if sheet == "orca" else "rgb(255, 255, 255)"))
+    # a reload keeps following it
+    page.emulate_media(color_scheme="dark")
+    page.reload()
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    report.check("[system live] a reload with the browser in dark applies Orca dark from the first paint", state(page) == ["orca", "orca-system", "orca-system"] and one_sheet(page, "orca"))
+    context.close()
+
+    # 3. Only the system choice follows the appearance: an explicit choice does not move when it changes.
+    for choice in ["classic", "sticker", "orca", "orca-light"]:
+        context, page, requests = open_page("light", saved=choice)
+        page.goto(base)
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        first = sheet_for(choice, "light")
+        before = len(requests)
+        for scheme in ["dark", "light", "dark"]:
+            page.emulate_media(color_scheme=scheme)
+            page.wait_for_timeout(300)
+        report.check(f"[system off] with {choice} chosen, the browser's appearance changing does not change the theme or request a sheet", state(page) == [first, choice, choice] and one_sheet(page, first) and asked(requests[before:]) == [], f"{state(page)} {asked(requests[before:])}")
+        # choosing the system choice from here adopts the current appearance, and then follows it
+        page.click("#theme-button")
+        page.click("[data-theme-choice=orca-system]")
+        now = "orca"  # the browser is dark now
+        until(page, f"document.documentElement.dataset.theme === '{now}' && document.querySelectorAll('link[rel=stylesheet][href*=\"/theme-\"]').length === 1", 8000)
+        report.check(f"[system off] choosing Orca (system) from {choice} with the browser dark shows Orca dark and saves Orca (system)", state(page) == [now, "orca-system", "orca-system"] and one_sheet(page, now), str(state(page)))
+        page.emulate_media(color_scheme="light")
+        until(page, "document.documentElement.dataset.theme === 'orca-light'", 8000)
+        report.check(f"[system off] after choosing Orca (system) the page follows the appearance to Orca Light", one_sheet(page, "orca-light"))
+        # leaving the system choice stops following it
+        page.click("#theme-button")
+        page.click("[data-theme-choice=sticker]")
+        until(page, "document.documentElement.dataset.theme === 'sticker' && document.querySelectorAll('link[rel=stylesheet][href*=\"/theme-\"]').length === 1", 8000)
+        before = len(requests)
+        page.emulate_media(color_scheme="dark")
+        page.wait_for_timeout(300)
+        report.check(f"[system off] after leaving Orca (system) for Sticker Bomb the appearance no longer matters", state(page) == ["sticker", "sticker", "sticker"] and asked(requests[before:]) == [])
+        context.close()
+
+    # 4. Overlap: quick appearance changes and picks with the sheet responses held, released in order or reversed, or failing.
+    # (label, release order, events in order: "dark"/"light" is the browser's appearance, anything else is a pick; saved choice at the start; expected sheet and choice at the end)
+    cases = [
+        ("flip dark, light, dark", "in order", ["dark", "light", "dark"], "orca-system", "orca", "orca-system"),
+        ("flip dark, light, dark", "reversed", ["dark", "light", "dark"], "orca-system", "orca", "orca-system"),
+        ("flip dark, light", "in order", ["dark", "light"], "orca-system", "orca-light", "orca-system"),
+        ("flip dark, then pick Orca Light", "reversed", ["dark", "orca-light"], "orca-system", "orca-light", "orca-light"),
+        ("flip dark, then pick Sticker Bomb", "in order", ["dark", "sticker"], "orca-system", "sticker", "sticker"),
+        ("pick Orca Dark, then flip dark", "in order", ["orca", "dark"], "orca-system", "orca", "orca"),
+        ("from Orca Dark pick Orca (system), then flip dark", "in order", ["orca-system", "dark"], "orca", "orca", "orca-system"),
+        ("from Orca Dark pick Orca (system), then flip dark and light", "reversed", ["orca-system", "dark", "light"], "orca", "orca-light", "orca-system"),
+        ("from Sticker Bomb pick Orca (system), then pick Orca Dark", "in order", ["orca-system", "orca"], "sticker", "orca", "orca"),
+    ]
+    for label, order, events, start, expected, choice in cases:
+        tag = f"[system overlap {label}, sheets released {order}]"
+        context, page, requests = open_page("light", saved=start)
+        page.goto(f"{base}#access_token={token}")
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        first = sheet_for(start, "light")
+        held = []
+        page.route("**/theme-*.css", lambda route: held.append(route))
+        page.evaluate("window.__changes = []; document.addEventListener('themechange', e => window.__changes.push(e.detail))")
+        for event in events:
+            if event in ("dark", "light"):
+                page.emulate_media(color_scheme=event)
+            else:
+                page.evaluate(f"AgentBridgeTheme.set({json.dumps(event)})")
+            page.wait_for_timeout(150)
+        for _ in range(20):
+            page.wait_for_timeout(100)
+        report.check(f"{tag} the applied theme does not change while the sheets are loading", page.evaluate("document.documentElement.dataset.theme") == first)
+        for route in (held if order == "in order" else reversed(held)):
+            route.continue_()
+        until(page, f"document.documentElement.dataset.theme === '{expected}'", 8000)
+        page.wait_for_timeout(500)
+        report.check(f"{tag} exactly one theme sheet is in the page, {expected}", one_sheet(page, expected), str(sheets_in_page(page)))
+        report.check(f"{tag} the choice and the saved value are {choice}", state(page)[1:] == [choice, choice], str(state(page)))
+        context.close()
+
+    # A sheet that fails to load goes back to the last choice that is applied (the existing failure rule); for a swap made while following the system appearance that is Orca (system).
+    tag = "[system overlap failed sheet]"
+    context, page, requests = open_page("light")
+    page.goto(f"{base}#access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    held = []
+    page.route("**/theme-orca.css", lambda route: held.append(route))
+    page.evaluate("window.__changes = []; document.addEventListener('themechange', e => window.__changes.push(e.detail))")
+    page.emulate_media(color_scheme="dark")
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    held[0].abort()
+    until(page, "window.__changes.length === 1", 8000)
+    page.wait_for_timeout(300)
+    report.check(f"{tag} the applied sheet stays, once, and the choice is still Orca (system), saved as such", state(page) == ["orca-light", "orca-system", "orca-system"] and one_sheet(page, "orca-light") and page.evaluate("window.__changes") == ["orca-system"], f"{state(page)} {page.evaluate('window.__changes')}")
+    # the failure was transient: the next appearance change that needs that sheet loads it, and the page follows again
+    page.unroute("**/theme-orca.css")
+    page.emulate_media(color_scheme="light")
+    page.wait_for_timeout(300)
+    page.emulate_media(color_scheme="dark")
+    until(page, "document.documentElement.dataset.theme === 'orca'", 8000)
+    page.wait_for_timeout(300)
+    report.check(f"{tag} after the failure a later flip loads the sheet and the page follows again, still Orca (system)", state(page) == ["orca", "orca-system", "orca-system"] and one_sheet(page, "orca"), str(state(page)))
+    page.emulate_media(color_scheme="light")
+    until(page, "document.documentElement.dataset.theme === 'orca-light'", 8000)
+    page.wait_for_timeout(300)
+    # the failure of an explicit pick made while following the system goes back to Orca (system)
+    held = []
+    page.route("**/theme-sticker.css", lambda route: held.append(route))
+    page.evaluate("window.__changes = []")
+    page.evaluate("AgentBridgeTheme.set('sticker')")
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    held[0].abort()
+    until(page, "window.__changes.length === 2", 8000)  # the pick, then the revert
+    page.wait_for_timeout(300)
+    report.check(f"{tag} a failed pick made while following the system goes back to Orca (system), still applied and saved", state(page) == ["orca-light", "orca-system", "orca-system"] and one_sheet(page, "orca-light") and page.evaluate("window.__changes") == ["sticker", "orca-system"], f"{state(page)} {page.evaluate('window.__changes')}")
+    context.close()
+
+    # A failed load goes back to the last choice that is applied, also when that choice was made by picking the sheet already applied.
+    for label, start, picks, flip_fails in [("explicit Orca Light, then Orca (system), then the browser turns dark and Orca dark fails", "orca-light", ["orca-system"], "orca"),
+                                            ("Orca (system), then explicit Orca Light, then Sticker Bomb fails", "orca-system", ["orca-light", "sticker"], None)]:
+        tag = f"[system failed sheet after a pick of the applied sheet: {label}]"
+        context, page, requests = open_page("light", saved=start)
+        page.goto(f"{base}#access_token={token}")
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        failing = flip_fails or "sticker"
+        held = []
+        page.route(f"**/theme-{failing}.css", lambda route: held.append(route))
+        page.evaluate("window.__changes = []; document.addEventListener('themechange', e => window.__changes.push(e.detail))")
+        for pick in picks:
+            if pick != failing:
+                page.evaluate(f"AgentBridgeTheme.set({json.dumps(pick)})")
+        if flip_fails:
+            page.emulate_media(color_scheme="dark")
+        else:
+            page.evaluate(f"AgentBridgeTheme.set({json.dumps(failing)})")
+        for _ in range(100):
+            if held:
+                break
+            page.wait_for_timeout(100)
+        held[0].abort()
+        until(page, f"window.__changes.length === {len(picks) + 1}", 8000)  # every pick, then the revert
+        page.wait_for_timeout(300)
+        choice = "orca-system" if flip_fails else "orca-light"
+        report.check(f"{tag} the choice goes back to {choice}, with the sheet that was applied, saved as such", state(page) == ["orca-light", choice, choice] and one_sheet(page, "orca-light"), f"{state(page)} {page.evaluate('window.__changes')}")
+        context.close()
+
+    # 5. The link: #theme=orca-system opens by the appearance, and the token still never leaves the page.
+    for scheme, sheet in [("light", "orca-light"), ("dark", "orca")]:
+        tag = f"[system link, browser {scheme}]"
+        context, page, requests = open_page(scheme, saved=None)
+        seen = []
+        page.on("request", lambda r: seen.append(r.url) if token in (r.url + (r.headers.get("referer") or "") + (r.post_data or "")) else None)
+        page.goto(f"{base}#theme=orca-system&access_token={token}")
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        stored = page.evaluate("Object.fromEntries(Object.keys(localStorage).map(k => [k, localStorage.getItem(k)]))")
+        report.check(f"{tag} the access link opens in {sheet}, remembers Orca (system), requests only that sheet", state(page) == [sheet, "orca-system", "orca-system"] and asked(requests) == [f"theme-{sheet}.css"] and stored.get("agent-bridge-theme") == "orca-system", f"{state(page)} {asked(requests)} {stored}")
+        report.check(f"{tag} the token and theme are gone from the address, storage, cookies and every request", "access_token" not in page.url and "theme" not in page.url and token not in json.dumps(stored) and token not in json.dumps(context.cookies()) and not seen and all(u.startswith(root + "/") for u in requests))
+        context.close()
+
+    csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
+    report.check("[system] no Content-Security-Policy violations", not csp, str(csp[:3]))
+    other_errors = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p and "Failed to load resource" not in p]
+    report.check("[system] no console or page errors", not other_errors, str(other_errors[:5]))
+    browser.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--theme", choices=["classic", "sticker", "orca", "all"], default="all")
+    parser.add_argument("--theme", choices=ALL_THEMES + ["all"], default="all")
     args = parser.parse_args()
     try:
         from playwright.sync_api import sync_playwright
@@ -975,14 +1299,20 @@ def main():
         bind_sessions(broker, out, listeners)
         topic_id = seed(broker)
         credentials = broker.rpc("monitor_enable", port=0)
-        themes = ["classic", "sticker", "orca"] if args.theme == "all" else [args.theme]
+        themes = ALL_THEMES if args.theme == "all" else [args.theme]
         with sync_playwright() as playwright:
             run_url_theme_section(playwright, credentials["access_url"], report)
-            if "orca" in themes:
-                run_orca_section(playwright, credentials["access_url"], topic_id, report, out)
+            run_theme_menu_section(playwright, credentials["access_url"], report)
+            # an explicit Orca choice is run in the opposite appearance, to show it ignores the browser's; the system choice in both
+            for choice, scheme in [("orca", "light"), ("orca-light", "dark"), ("orca-system", "dark"), ("orca-system", "light")]:
+                if choice in themes:
+                    run_orca_section(playwright, credentials["access_url"], topic_id, report, out, choice, scheme)
+            if "orca-system" in themes:
+                run_system_section(playwright, credentials["access_url"], report)
             run_overlap_section(playwright, credentials["access_url"], report)
             for theme in themes:
-                run_theme(playwright, theme, credentials["access_url"], topic_id, report, out)
+                for scheme in (["light", "dark"] if theme == "orca-system" else ["light"]):
+                    run_theme(playwright, theme, credentials["access_url"], topic_id, report, out, scheme)
     finally:
         if broker:
             broker.close()

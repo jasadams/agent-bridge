@@ -7,8 +7,14 @@
   const THEMES = [
     { id: "classic", label: "Classic" },
     { id: "sticker", label: "Sticker Bomb" },
-    { id: "orca", label: "Orca" },
+    { id: "orca", label: "Orca Dark" },
+    { id: "orca-light", label: "Orca Light" },
+    { id: "orca-system", label: "Orca (system)" },
   ];
+  // A choice that is not a sheet of its own: it uses the dark or the light Orca sheet, whichever the
+  // browser's appearance (prefers-color-scheme) asks for now. The choice is what is remembered.
+  const SYSTEM = "orca-system", dark = matchMedia("(prefers-color-scheme: dark)");
+  const sheetFor = choice => choice === SYSTEM ? (dark.matches ? "orca" : "orca-light") : choice;
   const KEY = "agent-bridge-theme", DEFAULT = "classic";
   const known = id => THEMES.some(theme => theme.id === id);
   let current = DEFAULT;
@@ -40,40 +46,57 @@
     link.rel = "stylesheet"; link.id = "theme-sheet"; link.href = `/theme-${id}.css`;
     return link;
   }
-  document.documentElement.dataset.theme = current;
-  document.head.append(sheet(current));
+  // `applied` is the sheet in the page (also `data-theme` on <html>); `current` is the choice, which
+  // is the same name unless the choice is the system one; `settled` is the last choice whose sheet
+  // loaded, which is what a failed load goes back to.
+  let applied = sheetFor(current), settled = current;
+  document.documentElement.dataset.theme = applied;
+  document.head.append(sheet(applied));
 
-  // The one sheet that is loading, if any. A new choice cancels it, so at most one sheet is ever
-  // pending and the loaded one is the last choice's.
-  let pending = null;
+  // The one sheet that is loading, if any, and which sheet it is. A new target cancels it, so at most
+  // one sheet is ever pending and the loaded one is the last target's.
+  let pending = null, pendingId = null;
+
+  // Make `id` the applied sheet: load it before dropping the old one, so switching never flashes
+  // unstyled content. A target that is already applied (or already loading) loads nothing.
+  function show(id) {
+    if (id === applied) { pending?.remove(); pending = pendingId = null; settled = current; return; }
+    if (id === pendingId) return;
+    pending?.remove();
+    const next = pending = sheet(id);
+    pendingId = id;
+    next.id = "theme-sheet-next";
+    next.addEventListener("load", () => {
+      if (pending !== next) return; // a later target already replaced this one
+      pending = pendingId = null;
+      document.getElementById("theme-sheet")?.remove();
+      next.id = "theme-sheet";
+      applied = document.documentElement.dataset.theme = id;
+      settled = current;
+    }, { once: true });
+    next.addEventListener("error", () => {
+      if (pending !== next) return; // a later target already replaced this one
+      pending = pendingId = null;
+      next.remove();
+      // Back to the last choice that is actually applied: a failed sheet never changes what was chosen
+      // before it (so a failed swap while following the system appearance stays on Orca (system)).
+      current = settled;
+      try { localStorage.setItem(KEY, current); } catch { /* ignore */ }
+      document.dispatchEvent(new CustomEvent("themechange", { detail: current }));
+    }, { once: true });
+    document.head.append(next);
+  }
+
+  // The system choice follows the browser's appearance live, in both directions, without a reload.
+  dark.addEventListener("change", () => { if (current === SYSTEM) show(sheetFor(SYSTEM)); });
 
   window.AgentBridgeTheme = {
     themes: THEMES,
     get: () => current,
     set(id) {
       if (!known(id) || id === current) return false;
-      pending?.remove();
-      const next = pending = sheet(id);
-      next.id = "theme-sheet-next";
-      // Load the new sheet before dropping the old one, so switching never flashes unstyled content.
-      next.addEventListener("load", () => {
-        if (pending !== next) return; // a later choice already replaced this one
-        pending = null;
-        document.getElementById("theme-sheet")?.remove();
-        next.id = "theme-sheet";
-        document.documentElement.dataset.theme = id;
-      }, { once: true });
-      next.addEventListener("error", () => {
-        if (pending !== next) return; // a later choice already replaced this one
-        pending = null;
-        next.remove();
-        // Back to the theme that is actually applied, which is not always the previous choice.
-        current = document.documentElement.dataset.theme;
-        try { localStorage.setItem(KEY, current); } catch { /* ignore */ }
-        document.dispatchEvent(new CustomEvent("themechange", { detail: current }));
-      }, { once: true });
-      document.head.append(next);
       current = id;
+      show(sheetFor(id));
       try { localStorage.setItem(KEY, id); } catch { /* the choice still applies for this page */ }
       document.dispatchEvent(new CustomEvent("themechange", { detail: id }));
       return true;

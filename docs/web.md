@@ -274,23 +274,34 @@ delivery subsystem.
 
 ## Themes
 
-The interface ships with three themes, chosen from **Theme** in the top bar. **Classic** (the default)
+The interface ships with five theme choices, chosen from **Theme** in the top bar. **Classic** (the default)
 is the look of earlier releases: dark teal with a lime accent and system fonts. **Sticker Bomb** is a
 bold, high-contrast light theme with thick outlines, flat colour and its own typefaces (Bricolage
 Grotesque and Space Mono, served from the executable under the SIL Open Font License; see
-[the third-party notices](../THIRD_PARTY_NOTICES.md)). **Orca** matches the Orca application's own
-default dark appearance, for a browser tab beside the agent chats in Orca: its neutral greys and
-borders, corner radii, 36px header and the Geist typeface (also served from the executable under the
-SIL Open Font License). It is dark only and does not follow later changes to Orca. Only the selected
-theme's stylesheet and fonts are requested. Switching applies immediately without a reload. Every agent gets a stable
-colour derived from its name. [DESIGN.md](../DESIGN.md) describes the design system.
+[the third-party notices](../THIRD_PARTY_NOTICES.md)). The three **Orca** choices are for a browser tab
+beside the agent chats in the Orca application: **Orca Dark** and **Orca Light** match Orca's own dark and
+light appearance (its neutral greys and borders, corner radii, 36px header and the Geist typeface, also
+served from the executable under the SIL Open Font License), and **Orca (system)** uses one or the other
+according to the browser's appearance (`prefers-color-scheme`), switching live, without a reload, when
+that appearance changes. Only the selected theme's stylesheet and fonts are requested (the system choice
+requests only the Orca sheet it currently needs), and exactly one theme stylesheet is in the page. Switching
+applies immediately without a reload. If a sheet fails to load, the page goes back to the last choice that is applied (so a failed swap while following the appearance stays on Orca (system)). Every agent gets a stable colour derived from its name.
+[DESIGN.md](../DESIGN.md) describes the design system and lists the Orca values it took from Orca.
 
 The browser remembers only two preferences: the theme, and whether the sidebar is collapsed. Neither
-is a credential or a draft.
+is a credential or a draft. For Orca (system) the remembered theme is `orca-system` itself, not the
+appearance it resolved to, so the page keeps following the appearance on every visit.
+
+### Orca (system) and the browser inside Orca
+
+The page cannot read Orca's setting; it only sees what the browser reports. What was found:
+
+- **Verified:** with Orca's own Appearance setting on System and macOS in its Light appearance, a page in an Orca browser tab (Orca's Electron 43.8.10) reports `prefers-color-scheme: light`.
+- **Not verified:** whether the tab mirrors Orca's own setting or only macOS. Orca's main process sets Electron's `nativeTheme.themeSource` from its Theme setting (System, Light or Dark; read in the application's `out/main/index.js`), so a tab is expected to follow Orca's own setting, but this was not tested with Orca set explicitly to Dark or Light, and with System and a Light macOS both explanations predict light. Orca can also override the colour scheme of a single site in a browser tab, which would apply to this page like any other. Orca (system) follows whatever the browser reports, so it behaves correctly either way; both appearances and a live change are covered by emulation in the browser test.
 
 ### Choosing the theme from the link
 
-Put `theme=<name>` in the address fragment (`classic`, `sticker` or `orca`) and the page opens in that
+Put `theme=<name>` in the address fragment (`classic`, `sticker`, `orca`, `orca-light` or `orca-system`) and the page opens in that
 theme from its first paint, with no click and no flash of another theme. The blocking `theme.js`
 applies it before the page is drawn and requests only that theme's stylesheet and fonts. For the
 plain address:
@@ -388,16 +399,19 @@ parsed Markdown. Data tests check historical session pinning, pagination, previe
 migration and reads without delivery writes.
 
 The disposable browser acceptance starts a private broker with seeded boards, topics and agent
-conversations and drives all three themes with an already installed Playwright and Chromium. It checks
+conversations and drives every theme choice with an already installed Playwright and Chromium. It checks
 choosing each theme from the plain address and from the access link (first paint, only that theme's
 sheet requested, the token and theme removed from the address and absent from storage, cookies and
 requests, a menu choice surviving a reload, and ignored unknown, empty and repeated values),
 unlocking, the sidebar, Markdown topics, mentions and publishing, read-only conversations and the
 details panel, the board view, All traffic, the collapsible sidebar, the quick switcher, theme
 switching (including quick overlapping picks with held sheet responses), contrast, that the page never scrolls or overflows at desktop and phone widths, and that
-no content-security violation occurs. For the Orca theme it also checks contrast, that no Classic or Sticker
-Bomb colour is used, and that nothing scrolls or overflows on every screen, menu, dialog, toast and empty
-state listed in [DESIGN.md](../DESIGN.md) (Orca theme):
+no content-security violation occurs. For Orca Dark, Orca Light and Orca (system) it also checks contrast,
+that no Classic or Sticker Bomb colour is used, and that nothing scrolls or overflows on every screen,
+menu, dialog, toast and empty state listed in [DESIGN.md](../DESIGN.md) (Orca theme), with the browser in
+each appearance. For Orca (system) it emulates both appearances and changes the appearance while the page is open
+(including quick changes with held sheet responses), and checks that the page follows it in both directions without a
+reload, requests only the sheet it needs, keeps one theme sheet, and still saves only `orca-system`:
 
 ```sh
 cargo build --locked
@@ -405,7 +419,10 @@ python3 tools/test_web_browser.py --binary ./target/debug/agent-bridge
 ```
 
 No browser is downloaded by the harness, and its private brokers and browser contexts are
-disposable; do not point it at a running owner service or saved profile. Run it with a Python that has
+disposable; do not point it at a running owner service or saved profile. A separate script,
+`python3 tools/check_orca_tokens.py`, compares the Orca colours, typeface and sizes in the two Orca sheets
+with the stylesheet of an installed Orca application (read only; it exits 2 and checks nothing where Orca
+is not installed); it is not run in CI. Run the browser test with a Python that has
 Playwright and a matching Chromium already installed (for example a throwaway virtual environment). It
 launches Chromium with `--use-mock-keychain --password-store=basic`, so macOS shows no keychain
 prompt. The broker's agents are Claude sessions bound to private sockets, and a stand-in `claude`
