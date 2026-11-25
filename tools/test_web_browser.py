@@ -666,14 +666,15 @@ def run_orca_section(playwright, url_for, topic_id, report, out, choice, scheme)
                scheme: getComputedStyle(document.documentElement).colorScheme };
     }""")
     report.check(f"{tag} colours, header height and radius are Orca's", values == ORCA_VALUES[applied], str(values))
-    # Every agent colour, whichever the seeded agents happen to hash to: an avatar of each of the six, and a mention.
-    palette = page.evaluate("""() => {
+    # Every agent colour, whichever the seeded agents happen to hash to: an avatar and a name of each of the six.
+    before = page.evaluate(RENDERED_CONTRAST)["checked"]
+    page.evaluate("""() => {
       const box = document.createElement('div'); box.id = 'agent-colours-probe';
       box.innerHTML = [0, 1, 2, 3, 4, 5].map(i => `<div class="avatar agent-c${i}">A${i}</div><span class="author agent-c${i}">name${i}</span>`).join('');
-      document.querySelector('#workspace').append(box); return true; }""")
+      document.querySelector('#workspace').append(box); }""")
     probe = page.evaluate(RENDERED_CONTRAST)
     page.evaluate("document.getElementById('agent-colours-probe').remove()")
-    report.check(f"{tag} all six agent colours (avatars and names) meet 4.5:1", palette and probe["checked"] >= 12 and not [f for f in probe["fails"] if "avatar" in f or "author" in f], str(probe["fails"][:6]))
+    report.check(f"{tag} all six agent colours (avatars and names) meet 4.5:1", probe["checked"] - before == 12 and not probe["fails"], f"{probe['checked'] - before} measured, {probe['fails'][:6]}")
 
     # Every screen is styled by Orca and readable: nothing keeps another theme's colours.
     def screen(name, minimum=3):
@@ -1218,6 +1219,35 @@ def run_system_section(playwright, url_for, report):
     page.wait_for_timeout(300)
     report.check(f"{tag} a failed pick made while following the system goes back to Orca (system), still applied and saved", state(page) == ["orca-light", "orca-system", "orca-system"] and one_sheet(page, "orca-light") and page.evaluate("window.__changes") == ["sticker", "orca-system"], f"{state(page)} {page.evaluate('window.__changes')}")
     context.close()
+
+    # A failed load goes back to the last choice that is applied, also when that choice was made by picking the sheet already applied.
+    for label, start, picks, flip_fails in [("explicit Orca Light, then Orca (system), then the browser turns dark and Orca dark fails", "orca-light", ["orca-system"], "orca"),
+                                            ("Orca (system), then explicit Orca Light, then Sticker Bomb fails", "orca-system", ["orca-light", "sticker"], None)]:
+        tag = f"[system failed sheet after a pick of the applied sheet: {label}]"
+        context, page, requests = open_page("light", saved=start)
+        page.goto(f"{base}#access_token={token}")
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        failing = flip_fails or "sticker"
+        held = []
+        page.route(f"**/theme-{failing}.css", lambda route: held.append(route))
+        page.evaluate("window.__changes = []; document.addEventListener('themechange', e => window.__changes.push(e.detail))")
+        for pick in picks:
+            if pick != failing:
+                page.evaluate(f"AgentBridgeTheme.set({json.dumps(pick)})")
+        if flip_fails:
+            page.emulate_media(color_scheme="dark")
+        else:
+            page.evaluate(f"AgentBridgeTheme.set({json.dumps(failing)})")
+        for _ in range(100):
+            if held:
+                break
+            page.wait_for_timeout(100)
+        held[0].abort()
+        until(page, f"window.__changes.length === {len(picks) + 1}", 8000)  # every pick, then the revert
+        page.wait_for_timeout(300)
+        choice = "orca-system" if flip_fails else "orca-light"
+        report.check(f"{tag} the choice goes back to {choice}, with the sheet that was applied, saved as such", state(page) == ["orca-light", choice, choice] and one_sheet(page, "orca-light"), f"{state(page)} {page.evaluate('window.__changes')}")
+        context.close()
 
     # 5. The link: #theme=orca-system opens by the appearance, and the token still never leaves the page.
     for scheme, sheet in [("light", "orca-light"), ("dark", "orca")]:

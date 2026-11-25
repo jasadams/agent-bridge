@@ -60,7 +60,7 @@
   // Make `id` the applied sheet: load it before dropping the old one, so switching never flashes
   // unstyled content. A target that is already applied (or already loading) loads nothing.
   function show(id) {
-    if (id === applied) { pending?.remove(); pending = pendingId = null; return; }
+    if (id === applied) { pending?.remove(); pending = pendingId = null; settled = current; return; }
     if (id === pendingId) return;
     pending?.remove();
     const next = pending = sheet(id);
