@@ -710,6 +710,187 @@ def run_overlap_section(playwright, url_for, report):
     browser.close()
 
 
+def run_url_theme_section(playwright, url_for, report):
+    """AGB-68: the theme named in the address fragment. Every context is fresh (nothing saved) unless
+    a check says otherwise, and every request is recorded."""
+    base, _, link_fragment = url_for.partition("#")
+    token = dict(part.split("=", 1) for part in link_fragment.split("&"))["access_token"]
+    origin = base.rstrip("/")
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    problems = []
+
+    def open_page(saved=None):
+        # The broker allows 100 requests a second in all; a page load and its unlock use many, so pace the loads.
+        time.sleep(1.1)
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        page = context.new_page()
+        requests = []
+        page.on("request", lambda r: requests.append(r.url))
+        # Where a token could really travel: the URL, a Referer, or a body. (Authorization to the broker's own origin is how the page authenticates.)
+        page.token_seen = []
+        page.on("request", lambda r: page.token_seen.append(r.url) if token in (r.url + (r.headers.get("referer") or "") + (r.post_data or "")) else None)
+        page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
+        page.on("pageerror", lambda e: problems.append(str(e)))
+        if saved:
+            # Seed the saved theme only on the first document of this context, so later reloads show what the page itself stored.
+            page.add_init_script(f"try {{ if (!sessionStorage.getItem('seeded')) {{ sessionStorage.setItem('seeded', '1'); localStorage.setItem('agent-bridge-theme', '{saved}') }} }} catch (e) {{}}")
+        return context, page, requests
+
+    theme_fonts = {"classic": set(), "sticker": {"bricolage-var.woff2", "space-mono-400.woff2", "space-mono-700.woff2"}, "orca": {"geist-var.woff2"}}
+
+    def sheets_of(requests):
+        return [u.rsplit("/", 1)[1] for u in requests if "/theme-" in u]
+
+    def stored(page):
+        return page.evaluate("Object.fromEntries(Object.keys(localStorage).map(k => [k, localStorage.getItem(k)]))")
+
+    for theme in ["classic", "sticker", "orca"]:
+        tag = f"[url theme {theme}]"
+        # 1. plain loopback URL: the theme is applied by the first paint, and no other theme's sheet is ever requested
+        context, page, requests = open_page()
+        page.goto(f"{base}#theme={theme}")
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"{tag} the plain URL opens in the theme before any input", page.evaluate("document.documentElement.dataset.theme") == theme)
+        report.check(f"{tag} only that theme's sheet was requested", sheets_of(requests) == [f"theme-{theme}.css"], str(sheets_of(requests)))
+        report.check(f"{tag} the loaded sheet is the theme's and it is the only one", [s.rsplit("/", 1)[1] for s in page.evaluate("[...document.styleSheets].map(s => s.href || '').filter(h => h.includes('/theme-'))")] == [f"theme-{theme}.css"])
+        page.evaluate("document.fonts.ready.then(() => true)")
+        fonts = {u.rsplit("/", 1)[1] for u in requests if "/fonts/" in u}
+        report.check(f"{tag} only that theme's fonts were requested", fonts <= theme_fonts[theme] and (bool(fonts) or theme == "classic"), str(fonts))
+        report.check(f"{tag} the choice is remembered and nothing else is stored", stored(page) == {"agent-bridge-theme": theme}, str(stored(page)))
+        report.check(f"{tag} the theme is removed from the address", page.evaluate("location.hash") == "" and page.url == base, page.url)
+        report.check(f"{tag} the menu shows it as chosen", page.evaluate(f"document.querySelector('[data-theme-choice={theme}]').getAttribute('aria-checked')") == "true")
+        context.close()
+
+        # 2. the private access link with the theme in it: unlocks, applies it, and keeps the token out of everything
+        context, page, requests = open_page()
+        page.goto(f"{base}#theme={theme}&access_token={token}")
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        report.check(f"{tag} the access link with a theme unlocks the page in that theme", page.evaluate("document.documentElement.dataset.theme") == theme and page.locator("#workspace").is_visible())
+        report.check(f"{tag} neither the token nor the theme stays in the address", "access_token" not in page.url and token not in page.url and "theme" not in page.url, page.url)
+        report.check(f"{tag} only that theme's sheet was requested with the access link", sheets_of(requests) == [f"theme-{theme}.css"], str(sheets_of(requests)))
+        report.check(f"{tag} the token is not in browser storage", set(stored(page)) <= {"agent-bridge-theme", "agent-bridge-sidebar"} and token not in json.dumps(stored(page)), str(list(stored(page))))
+        report.check(f"{tag} the token is in no request URL, referer or body, and nothing left the page's origin", all(u.startswith(origin + "/") for u in requests) and not page.token_seen, str([u for u in requests if not u.startswith(origin + "/")]))
+        report.check(f"{tag} no cookie holds the token", token not in json.dumps(context.cookies()))
+        # 4. a menu choice afterwards is remembered, and a reload (the address no longer has the theme) keeps it
+        other = {"classic": "orca", "sticker": "classic", "orca": "sticker"}[theme]
+        page.click("#theme-button")
+        page.click(f"[data-theme-choice={other}]")
+        until(page, f"document.documentElement.dataset.theme === '{other}'", 8000)
+        report.check(f"{tag} choosing {other} from the menu is remembered", stored(page)["agent-bridge-theme"] == other)
+        page.reload()
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"{tag} a reload shows the menu choice, not the link's theme", page.evaluate("document.documentElement.dataset.theme") == other and sheets_of(requests)[-1] == f"theme-{other}.css")
+        # reopening a link that carries the theme selects it again (the documented rule)
+        page.goto("about:blank")  # a new load: a change of the fragment alone is not one
+        page.goto(f"{base}#theme={theme}")
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"{tag} reopening the link selects its theme again and remembers it", page.evaluate("document.documentElement.dataset.theme") == theme and stored(page)["agent-bridge-theme"] == theme)
+        context.close()
+
+    # 3. unknown, empty, repeated and wrongly cased values are ignored: the saved theme (or Classic) applies, nothing is stored
+    for label, fragment in [("unknown", "theme=nope"), ("empty", "theme="), ("repeated", "theme=orca&theme=sticker"),
+                            ("repeated same value", "theme=orca&theme=orca"), ("wrong case", "theme=ORCA"),
+                            ("path-like", "theme=../style"), ("malformed escape", "theme=%E0%A4%A")]:
+        tag = f"[url theme {label}]"
+        context, page, requests = open_page()
+        page.goto(f"{base}#{fragment}")
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"{tag} Classic applies and nothing is stored", page.evaluate("document.documentElement.dataset.theme") == "classic" and stored(page) == {}, str(stored(page)))
+        report.check(f"{tag} only the Classic sheet was requested", sheets_of(requests) == ["theme-classic.css"], str(sheets_of(requests)))
+        context.close()
+        context, page, requests = open_page(saved="sticker")
+        page.goto(f"{base}#{fragment}")
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"{tag} the saved theme applies and stays saved", page.evaluate("document.documentElement.dataset.theme") == "sticker" and stored(page) == {"agent-bridge-theme": "sticker"}, str(stored(page)))
+        report.check(f"{tag} only the saved theme's sheet was requested", sheets_of(requests) == ["theme-sticker.css"], str(sheets_of(requests)))
+        context.close()
+    # an unknown theme beside the access link still unlocks the page and still clears the token
+    context, page, requests = open_page()
+    page.goto(f"{base}#theme=nope&access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    report.check("[url theme unknown] the access link still unlocks, in Classic, with the token removed", page.evaluate("document.documentElement.dataset.theme") == "classic" and token not in page.url and stored(page) == {})
+    context.close()
+
+    # The access link with an ignored or odd theme part still unlocks and removes the token; theme.js neither mis-parses nor leaks it.
+    for label, fragment, expected in [("repeated theme", f"theme=orca&theme=sticker&access_token={token}", "classic"),
+                                      ("empty theme", f"theme=&access_token={token}", "classic"),
+                                      ("odd separators", f"theme=orca&&&access_token={token}&", "orca"),
+                                      ("percent-encoded theme", f"theme=%6Frca&access_token={token}", "orca"),
+                                      ("repeated access_token", f"theme=orca&access_token={token}&access_token=bad", "orca"),
+                                      ("access_token first", f"access_token={token}&theme=sticker", "sticker")]:
+        tag = f"[url theme {label}]"
+        context, page, requests = open_page()
+        page.goto(f"{base}#{fragment}")
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        applied = page.evaluate("document.documentElement.dataset.theme")
+        report.check(f"{tag} unlocks and the token is not in the address", token not in page.url and "access_token" not in page.url, page.url)
+        report.check(f"{tag} the theme is the one the rule gives", applied == expected, applied)
+        report.check(f"{tag} token not in storage, cookies or any request URL, nothing left the origin",
+                     token not in json.dumps(stored(page)) and token not in json.dumps(context.cookies())
+                     and all(u.startswith(origin + "/") for u in requests) and not page.token_seen, str([u for u in requests if not u.startswith(origin + "/")]))
+        context.close()
+    # A separator the page does not parse: the whole fragment reads as one unknown theme, which is ignored; theme.js adds no change or leak.
+    context, page, requests = open_page()
+    page.goto(f"{base}#theme=orca;access_token={token}")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    report.check("[url theme semicolon] an unparsed link is ignored: Classic, nothing stored, token in no request", page.evaluate("document.documentElement.dataset.theme") == "classic" and stored(page) == {} and not page.token_seen)
+    context.close()
+
+    # Hash routes are unaffected: a route opens, reloads and navigates as before; a theme link lands on the default board, as a reload does.
+    context, page, requests = open_page()
+    page.goto(f"{base}#theme=orca&access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "document.querySelectorAll('#sidebar .nav-item').length >= 6", 20000)
+    report.check("[url theme route] after the link is consumed the page is on a valid route (the default board, as after a reload)", page.evaluate("location.hash") in ("", "#/board/main") and page.locator("#boards-view").is_visible(), page.url)
+    page.click('#sidebar .nav-item[data-route="#/board/release-checklist"]')
+    page.wait_for_selector("#board-document table", timeout=15000)
+    report.check("[url theme route] navigating to a route works after a theme link", page.evaluate("location.hash") == "#/board/release-checklist" and page.evaluate("document.documentElement.dataset.theme") == "orca")
+    # pasting a theme fragment into the open page does not reload it: the theme does not change and the page stays usable
+    page.evaluate("location.hash = '#theme=sticker'")
+    until(page, "location.hash !== '#theme=sticker'", 8000)  # the page's own hashchange handler replaces it with the default route
+    until(page, "!!document.querySelector('#boards-view:not([hidden])')", 8000)
+    report.check("[url theme route] a theme fragment set on an open page leaves the theme and a usable workspace on the default board", page.evaluate("document.documentElement.dataset.theme") == "orca" and page.evaluate("location.hash") == "#/board/main" and page.locator("#workspace").is_visible() and page.locator("#sidebar .nav-item").count() >= 6, page.url)
+    context.close()
+    # A route and a theme in one fragment: only the theme part is removed; every other character stays as typed.
+    for typed, left, expected in [("/board/release-checklist&theme=orca", "#/board/release-checklist", "orca"),
+                                  ("theme=sticker&/board/release-checklist", "#/board/release-checklist", "sticker"),
+                                  ("/board/a&theme=orca&b", "#/board/a&b", "orca"),
+                                  ("/topic/a%20b%2Fc&theme=orca", "#/topic/a%20b%2Fc", "orca"),
+                                  ("/board/x%26y&theme=orca", "#/board/x%26y", "orca"),
+                                  ("/board/x&%74heme=orca", "#/board/x", "orca"),
+                                  ("/board/x&theme=%6Frca&", "#/board/x&", "orca"),
+                                  ("/board/x&&theme=orca&&", "#/board/x&&&", "orca"),
+                                  ("theme=orca&?theme=sticker", "#&?theme=sticker", "orca"),
+                                  ("theme=orca&?access_token=not-a-token", "#&?access_token=not-a-token", "orca"),
+                                  ("?access_token=x&theme=orca", "", "orca"),
+                                  ("theme=orca", "", "orca")]:
+        context, page, requests = open_page()
+        page.goto(f"{base}#{typed}")
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"[url theme route+theme {typed}] the address keeps every other character as typed, without the theme", page.evaluate("location.hash") == left, page.url)
+        report.check(f"[url theme route+theme {typed}] the theme applies and is remembered", page.evaluate("document.documentElement.dataset.theme") == expected and stored(page) == {"agent-bridge-theme": expected})
+        context.close()
+    context, page, requests = open_page()
+    page.goto(f"{base}#/board/release-checklist")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    report.check("[url theme route] a route fragment without a theme is untouched", page.evaluate("location.hash") == "#/board/release-checklist" and stored(page) == {})
+    context.close()
+
+    # Storage that throws: the theme still applies to the page, with no error
+    context, page, requests = open_page()
+    page.add_init_script("Object.defineProperty(window, 'localStorage', { get() { throw new Error('blocked') } })")
+    page.goto(f"{base}#theme=orca")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    report.check("[url theme storage] with storage unavailable the theme still applies for the page", page.evaluate("document.documentElement.dataset.theme") == "orca" and sheets_of(requests) == ["theme-orca.css"])
+    context.close()
+
+    csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
+    report.check("[url theme] no Content-Security-Policy violations", not csp, str(csp[:3]))
+    other_errors = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p]
+    report.check("[url theme] no console or page errors", not other_errors, str(other_errors[:5]))
+    browser.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
@@ -736,6 +917,7 @@ def main():
         credentials = broker.rpc("monitor_enable", port=0)
         themes = ["classic", "sticker", "orca"] if args.theme == "all" else [args.theme]
         with sync_playwright() as playwright:
+            run_url_theme_section(playwright, credentials["access_url"], report)
             if "orca" in themes:
                 run_orca_section(playwright, credentials["access_url"], topic_id, report, out)
             run_overlap_section(playwright, credentials["access_url"], report)
