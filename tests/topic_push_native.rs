@@ -54,6 +54,7 @@ async fn opt_in_topic_push_uses_guarded_native_adapter_and_untrusted_context() {
         .request(Request::ClaudeBind {
             session: session.clone(),
             endpoint: socket.to_string_lossy().into_owned(),
+            orca_session: None,
         })
         .unwrap();
     let server = tokio::spawn(broker::serve(bound));
@@ -137,8 +138,21 @@ async fn opt_in_topic_push_uses_guarded_native_adapter_and_untrusted_context() {
     let _ = server.await;
 }
 
+/// A socket file left behind with nothing listening, as after a killed process.
 #[tokio::test]
 async fn stale_enabled_socket_failure_records_one_durable_gap() {
+    offline_socket_records_one_durable_gap(false).await;
+}
+
+/// A socket file that is gone, as after a clean stop. Topic notifications are never held for an
+/// offline session (they would arrive stale): this fails definitely, exactly as a refusing
+/// socket does, and the subscriber catches up from history.
+#[tokio::test]
+async fn gone_socket_failure_records_one_durable_gap_and_is_not_held() {
+    offline_socket_records_one_durable_gap(true).await;
+}
+
+async fn offline_socket_records_one_durable_gap(remove_socket_file: bool) {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = root.path().join("offline.sock");
@@ -160,9 +174,13 @@ async fn stale_enabled_socket_failure_records_one_durable_gap() {
         .request(Request::ClaudeBind {
             session: session.clone(),
             endpoint: socket.to_string_lossy().into_owned(),
+            orca_session: None,
         })
         .unwrap();
     drop(listener); // Registration stays enabled; the socket now refuses connections.
+    if remove_socket_file {
+        std::fs::remove_file(&socket).unwrap();
+    }
     let server = tokio::spawn(broker::serve(bound));
     let created = broker
         .request(Request::TopicCreate {

@@ -609,16 +609,26 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn claude_bind(&self, session: &str, endpoint: &str) -> Result<()> {
+    pub fn claude_bind(
+        &self,
+        session: &str,
+        endpoint: &str,
+        orca_session: Option<&str>,
+    ) -> Result<()> {
         crate::clients::validate_session(&Provider::Claude, session)?;
         let normalized = crate::clients::claude::validate_socket(Path::new(endpoint))?
             .to_string_lossy()
             .into_owned();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO claude_bindings(session,endpoint) VALUES(?,?)
-             ON CONFLICT(session) DO UPDATE SET endpoint=excluded.endpoint,orca_session=NULL,orca_cli=NULL",
-            params![session, normalized],
+            "INSERT INTO claude_bindings(session,endpoint,orca_session) VALUES(?1,?2,?3)
+             ON CONFLICT(session) DO UPDATE SET endpoint=excluded.endpoint,orca_session=excluded.orca_session",
+            // Only a well-formed Orca ID is kept; anything else means "not in Orca".
+            params![
+                session,
+                normalized,
+                orca_session.filter(|id| crate::orca_wake::valid_session(id))
+            ],
         )?;
         // The session is back: whatever was held as offline is an ordinary queued message again,
         // and is claimed now rather than after the retry backoff.
@@ -634,39 +644,17 @@ impl Db {
         Ok(())
     }
 
-    /// Record where this session runs in Orca. Follows `claude_bind`, which clears it, so it
-    /// always describes the session's latest start.
-    pub fn claude_orca_bind(
-        &self,
-        session: &str,
-        orca_session: &str,
-        orca_cli: &str,
-    ) -> Result<()> {
-        crate::orca_wake::validate(orca_session, orca_cli)?;
-        let changed = self.conn.execute(
-            "UPDATE claude_bindings SET orca_session=?2,orca_cli=?3 WHERE session=?1",
-            params![session, orca_session, orca_cli],
-        )?;
-        ensure!(changed == 1, "Claude session has no binding");
-        Ok(())
-    }
-
-    /// The Orca chat and `orca` command recorded for a bound Claude session, if any.
-    pub(crate) fn claude_orca(&self, session: &str) -> Result<Option<(String, String)>> {
+    /// The Orca chat recorded for a bound Claude session, if it runs in one.
+    pub(crate) fn claude_orca(&self, session: &str) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT orca_session,orca_cli FROM claude_bindings WHERE session=?",
+                "SELECT orca_session FROM claude_bindings WHERE session=?",
                 [session],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
-                },
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
-            .and_then(|(session, cli)| Some((session?, cli?))))
+            .flatten())
     }
 
     /// Add the outcome of a wake to a message still held as offline.
@@ -711,7 +699,8 @@ impl Db {
         // Topic notifications and controls do not come through here.
         if destination.provider == Provider::Claude
             && !destination.endpoint.is_empty()
-            && crate::clients::claude::socket_gone(&destination.endpoint)
+            && (crate::clients::claude::socket_gone(&destination.endpoint)
+                || self.held_ahead(id, &destination.session)?)
         {
             self.conn.execute(
                 "UPDATE messages SET detail=?1 WHERE id=?2 AND state='queued'",
@@ -1125,6 +1114,11 @@ impl Db {
             } else if provider == Provider::Claude {
                 let holds = self.holds_when_offline(&id)?;
                 if holds && offline_sessions.contains(&session) {
+                    // Waiting behind an earlier held message: say so.
+                    self.conn.execute(
+                        "UPDATE messages SET detail=?1 WHERE id=?2 AND state='queued' AND detail IS NULL",
+                        params![crate::clients::claude::OFFLINE_DETAIL, id],
+                    )?;
                     continue;
                 }
                 endpoint = self.binding_endpoint(&provider, &session)?;
@@ -1229,6 +1223,16 @@ impl Db {
             && !previous
                 .as_deref()
                 .is_some_and(|detail| detail.starts_with(crate::clients::claude::OFFLINE_PREFIX)))
+    }
+
+    /// Another message for this session is already held as offline, so this one waits behind it
+    /// too, whatever state the socket file is in.
+    fn held_ahead(&self, id: &str, session: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE recipient_session=?1 AND id<>?2 AND state='queued' AND detail LIKE ?3)",
+            params![session, id, crate::clients::claude::OFFLINE_LIKE],
+            |row| row.get(0),
+        )?)
     }
 
     /// Only an ordinary message is held for an offline Claude session. Topic notifications and

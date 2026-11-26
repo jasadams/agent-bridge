@@ -310,7 +310,7 @@ fn version_twenty_one_drops_only_the_removed_registration_table_by_prefix() {
         .unwrap();
 }
 
-/// AGB-72: the previous schema (v21, no Orca columns on the Claude bindings) migrates with the
+/// AGB-72: the previous schema (v21, no Orca column on the Claude bindings) migrates with the
 /// stored messages and bindings intact, and the new columns start empty.
 #[test]
 fn version_twenty_one_database_gains_the_orca_columns_without_losing_data() {
@@ -324,7 +324,6 @@ fn version_twenty_one_database_gains_the_orca_columns_without_losing_data() {
          INSERT INTO messages VALUES('held-id','user','claude-{session}','{session}','hello',NULL,0,'queued','offline: kept',10,10);
          INSERT INTO message_context(id,source,destination) VALUES('held-id','{{}}','{{\"provider\":\"claude\"}}');
          ALTER TABLE claude_bindings DROP COLUMN orca_session;
-         ALTER TABLE claude_bindings DROP COLUMN orca_cli;
          PRAGMA user_version=21;"
     ))
     .unwrap();
@@ -339,14 +338,14 @@ fn version_twenty_one_database_gains_the_orca_columns_without_losing_data() {
     drop(db);
     let conn = Connection::open(&path).unwrap();
     assert_eq!(user_version(&conn), SCHEMA_VERSION);
-    let row: (String, Option<String>, Option<String>) = conn
+    let row: (String, Option<String>) = conn
         .query_row(
-            "SELECT endpoint,orca_session,orca_cli FROM claude_bindings WHERE session=?",
+            "SELECT endpoint,orca_session FROM claude_bindings WHERE session=?",
             [session],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(row, ("/tmp/old.sock".into(), None, None));
+    assert_eq!(row, ("/tmp/old.sock".into(), None));
 }
 
 /// A binary older than this schema refuses the newer database instead of misreading it.

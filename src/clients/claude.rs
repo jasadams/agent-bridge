@@ -58,6 +58,13 @@ pub const OFFLINE_PREFIX: &str = "offline:";
 /// The same as an SQL `LIKE` pattern, bound as a parameter.
 pub const OFFLINE_LIKE: &str = "offline:%";
 
+/// Why a send to a Claude session with no binding is refused.
+pub fn not_registered(name: &str) -> String {
+    format!(
+        "Recipient {name} is not registered: it has no Agent Bridge binding, either because it never started with the hooks installed or because it ended; start or resume the session"
+    )
+}
+
 /// The bound socket file no longer exists: the session's process stopped or restarted. This
 /// only inspects the file, so it never reaches the session as a connection.
 pub fn socket_gone(endpoint: &str) -> bool {

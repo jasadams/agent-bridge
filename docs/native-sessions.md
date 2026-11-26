@@ -69,24 +69,40 @@ messages are delivered to that session only, once each, in send order, with the 
 states and retry rules. A partial write stays Unknown, as before. Messages are held
 without expiry, and they count toward the shared 1000-message queue limit.
 
+Topic notifications and event controls are not held for an offline session: they would
+arrive long after they matter. They still fail definitely, as before, and a topic
+subscriber catches up by reading the topic history. Messages already queued when a session
+ends cleanly stay pending, without expiry, until it is resumed. The same holds for a board
+message input: a Claude input is guarded by the session ID, not by a socket path, and is
+refused when the session has no binding.
+
 **Waking an Orca chat.** A suspended chat would otherwise only receive its held messages
-when someone types in it. When the start hook runs inside Orca it also records the
-session's Orca ID and the `orca` command Orca exported (`ORCA_AGENT_SESSION_ID`,
-`ORCA_CLI_COMMAND`; the command must be the absolute path of a file named `orca`). When a
-message is held for a session with a recorded Orca ID, and the sender is itself a bound
-Claude session running in Orca, the broker runs `orca orchestration send --from <sender's
-Orca ID> --to <recipient's Orca ID>` once per outage (10 s limit, off the database lock;
-the next send retries only if the call failed). The note is fixed text, "Your Agent Bridge
-inbox has a message waiting...", with no message content and nothing the sender wrote: the
-real message still arrives through the bridge with its usual banner. The outcome is added to
-the message detail: `offline: queued until the recipient session reconnects; wake
-requested`, `...; wake failed: <reason>`, or `...; cannot wake: <reason>`. Only the first
-message of an outage carries the wake outcome. A wake needs both ends in Orca, so a message
-from an OpenCode, Codex or plain CLI sender, or from a board message input, is held but cannot
-wake the recipient today; the recipient receives it when it next starts. The wake costs one
-model turn in the woken chat. Recording the Orca ID adds two nullable columns to
-`claude_bindings` (schema version 22); a binary older than this version refuses the newer
-database, so rolling back needs the backup the update makes.
+when someone types in it. When the start hook runs inside Orca, it reports the session's
+Orca ID (`ORCA_AGENT_SESSION_ID`) in the same bind request, and the broker keeps it if it is
+a UUID. When a message is held for a session with a recorded Orca ID, and the sender is
+itself a bound Claude session running in Orca, the broker runs the installed Orca CLI,
+`/Applications/Orca.app/Contents/Resources/bin/orca orchestration send --from <sender's
+Orca ID> --to <recipient's Orca ID>`, once per outage (10 s limit, whole process group
+ended on timeout, off the database lock; the next send retries only if the call failed).
+That fixed location is the only supported one: nothing a session reports is ever run, and
+the command gets only `HOME` and a fixed `PATH` in the root directory. If the file is not
+there, the detail says `cannot wake: Orca CLI not found`. The note is fixed text, "Your
+Agent Bridge inbox has a message waiting...", with no message content and nothing the sender
+wrote: the real message still arrives through the bridge with its usual banner. Every held
+message shows `offline: queued until the recipient session reconnects`; the message that
+made the attempt adds `; wake requested` or `; wake failed: <reason>`, and a message for
+which no attempt could be made adds `; cannot wake: <reason>` (that never uses up the
+outage's one attempt). A wake needs both ends in Orca, so a message from an OpenCode, Codex
+or plain CLI sender, or from a board message input, is held but cannot wake the recipient
+today; the recipient receives it when it next starts. The wake costs one model turn in the
+woken chat. Recording the Orca ID adds one nullable column to `claude_bindings` (schema
+version 22); a binary older than this version refuses the newer database, so rolling back
+needs the backup the update makes.
+
+Trust: any process running as the same user can already forge a session's registration. With
+the Orca ID recorded, such a process can also point a wake at another Orca chat or cause
+repeated wakes, each costing one model turn in the woken chat. That is the same trust level
+as before; the note it can cause is fixed text and it cannot run anything.
 
 A send is refused without being stored (`persisted: false`) when the session has no
 binding: it never started with the hooks installed, or it ended cleanly (the end hook

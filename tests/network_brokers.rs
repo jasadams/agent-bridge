@@ -202,6 +202,7 @@ async fn two_brokers_deliver_once_to_native_socket_and_sync_delivery_and_reply()
     bob.request(Request::ClaudeBind {
         session: reviewer_session.clone(),
         endpoint: native_path.to_string_lossy().into_owned(),
+        orca_session: None,
     });
     alice.request(Request::Register {
         name: "reviewer".into(),

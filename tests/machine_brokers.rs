@@ -160,6 +160,7 @@ async fn authenticated_machine_names_survive_renaming_with_pinned_queued_deliver
     bob.request(Request::ClaudeBind {
         session: session.clone(),
         endpoint: socket_path.to_string_lossy().into_owned(),
+        orca_session: None,
     });
     alice.request(Request::Register {
         name: "reviewer".into(),

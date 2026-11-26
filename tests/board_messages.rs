@@ -272,6 +272,7 @@ async fn composer_uses_actual_native_claude_delivery_and_a_gone_socket_holds_the
         .request(Request::ClaudeBind {
             session: owner.session.clone(),
             endpoint: owner.endpoint.clone(),
+            orca_session: None,
         })
         .unwrap();
     let snapshot = add(&broker, &Name::default(), &owner.name, "compose");

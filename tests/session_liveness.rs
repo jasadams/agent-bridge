@@ -28,6 +28,7 @@ async fn claude_binding_start_end_and_replacement_are_exact_endpoint_fenced() {
         .request(Request::ClaudeBind {
             session: session.clone(),
             endpoint: first.to_string_lossy().into_owned(),
+            orca_session: None,
         })
         .unwrap();
     bound
@@ -35,6 +36,7 @@ async fn claude_binding_start_end_and_replacement_are_exact_endpoint_fenced() {
         .request(Request::ClaudeBind {
             session: session.clone(),
             endpoint: replacement.to_string_lossy().into_owned(),
+            orca_session: None,
         })
         .unwrap();
     // A delayed SessionEnd for the old socket cannot remove the replacement.

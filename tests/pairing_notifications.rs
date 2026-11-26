@@ -138,6 +138,7 @@ impl Native {
         broker.request(Request::ClaudeBind {
             session: agent.session.clone(),
             endpoint: agent.endpoint.clone(),
+            orca_session: None,
         });
         let (sender, frames) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {

@@ -4624,6 +4624,7 @@ mod tests {
             .request(Request::ClaudeBind {
                 session,
                 endpoint: socket_path.to_string_lossy().into_owned(),
+                orca_session: None,
             })
             .unwrap();
         let (captured, mut received) = mpsc::channel(8);

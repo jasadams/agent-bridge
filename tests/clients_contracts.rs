@@ -88,6 +88,7 @@ async fn claude_binding_accepts_only_private_owned_sockets_and_unbinds_exact_end
                 &Request::ClaudeBind {
                     session: SESSION.into(),
                     endpoint: bad.into(),
+                    orca_session: None,
                 }
             )
             .await
@@ -101,6 +102,7 @@ async fn claude_binding_accepts_only_private_owned_sockets_and_unbinds_exact_end
             &Request::ClaudeBind {
                 session: SESSION.into(),
                 endpoint: endpoint.into(),
+                orca_session: None,
             }
         )
         .await
@@ -114,6 +116,7 @@ async fn claude_binding_accepts_only_private_owned_sockets_and_unbinds_exact_end
             &Request::ClaudeBind {
                 session: "bad-session".into(),
                 endpoint: endpoint.into(),
+                orca_session: None,
             }
         )
         .await
@@ -125,6 +128,7 @@ async fn claude_binding_accepts_only_private_owned_sockets_and_unbinds_exact_end
         &Request::ClaudeBind {
             session: SESSION.into(),
             endpoint: endpoint.into(),
+            orca_session: None,
         },
     )
     .await
@@ -137,6 +141,7 @@ async fn claude_binding_accepts_only_private_owned_sockets_and_unbinds_exact_end
         &Request::ClaudeBind {
             session: SESSION.into(),
             endpoint: replacement.to_str().unwrap().into(),
+            orca_session: None,
         },
     )
     .await

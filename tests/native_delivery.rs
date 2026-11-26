@@ -48,6 +48,7 @@ async fn claude_socket_only_history_allows_65_sends_without_receipts_or_status_p
         &Request::ClaudeBind {
             session,
             endpoint: socket.to_string_lossy().into_owned(),
+            orca_session: None,
         },
     )
     .await
@@ -159,6 +160,7 @@ async fn real_broker_routes_native_claude_frame_and_accepts_correlated_reply() {
         &Request::ClaudeBind {
             session: session.clone(),
             endpoint: socket.to_string_lossy().into_owned(),
+            orca_session: None,
         },
     )
     .await

@@ -526,7 +526,9 @@ suspended or restarted keeps receiving messages, and a message sent while it is 
 is held as described in [native sessions](native-sessions.md). Composers written
 before this change carry the socket path they were created with in `endpoint`; it is
 ignored, so they work again without editing the board. A composer whose session no
-longer matches the agent's current session is refused.
+longer matches the agent's current session is refused, and so is one for a Claude session
+that has no binding (never started with the hooks, or ended): for Claude, the composer is
+guarded by the session ID, not by the socket path.
 
 The CLI equivalent is:
 

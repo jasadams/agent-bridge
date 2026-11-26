@@ -364,18 +364,14 @@ DROP TABLE IF EXISTS remote_agents;",
     }
     if version < 22 {
         // Where a Claude session runs in Orca, recorded by its start hook so a message held for
-        // it can wake the chat. Both stay NULL for existing rows and for sessions outside Orca.
-        for column in ["orca_session", "orca_cli"] {
-            let present: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('claude_bindings') WHERE name=?)",
-                [column],
-                |row| row.get(0),
-            )?;
-            if !present {
-                tx.execute_batch(&format!(
-                    "ALTER TABLE claude_bindings ADD COLUMN {column} TEXT;"
-                ))?;
-            }
+        // it can wake the chat. NULL for existing rows and for sessions outside Orca.
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('claude_bindings') WHERE name='orca_session')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !present {
+            tx.execute_batch("ALTER TABLE claude_bindings ADD COLUMN orca_session TEXT;")?;
         }
         tx.pragma_update(None, "user_version", 22)?;
     }
