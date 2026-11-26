@@ -658,6 +658,17 @@ impl Db {
         hops: u32,
     ) -> Result<Message> {
         insert_message_in(&self.conn, id, source, destination, body, parent, hops)?;
+        // A Claude session whose bound socket is gone keeps an ordinary message queued; say so.
+        // Topic notifications and controls do not come through here.
+        if destination.provider == Provider::Claude
+            && !destination.endpoint.is_empty()
+            && crate::clients::claude::socket_gone(&destination.endpoint)
+        {
+            self.conn.execute(
+                "UPDATE messages SET detail=?1 WHERE id=?2 AND state='queued'",
+                params![crate::clients::claude::OFFLINE_DETAIL, id],
+            )?;
+        }
         self.get(id)
     }
 
@@ -1082,6 +1093,7 @@ impl Db {
                     |row| row.get(0),
                 )?;
                 if !endpoint.is_empty()
+                    && self.holds_when_offline(&id)?
                     && (crate::clients::claude::socket_gone(&endpoint) || backing_off)
                 {
                     self.conn.execute(
@@ -1111,16 +1123,33 @@ impl Db {
     pub fn finish(&self, id: &str, state: &str, detail: &str) -> Result<()> {
         // Only the worker that still owns an in-flight delivery can finish it. An offline
         // recipient is not an outcome: nothing was written, so the message goes back to the queue.
-        let (state, detail) = if state == "offline" {
-            ("queued", crate::clients::claude::OFFLINE_DETAIL)
-        } else {
-            (state, detail)
+        let (state, detail) = match state {
+            "offline" if self.holds_when_offline(id)? => {
+                ("queued", crate::clients::claude::OFFLINE_DETAIL)
+            }
+            // Notifications and controls keep their existing rule: a definite failure, which a
+            // topic subscriber answers by reading history.
+            "offline" => ("failed", detail),
+            _ => (state, detail),
         };
         self.conn.execute(
             "UPDATE messages SET state=?,detail=?,updated=? WHERE id=? AND state='sending'",
             params![state, detail, now(), id],
         )?;
         Ok(())
+    }
+
+    /// Only an ordinary message is held for an offline Claude session. Topic notifications and
+    /// event controls are best-effort and fail definitely, as they always have.
+    fn holds_when_offline(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM topic_push_work WHERE message_id=?1)
+                AND NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=?1
+                    AND (json_extract(c.destination,'$.control_notice')=1
+                         OR json_extract(c.destination,'$.event_control') IS NOT NULL))",
+            [id],
+            |row| row.get(0),
+        )?)
     }
 
     /// A local message the claim loop can take now. Keep in step with the candidate
@@ -1322,13 +1351,8 @@ pub(crate) fn insert_message_in(
             None => conn.execute(sql, values)?,
         })
     };
-    // A Claude session whose bound socket is gone keeps its messages queued; say so.
-    let detail = (destination.provider == Provider::Claude
-        && !destination.endpoint.is_empty()
-        && crate::clients::claude::socket_gone(&destination.endpoint))
-    .then_some(crate::clients::claude::OFFLINE_DETAIL);
     exec(
-        "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',?9,?8,?8)",
+        "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,'queued',NULL,?8,?8)",
         &[
             &id,
             &source.name,
@@ -1338,7 +1362,6 @@ pub(crate) fn insert_message_in(
             parent,
             &hops,
             &t,
-            &detail,
         ],
     )?;
     let source_json = serde_json::to_string(&snapshot(source))?;
