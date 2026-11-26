@@ -1029,6 +1029,25 @@ impl View {
         }
         self.update(result)
     }
+    /// A broker read with its owner labels. The labels belong to that read: a read for another board or an
+    /// older generation (a board switch with a read in flight) is dropped whole, labels included.
+    fn read_with_labels(
+        &mut self,
+        board: &Name,
+        generation: u64,
+        result: Result<(Snapshot, crate::board_messages::DisplayLabels)>,
+    ) -> bool {
+        let mut changed = false;
+        let current = &self.board == board && self.generation == generation;
+        let result = result.map(|(snapshot, labels)| {
+            if current && self.message_labels != labels {
+                self.message_labels = labels;
+                changed = true;
+            }
+            snapshot
+        });
+        changed | self.read_result(board, generation, result)
+    }
     fn update_release_notice(&mut self, notice: Option<String>) -> bool {
         let changed = self.update_notice != notice;
         self.update_notice = notice;
@@ -2674,13 +2693,9 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     }
                     Update::Read(board, generation, result, notice) => {
                         dirty |= view.update_release_notice(notice);
-                        let result = result.map(|(snapshot, labels)| {
-                            if view.message_labels != labels { view.message_labels = labels; dirty = true; }
-                            snapshot
-                        });
-                        dirty |= view.read_result(&board, generation, result);
+                        dirty |= view.read_with_labels(&board, generation, result);
                     },
-                    Update::Saved(save, result) => { view.saved(save, result); dirty = true; },
+                    Update::Saved(save, result) => { view.saved(save, result); let _ = refresh.try_send(()); dirty = true; },
                     Update::Message(request, result) => { view.message_result(request, result); dirty = true; },
                 }
             }
@@ -3140,6 +3155,35 @@ mod tests {
         terminal.draw(|frame| view.draw(frame)).unwrap();
         assert!(buffer_text(&terminal).contains("Claude 9f3c"));
         assert!(!buffer_text(&terminal).contains("alpha"));
+    }
+    #[test]
+    fn a_stale_read_never_replaces_the_current_boards_labels() {
+        let mut view = message_view();
+        let labels = view.message_labels.clone();
+        assert!(!labels.is_empty());
+        let stale = snapshot(&message_field("coordinator", "alpha"), &"b".repeat(64));
+        let generation = view.generation;
+        let board = view.board.clone();
+        // A read for another generation (board switch in flight) carries other labels.
+        view.read_with_labels(
+            &board,
+            generation.wrapping_add(1),
+            Ok((
+                stale,
+                [("other-scope".to_owned(), "Elsewhere".to_owned())].into(),
+            )),
+        );
+        assert_eq!(view.message_labels, labels);
+        let other: Name = "other".parse().unwrap();
+        view.read_with_labels(
+            &other,
+            generation,
+            Ok((
+                snapshot("", &"c".repeat(64)),
+                [("x".to_owned(), "Elsewhere".to_owned())].into(),
+            )),
+        );
+        assert_eq!(view.message_labels, labels);
     }
     fn message_view() -> View {
         let mut view = View::default();
