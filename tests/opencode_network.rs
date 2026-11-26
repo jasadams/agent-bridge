@@ -39,7 +39,7 @@ fn read_native_frame(stream: &UnixStream) -> Value {
     });
     let line = receiver
         .recv_timeout(Duration::from_secs(5))
-        .expect("native frame within 5 seconds")
+        .expect("native frame within 5 seconds, or the reader thread died")
         .unwrap();
     serde_json::from_str(&line).unwrap()
 }
@@ -64,10 +64,28 @@ fn native_fixture_reads_delayed_frames_and_frames_from_closed_peers() {
     writeln!(closed, "{{\"op\":\"probe\",\"session\":\"{A}\"}}").unwrap();
     drop(closed);
     let (reader, _) = listener.accept().unwrap();
+    let mut reader = reader;
     assert_eq!(
         read_native_frame(&reader),
         json!({"op":"probe", "session":A})
     );
+    // The receipt for that closed peer finds nobody to read it.
+    reply(&mut reader, &json!({"ok":true}));
+}
+
+// The frame is already recorded when the receipt is written. A broker that
+// timed out or was stopped has closed its end, so the write may find the peer
+// gone; that is the only error accepted. Any other write error still panics.
+fn reply(stream: &mut UnixStream, receipt: &Value) {
+    if let Err(error) = writeln!(stream, "{receipt}") {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ),
+            "native receipt write: {error}"
+        );
+    }
 }
 
 struct Native {
@@ -111,7 +129,7 @@ impl Native {
                         receipt["sessions"] = json!([row]);
                         receipt["next_cursor"] = Value::Null;
                     }
-                    writeln!(stream, "{receipt}").unwrap();
+                    reply(&mut stream, &receipt);
                     continue;
                 }
                 if frame["op"] == "deliver" {
@@ -139,7 +157,7 @@ impl Native {
                         receipt["status"] = json!("uncertain");
                     }
                 }
-                writeln!(stream, "{receipt}").unwrap();
+                reply(&mut stream, &receipt);
             }
         });
         Self {
@@ -169,10 +187,9 @@ impl Drop for Native {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let worker = self.worker.take().unwrap();
-        // A finished worker (it panicked) has dropped its listener; join reports it.
-        if !worker.is_finished() {
-            UnixStream::connect(&self.path).expect("wake native accept");
-        }
+        // The connect only wakes a blocking accept. If it fails the worker has
+        // already dropped its listener (it panicked), and join reports that.
+        let _ = UnixStream::connect(&self.path);
         worker.join().unwrap();
     }
 }
