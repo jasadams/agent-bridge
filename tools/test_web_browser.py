@@ -613,12 +613,16 @@ def access_link_shapes(token):
         ("comma separator", f"theme=orca,access_token={t}", False),
         ("slash separator", f"/board/main/access_token={t}", False),
         ("space separator", f"theme=orca%20access_token={t}", False),
+        ("board name containing the text", "/board/access_token_rotation", False),
         ("token after a slash in a route", f"/board/main/access_token/{t}", False),
         ("token after a colon in a route", f"/topic/x:access_token:{t}", False),
         ("encoded route with the token appended", f"%2Fboard%2Faccess_token_{t}", False),
         ("board id with the token appended", f"/board/access_token_{t}", False),
         ("topic id with the token appended", f"/topic/access_token-{t}", False),
         ("dm id with the token appended", f"/dm/access_token.{t}", False),
+        ("triple-encoded key", f"access_t%25256Fken={t}", False),
+        ("a second hash sign", f"x=1#access_token={t}", False),
+        ("encoded nine times", f"{'%25' * 8}61ccess_token={t}", False),
         ("token with a trailing escape", f"access_token={t}%", False),
         ("token too short", "access_token=x", False),
         ("empty token", "access_token=", False),
@@ -652,6 +656,8 @@ def run_access_link_section(playwright, url_for, report):
         else:
             page.wait_for_selector("#login:not([hidden])", timeout=8000)
             time.sleep(.5)  # a late unlock must not happen
+            if label != "repeated key, bad one first":  # that one tries the login and is refused, as on main
+                report.check(f"{tag} the page makes no API request (it never tries to unlock)", not any("/api/" in u for u in requests), str([u.split("?")[0] for u in requests if "/api/" in u]))
         shown_workspace = page.locator("#workspace").is_visible()
         shown_login = page.locator("#login").is_visible()
         report.check(f"{tag} {'unlocks' if unlocks else 'stays locked on the login screen'}", shown_workspace == unlocks and shown_login != unlocks, f"workspace={shown_workspace} login={shown_login}")
@@ -681,6 +687,14 @@ def run_access_link_section(playwright, url_for, report):
         until(page, "location.hash === '#/board/main'", 8000)
         report.check(f"{tag} the address is back to the current route, with no access_token", "access_token" not in page.url.lower() and token not in page.url and page.evaluate("location.hash") == "#/board/main", page.url.replace(token, "<token>"))
         report.check(f"{tag} the open session is kept", page.locator("#workspace").is_visible() and page.locator("#login").is_hidden())
+    # Back and Forward onto a history entry that names the text are cleared too (documented): the open session stays on the current board.
+    page.evaluate("history.pushState(null, '', '#/board/access_token_rotation')")
+    page.go_back()
+    until(page, "location.hash === '#/board/main'", 8000)
+    page.go_forward()
+    until(page, "location.hash === '#/board/main'", 8000)
+    time.sleep(.3)
+    report.check("[access link history] Forward onto an entry naming access_token is cleared and the open session stays on the current board", page.evaluate("location.hash") == "#/board/main" and "access_token" not in page.url and page.locator("#workspace").is_visible())
     context.close()
     # The same shapes pasted into a locked page: cleared, still locked.
     context = browser.new_context(viewport={"width": 1440, "height": 900})
@@ -703,22 +717,31 @@ def run_access_link_section(playwright, url_for, report):
     page.wait_for_selector("#login:not([hidden])", timeout=8000)
     report.check("[access link] a route without a token is untouched", page.evaluate("location.hash") == "#/board/release-checklist")
     context.close()
-    # A board or topic id may contain the text `access_token`: such a plain route is not an access link and is left alone.
-    for route in ["#/board/access_token_rotation", "#/topic/access_token.notes", "#/board/access_token", "#/dm/claude-access_token_y"]:
-        time.sleep(1.1)  # the broker allows 100 requests a second in all
-        context = browser.new_context(viewport={"width": 1440, "height": 900})
-        page = context.new_page()
-        page.goto(f"{base}{route}")
-        page.wait_for_selector("#login:not([hidden])", timeout=8000)
-        report.check(f"[access link route {route}] a plain route naming access_token is untouched on load", page.evaluate("location.hash") == route, page.url)
-        page.reload()
-        page.wait_for_selector("#login:not([hidden])", timeout=8000)
-        report.check(f"[access link route {route}] and after a reload", page.evaluate("location.hash") == route, page.url)
-        page.evaluate("location.hash = '#/board/other'")
-        page.evaluate("fragment => { location.hash = fragment }", route)
-        time.sleep(.5)  # the page's hashchange handler has run by now
-        report.check(f"[access link route {route}] and when pasted into the page", page.evaluate("location.hash") == route, page.url)
-        context.close()
+    # A very long, repeatedly encoded fragment must not hang the page: it is cleared promptly.
+    time.sleep(1.1)
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    started = time.monotonic()
+    page.goto(f"{base}#%{'25' * 90000}61")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    until(page, "location.hash === ''", 8000)
+    elapsed = time.monotonic() - started
+    report.check("[access link long encoding] a 180 KB, deeply nested encoding is cleared within two seconds of loading", elapsed < 2 and page.locator("#workspace").is_hidden(), f"{elapsed:.1f}s")
+    context.close()
+    # No exception: a board whose own name contains the text cannot be opened by a link. The fragment is
+    # cleared, nothing opens, and after unlocking by hand the page opens the default board.
+    time.sleep(1.1)
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    page.goto(f"{base}#/board/access_token_rotation")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    report.check("[access link board name] a board whose name contains access_token is cleared from the address", page.evaluate("location.hash") == "" and page.locator("#workspace").is_hidden(), page.url)
+    page.fill("#access-token", token)
+    page.click("#login-form button[type=submit]")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "location.hash === '#/board/main'", 15000)
+    report.check("[access link board name] after unlocking by hand the default board opens", page.evaluate("location.hash") == "#/board/main")
+    context.close()
     csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
     report.check("[access link] no Content-Security-Policy violations", not csp, str(csp[:3]))
     other = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p and "401" not in p]

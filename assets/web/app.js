@@ -11,21 +11,22 @@
   // URLSearchParams reads only `&`-separated parameters, so a link with another separator (`;`), a `?`
   // inside the fragment, or the key inside a route would not be recognised and its valid token would stay
   // in the address bar and the history. A fragment is therefore treated as an access link whenever the
-  // text `access_token` appears in it in any case, raw or percent-encoded (repeatedly), whatever the
-  // separators. The one exception is a plain route (`#/board/<id>`) whose id merely contains that text,
-  // as a board or topic name may: it is left alone when its id has no separator character and no run
-  // of 43 token characters, so a token appended to such a route is still cleared. Every other fragment naming it is cleared;
-  // it unlocks the page only when the token is a parameter this page can read, exactly as before.
+  // text `access_token` appears in it in any case, raw or percent-encoded (up to eight levels), whatever the
+  // separators. It is always cleared; it unlocks the page only when the token is a parameter this page
+  // can read, exactly as before. There is no exception: a board whose own name contains the text cannot
+  // be opened by a link.
   function namesAccessToken(hash) {
+    // Each pass decodes one more level of encoding. Eight levels is far beyond any real link; a
+    // fragment still changing after that is cleared as an access link, so a long run of `%25` cannot
+    // make this loop cost more than eight linear passes.
     let text = hash;
-    for (;;) {
+    for (let pass = 0; pass < 8; pass++) {
+      if (/access_token/i.test(text)) return true;
       const next = text.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-      if (next === text) break;
+      if (next === text) return false;
       text = next;
     }
-    if (!/access_token/i.test(text)) return false;
-    const plainRoute = /^#\/(board|topic|dm)\/[A-Za-z0-9_.~%-]+$/.test(hash) && /^#\/(board|topic|dm)\/[^=&;?,\s\/:+]+$/.test(text);
-    return !plainRoute || /[A-Za-z0-9_-]{43}/.test(text);
+    return true;
   }
   function takeAccessLink() {
     if (!namesAccessToken(window.location.hash)) return null; // an ordinary route such as #/topic/x
