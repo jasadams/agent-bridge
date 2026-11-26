@@ -576,6 +576,10 @@ independently scrollable board. Each box shows a cosmetic label, an editable inp
 and Send. The label is the owner's name as the broker resolver reports it (see
 `docs/naming.md`) in both interfaces: the browser's board read and the terminal's
 board inspect (`message_labels`) resolve it after the database lock is released.
+The browser resolves on each board load. The terminal asks the broker for names on the first view of a board and
+whenever its message controls change, and reuses them between its one-second polls, so an agent's rename shows
+there when the controls change or the board is reopened. Against a broker that rejects `BoardInspect` every
+terminal box shows an un-numbered "Agent".
 Neither interface derives a name from the owner's ID or the marker's authored label;
 an owner with no client name shows the single provider fallback (for example
 `Claude 9f3c`). Names never route or authorize a destination. A replacement session

@@ -264,6 +264,10 @@ pub enum Request {
     BoardArchivedList,
     BoardInspect {
         board: crate::board::Name,
+        /// Resolve the owner names of message controls (`message_labels`). Resolution reads native
+        /// clients, so a caller that polls sets it only when it needs names.
+        #[serde(default)]
+        labels: bool,
     },
     BoardArchive {
         board: crate::board::Name,
@@ -445,7 +449,10 @@ impl Request {
         if board.is_main() {
             Self::BoardRead
         } else {
-            Self::BoardInspect { board }
+            Self::BoardInspect {
+                board,
+                labels: false,
+            }
         }
     }
 

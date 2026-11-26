@@ -1182,7 +1182,7 @@ impl Broker {
 
     pub fn request(&self, req: Request) -> Result<Value> {
         let sending = matches!(req, Request::Send { .. });
-        let inspecting = matches!(req, Request::BoardInspect { .. });
+        let inspecting = matches!(req, Request::BoardInspect { labels: true, .. });
         let mut value = self.request_locked(req)?;
         if inspecting {
             // Owner names are resolved here, after the database lock is released: native reads block.
@@ -1484,7 +1484,7 @@ impl Broker {
                     &self.state_dir,
                     crate::db::now()
                 )?),
-                Request::BoardInspect { board } => {
+                Request::BoardInspect { board, .. } => {
                     let snapshot = crate::board_lifecycle::inspect(
                         &db,
                         &self.state_dir,

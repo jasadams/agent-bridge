@@ -98,6 +98,14 @@ payloads, and `tests/monitor_http.rs` fails if the removed heuristics return. Th
 (`board_tui`, `board inspect`) uses the same labels: the broker's `BoardInspect` reply carries `message_labels`
 from the same resolver (`Broker::board_message_labels`), computed in `Broker::request` after the database lock
 is released, once per inspect request. The terminal never derives a name from the owner's ID or the marker's
-text; a control the broker did not label shows "Agent", as the web page does. The terminal composer re-reads the
-board every second and on file changes, so a board with message controls costs one native name read per provider
-that owns a control (a `claude agents --json` for Claude) on each of those reads; nothing is kept between reads.
+text; a control the broker did not label shows "Agent", as the web page does.
+
+The terminal composer polls the board every second and on file changes, so it does not ask for names on each
+poll: `BoardInspect` carries a `labels` flag (default off) and the broker resolves `message_labels` only when it
+is set. The viewer sets it for the first view of a board and whenever a message control it is showing has no name
+it holds (a control is keyed by its ID, label, owner and the board's identity, so a new or changed control or
+owner qualifies); every other poll reuses the names it holds. Nothing is cached in the broker. So a name shows
+at first view, when the controls change, and when the board is reopened; an agent rename shows up at the next of
+those, not on the next poll. Against a broker that rejects `BoardInspect` (the main board's legacy read) the
+viewer has no names and every control shows an un-numbered "Agent". CLI `board --metadata --archived` and MCP
+`inspect_board` set the flag, so their replies carry `message_labels`.

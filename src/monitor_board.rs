@@ -937,6 +937,7 @@ mod tests {
         let value = broker
             .request(crate::protocol::Request::BoardInspect {
                 board: Name::default(),
+                labels: true,
             })
             .unwrap();
         let labels: std::collections::BTreeSet<String> = value["message_labels"]
@@ -950,6 +951,21 @@ mod tests {
             ["coordinator".to_owned(), "Claude 5555".to_owned()].into()
         );
         assert!(!value["message_labels"].to_string().contains(other));
+    }
+    #[tokio::test]
+    async fn board_inspect_resolves_names_only_when_asked() {
+        let (_root, bound, _old) = setup();
+        let ask = |labels| {
+            bound
+                .broker
+                .request(crate::protocol::Request::BoardInspect {
+                    board: Name::default(),
+                    labels,
+                })
+                .unwrap()
+        };
+        assert!(ask(false).get("message_labels").is_none());
+        assert!(ask(true).get("message_labels").is_some());
     }
     #[tokio::test]
     async fn main_cosmetic_labels_do_not_change_board_identity() {
