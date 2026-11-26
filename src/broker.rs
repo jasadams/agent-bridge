@@ -3551,6 +3551,140 @@ mod machine_tests {
         assert_eq!(retry["id"], first["id"]);
     }
 
+    /// A private socket directory and a live listener on `name` inside it, as a Claude
+    /// session's hook binds one.
+    fn claude_listener(
+        directory: &std::path::Path,
+        name: &str,
+    ) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
+        use std::os::unix::fs::PermissionsExt;
+        let sockets = directory.join("s");
+        if !sockets.exists() {
+            std::fs::create_dir(&sockets).unwrap();
+            std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let socket = sockets.join(name);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (socket, listener)
+    }
+
+    fn claude_frame_id(listener: &std::os::unix::net::UnixListener) -> String {
+        use std::io::BufRead;
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream).read_line(&mut line).unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        frame.to_string()
+    }
+
+    /// AGB-72: the session's process stopped, so its socket is gone while its registration
+    /// stays. Sends must be kept, not refused, and arrive once and in order after the
+    /// session binds its new socket.
+    #[tokio::test]
+    async fn messages_to_a_claude_session_whose_socket_is_gone_queue_and_arrive_once_in_order_after_it_rebinds()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let (live, _live_listener) = claude_listener(directory.path(), "sender.sock");
+        let sender = bind_claude(broker, "97e8d81e-073d-4cde-a017-4a8255b7b3b8", &live);
+        let (old, old_listener) = claude_listener(directory.path(), "old.sock");
+        let recipient = bind_claude(broker, "11111111-2222-4333-8444-555555555555", &old);
+        drop(old_listener);
+        std::fs::remove_file(&old).unwrap();
+        let ids = [uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string()];
+        for (number, id) in ids.iter().enumerate() {
+            let sent = broker
+                .request(Request::Send {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    body: format!("message {number}"),
+                    parent: None,
+                })
+                .unwrap_or_else(|error| panic!("a send to an offline session must queue: {error:#}"));
+            assert_eq!(sent["id"], json!(id));
+            assert_eq!(sent["state"], "pending", "{sent}");
+        }
+        let claim = || {
+            let readiness = broker.native_readiness();
+            broker
+                .db
+                .lock()
+                .unwrap()
+                .claim_excluding_codex(&[], Some(&readiness))
+                .unwrap()
+        };
+        assert!(claim().is_none(), "nothing may be attempted while the socket is gone");
+        for id in &ids {
+            let message = broker.request(Request::Get { id: id.clone() }).unwrap();
+            assert_eq!(message["state"], "pending", "{message}");
+        }
+        let (fresh, listener) = claude_listener(directory.path(), "new.sock");
+        bind_claude(broker, "11111111-2222-4333-8444-555555555555", &fresh);
+        for (number, id) in ids.iter().enumerate() {
+            let (message, agent) = claim().expect("a rebind releases the queued messages");
+            assert_eq!(&message.id, id, "send order");
+            assert_eq!(agent.endpoint, fresh.to_string_lossy());
+            let outcome = crate::delivery::deliver(&agent, &message, std::path::Path::new("/missing/codex"), directory.path()).await;
+            assert_eq!(outcome.state, "submitted", "{}", outcome.detail);
+            broker
+                .db
+                .lock()
+                .unwrap()
+                .finish(&message.id, outcome.state, &outcome.detail)
+                .unwrap();
+            assert!(claude_frame_id(&listener).contains(&format!("message {number}")));
+        }
+        assert!(claim().is_none(), "each message is delivered exactly once");
+    }
+
+    /// AGB-72: a board "Message <agent>" input must follow the agent across a restart.
+    #[tokio::test]
+    async fn a_board_message_input_still_delivers_after_its_claude_session_gets_a_new_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let session = "11111111-2222-4333-8444-555555555555";
+        let (old, old_listener) = claude_listener(directory.path(), "old.sock");
+        let owner = bind_claude(broker, session, &old);
+        let before: crate::board::Snapshot =
+            serde_json::from_value(broker.request(Request::BoardRead).unwrap()).unwrap();
+        let added = broker
+            .request(Request::AddBoardMessageInput {
+                agent: owner,
+                board: Default::default(),
+                expected_revision: before.revision,
+                id: "compose".into(),
+                label: "Message coordinator".into(),
+            })
+            .unwrap();
+        assert_eq!(added["applied"], true, "{added}");
+        let board: crate::board::Snapshot = serde_json::from_value(added["board"].clone()).unwrap();
+        // The restart: the old socket disappears, the session binds a new one.
+        drop(old_listener);
+        std::fs::remove_file(&old).unwrap();
+        let (fresh, _listener) = claude_listener(directory.path(), "new.sock");
+        bind_claude(broker, session, &fresh);
+        let control = crate::board_interaction::controls(&board.markdown)
+            .into_iter()
+            .find(|control| matches!(control.kind, crate::board_interaction::Kind::Message { .. }))
+            .unwrap();
+        let sent = broker
+            .request(Request::BoardMessageSend {
+                request: crate::board_messages::Submission {
+                    board: Default::default(),
+                    expected_revision: board.revision.clone(),
+                    control_id: crate::board_interaction::control_id(&board, &control),
+                    id: uuid::Uuid::new_v4().to_string(),
+                    text: "after the restart".into(),
+                },
+            })
+            .unwrap();
+        assert_eq!(sent["accepted"], true, "{sent}");
+    }
+
     #[tokio::test]
     async fn every_payload_with_an_agent_also_carries_its_name() {
         let directory = tempfile::tempdir().unwrap();
