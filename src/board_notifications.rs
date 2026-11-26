@@ -457,7 +457,7 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
                         guard,
                     )
                     .await;
-                    if outcome.state == "failed" {
+                    if matches!(outcome.state, "failed" | "offline") {
                         eprintln!("Board notification failed: {}", outcome.detail);
                     } else if outcome.state == "uncertain" {
                         eprintln!(

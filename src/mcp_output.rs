@@ -60,8 +60,17 @@ pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value
         return value;
     }
 
+    // A send held for an offline session says so: pending alone cannot tell it from a send in
+    // progress. Only that stable marker is kept; other details stay in `get_message`.
+    let mut value = value;
+    if tool == "send_message"
+        && value["detail"] != crate::clients::claude::OFFLINE_DETAIL
+        && let Some(object) = value.as_object_mut()
+    {
+        object.remove("detail");
+    }
     let names: &[&str] = match tool {
-        "send_message" => &["id", "state"],
+        "send_message" => &["id", "state", "detail"],
         "subscribe" | "unsubscribe" => &["agent", "events", "agents", "persistent", "recovery"],
         "open_pairing" => &["open", "valid_for_seconds", "notifications"],
         "create_invite" => &[
@@ -328,6 +337,20 @@ mod tests {
         ] {
             assert_eq!(write_result("send_message", value.clone(), false), value);
         }
+    }
+
+    #[test]
+    fn a_send_held_for_an_offline_session_keeps_its_offline_marker_in_the_compact_receipt() {
+        let held = json!({"id":"m","state":"pending","detail":crate::clients::claude::OFFLINE_DETAIL,"body":"x"});
+        assert_eq!(
+            write_result("send_message", held, false),
+            json!({"id":"m","state":"pending","detail":crate::clients::claude::OFFLINE_DETAIL})
+        );
+        let other = json!({"id":"m","state":"failed","detail":"some long diagnostic"});
+        assert_eq!(
+            write_result("send_message", other, false),
+            json!({"id":"m","state":"failed"})
+        );
     }
 
     #[test]

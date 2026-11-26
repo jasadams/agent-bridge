@@ -54,10 +54,24 @@ agent-bridge hooks install
 
 The startup hook records the session's private inbox socket as a delivery binding.
 The end hook removes only the matching normalized endpoint, so a late end event
-cannot close a replacement. No native membership or enabling flag is stored. A send
-to a Claude session checks only that its bound socket file still exists and is a
-private socket, without connecting or starting Claude, and is rejected without being
-stored when the socket is missing or invalid. Hooks run
+cannot close a replacement. No native membership or enabling flag is stored.
+
+A session that has bound a socket is registered even while that socket is gone, for
+example after Orca suspends the chat or the process restarts. A send to it is accepted
+and stored, and the sender gets the message ID with state `pending` and the detail
+`offline: queued until the recipient session reconnects` (also in `get_message`; match
+on the `offline:` prefix). Nothing is attempted while the socket file is missing. A
+socket file that exists with nothing listening is the same: the attempt writes
+nothing, the message goes back to the queue and is retried at most once a second. When
+the session starts or resumes, its start hook binds the new socket, and the held
+messages are delivered to that session only, once each, in send order, with the usual
+states and retry rules. A partial write stays Unknown, as before. Messages are held
+without expiry, and they count toward the shared 1000-message queue limit.
+
+A send is refused without being stored (`persisted: false`) when the session has no
+binding: it never started with the hooks installed, or it ended cleanly (the end hook
+removes the binding; `claude agents --json` lists only running processes, so it cannot
+vouch for it either). Start or resume the session, then send again. Hooks run
 through Claude Code's normal workspace trust flow. Check the client session's status
 if it does not expose an inbox socket.
 

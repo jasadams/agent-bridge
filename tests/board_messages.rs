@@ -235,7 +235,7 @@ fn register_session(broker: &Broker) -> String {
 }
 
 #[tokio::test]
-async fn composer_uses_actual_native_claude_delivery_and_closed_owner_is_unavailable() {
+async fn composer_uses_actual_native_claude_delivery_and_a_gone_socket_holds_the_message() {
     use tokio::{
         io::{AsyncBufReadExt, BufReader},
         net::UnixListener,
@@ -305,7 +305,14 @@ async fn composer_uses_actual_native_claude_delivery_and_closed_owner_is_unavail
     drop(listener);
     std::fs::remove_file(socket).unwrap();
     let fresh = submission(&snapshot, "compose", "keep draft");
-    assert_eq!(send(&broker, &fresh)["code"], "unavailable");
+    // The session's process is gone, not the owner: the message is kept until it reconnects.
+    let held = send(&broker, &fresh);
+    assert_eq!(held["accepted"], true, "{held}");
+    assert_eq!(held["state"], "pending");
+    assert_eq!(
+        held["message"]["detail"],
+        agent_bridge::clients::claude::OFFLINE_DETAIL
+    );
     assert_eq!(send(&broker, &request)["duplicate"], true);
     server.abort();
     let _ = server.await;

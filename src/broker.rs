@@ -255,10 +255,10 @@ impl Broker {
             }
         }
         let mut candidates = Vec::new();
-        let mut unavailable = Vec::new();
         for provider in [Provider::Claude, Provider::Codex, Provider::OpenCode] {
-            match self.native_list(&provider, 7) {
-                Ok(states) => candidates.extend(states.into_iter().map(|state| {
+            // A provider that cannot be read contributes no candidates.
+            if let Ok(states) = self.native_list(&provider, 7) {
+                candidates.extend(states.into_iter().map(|state| {
                     let name = state
                         .display_name
                         .as_deref()
@@ -270,11 +270,10 @@ impl Broker {
                         crate::clients::lifecycle::routing_name(&provider, &state.session),
                         name,
                     )
-                })),
-                Err(_) => unavailable.push(provider.label().to_owned()),
+                }));
             }
         }
-        crate::naming::match_name(input, &candidates, &unavailable)
+        crate::naming::match_name(input, &candidates)
             .map_err(|message| crate::protocol::SendNotPersisted(message).into())
     }
 
@@ -527,24 +526,14 @@ impl Broker {
         }
         let source = self.prepare_agent(sender, true)?;
         let destination = self.prepare_agent(recipient, true)?;
-        // Inspect the bound socket file only: a connection here would reach the session as an
-        // empty message, and `claude agents --json` is far slower than this check.
-        if destination.provider == Provider::Claude
-            && let Err(error) =
-                crate::clients::claude::validate_socket(Path::new(&destination.endpoint))
-        {
-            let problem = if destination.endpoint.is_empty() {
-                "not bound; start the session with the Agent Bridge hooks installed"
-            } else if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            {
-                "missing"
-            } else {
-                "invalid"
-            };
+        // A Claude session that has bound a socket is registered even while that socket is gone
+        // (its process stopped or restarted): the message is kept and delivered when it binds
+        // again. A session that never bound one, or ended cleanly and unbound, is refused.
+        // Only the binding row is read: `claude agents --json` is far slower and lists only
+        // running processes, so it adds nothing for a session that is down.
+        if destination.provider == Provider::Claude && destination.endpoint.is_empty() {
             return Err(crate::protocol::SendNotPersisted(format!(
-                "Recipient {} is not reachable: its Claude inbox socket is {problem}",
+                "Recipient {} is not registered: it has no Agent Bridge binding, either because it never started with the hooks installed or because it ended; start or resume the session",
                 destination.name
             ))
             .into());
@@ -1236,10 +1225,6 @@ impl Broker {
             Request::List { all, max_age_days } => Some(self.prepare_list(*all, *max_age_days)?),
             _ => None,
         };
-        let board_preflight = match &req {
-            Request::BoardMessageSend { request } => Some(self.board_send_preflight(request)?),
-            _ => None,
-        };
         let prepared_subscribe = match &req {
             Request::Subscribe { agent, .. } => Some(self.prepare_agent(agent, true)?),
             _ => None,
@@ -1344,11 +1329,7 @@ impl Broker {
                 // Board edits share the broker's local administration mutex. No
                 // network request can invoke this API or select a filesystem path.
                 Request::BoardMessageSend { request } => {
-                    if let Some(detail) = board_preflight.flatten() {
-                        crate::board_messages::Reply::error(503, "unavailable", detail).body
-                    } else {
-                        self.board_message_submit_locked(&db, &request).body
-                    }
+                    self.board_message_submit_locked(&db, &request).body
                 }
                 Request::AddBoardMessageInput {
                     agent,
@@ -1372,7 +1353,9 @@ impl Broker {
                             name: actor.name.clone(),
                             provider: actor.provider.clone(),
                             session: actor.session.clone(),
-                            endpoint: actor.endpoint.clone(),
+                            // The target is resolved by name when a message is sent, never
+                            // pinned to a socket path that dies with the session's process.
+                            endpoint: String::new(),
                         },
                     };
                     ensure!(
@@ -1573,6 +1556,8 @@ impl Broker {
                 }
                 Request::ClaudeBind { session, endpoint } => {
                     db.claude_bind(&session, &endpoint)?;
+                    // Messages held while the session was down are claimable now.
+                    self.wake.notify_one();
                     json!({"bound":true,"session":session})
                 }
                 Request::ClaudeUnbind { session, endpoint } => {
@@ -2414,50 +2399,6 @@ impl Broker {
             }
         }
         Ok(())
-    }
-
-    /// Expensive native checks for a board submission happen before the DB
-    /// administration lock. Receipt duplicates and identity conflicts skip
-    /// all native I/O. Returning Some(detail) is a definite 503.
-    fn board_send_preflight(
-        &self,
-        request: &crate::board_messages::Submission,
-    ) -> Result<Option<String>> {
-        let owner = {
-            let db = self.db.lock().unwrap();
-            match db.board_message_receipt(request) {
-                Ok(Some(_)) | Err(_) => return Ok(None),
-                Ok(None) => {}
-            }
-            if !request.valid() {
-                return Ok(None);
-            }
-            let snapshot = match self.read_board_locked(&db, &request.board) {
-                Ok(snapshot) => snapshot,
-                Err(_) => return Ok(None),
-            };
-            if snapshot.revision != request.expected_revision {
-                return Ok(None);
-            }
-            crate::board_interaction::controls(&snapshot.markdown)
-                .iter()
-                .find(|control| {
-                    crate::board_interaction::control_id(&snapshot, control) == request.control_id
-                })
-                .and_then(|control| match &control.kind {
-                    crate::board_interaction::Kind::Message { owner, .. } => Some(owner.clone()),
-                    _ => None,
-                })
-        };
-        let Some(owner) = owner else {
-            return Ok(None);
-        };
-        if owner.provider == Provider::Claude {
-            return Ok(crate::clients::claude::stale_reason(Path::new(
-                &owner.endpoint,
-            )));
-        }
-        Ok(None)
     }
 
     /// Shared explicit user submission path. The caller holds the DB mutex.
@@ -3480,32 +3421,21 @@ mod machine_tests {
     }
 
     #[tokio::test]
-    async fn a_claude_send_to_a_gone_socket_fails_at_once_without_storing_the_message() {
-        use std::os::unix::fs::PermissionsExt;
+    async fn a_claude_session_that_never_bound_a_socket_is_still_refused_before_anything_is_stored()
+    {
         let directory = tempfile::tempdir().unwrap();
         let mut bound =
             Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
         let calls = counting_claude_directory(directory.path(), &mut bound);
-        let sockets = directory.path().join("s");
-        std::fs::create_dir(&sockets).unwrap();
-        std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let live = sockets.join("s.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
-        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap();
         let broker = &bound.broker;
+        let (live, _listener) = claude_listener(directory.path(), "s.sock");
         let sender = bind_claude(broker, "97e8d81e-073d-4cde-a017-4a8255b7b3b8", &live);
-        let gone = sockets.join("gone.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&gone).unwrap();
-        std::fs::set_permissions(&gone, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let recipient = bind_claude(broker, "11111111-2222-4333-8444-555555555555", &gone);
-        drop(listener);
-        std::fs::remove_file(&gone).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let error = broker
             .request(Request::Send {
                 id: id.clone(),
                 sender,
-                recipient,
+                recipient: "claude-11111111-2222-4333-8444-555555555555".into(),
                 body: "hello".into(),
                 parent: None,
             })
@@ -3516,9 +3446,116 @@ mod machine_tests {
                 .is_some(),
             "{error:#}"
         );
-        assert!(format!("{error:#}").contains("not reachable"), "{error:#}");
+        assert!(format!("{error:#}").contains("not registered"), "{error:#}");
         assert!(broker.request(Request::Get { id }).is_err());
         assert!(!calls.exists());
+    }
+
+    #[tokio::test]
+    async fn a_queued_message_says_it_is_offline_and_a_refused_socket_is_offline_not_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let (live, _live_listener) = claude_listener(directory.path(), "sender.sock");
+        let sender = bind_claude(broker, "97e8d81e-073d-4cde-a017-4a8255b7b3b8", &live);
+        let session = "11111111-2222-4333-8444-555555555555";
+        // The file stays but nothing listens on it: the process died without cleaning up.
+        let (stale, listener) = claude_listener(directory.path(), "stale.sock");
+        let recipient = bind_claude(broker, session, &stale);
+        drop(listener);
+        let id = uuid::Uuid::new_v4().to_string();
+        let sent = broker
+            .request(Request::Send {
+                id: id.clone(),
+                sender,
+                recipient,
+                body: "hello".into(),
+                parent: None,
+            })
+            .unwrap();
+        assert_eq!(sent["state"], "pending", "{sent}");
+        let claim = || {
+            let readiness = broker.native_readiness();
+            broker
+                .db
+                .lock()
+                .unwrap()
+                .claim_excluding_codex(&[], Some(&readiness))
+                .unwrap()
+        };
+        // First attempt reaches the refused socket and writes nothing.
+        let (message, agent) = claim().unwrap();
+        let outcome = crate::delivery::deliver(
+            &agent,
+            &message,
+            std::path::Path::new("/missing/codex"),
+            directory.path(),
+        )
+        .await;
+        assert_eq!(outcome.state, "offline", "{}", outcome.detail);
+        broker
+            .db
+            .lock()
+            .unwrap()
+            .finish(&id, outcome.state, &outcome.detail)
+            .unwrap();
+        let held = broker.request(Request::Get { id: id.clone() }).unwrap();
+        assert_eq!(held["state"], "pending", "{held}");
+        assert_eq!(held["detail"], crate::clients::claude::OFFLINE_DETAIL);
+        assert!(
+            claim().is_none(),
+            "a refused socket is not retried until it changes"
+        );
+        let (fresh, listener) = claude_listener(directory.path(), "new.sock");
+        bind_claude(broker, session, &fresh);
+        let (message, agent) = claim().expect("the rebind releases it");
+        let outcome = crate::delivery::deliver(
+            &agent,
+            &message,
+            std::path::Path::new("/missing/codex"),
+            directory.path(),
+        )
+        .await;
+        assert_eq!(outcome.state, "submitted", "{}", outcome.detail);
+        assert!(claude_frame_id(&listener).contains("hello"));
+    }
+
+    /// The shared 1000-message queue cap counts messages held for offline sessions, so a dead
+    /// session can fill it. Pinned here so the owner's decision on limits is easy to apply.
+    #[tokio::test]
+    async fn messages_held_for_an_offline_session_count_toward_the_shared_queue_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let (live, _live_listener) = claude_listener(directory.path(), "sender.sock");
+        let sender = bind_claude(broker, "97e8d81e-073d-4cde-a017-4a8255b7b3b8", &live);
+        let (old, listener) = claude_listener(directory.path(), "old.sock");
+        let dead = bind_claude(broker, "11111111-2222-4333-8444-555555555555", &old);
+        let (other, _other_listener) = claude_listener(directory.path(), "other.sock");
+        let live_recipient = bind_claude(broker, "22222222-3333-4444-8555-666666666666", &other);
+        drop(listener);
+        std::fs::remove_file(&old).unwrap();
+        for number in 0..1000 {
+            broker
+                .request(Request::Send {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    sender: sender.clone(),
+                    recipient: dead.clone(),
+                    body: format!("held {number}"),
+                    parent: None,
+                })
+                .unwrap();
+        }
+        let error = broker
+            .request(Request::Send {
+                id: uuid::Uuid::new_v4().to_string(),
+                sender,
+                recipient: live_recipient,
+                body: "to a live session".into(),
+                parent: None,
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Queue is full"), "{error:#}");
     }
 
     #[tokio::test]
@@ -3573,7 +3610,9 @@ mod machine_tests {
         use std::io::BufRead;
         let (stream, _) = listener.accept().unwrap();
         let mut line = String::new();
-        std::io::BufReader::new(stream).read_line(&mut line).unwrap();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap();
         let frame: Value = serde_json::from_str(&line).unwrap();
         frame.to_string()
     }
@@ -3593,7 +3632,10 @@ mod machine_tests {
         let recipient = bind_claude(broker, "11111111-2222-4333-8444-555555555555", &old);
         drop(old_listener);
         std::fs::remove_file(&old).unwrap();
-        let ids = [uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string()];
+        let ids = [
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        ];
         for (number, id) in ids.iter().enumerate() {
             let sent = broker
                 .request(Request::Send {
@@ -3603,7 +3645,9 @@ mod machine_tests {
                     body: format!("message {number}"),
                     parent: None,
                 })
-                .unwrap_or_else(|error| panic!("a send to an offline session must queue: {error:#}"));
+                .unwrap_or_else(|error| {
+                    panic!("a send to an offline session must queue: {error:#}")
+                });
             assert_eq!(sent["id"], json!(id));
             assert_eq!(sent["state"], "pending", "{sent}");
         }
@@ -3616,7 +3660,10 @@ mod machine_tests {
                 .claim_excluding_codex(&[], Some(&readiness))
                 .unwrap()
         };
-        assert!(claim().is_none(), "nothing may be attempted while the socket is gone");
+        assert!(
+            claim().is_none(),
+            "nothing may be attempted while the socket is gone"
+        );
         for id in &ids {
             let message = broker.request(Request::Get { id: id.clone() }).unwrap();
             assert_eq!(message["state"], "pending", "{message}");
@@ -3626,8 +3673,19 @@ mod machine_tests {
         for (number, id) in ids.iter().enumerate() {
             let (message, agent) = claim().expect("a rebind releases the queued messages");
             assert_eq!(&message.id, id, "send order");
-            assert_eq!(agent.endpoint, fresh.to_string_lossy());
-            let outcome = crate::delivery::deliver(&agent, &message, std::path::Path::new("/missing/codex"), directory.path()).await;
+            assert_eq!(
+                std::path::Path::new(&agent.endpoint)
+                    .canonicalize()
+                    .unwrap(),
+                fresh.canonicalize().unwrap()
+            );
+            let outcome = crate::delivery::deliver(
+                &agent,
+                &message,
+                std::path::Path::new("/missing/codex"),
+                directory.path(),
+            )
+            .await;
             assert_eq!(outcome.state, "submitted", "{}", outcome.detail);
             broker
                 .db
@@ -3640,20 +3698,26 @@ mod machine_tests {
         assert!(claim().is_none(), "each message is delivered exactly once");
     }
 
-    /// AGB-72: a board "Message <agent>" input must follow the agent across a restart.
+    /// AGB-72: a board "Message <agent>" input must follow the agent across a restart, whether
+    /// it was created with an empty endpoint (now) or a socket path (before), and must never
+    /// deliver to a different session.
     #[tokio::test]
-    async fn a_board_message_input_still_delivers_after_its_claude_session_gets_a_new_socket() {
+    async fn board_message_inputs_resolve_their_claude_target_by_name_after_a_restart() {
+        use crate::board_messages::{Marker, Owner, Submission};
         let directory = tempfile::tempdir().unwrap();
         let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
         let broker = &bound.broker;
         let session = "11111111-2222-4333-8444-555555555555";
         let (old, old_listener) = claude_listener(directory.path(), "old.sock");
         let owner = bind_claude(broker, session, &old);
+        let other_session = "22222222-3333-4444-8555-666666666666";
+        let (other_socket, _other_listener) = claude_listener(directory.path(), "other.sock");
+        bind_claude(broker, other_session, &other_socket);
         let before: crate::board::Snapshot =
             serde_json::from_value(broker.request(Request::BoardRead).unwrap()).unwrap();
         let added = broker
             .request(Request::AddBoardMessageInput {
-                agent: owner,
+                agent: owner.clone(),
                 board: Default::default(),
                 expected_revision: before.revision,
                 id: "compose".into(),
@@ -3661,28 +3725,104 @@ mod machine_tests {
             })
             .unwrap();
         assert_eq!(added["applied"], true, "{added}");
-        let board: crate::board::Snapshot = serde_json::from_value(added["board"].clone()).unwrap();
+        // An input written before this change carries the socket path of the dead process; one
+        // naming another session than the owner it claims must stay refused.
+        let marker = |id: &str, endpoint: &str, session: &str| Marker {
+            id: id.into(),
+            instance: uuid::Uuid::new_v4().to_string(),
+            label: format!("Message {id}"),
+            owner: Owner {
+                name: owner.clone(),
+                provider: crate::protocol::Provider::Claude,
+                session: session.into(),
+                endpoint: endpoint.into(),
+            },
+        };
+        let text = [
+            marker("legacy", &old.to_string_lossy(), session),
+            marker("wrong-session", "", other_session),
+        ]
+        .iter()
+        .map(|marker| {
+            format!(
+                "<!-- board-message: {} -->\n",
+                serde_json::to_string(marker).unwrap()
+            )
+        })
+        .collect::<String>();
+        let current: crate::board::Snapshot =
+            serde_json::from_value(added["board"].clone()).unwrap();
+        let board = crate::board::update_named(
+            &broker.state_dir,
+            &Default::default(),
+            &current.revision,
+            &[crate::board::Edit::Append { text }],
+        )
+        .unwrap();
         // The restart: the old socket disappears, the session binds a new one.
         drop(old_listener);
         std::fs::remove_file(&old).unwrap();
-        let (fresh, _listener) = claude_listener(directory.path(), "new.sock");
+        let (fresh, listener) = claude_listener(directory.path(), "new.sock");
         bind_claude(broker, session, &fresh);
-        let control = crate::board_interaction::controls(&board.markdown)
-            .into_iter()
-            .find(|control| matches!(control.kind, crate::board_interaction::Kind::Message { .. }))
-            .unwrap();
-        let sent = broker
-            .request(Request::BoardMessageSend {
-                request: crate::board_messages::Submission {
-                    board: Default::default(),
-                    expected_revision: board.revision.clone(),
-                    control_id: crate::board_interaction::control_id(&board, &control),
-                    id: uuid::Uuid::new_v4().to_string(),
-                    text: "after the restart".into(),
-                },
-            })
-            .unwrap();
-        assert_eq!(sent["accepted"], true, "{sent}");
+        let controls = crate::board_interaction::controls(&board.markdown);
+        let send = |label: &str, body: &str| {
+            let control = controls
+                .iter()
+                .find(|control| control.label == label)
+                .unwrap();
+            broker
+                .request(Request::BoardMessageSend {
+                    request: Submission {
+                        board: Default::default(),
+                        expected_revision: board.revision.clone(),
+                        control_id: crate::board_interaction::control_id(&board, control),
+                        id: uuid::Uuid::new_v4().to_string(),
+                        text: body.into(),
+                    },
+                })
+                .unwrap()
+        };
+        for (label, body) in [
+            ("Message coordinator", "new input"),
+            ("Message legacy", "old input"),
+        ] {
+            let sent = send(label, body);
+            assert_eq!(sent["accepted"], true, "{label}: {sent}");
+            assert_eq!(sent["message"]["recipient"], json!(owner));
+            let readiness = broker.native_readiness();
+            let (message, agent) = broker
+                .db
+                .lock()
+                .unwrap()
+                .claim_excluding_codex(&[], Some(&readiness))
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.recipient_session, session);
+            assert_eq!(
+                std::path::Path::new(&agent.endpoint)
+                    .canonicalize()
+                    .unwrap(),
+                fresh.canonicalize().unwrap()
+            );
+            let outcome = crate::delivery::deliver(
+                &agent,
+                &message,
+                std::path::Path::new("/missing/codex"),
+                directory.path(),
+            )
+            .await;
+            assert_eq!(outcome.state, "submitted", "{}", outcome.detail);
+            broker
+                .db
+                .lock()
+                .unwrap()
+                .finish(&message.id, outcome.state, &outcome.detail)
+                .unwrap();
+            assert!(claude_frame_id(&listener).contains(body));
+        }
+        let refused = send("Message wrong-session", "never");
+        assert_eq!(refused["accepted"], false, "{refused}");
+        assert_eq!(refused["code"], "unavailable");
     }
 
     #[tokio::test]

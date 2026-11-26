@@ -53,6 +53,13 @@ impl Outcome {
             detail: e.to_string(),
         }
     }
+    /// The recipient's native endpoint is down and nothing was written. The message stays queued.
+    pub fn offline(e: impl std::fmt::Display) -> Self {
+        Self {
+            state: "offline",
+            detail: e.to_string(),
+        }
+    }
     pub fn submitted(e: impl Into<String>) -> Self {
         Self {
             state: "submitted",

@@ -118,6 +118,17 @@ pub fn stale_reason(path: &Path) -> Option<String> {
     }
 }
 
+/// Stable, machine-readable prefix of the detail on a message held for a Claude session
+/// whose inbox socket is gone. Documented in docs/mcp.md; agents may match on it.
+pub const OFFLINE_DETAIL: &str = "offline: queued until the recipient session reconnects";
+
+/// The bound socket file no longer exists: the session's process stopped or restarted. This
+/// only inspects the file, so it never reaches the session as a connection.
+pub fn socket_gone(endpoint: &str) -> bool {
+    std::fs::symlink_metadata(endpoint)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 pub fn claude_frame(msg: &Message, _state_dir: &Path) -> serde_json::Value {
     frame(msg, &claude_content(msg, &serde_json::Value::Null))
 }
@@ -237,10 +248,20 @@ pub(crate) async fn deliver_guarded(
 ) -> Outcome {
     let path = match validate_socket(Path::new(&agent.endpoint)) {
         Ok(p) => p,
+        Err(e) if is_io_kind(&e, std::io::ErrorKind::NotFound) => return Outcome::offline(e),
         Err(e) => return Outcome::failed(e),
     };
     let mut stream = match timeout(Duration::from_secs(3), UnixStream::connect(path)).await {
         Ok(Ok(s)) => s,
+        // Nothing was written: the session is down, not the message.
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Outcome::offline(e);
+        }
         Ok(Err(e)) => return Outcome::failed(e),
         Err(e) => return Outcome::failed(e),
     };
@@ -256,6 +277,12 @@ pub(crate) async fn deliver_guarded(
     let mut bytes = serde_json::to_vec(&frame).expect("JSON value serialization");
     bytes.push(b'\n');
     write_frame(&mut stream, &bytes).await
+}
+
+fn is_io_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == kind)
 }
 
 async fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> Outcome {

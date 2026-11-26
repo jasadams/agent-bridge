@@ -276,7 +276,9 @@ message persistence, delivery, CLI output and access checks are unchanged.
 
 - `update_board` returns `{"result":{"board":"main","revision":"…"}}` on success.
 - `send_message` returns `{"result":{"id":"…","state":"pending"},"id":"…"}`
-  on success. On error it returns `request_id` for safe retry, plus either
+  on success. A message held for a Claude session whose socket is gone also carries
+  `"detail":"offline: queued until the recipient session reconnects"` (match on the
+  `offline:` prefix); it is delivered when the session reconnects. On error it returns `request_id` for safe retry, plus either
   `persisted: false` when confirmed or `persistence: "unknown"` otherwise.
 - Subscriptions retain the effective `events` and complete `agents` snapshot, including in compact results.
   Pairing tools retain the exchange ID, verification state, invitation link and

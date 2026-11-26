@@ -514,11 +514,19 @@ Also check clipboard selection, refresh/reconnect and the selected-name display.
 
 Use MCP `add_board_message_input(agent, board, expected_revision, id, label)` after
 `read_board`. `agent` must resolve to an exact local route, not a native
-display name. The tool pins its name, provider, session and endpoint and appends a
+display name. The tool pins its name, provider and session, and appends a
 composer using the same revision checks and own-write notice suppression as
 `update_board`. IDs are 1–80 ASCII letters, digits, dots, underscores or hyphens
 and must be unique across message composers and response fields on that board.
 Labels cannot contain control characters or HTML comment delimiters.
+
+The composer does not store a socket path. Each submission resolves the pinned name,
+provider and session to the agent's current binding, so a Claude session that was
+suspended or restarted keeps receiving messages, and a message sent while it is down
+is held as described in [native sessions](native-sessions.md). Composers written
+before this change carry the socket path they were created with in `endpoint`; it is
+ignored, so they work again without editing the board. A composer whose session no
+longer matches the agent's current session is refused.
 
 The CLI equivalent is:
 
@@ -577,7 +585,7 @@ While composing, **Enter sends** and **Shift-Enter inserts a newline**. Legacy
 terminals may encode Shift-Enter as ordinary Enter; use **Ctrl-J for newline**
 there. Page Up/Down still scrolls the board. Mouse wheel over the board scrolls
 the document; wheel over the input stack scrolls the boxes. Ctrl-O opens exact
-provider, session and endpoint details in the board
+provider and session details in the board
 area; arrows or Page Up/Down scroll them, and Escape/Ctrl-O returns to the
 unchanged draft. The original marker is also available in
 `board NAME --raw` for inspection.

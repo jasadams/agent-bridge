@@ -7,7 +7,7 @@ plugin receipt journal has a separate additive schema-2 upgrade described below.
 
 | Outcome (`state`) | Meaning |
 | --- | --- |
-| Pending (`pending`) | The bridge persisted the message; delivery is queued, in progress or policy-blocked. A policy block includes a reason and requires explicit retry after restoring access. |
+| Pending (`pending`) | The bridge persisted the message; delivery is queued, in progress or policy-blocked. A policy block includes a reason and requires explicit retry after restoring access. A Claude session that is down (its socket is gone) holds the message as Pending with the detail `offline: queued until the recipient session reconnects`; it is delivered when the session binds a new socket. |
 | Delivered (`delivered`) | The recipient client confirmed acceptance through its supported native interface. This does not prove model read, understanding, action or task completion. |
 | Failed (`failed`) | Definite rejection/non-delivery for the current attempt, including cancellation of unattempted work. Inspect the reason and retry restrictions. |
 | Unknown (`unknown`) | Delivery may have happened, but confirmation is missing or insufficient. Never automatically replay an ambiguous native write. |
