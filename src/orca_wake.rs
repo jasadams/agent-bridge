@@ -64,9 +64,19 @@ pub fn wake(cli: &Path, from: &str, to: &str, deadline: Duration) -> Result<()> 
         .map_err(|error| anyhow::anyhow!("cannot run orca: {error}"))?;
     let limit = Instant::now() + deadline;
     loop {
-        if let Some(status) = child.try_wait()? {
-            ensure!(status.success(), "orca exited with {status}");
-            return Ok(());
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                ensure!(status.success(), "orca exited with {status}");
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Never leave the child or anything it started behind.
+                // SAFETY: a negative pid addresses the child's own process group.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.wait();
+                return Err(error.into());
+            }
         }
         if Instant::now() >= limit {
             // SAFETY: a negative pid addresses the child's own process group, created above.
