@@ -95,5 +95,18 @@ a rename shows on the next board load.
 The old `/api/agents` name list, the page's name polling and its ID-pattern heuristics are gone.
 `tests/web/labels.js` (run by `tests/web_labels.rs`, needs Node) exercises the label helpers with ID-bearing
 payloads, and `tests/monitor_http.rs` fails if the removed heuristics return. The terminal board composer
-(`board_tui`, `board inspect`) still labels owners with `board_messages::fallback_label`, a separate fallback
-that is not part of the web interface and remains to be moved onto this resolver.
+(`board_tui`, `board inspect`) uses the same labels: the broker's `BoardInspect` reply carries `message_labels`
+from the same resolver (`Broker::board_message_labels`), computed in `Broker::request` after the database lock
+is released, once per inspect request. The terminal never derives a name from the owner's ID or the marker's
+text; a control the broker did not label shows "Agent", as the web page does.
+
+The terminal composer polls the board every second and on file changes, so it does not ask for names on each
+poll: `BoardInspect` carries a `labels` flag (default off) and the broker resolves `message_labels` only when it
+is set. The viewer sets it for the first view of a board and whenever the message controls it is showing are not
+exactly the ones it holds names for (a control is keyed by its ID, label, owner and the board's identity, so an
+added, removed or changed control or owner qualifies); every other poll reuses the names it holds. Nothing is cached in the broker. So a name shows
+at first view, when the controls change, and when the board is reopened; an agent rename shows up at the next of
+those, not on the next poll. If a provider's native read fails when names are resolved, its agents show the generated
+fallback name until then. Against a broker that rejects `BoardInspect` (the main board's legacy read) the
+viewer has no names and every control shows an un-numbered "Agent". CLI `board --metadata --archived` and MCP
+`inspect_board` set the flag, so their replies carry `message_labels`.

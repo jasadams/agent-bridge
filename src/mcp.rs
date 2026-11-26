@@ -676,8 +676,14 @@ impl Bridge {
         )
     )]
     async fn inspect_board(&self, Parameters(args): Parameters<BoardCreate>) -> CallToolResult {
-        self.result(self.rpc(Request::BoardInspect { board: args.board }), None)
-            .await
+        self.result(
+            self.rpc(Request::BoardInspect {
+                board: args.board,
+                labels: true,
+            }),
+            None,
+        )
+        .await
     }
 
     #[tool(

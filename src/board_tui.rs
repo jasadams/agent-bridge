@@ -1029,6 +1029,25 @@ impl View {
         }
         self.update(result)
     }
+    /// A broker read with its owner labels. The labels belong to that read: a read for another board or an
+    /// older generation (a board switch with a read in flight) is dropped whole, labels included.
+    fn read_with_labels(
+        &mut self,
+        board: &Name,
+        generation: u64,
+        result: Result<(Snapshot, crate::board_messages::DisplayLabels)>,
+    ) -> bool {
+        let mut changed = false;
+        let current = &self.board == board && self.generation == generation;
+        let result = result.map(|(snapshot, labels)| {
+            if current && self.message_labels != labels {
+                self.message_labels = labels;
+                changed = true;
+            }
+            snapshot
+        });
+        changed | self.read_result(board, generation, result)
+    }
     fn update_release_notice(&mut self, notice: Option<String>) -> bool {
         let changed = self.update_notice != notice;
         self.update_notice = notice;
@@ -1163,7 +1182,7 @@ impl View {
             .take(visible)
             .enumerate()
         {
-            let Kind::Message { owner, .. } = &control.kind else {
+            let Kind::Message { .. } = &control.kind else {
                 continue;
             };
             let row = Rect::new(area.x, area.y + slot as u16 * 3, area.width, 3);
@@ -1198,7 +1217,8 @@ impl View {
                 .as_ref()
                 .and_then(|key| self.message_labels.get(key))
                 .cloned()
-                .unwrap_or_else(|| crate::board_messages::fallback_label(owner, &control.label));
+                // The broker labels every control it reports (`message_labels`); the viewer never derives a name.
+                .unwrap_or_else(|| "Agent".into());
             let mut title = if rows.len() > visible {
                 format!(
                     "{} · {}/{}",
@@ -2454,34 +2474,86 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     run_named(state_dir, Name::default()).await
 }
 
+/// The owner names the viewer holds, for the one board they were read for.
+type HeldLabels = Option<(Name, crate::board_messages::DisplayLabels)>;
+
 async fn read_composer_snapshot(
     state: &Path,
     board: &Name,
+    held: &mut HeldLabels,
 ) -> Result<(Snapshot, crate::board_messages::DisplayLabels)> {
-    // Keep the frozen legacy read contract intact. New brokers can inspect main
-    // with presentation metadata; older brokers retain the safe main fallback.
-    let value = match broker::rpc(
-        state,
-        &Request::BoardInspect {
-            board: board.clone(),
-        },
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(_) if board.is_main() => broker::rpc(state, &Request::BoardRead).await?,
-        Err(error) => return Err(error),
-    };
-    let labels = match value.get("message_labels") {
-        Some(value) => {
-            serde_json::from_value(value.clone()).context("Invalid composer labels from broker")?
+    read_composer_with(board, held, |labels| async move {
+        // Keep the frozen legacy read contract intact. New brokers can inspect main
+        // with presentation metadata; older brokers retain the safe main fallback.
+        match broker::rpc(
+            state,
+            &Request::BoardInspect {
+                board: board.clone(),
+                labels,
+            },
+        )
+        .await
+        {
+            Ok(value) => Ok((value, true)),
+            Err(_) if board.is_main() && !labels => {
+                Ok((broker::rpc(state, &Request::BoardRead).await?, false))
+            }
+            Err(error) => Err(error),
         }
-        None => BTreeMap::new(),
+    })
+    .await
+}
+
+/// Owner names are resolved by the broker from the native clients, which costs a process per provider,
+/// so the polling viewer asks for them only when it holds none for a message control it is showing: the
+/// first view of a board, or after the board's controls changed (a control's key binds its ID, label,
+/// owner and the board's identity). Otherwise it keeps the names it holds. `inspect(labels)` returns the
+/// broker's reply and whether that broker can inspect (false for the legacy main read, which has no names).
+async fn read_composer_with<F, Fut>(
+    board: &Name,
+    held: &mut HeldLabels,
+    mut inspect: F,
+) -> Result<(Snapshot, crate::board_messages::DisplayLabels)>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<(serde_json::Value, bool)>>,
+{
+    let keys = |snapshot: &Snapshot| -> Vec<String> {
+        crate::board_interaction::controls(&snapshot.markdown)
+            .iter()
+            .filter_map(|control| control.message_key(&snapshot.control_scope()))
+            .collect()
     };
-    Ok((
-        serde_json::from_value(value).context("Invalid board snapshot from broker")?,
-        labels,
-    ))
+    let (value, inspected) = inspect(false).await?;
+    let snapshot: Snapshot =
+        serde_json::from_value(value).context("Invalid board snapshot from broker")?;
+    let wanted = keys(&snapshot);
+    if wanted.is_empty() || !inspected {
+        *held = None;
+        return Ok((snapshot, BTreeMap::new()));
+    }
+    // Reuse only when the controls shown are exactly the ones named: a removed control changes the
+    // numbering of the names that share its name, so it needs new names as much as an added one.
+    let wanted: std::collections::BTreeSet<&String> = wanted.iter().collect();
+    if let Some((_, labels)) = held.as_ref().filter(|(name, labels)| {
+        name == board
+            && labels.len() == wanted.len()
+            && wanted.iter().all(|key| labels.contains_key(*key))
+    }) {
+        return Ok((snapshot, labels.clone()));
+    }
+    let (value, _) = inspect(true).await?;
+    let labels: crate::board_messages::DisplayLabels = serde_json::from_value(
+        value
+            .get("message_labels")
+            .cloned()
+            .context("Broker did not return composer labels")?,
+    )
+    .context("Invalid composer labels from broker")?;
+    let snapshot: Snapshot =
+        serde_json::from_value(value).context("Invalid board snapshot from broker")?;
+    *held = Some((board.clone(), labels.clone()));
+    Ok((snapshot, labels))
 }
 
 pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
@@ -2489,7 +2561,8 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         "The board viewer needs an interactive terminal; use board --raw to print Markdown"
     );
-    let (initial, initial_labels) = read_composer_snapshot(&state_dir, &board).await?;
+    let mut held = None;
+    let (initial, initial_labels) = read_composer_snapshot(&state_dir, &board, &mut held).await?;
     ensure!(
         initial.name == board.as_str(),
         "Broker returned a different board"
@@ -2563,7 +2636,7 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                 request = requests.recv() => {
                     if request.is_none() { break; }
                     let (board, generation) = current_selection.borrow().clone();
-                    let result = read_composer_snapshot(&state, &board).await;
+                    let result = read_composer_snapshot(&state, &board, &mut held).await;
                     // Availability is broker-owned cached metadata. Reading it
                     // never fetches a release or changes the board document.
                     let notice = cached_release_notice(&state);
@@ -2673,13 +2746,9 @@ pub async fn run_named(state_dir: PathBuf, board: Name) -> Result<()> {
                     }
                     Update::Read(board, generation, result, notice) => {
                         dirty |= view.update_release_notice(notice);
-                        let result = result.map(|(snapshot, labels)| {
-                            if view.message_labels != labels { view.message_labels = labels; dirty = true; }
-                            snapshot
-                        });
-                        dirty |= view.read_result(&board, generation, result);
+                        dirty |= view.read_with_labels(&board, generation, result);
                     },
-                    Update::Saved(save, result) => { view.saved(save, result); dirty = true; },
+                    Update::Saved(save, result) => { view.saved(save, result); let _ = refresh.try_send(()); dirty = true; },
                     Update::Message(request, result) => { view.message_result(request, result); dirty = true; },
                 }
             }
@@ -3071,6 +3140,29 @@ mod tests {
         assert_eq!(view.selection.as_ref().unwrap().area(), area);
     }
 
+    /// A control with the same ID and authored label as `message_field("one", "alpha")` and the given owner.
+    fn message_owned_by(
+        name: &str,
+        provider: crate::protocol::Provider,
+        session: &str,
+        endpoint: &str,
+    ) -> String {
+        let marker = crate::board_messages::Marker {
+            instance: "00000000-0000-4000-8000-000000000001".into(),
+            id: "one".into(),
+            label: "Message alpha".into(),
+            owner: crate::board_messages::Owner {
+                name: name.into(),
+                provider,
+                session: session.into(),
+                endpoint: endpoint.into(),
+            },
+        };
+        format!(
+            "<!-- board-message: {} -->\n",
+            serde_json::to_string(&marker).unwrap()
+        )
+    }
     fn message_field(id: &str, route: &str) -> String {
         let marker = crate::board_messages::Marker {
             instance: "00000000-0000-4000-8000-000000000001".into(),
@@ -3103,12 +3195,257 @@ mod tests {
         assert_eq!(raw, original);
         assert_eq!(board_interaction::controls(&raw).len(), 1);
     }
+    /// What the broker reports for each control: the owner's resolved name (here the owner route, which
+    /// the viewer must show exactly as given).
+    fn broker_labels(view: &mut View) {
+        let snapshot = view.snapshot.as_ref().unwrap();
+        view.message_labels = board_interaction::controls(&snapshot.markdown)
+            .iter()
+            .filter_map(|control| match &control.kind {
+                Kind::Message { owner, .. } => control
+                    .message_key(&snapshot.control_scope())
+                    .map(|key| (key, owner.name.clone())),
+                _ => None,
+            })
+            .collect();
+    }
+    #[test]
+    fn message_box_title_is_the_broker_name_and_never_derived_from_the_owner_or_label() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(
+            &message_field("coordinator", "alpha"),
+            &"a".repeat(64),
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+        // The broker reported no name for this control: the viewer shows "Agent", not the owner or label.
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(!buffer_text(&terminal).contains("alpha"));
+        assert!(buffer_text(&terminal).contains("Agent"));
+        let key = {
+            let snapshot = view.snapshot.as_ref().unwrap();
+            board_interaction::controls(&snapshot.markdown)[0]
+                .message_key(&snapshot.control_scope())
+                .unwrap()
+        };
+        view.message_labels.insert(key, "Claude 9f3c".into());
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(buffer_text(&terminal).contains("Claude 9f3c"));
+        assert!(!buffer_text(&terminal).contains("alpha"));
+    }
+    /// A fake broker: counts the polls that asked for names (the ones that would run the resolver).
+    fn polled(
+        board: &Name,
+        held: &mut HeldLabels,
+        markdown: &str,
+        resolved: &std::cell::Cell<usize>,
+    ) -> crate::board_messages::DisplayLabels {
+        let snap = snapshot(markdown, &"a".repeat(64));
+        let value = serde_json::json!(snap);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (_, labels) = runtime
+            .block_on(read_composer_with(board, held, |labels| {
+                let mut value = value.clone();
+                if labels {
+                    resolved.set(resolved.get() + 1);
+                    let named: crate::board_messages::DisplayLabels =
+                        board_interaction::controls(&snap.markdown)
+                            .iter()
+                            .filter_map(|control| match &control.kind {
+                                Kind::Message { owner, .. } => control
+                                    .message_key(&snap.control_scope())
+                                    .map(|key| (key, format!("Resolved {}", owner.name))),
+                                _ => None,
+                            })
+                            .collect();
+                    value["message_labels"] = serde_json::json!(named);
+                }
+                async move { Ok((value, true)) }
+            }))
+            .unwrap();
+        labels
+    }
+    #[test]
+    fn names_are_resolved_on_first_view_and_control_changes_but_not_on_an_unchanged_poll() {
+        let board = Name::default();
+        let mut held = None;
+        let resolved = std::cell::Cell::new(0);
+        let one = message_field("one", "alpha");
+        // First view of the board resolves.
+        let labels = polled(&board, &mut held, &one, &resolved);
+        assert_eq!(resolved.get(), 1);
+        assert_eq!(labels.values().collect::<Vec<_>>(), ["Resolved alpha"]);
+        // Unchanged polls (also after an unrelated board edit) do not.
+        for _ in 0..3 {
+            assert_eq!(polled(&board, &mut held, &one, &resolved), labels);
+        }
+        let edited = format!("# Notes\n{one}");
+        assert_eq!(polled(&board, &mut held, &edited, &resolved), labels);
+        assert_eq!(resolved.get(), 1);
+        // A save that adds a control: the next inspect names it, and keeps the first.
+        let two = format!("{one}{}", message_field("two", "beta"));
+        let both = polled(&board, &mut held, &two, &resolved);
+        assert_eq!(resolved.get(), 2);
+        assert_eq!(both.len(), 2);
+        assert!(both.values().any(|label| label == "Resolved beta"));
+        // Removing a control resolves again: names that shared a name are numbered per control set.
+        let single = polled(&board, &mut held, &one, &resolved);
+        assert_eq!(resolved.get(), 3);
+        assert_eq!(single.len(), 1);
+        // A changed owner on the same control id resolves again.
+        let moved = message_field("one", "gamma");
+        let changed = polled(&board, &mut held, &moved, &resolved);
+        assert_eq!(resolved.get(), 4);
+        assert_eq!(changed.values().collect::<Vec<_>>(), ["Resolved gamma"]);
+        // Reopening the board (nothing held) resolves; so does another board.
+        let mut reopened = None;
+        polled(&board, &mut reopened, &moved, &resolved);
+        assert_eq!(resolved.get(), 5);
+        polled(&"other".parse().unwrap(), &mut held, &moved, &resolved);
+        assert_eq!(resolved.get(), 6);
+        // A board with no message controls never resolves.
+        polled(&board, &mut held, "# Plain\n", &resolved);
+        assert_eq!(resolved.get(), 6);
+    }
+    #[test]
+    fn a_change_of_only_the_owner_resolves_names_again() {
+        use crate::protocol::Provider::{Claude, Inbox};
+        const SESSION: &str = "11111111-1111-4111-8111-111111111111";
+        let board = Name::default();
+        let resolved = std::cell::Cell::new(0);
+        let mut held = None;
+        polled(
+            &board,
+            &mut held,
+            &message_owned_by("alpha", Inbox, SESSION, ""),
+            &resolved,
+        );
+        assert_eq!(resolved.get(), 1);
+        // Same control ID, instance and authored label every time; one owner field changes per step.
+        for (step, changed) in [
+            message_owned_by("renamed", Inbox, SESSION, ""),
+            message_owned_by("renamed", Claude, SESSION, ""),
+            message_owned_by(
+                "renamed",
+                Claude,
+                "22222222-2222-4222-8222-222222222222",
+                "",
+            ),
+            message_owned_by(
+                "renamed",
+                Claude,
+                "22222222-2222-4222-8222-222222222222",
+                "/tmp/new.sock",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            polled(&board, &mut held, changed, &resolved);
+            assert_eq!(resolved.get(), 2 + step, "owner field change {step}");
+            polled(&board, &mut held, changed, &resolved);
+            assert_eq!(
+                resolved.get(),
+                2 + step,
+                "unchanged poll after change {step}"
+            );
+        }
+    }
+    #[test]
+    fn a_broker_that_cannot_inspect_gives_no_names_and_is_not_asked_again() {
+        let value = serde_json::json!(snapshot(&message_field("one", "alpha"), &"a".repeat(64)));
+        let asked = std::cell::Cell::new(Vec::new());
+        let mut held = Some((Name::default(), BTreeMap::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (_, labels) = runtime
+            .block_on(read_composer_with(&Name::default(), &mut held, |labels| {
+                let mut seen = asked.take();
+                seen.push(labels);
+                asked.set(seen);
+                let value = value.clone();
+                async move { Ok((value, false)) }
+            }))
+            .unwrap();
+        assert!(labels.is_empty() && held.is_none());
+        assert_eq!(asked.take(), [false]);
+    }
+    #[test]
+    fn a_failed_name_request_keeps_the_held_names_and_surfaces_the_error() {
+        let board = Name::default();
+        let resolved = std::cell::Cell::new(0);
+        let one = message_field("one", "alpha");
+        let mut held = None;
+        let labels = polled(&board, &mut held, &one, &resolved);
+        let two = format!("{one}{}", message_field("two", "beta"));
+        let value = serde_json::json!(snapshot(&two, &"a".repeat(64)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(read_composer_with(&board, &mut held, |asked| {
+            let value = value.clone();
+            async move {
+                if asked {
+                    anyhow::bail!("names unavailable")
+                }
+                Ok((value, true))
+            }
+        }));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("names unavailable")
+        );
+        assert_eq!(held, Some((board, labels)));
+    }
+    #[test]
+    fn an_inspect_request_without_the_labels_flag_still_parses() {
+        let request: Request =
+            serde_json::from_str(r#"{"op":"board_inspect","board":"main"}"#).unwrap();
+        assert!(matches!(
+            request,
+            Request::BoardInspect { labels: false, .. }
+        ));
+    }
+    #[test]
+    fn a_stale_read_never_replaces_the_current_boards_labels() {
+        let mut view = message_view();
+        let labels = view.message_labels.clone();
+        assert!(!labels.is_empty());
+        let stale = snapshot(&message_field("coordinator", "alpha"), &"b".repeat(64));
+        let generation = view.generation;
+        let board = view.board.clone();
+        // A read for another generation (board switch in flight) carries other labels.
+        view.read_with_labels(
+            &board,
+            generation.wrapping_add(1),
+            Ok((
+                stale,
+                [("other-scope".to_owned(), "Elsewhere".to_owned())].into(),
+            )),
+        );
+        assert_eq!(view.message_labels, labels);
+        let other: Name = "other".parse().unwrap();
+        view.read_with_labels(
+            &other,
+            generation,
+            Ok((
+                snapshot("", &"c".repeat(64)),
+                [("x".to_owned(), "Elsewhere".to_owned())].into(),
+            )),
+        );
+        assert_eq!(view.message_labels, labels);
+    }
     fn message_view() -> View {
         let mut view = View::default();
         view.update(Ok(snapshot(
             &message_field("coordinator", "alpha"),
             &"a".repeat(64),
         )));
+        broker_labels(&mut view);
         press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
         assert!(
             view.editor.is_some(),
@@ -3125,6 +3462,7 @@ mod tests {
             + &message_field("three", "gamma");
         let mut view = View::default();
         view.update(Ok(snapshot(&markdown, &"a".repeat(64))));
+        broker_labels(&mut view);
         let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
         terminal.draw(|frame| view.draw(frame)).unwrap();
         let board = view.viewport.as_ref().unwrap().area();

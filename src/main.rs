@@ -899,7 +899,10 @@ async fn main() -> Result<()> {
             let name = name.unwrap_or_default();
             if metadata {
                 let request = if archived {
-                    Request::BoardInspect { board: name }
+                    Request::BoardInspect {
+                        board: name,
+                        labels: true,
+                    }
                 } else {
                     Request::board_read(name)
                 };
@@ -915,6 +918,7 @@ async fn main() -> Result<()> {
                 let request = if archived {
                     Request::BoardInspect {
                         board: name.clone(),
+                        labels: false,
                     }
                 } else {
                     Request::board_read(name.clone())

@@ -264,6 +264,10 @@ pub enum Request {
     BoardArchivedList,
     BoardInspect {
         board: crate::board::Name,
+        /// Resolve the owner names of message controls (`message_labels`). Resolution reads native
+        /// clients, so a caller that polls sets it only when it needs names.
+        #[serde(default)]
+        labels: bool,
     },
     BoardArchive {
         board: crate::board::Name,
@@ -445,7 +449,11 @@ impl Request {
         if board.is_main() {
             Self::BoardRead
         } else {
-            Self::BoardInspect { board }
+            // Callers of this helper get the same reply as before the flag existed: with owner names.
+            Self::BoardInspect {
+                board,
+                labels: true,
+            }
         }
     }
 
@@ -630,5 +638,22 @@ mod board_compatibility_tests {
             assert!(!old_accepts(wire.clone()), "{wire}");
             assert!(serde_json::from_value::<Request>(wire).is_ok());
         }
+    }
+    #[test]
+    fn board_request_helpers_keep_their_replies_when_names_are_optional() {
+        let named: crate::board::Name = "alpha".parse().unwrap();
+        // `board_inspect` always replied with owner names; `board_read` of a named board never did.
+        assert!(matches!(
+            Request::board_inspect(named.clone()),
+            Request::BoardInspect { labels: true, .. }
+        ));
+        assert!(matches!(
+            Request::board_read(named),
+            Request::NamedBoardRead { .. }
+        ));
+        assert!(matches!(
+            Request::board_inspect(crate::board::Name::default()),
+            Request::BoardRead
+        ));
     }
 }

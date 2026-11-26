@@ -1182,7 +1182,13 @@ impl Broker {
 
     pub fn request(&self, req: Request) -> Result<Value> {
         let sending = matches!(req, Request::Send { .. });
+        let inspecting = matches!(req, Request::BoardInspect { labels: true, .. });
         let mut value = self.request_locked(req)?;
+        if inspecting {
+            // Owner names are resolved here, after the database lock is released: native reads block.
+            let snapshot: crate::board::Snapshot = serde_json::from_value(value.clone())?;
+            value["message_labels"] = json!(self.board_message_labels(&snapshot));
+        }
         // Resolved after the database lock is released: native name reads block.
         let mut seen = AgentRefs::default();
         if sending {
@@ -1478,17 +1484,14 @@ impl Broker {
                     &self.state_dir,
                     crate::db::now()
                 )?),
-                Request::BoardInspect { board } => {
+                Request::BoardInspect { board, .. } => {
                     let snapshot = crate::board_lifecycle::inspect(
                         &db,
                         &self.state_dir,
                         &board,
                         crate::db::now(),
                     )?;
-                    let labels = crate::board_messages::display_labels(&db, &snapshot)?;
-                    let mut value = json!(snapshot);
-                    value["message_labels"] = json!(labels);
-                    value
+                    json!(snapshot)
                 }
                 Request::BoardArchive {
                     board,
