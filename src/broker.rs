@@ -80,6 +80,8 @@ pub struct Broker {
     pub(crate) db: Arc<Mutex<Db>>,
     pub(crate) monitor_control: Arc<Mutex<crate::monitor::Control>>,
     pub(crate) wake: Arc<Notify>,
+    /// Claude sessions an Orca wake was requested for and that have not bound a socket since.
+    orca_wakes: Arc<Mutex<std::collections::HashSet<String>>>,
     pub(crate) network_wake: Arc<Notify>,
     pub(crate) pairing_notifications: Arc<Mutex<crate::pairing_notifications::State>>,
     pub(crate) board_notifications: Arc<Mutex<crate::board_notifications::State>>,
@@ -364,6 +366,7 @@ impl Broker {
             db: Arc::new(Mutex::new(db)),
             monitor_control: Arc::new(Mutex::new(crate::monitor::Control::default())),
             wake: Arc::new(Notify::new()),
+            orca_wakes: Arc::new(Mutex::new(std::collections::HashSet::new())),
             network_wake: Arc::new(Notify::new()),
             pairing_notifications: Arc::new(Mutex::new(
                 crate::pairing_notifications::State::default(),
@@ -427,6 +430,65 @@ impl Broker {
             Ok(None) => Ok(Vec::new()),
             Err(error) => Err(crate::clients::StateError::Unavailable(error.to_string())),
         }
+    }
+
+    /// A new message was accepted for a Claude session whose socket is gone. Say whether its
+    /// Orca chat can be woken and, when it can, ask once per outage; the answer is added to the
+    /// message detail when the call settles, so a failure is never hidden. The call runs on its
+    /// own thread, off the database lock.
+    fn hold_offline(
+        &self,
+        db: &Db,
+        source: &Agent,
+        destination: &Agent,
+        message: crate::protocol::Message,
+    ) -> Result<crate::protocol::Message> {
+        if !message
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with(crate::clients::claude::OFFLINE_PREFIX))
+        {
+            return Ok(message);
+        }
+        let target = db.claude_orca(&destination.session)?;
+        let from = if source.provider == Provider::Claude {
+            db.claude_orca(&source.session)?
+        } else {
+            None
+        };
+        let (Some((to, cli)), Some((from, _))) = (target.clone(), from.clone()) else {
+            let note = if target.is_none() {
+                "cannot wake: no Orca session is recorded for the recipient"
+            } else {
+                "cannot wake: only a Claude session running in Orca can wake the recipient, and the sender is not one"
+            };
+            db.offline_note(&message.id, note)?;
+            return db.get(&message.id);
+        };
+        if !self
+            .orca_wakes
+            .lock()
+            .unwrap()
+            .insert(destination.session.clone())
+        {
+            return Ok(message);
+        }
+        let broker = self.clone();
+        let (id, session) = (message.id.clone(), destination.session.clone());
+        std::thread::spawn(move || {
+            let note = match crate::orca_wake::wake(&cli, &from, &to) {
+                Ok(()) => "wake requested".to_owned(),
+                Err(error) => {
+                    // A later send may try again.
+                    broker.orca_wakes.lock().unwrap().remove(&session);
+                    format!("wake failed: {error:#}")
+                }
+            };
+            if let Err(error) = broker.db.lock().unwrap().offline_note(&id, &note) {
+                eprintln!("Could not record the wake outcome for {id}: {error:#}");
+            }
+        });
+        Ok(message)
     }
 
     /// Resolve configured routing identity and enrich transport details from the
@@ -1556,8 +1618,18 @@ impl Broker {
                 }
                 Request::ClaudeBind { session, endpoint } => {
                     db.claude_bind(&session, &endpoint)?;
-                    // Messages held while the session was down are claimable now.
+                    // The session is back: a later outage may wake it again, and the
+                    // messages held while it was down are claimable now.
+                    self.orca_wakes.lock().unwrap().remove(&session);
                     self.wake.notify_one();
+                    json!({"bound":true,"session":session})
+                }
+                Request::ClaudeOrcaBind {
+                    session,
+                    orca_session,
+                    orca_cli,
+                } => {
+                    db.claude_orca_bind(&session, &orca_session, &orca_cli)?;
                     json!({"bound":true,"session":session})
                 }
                 Request::ClaudeUnbind { session, endpoint } => {
@@ -1672,6 +1744,9 @@ impl Broker {
                                     "Route changed while preparing the send; retry with the current identity"
                                 );
                                 db.send(&id, &source, &destination, &body, &parent)
+                                    .and_then(|message| {
+                                        self.hold_offline(&db, &source, &destination, message)
+                                    })
                             }
                         }
                     };
@@ -3518,6 +3593,205 @@ mod machine_tests {
         .await;
         assert_eq!(outcome.state, "submitted", "{}", outcome.detail);
         assert!(claude_frame_id(&listener).contains("hello"));
+    }
+
+    /// A directory holding an executable `orca` that records its arguments, and fails when a
+    /// `fail` file exists. No real Orca is involved.
+    fn fake_orca(directory: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = directory.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let calls = directory.join("orca-calls");
+        let script = bin.join("orca");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\n[ -e {fail} ] && {{ echo nope >&2; exit 1; }}\nexit 0\n",
+                calls = calls.display(),
+                fail = directory.join("fail").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (script, calls)
+    }
+
+    fn orca_bind(broker: &Broker, session: &str, orca_session: &str, cli: &std::path::Path) {
+        broker
+            .request(Request::ClaudeOrcaBind {
+                session: session.into(),
+                orca_session: orca_session.into(),
+                orca_cli: cli.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+    }
+
+    fn wait_for_detail(broker: &Broker, id: &str, needle: &str) -> String {
+        for _ in 0..500 {
+            let detail = broker.request(Request::Get { id: id.into() }).unwrap()["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if detail.contains(needle) {
+                return detail;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("detail never contained {needle:?}");
+    }
+
+    const SENDER_SESSION: &str = "97e8d81e-073d-4cde-a017-4a8255b7b3b8";
+    const RECIPIENT_SESSION: &str = "11111111-2222-4333-8444-555555555555";
+    const SENDER_ORCA: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const RECIPIENT_ORCA: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    fn offline_pair(
+        directory: &std::path::Path,
+        broker: &Broker,
+    ) -> (String, String, std::path::PathBuf) {
+        let (live, listener) = claude_listener(directory, "sender.sock");
+        std::mem::forget(listener);
+        let sender = bind_claude(broker, SENDER_SESSION, &live);
+        let (old, old_listener) = claude_listener(directory, "old.sock");
+        let recipient = bind_claude(broker, RECIPIENT_SESSION, &old);
+        drop(old_listener);
+        std::fs::remove_file(&old).unwrap();
+        (sender, recipient, old)
+    }
+
+    fn send_to(broker: &Broker, sender: &str, recipient: &str, body: &str) -> Value {
+        broker
+            .request(Request::Send {
+                id: uuid::Uuid::new_v4().to_string(),
+                sender: sender.into(),
+                recipient: recipient.into(),
+                body: body.into(),
+                parent: None,
+            })
+            .unwrap()
+    }
+
+    /// AGB-72 wake: one fixed-text note per outage, from the sender's Orca chat to the
+    /// recipient's, carrying nothing of the message; the outcome lands in the detail.
+    #[tokio::test]
+    async fn an_offline_recipient_in_orca_is_woken_once_per_outage_with_a_fixed_note() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let (cli, calls) = fake_orca(directory.path());
+        let (sender, recipient, _) = offline_pair(directory.path(), broker);
+        orca_bind(broker, SENDER_SESSION, SENDER_ORCA, &cli);
+        orca_bind(broker, RECIPIENT_SESSION, RECIPIENT_ORCA, &cli);
+        let first = send_to(broker, &sender, &recipient, "SECRET-BODY-1");
+        let second = send_to(broker, &sender, &recipient, "SECRET-BODY-2");
+        let detail = wait_for_detail(broker, first["id"].as_str().unwrap(), "wake requested");
+        assert!(
+            detail.starts_with(crate::clients::claude::OFFLINE_PREFIX),
+            "{detail}"
+        );
+        let recorded = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(
+            recorded.lines().count(),
+            1,
+            "one wake for two sends: {recorded}"
+        );
+        assert!(recorded.contains(&format!("--from orca_session_id:{SENDER_ORCA}")));
+        assert!(recorded.contains(&format!("--to orca_session_id:{RECIPIENT_ORCA}")));
+        assert!(
+            !recorded.contains("SECRET-BODY"),
+            "the note carries no message content"
+        );
+        assert!(!recorded.contains(&sender) && !recorded.contains(&recipient));
+        let held = broker
+            .request(Request::Get {
+                id: second["id"].as_str().unwrap().into(),
+            })
+            .unwrap();
+        assert_eq!(held["state"], "pending");
+        // The session binds a new socket (the wake worked); a later outage wakes it again.
+        let (fresh, fresh_listener) = claude_listener(directory.path(), "new.sock");
+        bind_claude(broker, RECIPIENT_SESSION, &fresh);
+        drop(fresh_listener);
+        std::fs::remove_file(&fresh).unwrap();
+        orca_bind(broker, RECIPIENT_SESSION, RECIPIENT_ORCA, &cli);
+        let third = send_to(broker, &sender, &recipient, "again");
+        wait_for_detail(broker, third["id"].as_str().unwrap(), "wake requested");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_wake_that_cannot_be_made_says_why_in_the_detail_and_a_failed_one_is_retried_by_the_next_send()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let (cli, calls) = fake_orca(directory.path());
+        let (sender, recipient, _) = offline_pair(directory.path(), broker);
+        // Nothing recorded for the recipient.
+        let none = send_to(broker, &sender, &recipient, "a");
+        assert!(
+            none["detail"]
+                .as_str()
+                .unwrap()
+                .contains("cannot wake: no Orca session is recorded for the recipient"),
+            "{none}"
+        );
+        // Recipient in Orca, sender not.
+        orca_bind(broker, RECIPIENT_SESSION, RECIPIENT_ORCA, &cli);
+        let plain = send_to(broker, "user", &recipient, "b");
+        assert!(
+            plain["detail"].as_str().unwrap().starts_with("offline:"),
+            "{plain}"
+        );
+        let unsent = send_to(broker, &sender, &recipient, "c");
+        assert!(
+            unsent["detail"]
+                .as_str()
+                .unwrap()
+                .contains("the sender is not one"),
+            "{unsent}"
+        );
+        assert!(!calls.exists(), "no wake without both Orca sessions");
+        // Both in Orca, but the command fails: reported, and the next send tries again.
+        orca_bind(broker, SENDER_SESSION, SENDER_ORCA, &cli);
+        std::fs::write(directory.path().join("fail"), "").unwrap();
+        let failed = send_to(broker, &sender, &recipient, "d");
+        let detail = wait_for_detail(broker, failed["id"].as_str().unwrap(), "wake failed");
+        assert!(detail.starts_with("offline:"), "{detail}");
+        let again = send_to(broker, &sender, &recipient, "e");
+        wait_for_detail(broker, again["id"].as_str().unwrap(), "wake failed");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn only_an_orca_session_uuid_and_an_absolute_orca_command_can_be_recorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let (cli, _) = fake_orca(directory.path());
+        let (live, _listener) = claude_listener(directory.path(), "s.sock");
+        bind_claude(broker, RECIPIENT_SESSION, &live);
+        let bind = |orca_session: &str, orca_cli: &str| {
+            broker.request(Request::ClaudeOrcaBind {
+                session: RECIPIENT_SESSION.into(),
+                orca_session: orca_session.into(),
+                orca_cli: orca_cli.into(),
+            })
+        };
+        assert!(bind(RECIPIENT_ORCA, &cli.to_string_lossy()).is_ok());
+        assert!(bind("not-a-uuid", &cli.to_string_lossy()).is_err());
+        assert!(bind(RECIPIENT_ORCA, "orca").is_err());
+        assert!(bind(RECIPIENT_ORCA, "/bin/sh").is_err());
+        // A session that never bound a socket has nothing to attach it to.
+        assert!(
+            broker
+                .request(Request::ClaudeOrcaBind {
+                    session: SENDER_SESSION.into(),
+                    orca_session: RECIPIENT_ORCA.into(),
+                    orca_cli: cli.to_string_lossy().into_owned(),
+                })
+                .is_err()
+        );
     }
 
     /// The shared 1000-message queue cap counts messages held for offline sessions, so a dead

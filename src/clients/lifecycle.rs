@@ -62,6 +62,23 @@ async fn run_inner(state: &Path, provider: Provider) -> Result<()> {
             },
         )
         .await?;
+        // Inside Orca the session can be woken when a message is held for it. A failure here
+        // must not undo the binding, so it is reported on its own.
+        if let (Ok(orca_session), Ok(orca_cli)) = (
+            std::env::var("ORCA_AGENT_SESSION_ID"),
+            std::env::var("ORCA_CLI_COMMAND"),
+        ) && let Err(error) = rpc(
+            state,
+            &Request::ClaudeOrcaBind {
+                session: session.into(),
+                orca_session,
+                orca_cli,
+            },
+        )
+        .await
+        {
+            eprintln!("Agent Bridge hook: could not record the Orca session: {error:#}");
+        }
     }
     let machine_context = rpc(state, &Request::MachineShow)
         .await

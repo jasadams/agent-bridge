@@ -64,7 +64,9 @@ pub(super) fn write_result(tool: &str, mut value: Value, verbose: bool) -> Value
     // progress. Only that stable marker is kept; other details stay in `get_message`.
     let mut value = value;
     if tool == "send_message"
-        && value["detail"] != crate::clients::claude::OFFLINE_DETAIL
+        && !value["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with(crate::clients::claude::OFFLINE_PREFIX))
         && let Some(object) = value.as_object_mut()
     {
         object.remove("detail");

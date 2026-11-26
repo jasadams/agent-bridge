@@ -68,6 +68,25 @@ messages are delivered to that session only, once each, in send order, with the 
 states and retry rules. A partial write stays Unknown, as before. Messages are held
 without expiry, and they count toward the shared 1000-message queue limit.
 
+**Waking an Orca chat.** A suspended chat would otherwise only receive its held messages
+when someone types in it. When the start hook runs inside Orca it also records the
+session's Orca ID and the `orca` command Orca exported (`ORCA_AGENT_SESSION_ID`,
+`ORCA_CLI_COMMAND`; the command must be the absolute path of a file named `orca`). When a
+message is held for a session with a recorded Orca ID, and the sender is itself a bound
+Claude session running in Orca, the broker runs `orca orchestration send --from <sender's
+Orca ID> --to <recipient's Orca ID>` once per outage (10 s limit, off the database lock;
+the next send retries only if the call failed). The note is fixed text, "Your Agent Bridge
+inbox has a message waiting...", with no message content and nothing the sender wrote: the
+real message still arrives through the bridge with its usual banner. The outcome is added to
+the message detail: `offline: queued until the recipient session reconnects; wake
+requested`, `...; wake failed: <reason>`, or `...; cannot wake: <reason>`. Only the first
+message of an outage carries the wake outcome. A wake needs both ends in Orca, so a message
+from an OpenCode, Codex or plain CLI sender, or from a board message input, is held but cannot
+wake the recipient today; the recipient receives it when it next starts. The wake costs one
+model turn in the woken chat. Recording the Orca ID adds two nullable columns to
+`claude_bindings` (schema version 22); a binary older than this version refuses the newer
+database, so rolling back needs the backup the update makes.
+
 A send is refused without being stored (`persisted: false`) when the session has no
 binding: it never started with the hooks installed, or it ended cleanly (the end hook
 removes the binding; `claude agents --json` lists only running processes, so it cannot

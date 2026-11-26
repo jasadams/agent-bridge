@@ -121,6 +121,8 @@ pub fn stale_reason(path: &Path) -> Option<String> {
 /// Stable, machine-readable prefix of the detail on a message held for a Claude session
 /// whose inbox socket is gone. Documented in docs/mcp.md; agents may match on it.
 pub const OFFLINE_DETAIL: &str = "offline: queued until the recipient session reconnects";
+/// What every offline detail starts with: the base text, optionally followed by `; wake ...`.
+pub const OFFLINE_PREFIX: &str = "offline:";
 
 /// The bound socket file no longer exists: the session's process stopped or restarted. This
 /// only inspects the file, so it never reaches the session as a connection.

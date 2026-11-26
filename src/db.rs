@@ -620,16 +620,60 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO claude_bindings(session,endpoint) VALUES(?,?)
-             ON CONFLICT(session) DO UPDATE SET endpoint=excluded.endpoint",
+             ON CONFLICT(session) DO UPDATE SET endpoint=excluded.endpoint,orca_session=NULL,orca_cli=NULL",
             params![session, normalized],
         )?;
         // The session is back: whatever was held as offline is an ordinary queued message again,
         // and is claimed now rather than after the retry backoff.
         tx.execute(
-            "UPDATE messages SET detail=NULL WHERE recipient_session=?1 AND state='queued' AND detail=?2",
-            params![session, crate::clients::claude::OFFLINE_DETAIL],
+            "UPDATE messages SET detail=NULL WHERE recipient_session=?1 AND state='queued' AND detail LIKE 'offline:%'",
+            params![session],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Record where this session runs in Orca. Follows `claude_bind`, which clears it, so it
+    /// always describes the session's latest start.
+    pub fn claude_orca_bind(
+        &self,
+        session: &str,
+        orca_session: &str,
+        orca_cli: &str,
+    ) -> Result<()> {
+        crate::orca_wake::validate(orca_session, orca_cli)?;
+        let changed = self.conn.execute(
+            "UPDATE claude_bindings SET orca_session=?2,orca_cli=?3 WHERE session=?1",
+            params![session, orca_session, orca_cli],
+        )?;
+        ensure!(changed == 1, "Claude session has no binding");
+        Ok(())
+    }
+
+    /// The Orca chat and `orca` command recorded for a bound Claude session, if any.
+    pub(crate) fn claude_orca(&self, session: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT orca_session,orca_cli FROM claude_bindings WHERE session=?",
+                [session],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?
+            .and_then(|(session, cli)| Some((session?, cli?))))
+    }
+
+    /// Add the outcome of a wake to a message still held as offline.
+    pub(crate) fn offline_note(&self, id: &str, note: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET detail=?2 WHERE id=?1 AND state='queued' AND detail LIKE 'offline:%'",
+            params![id, format!("{}; {note}", crate::clients::claude::OFFLINE_DETAIL)],
+        )?;
         Ok(())
     }
 
@@ -1084,12 +1128,8 @@ impl Db {
                 // attempt (nothing listens on it) is retried at most once per backoff, so it is
                 // neither spun on nor probed with an extra connection.
                 let backing_off: bool = self.conn.query_row(
-                    "SELECT coalesce(detail=?1 AND updated>?3,0) FROM messages WHERE id=?2",
-                    params![
-                        crate::clients::claude::OFFLINE_DETAIL,
-                        id,
-                        time - OFFLINE_RETRY_MS
-                    ],
+                    "SELECT coalesce(detail LIKE 'offline:%' AND updated>?2,0) FROM messages WHERE id=?1",
+                    params![id, time - OFFLINE_RETRY_MS],
                     |row| row.get(0),
                 )?;
                 if !endpoint.is_empty()
@@ -1105,8 +1145,8 @@ impl Db {
                 }
             }
             self.conn.execute(
-                "UPDATE messages SET state='sending',detail=CASE WHEN detail=?3 THEN NULL ELSE detail END,updated=?1 WHERE id=?2 AND state IN ('queued','uncertain')",
-                params![time, id, crate::clients::claude::OFFLINE_DETAIL],
+                "UPDATE messages SET state='sending',detail=CASE WHEN detail LIKE 'offline:%' THEN NULL ELSE detail END,updated=?1 WHERE id=?2 AND state IN ('queued','uncertain')",
+                params![time, id],
             )?;
             let msg = self.get(&id)?;
             let agent = Agent {

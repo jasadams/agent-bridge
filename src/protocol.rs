@@ -168,6 +168,13 @@ pub enum Request {
         session: String,
         endpoint: String,
     },
+    /// Where the session just bound by `ClaudeBind` runs in Orca, so a message held for it can
+    /// wake the chat. Sent by the start hook only inside an Orca session.
+    ClaudeOrcaBind {
+        session: String,
+        orca_session: String,
+        orca_cli: String,
+    },
     /// End only the matching normalized Claude endpoint, never its replacement.
     ClaudeUnbind {
         session: String,
