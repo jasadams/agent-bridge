@@ -573,6 +573,214 @@ ORCA_VALUES = {  # what the rendered page must paint, by sheet (DESIGN.md: Orca 
 }
 
 
+def percent(text):
+    """Every character of `text` percent-encoded."""
+    return "".join(f"%{byte:02X}" for byte in text.encode())
+
+
+def encoded(char, levels):
+    """`char` percent-encoded `levels` times over (one level is `%5F` for an underscore)."""
+    for _ in range(levels):
+        char = "".join(f"%{byte:02X}" for byte in char.encode())
+    return char
+
+
+def access_link_shapes(token):
+    """AGB-69: (label, fragment, unlocks). `unlocks` is what main did before this ticket (checked against a
+    main build): only a token this page can read as an `&`-separated `access_token` parameter unlocks.
+    Every shape, recognised or not, must leave no access token in the address."""
+    t, bad = token, "x" * 43
+    return [
+        ("documented", f"access_token={t}", True),
+        ("theme first", f"theme=orca&access_token={t}", True),
+        ("theme last", f"access_token={t}&theme=orca", True),
+        ("double separators", f"&&access_token={t}&&", True),
+        ("leading question mark", f"?access_token={t}", True),
+        ("percent-encoded key", f"%61ccess_token={t}", True),
+        ("percent-encoded underscore", f"access%5Ftoken={t}", True),
+        ("percent-encoded value", f"access_token={percent(t[:4])}{t[4:]}", True),
+        ("fully percent-encoded key and value", f"{percent('access_token')}={percent(t)}", True),
+        ("repeated key, token first", f"access_token={t}&access_token={bad}", True),
+        ("malformed escape elsewhere", f"%E0%A4%A&access_token={t}", True),
+        ("route before the token", f"/board/main&access_token={t}", True),
+        ("repeated key, bad one first", f"access_token={bad}&access_token={t}", False),
+        ("semicolon after a theme", f"theme=orca;access_token={t}", False),
+        ("semicolon before a theme", f"access_token={t};theme=orca", False),
+        ("semicolon after the token", f"access_token={t};y", False),
+        ("semicolon, short value", "access_token=x;y", False),
+        ("token inside a route", f"/x?access_token={t}", False),
+        ("question mark after an ampersand", f"theme=orca&?access_token={t}", False),
+        ("ampersand then question mark", f"&?access_token={t}", False),
+        ("token as another key's value", f"x=access_token={t}", False),
+        ("key and token as another key's encoded value", f"x=access_token%3D{t}", False),
+        ("key in another key's name", f"access_token_x={t}", False),
+        ("encoded equals sign", f"access_token%3D{t}", False),
+        ("upper case key", f"ACCESS_TOKEN={t}", False),
+        ("double-encoded key", f"%2561ccess_token={t}", False),
+        ("comma separator", f"theme=orca,access_token={t}", False),
+        ("slash separator", f"/board/main/access_token={t}", False),
+        ("space separator", f"theme=orca%20access_token={t}", False),
+        ("board name containing the text", "/board/access_token_rotation", False),
+        ("token after a slash in a route", f"/board/main/access_token/{t}", False),
+        ("token after a colon in a route", f"/topic/x:access_token:{t}", False),
+        ("encoded route with the token appended", f"%2Fboard%2Faccess_token_{t}", False),
+        ("board id with the token appended", f"/board/access_token_{t}", False),
+        ("topic id with the token appended", f"/topic/access_token-{t}", False),
+        ("dm id with the token appended", f"/dm/access_token.{t}", False),
+        ("triple-encoded key", f"access_t%25256Fken={t}", False),
+        ("a second hash sign", f"x=1#access_token={t}", False),
+        ("underscore encoded seven times", f"access{encoded('_', 7)}token={t}", False),
+        ("underscore encoded eight times", f"access{encoded('_', 8)}token={t}", False),
+        ("underscore encoded nine times", f"access{encoded('_', 9)}token={t}", False),
+        ("token with a trailing escape", f"access_token={t}%", False),
+        ("token too short", "access_token=x", False),
+        ("empty token", "access_token=", False),
+        ("key without a value", "access_token", False),
+        ("repeated theme and a semicolon", f"theme=orca&theme=sticker;access_token={t}", False),
+    ]
+
+
+def run_access_link_section(playwright, url_for, report):
+    """AGB-69: no link shape, recognised or not, leaves an access token in the address bar. A link the page
+    cannot read does not unlock: it shows the locked screen, is cleared of the token and stores nothing."""
+    base, _, link_fragment = url_for.partition("#")
+    token = dict(part.split("=", 1) for part in link_fragment.split("&"))["access_token"]
+    origin = base.rstrip("/")
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    problems = []
+    for label, fragment, unlocks in access_link_shapes(token):
+        tag = f"[access link {label}]"
+        time.sleep(1.1)  # the broker allows 100 requests a second in all
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        page = context.new_page()
+        requests, leaks, texts = [], [], []
+        page.on("request", lambda r: requests.append(r.url))
+        page.on("request", lambda r: leaks.append(r.url) if token in (r.url + (r.headers.get("referer") or "") + (r.post_data or "")) else None)
+        page.on("console", lambda m: texts.append(m.text))
+        page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
+        page.on("pageerror", lambda e: problems.append(str(e)))
+        page.goto(f"{base}#{fragment}")
+        if unlocks:
+            page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        else:
+            page.wait_for_selector("#login:not([hidden])", timeout=8000)
+            time.sleep(.5)  # a late unlock must not happen
+            if label != "repeated key, bad one first":  # that one tries the login and is refused, as on main
+                report.check(f"{tag} the page makes no API request (it never tries to unlock)", not any("/api/" in u for u in requests), str([u.split("?")[0] for u in requests if "/api/" in u]))
+        shown_workspace = page.locator("#workspace").is_visible()
+        shown_login = page.locator("#login").is_visible()
+        report.check(f"{tag} {'unlocks' if unlocks else 'stays locked on the login screen'}", shown_workspace == unlocks and shown_login != unlocks, f"workspace={shown_workspace} login={shown_login}")
+        address = page.evaluate("location.href + ' ' + JSON.stringify(history.state)")
+        report.check(f"{tag} the address and history entry carry no access_token key or value", page.url in (base, f"{base}#/board/main") and "access_token" not in address.lower() and token not in address, page.url.replace(token, "<token>"))
+        store = page.evaluate("Object.fromEntries(Object.keys(localStorage).concat(Object.keys(sessionStorage)).map(k => [k, 1]))")
+        report.check(f"{tag} nothing is stored", set(store) <= {"agent-bridge-theme", "agent-bridge-sidebar"} and token not in json.dumps(context.cookies()), str(list(store)))
+        report.check(f"{tag} the token is in no request URL, Referer or body, no console message, and nothing left the origin",
+                     not leaks and all(u.startswith(origin + "/") for u in requests) and not any(token in text for text in texts), str([u for u in requests if not u.startswith(origin + "/")]))
+        page.reload()
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"{tag} a reload shows the locked screen again (the token was not kept)", page.locator("#workspace").is_hidden())
+        context.close()
+
+    # The same shapes pasted into a page that is already open: the address is cleared, the open session and its route are kept.
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
+    page.on("pageerror", lambda e: problems.append(str(e)))
+    time.sleep(1.1)
+    page.goto(f"{base}#access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "location.hash === '#/board/main'", 15000)
+    for label, fragment, _ in access_link_shapes(token):
+        tag = f"[access link pasted {label}]"
+        page.evaluate("fragment => { location.hash = fragment }", fragment)
+        until(page, "location.hash === '#/board/main'", 8000)
+        report.check(f"{tag} the address is back to the current route, with no access_token", "access_token" not in page.url.lower() and token not in page.url and page.evaluate("location.hash") == "#/board/main", page.url.replace(token, "<token>"))
+        report.check(f"{tag} the open session is kept", page.locator("#workspace").is_visible() and page.locator("#login").is_hidden())
+    # Back and Forward onto a history entry that names the text are cleared too (documented): the open session stays on the current board.
+    page.evaluate("history.pushState(null, '', '#/board/access_token_rotation')")
+    page.go_back()
+    until(page, "location.hash === '#/board/main'", 8000)
+    page.go_forward()
+    until(page, "location.hash === '#/board/main'", 8000)
+    time.sleep(.3)
+    report.check("[access link history] Forward onto an entry naming access_token is cleared and the open session stays on the current board", page.evaluate("location.hash") == "#/board/main" and "access_token" not in page.url and page.locator("#workspace").is_visible())
+    context.close()
+    # The same shapes pasted into a locked page: cleared, still locked.
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    page.on("pageerror", lambda e: problems.append(str(e)))
+    page.goto(base)
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    for label, fragment, unlocks in access_link_shapes(token):
+        if unlocks:
+            continue
+        tag = f"[access link pasted locked {label}]"
+        page.evaluate("fragment => { location.hash = fragment }", fragment)
+        until(page, "location.hash === ''", 8000)
+        report.check(f"{tag} the address is cleared and the page stays locked", "access_token" not in page.url.lower() and token not in page.url and page.locator("#login").is_visible() and page.locator("#workspace").is_hidden(), page.url.replace(token, "<token>"))
+    context.close()
+    # An ordinary route is left alone.
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    page.goto(f"{base}#/board/release-checklist")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    report.check("[access link] a route without a token is untouched", page.evaluate("location.hash") == "#/board/release-checklist")
+    context.close()
+    # A very long, repeatedly encoded fragment must not hang the page: it is cleared promptly.
+    time.sleep(1.1)
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    started = time.monotonic()
+    page.goto(f"{base}#%{'25' * 90000}61")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    until(page, "location.hash === ''", 8000)
+    elapsed = time.monotonic() - started
+    report.check("[access link long encoding] a 180 KB, deeply nested encoding is cleared within two seconds of loading", elapsed < 2 and page.locator("#workspace").is_hidden(), f"{elapsed:.1f}s")
+    context.close()
+    # No exception: a board whose own name contains the text cannot be opened by a link. The fragment is
+    # cleared, nothing opens, and after unlocking by hand the page opens the default board.
+    time.sleep(1.1)
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    page.goto(f"{base}#/board/access_token_rotation")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    report.check("[access link board name] a board whose name contains access_token is cleared from the address", page.evaluate("location.hash") == "" and page.locator("#workspace").is_hidden(), page.url)
+    page.fill("#access-token", token)
+    page.click("#login-form button[type=submit]")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "location.hash === '#/board/main'", 15000)
+    report.check("[access link board name] after unlocking by hand the default board opens", page.evaluate("location.hash") == "#/board/main")
+    context.close()
+    csp = [p for p in problems if "Content Security Policy" in p or "Refused to" in p]
+    report.check("[access link] no Content-Security-Policy violations", not csp, str(csp[:3]))
+    other = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p and "401" not in p]
+    report.check("[access link] no console or page errors", not other, str(other[:5]))
+    browser.close()
+
+
+def run_access_link_board_section(playwright, url_for, broker, report):
+    """AGB-69: a board whose name contains `access_token` cannot be opened by a link, but choosing it in the
+    sidebar works (documented). Run last, because it adds a board the other sections do not expect."""
+    base, _, link_fragment = url_for.partition("#")
+    token = dict(part.split("=", 1) for part in link_fragment.split("&"))["access_token"]
+    broker.rpc("board_create", board="access_token_rotation")
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    time.sleep(1.1)
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    problems = []
+    page.on("pageerror", lambda e: problems.append(str(e)))
+    page.goto(f"{base}#access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "!!document.querySelector('#sidebar .nav-item[data-route=\"#/board/access_token_rotation\"]')", 20000)
+    page.click('#sidebar .nav-item[data-route="#/board/access_token_rotation"]')
+    until(page, "location.hash === '#/board/access_token_rotation'", 8000)
+    time.sleep(.5)
+    report.check("[access link board name] the board can be chosen in the sidebar and stays open", page.evaluate("location.hash") == "#/board/access_token_rotation" and page.locator("#boards-view").is_visible() and not problems, str(problems[:3]))
+    context.close()
+    browser.close()
+
+
 def run_theme_menu_section(playwright, url_for, report):
     """The Theme menu and live switching between all five choices with the browser in light mode:
     Classic is the default, nothing but the chosen sheet and its fonts is ever requested, and no pick reloads."""
@@ -969,7 +1177,7 @@ def run_url_theme_section(playwright, url_for, report):
     context, page, requests = open_page()
     page.goto(f"{base}#theme=orca;access_token={token}")
     page.wait_for_selector("#login:not([hidden])", timeout=8000)
-    report.check("[url theme semicolon] an unparsed link is ignored: Classic, nothing stored, token in no request", page.evaluate("document.documentElement.dataset.theme") == "classic" and stored(page) == {} and not page.token_seen)
+    report.check("[url theme semicolon] an unparsed link is ignored: Classic, nothing stored, token in no request, and cleared from the address (AGB-69)", page.evaluate("document.documentElement.dataset.theme") == "classic" and stored(page) == {} and not page.token_seen and page.evaluate("location.hash") == "")
     context.close()
 
     # Hash routes are unaffected: a route opens, reloads and navigates as before; a theme link lands on the default board, as a reload does.
@@ -997,7 +1205,7 @@ def run_url_theme_section(playwright, url_for, report):
                                   ("/board/x&theme=%6Frca&", "#/board/x&", "orca"),
                                   ("/board/x&&theme=orca&&", "#/board/x&&&", "orca"),
                                   ("theme=orca&?theme=sticker", "#&?theme=sticker", "orca"),
-                                  ("theme=orca&?access_token=not-a-token", "#&?access_token=not-a-token", "orca"),
+                                  ("theme=orca&?access_token=not-a-token", "", "orca"),  # AGB-69: any fragment naming access_token is cleared
                                   ("?access_token=x&theme=orca", "", "orca"),
                                   ("theme=orca", "", "orca"),
                                   ("/board/release-checklist&theme=orca-light", "#/board/release-checklist", "orca-light"),
@@ -1302,6 +1510,7 @@ def main():
         themes = ALL_THEMES if args.theme == "all" else [args.theme]
         with sync_playwright() as playwright:
             run_url_theme_section(playwright, credentials["access_url"], report)
+            run_access_link_section(playwright, credentials["access_url"], report)
             run_theme_menu_section(playwright, credentials["access_url"], report)
             # an explicit Orca choice is run in the opposite appearance, to show it ignores the browser's; the system choice in both
             for choice, scheme in [("orca", "light"), ("orca-light", "dark"), ("orca-system", "dark"), ("orca-system", "light")]:
@@ -1313,6 +1522,7 @@ def main():
             for theme in themes:
                 for scheme in (["light", "dark"] if theme == "orca-system" else ["light"]):
                     run_theme(playwright, theme, credentials["access_url"], topic_id, report, out, scheme)
+            run_access_link_board_section(playwright, credentials["access_url"], broker, report)
     finally:
         if broker:
             broker.close()

@@ -8,13 +8,31 @@
 
   // Consume the private link before making requests or displaying the workspace.
   // Fragments never travel in HTTP requests; replace this history entry as well.
+  // URLSearchParams reads only `&`-separated parameters, so a link with another separator (`;`), a `?`
+  // inside the fragment, or the key inside a route would not be recognised and its valid token would stay
+  // in the address bar and the history. A fragment is therefore treated as an access link whenever the
+  // text `access_token` appears in it in any case, raw or percent-encoded (up to eight levels), whatever the
+  // separators. It is always cleared; it unlocks the page only when the token is a parameter this page
+  // can read, exactly as before. There is no exception: a board whose own name contains the text cannot
+  // be opened by a link.
+  function namesAccessToken(hash) {
+    // Each pass decodes one more level of encoding. Eight levels is far beyond any real link; a
+    // fragment still changing after that is cleared as an access link, so a long run of `%25` cannot
+    // make this loop cost more than eight linear passes.
+    let text = hash;
+    for (let pass = 0; pass < 8; pass++) {
+      if (/access_token/i.test(text)) return true;
+      const next = text.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+      if (next === text) return false;
+      text = next;
+    }
+    return true;
+  }
   function takeAccessLink() {
-    if (!window.location.hash) return null;
-    const fragment = new URLSearchParams(window.location.hash.slice(1));
-    const candidate = fragment.get("access_token");
-    if (candidate === null) return null; // an ordinary route such as #/topic/x
+    if (!namesAccessToken(window.location.hash)) return null; // an ordinary route such as #/topic/x
+    const candidate = new URLSearchParams(window.location.hash.slice(1)).get("access_token");
     window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    return /^[A-Za-z0-9_-]{43}$/.test(candidate) ? candidate : null;
+    return candidate !== null && /^[A-Za-z0-9_-]{43}$/.test(candidate) ? candidate : null;
   }
   let accessFromLink = takeAccessLink();
   const $ = id => document.getElementById(id);
@@ -530,7 +548,7 @@
   }
   window.addEventListener("hashchange", () => {
     // A pasted access link is always consumed first so the token never lingers in the address bar.
-    if (new URLSearchParams(location.hash.slice(1)).has("access_token")) { unlockFromLink(takeAccessLink()); if (token && route) restoreHash(); return; }
+    if (namesAccessToken(location.hash)) { unlockFromLink(takeAccessLink()); if (token && route) restoreHash(); return; }
     if (!token) return;
     void navigate(parseRoute(location.hash) || defaultRoute(), true);
   });

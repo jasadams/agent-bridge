@@ -324,7 +324,8 @@ sent in a request, and the token is consumed and removed exactly as without a th
   saved theme (the page still stores only the theme name and the sidebar state).
 - Only one known, lowercase name counts (after percent-decoding). An unknown, empty, differently cased or repeated
   `theme` is ignored: the saved theme (or Classic) applies, nothing is stored, and the address is left
-  as it was.
+  as it was (unless the fragment also names `access_token`, which is always cleared; see
+  [Browser access](#browser-access)).
 - After applying it the page removes `theme` from the address, so a later reload keeps whatever you
   chose from the menu in the meantime. Opening a link that carries a theme (a new tab, a bookmark, a
   pasted link in a fresh load) selects that theme again; changing only the fragment of a page that is
@@ -345,7 +346,30 @@ controls, drafts, pending requests and the token,
 and closing/reloading the cleaned page requires access again. Reopening the private
 access link unlocks it again while that credential remains valid. Tokens in access
 links use only the fragment, never the query string. After consuming the fragment,
-requests use only Authorization headers. Tokens are not stored in cookies,
+requests use only Authorization headers.
+
+The page removes the token from the address bar and the current history entry for every link
+shape, including one it cannot read. It unlocks only when the first `access_token` parameter of the
+fragment, after splitting on `&` (a leading `?` and percent-encoding of the key or value are
+accepted), holds a valid token; this covers `#access_token=<token>` and, with a theme,
+`#theme=<name>&access_token=<token>` in either order. A fragment that contains the text
+`access_token` in any other shape, for example joined with `;`, `,` or a space, after an `&?`,
+inside a route (`#/x?access_token=<token>`), as another parameter's value, in upper case or encoded
+more than once, or as a repeated key whose first value is not the token, does not unlock: the page
+shows the normal locked screen, replaces the whole fragment with an empty one (a route in it is
+lost too) and stores nothing. It sends nothing either, except in one case: a repeated `access_token`
+key whose first value is a well-formed token is tried as if typed and refused, and the address,
+storage and every URL still hold no token. Open the link as `agent-bridge web enable` printed it,
+or enter the token by hand. The same applies when such a link is pasted into a page that is already
+open: the open session and its route are kept and the fragment is cleared. A fragment encoded eight or more
+times is cleared too. A board or topic whose own name contains the text `access_token` cannot be
+opened by a link, a reload or the browser's Back and Forward buttons: its fragment is cleared and the
+page opens, or stays on, the current or default board (choosing it in the sidebar still works).
+A route that does not contain the text is left alone. Only a fragment that contains the text
+`access_token` is recognised as a link: a token with no such text beside it cannot be told from an
+ordinary route and is not touched.
+
+Tokens are not stored in cookies,
 referrers or browser storage; the page stores only the theme and sidebar preferences described above. Static login assets contain no message history or
 credentials. A theme can be added to the access link's fragment
 ([Choosing the theme from the link](#choosing-the-theme-from-the-link)); the token is still
@@ -411,7 +435,11 @@ that no Classic or Sticker Bomb colour is used, and that nothing scrolls or over
 menu, dialog, toast and empty state listed in [DESIGN.md](../DESIGN.md) (Orca theme), with the browser in
 each appearance. For Orca (system) it emulates both appearances and changes the appearance while the page is open
 (including quick changes with held sheet responses), and checks that the page follows it in both directions without a
-reload, requests only the sheet it needs, keeps one theme sheet, and still saves only `orca-system`:
+reload, requests only the sheet it needs, keeps one theme sheet, and still saves only `orca-system`.
+It also opens every access-link shape listed under [Browser access](#browser-access), readable or not,
+at load and pasted into an open or a locked page, and checks that the address and history entry never
+keep the token, that only the readable shapes unlock, and that nothing reaches storage, cookies, a
+request, the console or another origin:
 
 ```sh
 cargo build --locked
