@@ -361,10 +361,11 @@ lost too) and stores nothing. It sends nothing either, except in one case: a rep
 key whose first value is a well-formed token is tried as if typed and refused, and the address,
 storage and every URL still hold no token. Open the link as `agent-bridge web enable` printed it,
 or enter the token by hand. The same applies when such a link is pasted into a page that is already
-open: the open session and its route are kept and the fragment is cleared. A fragment encoded more than eight
+open: the open session and its route are kept and the fragment is cleared. A fragment encoded eight or more
 times is cleared too. A board or topic whose own name contains the text `access_token` cannot be
 opened by a link, a reload or the browser's Back and Forward buttons: its fragment is cleared and the
-page opens, or stays on, the current or default board (choosing it in the sidebar still works). A route that does not contain the text is left alone. Only a fragment that contains the text
+page opens, or stays on, the current or default board (choosing it in the sidebar still works).
+A route that does not contain the text is left alone. Only a fragment that contains the text
 `access_token` is recognised as a link: a token with no such text beside it cannot be told from an
 ordinary route and is not touched.
 

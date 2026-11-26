@@ -578,6 +578,13 @@ def percent(text):
     return "".join(f"%{byte:02X}" for byte in text.encode())
 
 
+def encoded(char, levels):
+    """`char` percent-encoded `levels` times over (one level is `%5F` for an underscore)."""
+    for _ in range(levels):
+        char = "".join(f"%{byte:02X}" for byte in char.encode())
+    return char
+
+
 def access_link_shapes(token):
     """AGB-69: (label, fragment, unlocks). `unlocks` is what main did before this ticket (checked against a
     main build): only a token this page can read as an `&`-separated `access_token` parameter unlocks.
@@ -622,7 +629,9 @@ def access_link_shapes(token):
         ("dm id with the token appended", f"/dm/access_token.{t}", False),
         ("triple-encoded key", f"access_t%25256Fken={t}", False),
         ("a second hash sign", f"x=1#access_token={t}", False),
-        ("encoded nine times", f"{'%25' * 8}61ccess_token={t}", False),
+        ("underscore encoded seven times", f"access{encoded('_', 7)}token={t}", False),
+        ("underscore encoded eight times", f"access{encoded('_', 8)}token={t}", False),
+        ("underscore encoded nine times", f"access{encoded('_', 9)}token={t}", False),
         ("token with a trailing escape", f"access_token={t}%", False),
         ("token too short", "access_token=x", False),
         ("empty token", "access_token=", False),
@@ -746,6 +755,29 @@ def run_access_link_section(playwright, url_for, report):
     report.check("[access link] no Content-Security-Policy violations", not csp, str(csp[:3]))
     other = [p for p in problems if p not in csp and "net::ERR_ABORTED" not in p and "401" not in p]
     report.check("[access link] no console or page errors", not other, str(other[:5]))
+    browser.close()
+
+
+def run_access_link_board_section(playwright, url_for, broker, report):
+    """AGB-69: a board whose name contains `access_token` cannot be opened by a link, but choosing it in the
+    sidebar works (documented). Run last, because it adds a board the other sections do not expect."""
+    base, _, link_fragment = url_for.partition("#")
+    token = dict(part.split("=", 1) for part in link_fragment.split("&"))["access_token"]
+    broker.rpc("board_create", board="access_token_rotation")
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    time.sleep(1.1)
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    problems = []
+    page.on("pageerror", lambda e: problems.append(str(e)))
+    page.goto(f"{base}#access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "!!document.querySelector('#sidebar .nav-item[data-route=\"#/board/access_token_rotation\"]')", 20000)
+    page.click('#sidebar .nav-item[data-route="#/board/access_token_rotation"]')
+    until(page, "location.hash === '#/board/access_token_rotation'", 8000)
+    time.sleep(.5)
+    report.check("[access link board name] the board can be chosen in the sidebar and stays open", page.evaluate("location.hash") == "#/board/access_token_rotation" and page.locator("#boards-view").is_visible() and not problems, str(problems[:3]))
+    context.close()
     browser.close()
 
 
@@ -1490,6 +1522,7 @@ def main():
             for theme in themes:
                 for scheme in (["light", "dark"] if theme == "orca-system" else ["light"]):
                     run_theme(playwright, theme, credentials["access_url"], topic_id, report, out, scheme)
+            run_access_link_board_section(playwright, credentials["access_url"], broker, report)
     finally:
         if broker:
             broker.close()
