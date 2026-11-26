@@ -50,9 +50,14 @@ impl PluginSocket {
                 // an accepted socket: on macOS set_nonblocking fails with EINVAL
                 // when the client already wrote its frame and closed.
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
+                let read = BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
                     .unwrap();
+                if read == 0 {
+                    // The client connected and closed without sending a frame:
+                    // a test aborts the broker while an attempt is in flight.
+                    continue;
+                }
                 let frame = serde_json::from_str(&line).unwrap();
                 let Some(response) = response(frame, &instance) else {
                     continue;
