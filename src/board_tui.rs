@@ -2532,16 +2532,15 @@ where
         *held = None;
         return Ok((snapshot, BTreeMap::new()));
     }
-    let known = held.as_ref().filter(|(name, labels)| {
-        name == board && wanted.iter().all(|key| labels.contains_key(key))
-    });
-    if let Some((_, labels)) = known {
-        let labels: crate::board_messages::DisplayLabels = wanted
-            .iter()
-            .filter_map(|key| labels.get(key).map(|label| (key.clone(), label.clone())))
-            .collect();
-        *held = Some((board.clone(), labels.clone()));
-        return Ok((snapshot, labels));
+    // Reuse only when the controls shown are exactly the ones named: a removed control changes the
+    // numbering of the names that share its name, so it needs new names as much as an added one.
+    let wanted: std::collections::BTreeSet<&String> = wanted.iter().collect();
+    if let Some((_, labels)) = held.as_ref().filter(|(name, labels)| {
+        name == board
+            && labels.len() == wanted.len()
+            && wanted.iter().all(|key| labels.contains_key(*key))
+    }) {
+        return Ok((snapshot, labels.clone()));
     }
     let (value, _) = inspect(true).await?;
     let labels: crate::board_messages::DisplayLabels = serde_json::from_value(
@@ -3267,20 +3266,82 @@ mod tests {
         assert_eq!(resolved.get(), 2);
         assert_eq!(both.len(), 2);
         assert!(both.values().any(|label| label == "Resolved beta"));
+        // Removing a control resolves again: names that shared a name are numbered per control set.
+        let single = polled(&board, &mut held, &one, &resolved);
+        assert_eq!(resolved.get(), 3);
+        assert_eq!(single.len(), 1);
         // A changed owner on the same control id resolves again.
         let moved = message_field("one", "gamma");
         let changed = polled(&board, &mut held, &moved, &resolved);
-        assert_eq!(resolved.get(), 3);
+        assert_eq!(resolved.get(), 4);
         assert_eq!(changed.values().collect::<Vec<_>>(), ["Resolved gamma"]);
         // Reopening the board (nothing held) resolves; so does another board.
         let mut reopened = None;
         polled(&board, &mut reopened, &moved, &resolved);
-        assert_eq!(resolved.get(), 4);
-        polled(&"other".parse().unwrap(), &mut held, &moved, &resolved);
         assert_eq!(resolved.get(), 5);
+        polled(&"other".parse().unwrap(), &mut held, &moved, &resolved);
+        assert_eq!(resolved.get(), 6);
         // A board with no message controls never resolves.
         polled(&board, &mut held, "# Plain\n", &resolved);
-        assert_eq!(resolved.get(), 5);
+        assert_eq!(resolved.get(), 6);
+    }
+    #[test]
+    fn a_broker_that_cannot_inspect_gives_no_names_and_is_not_asked_again() {
+        let value = serde_json::json!(snapshot(&message_field("one", "alpha"), &"a".repeat(64)));
+        let asked = std::cell::Cell::new(Vec::new());
+        let mut held = Some((Name::default(), BTreeMap::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (_, labels) = runtime
+            .block_on(read_composer_with(&Name::default(), &mut held, |labels| {
+                let mut seen = asked.take();
+                seen.push(labels);
+                asked.set(seen);
+                let value = value.clone();
+                async move { Ok((value, false)) }
+            }))
+            .unwrap();
+        assert!(labels.is_empty() && held.is_none());
+        assert_eq!(asked.take(), [false]);
+    }
+    #[test]
+    fn a_failed_name_request_keeps_the_held_names_and_surfaces_the_error() {
+        let board = Name::default();
+        let resolved = std::cell::Cell::new(0);
+        let one = message_field("one", "alpha");
+        let mut held = None;
+        let labels = polled(&board, &mut held, &one, &resolved);
+        let two = format!("{one}{}", message_field("two", "beta"));
+        let value = serde_json::json!(snapshot(&two, &"a".repeat(64)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(read_composer_with(&board, &mut held, |asked| {
+            let value = value.clone();
+            async move {
+                if asked {
+                    anyhow::bail!("names unavailable")
+                }
+                Ok((value, true))
+            }
+        }));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("names unavailable")
+        );
+        assert_eq!(held, Some((board, labels)));
+    }
+    #[test]
+    fn an_inspect_request_without_the_labels_flag_still_parses() {
+        let request: Request =
+            serde_json::from_str(r#"{"op":"board_inspect","board":"main"}"#).unwrap();
+        assert!(matches!(
+            request,
+            Request::BoardInspect { labels: false, .. }
+        ));
     }
     #[test]
     fn a_stale_read_never_replaces_the_current_boards_labels() {
