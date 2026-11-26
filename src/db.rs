@@ -1183,6 +1183,24 @@ impl Db {
             self.finish(id, "failed", detail)?;
             return Ok(false);
         }
+        // The session may have bound another socket while the attempt was in flight (the bind
+        // could not touch a message that was `sending`). Then the refusal is already history:
+        // requeue it plainly, claimable at once, and there is no outage to wake anyone for.
+        let current: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT b.endpoint FROM claude_bindings b JOIN messages m ON m.recipient_session=b.session WHERE m.id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(attempted) {
+            self.conn.execute(
+                "UPDATE messages SET state='queued',detail=CASE WHEN detail LIKE ?2 THEN NULL ELSE detail END,updated=?3 WHERE id=?1 AND state='sending'",
+                params![id, crate::clients::claude::OFFLINE_LIKE, now()],
+            )?;
+            return Ok(false);
+        }
         let previous: Option<String> = self
             .conn
             .query_row(
@@ -1302,6 +1320,11 @@ impl Db {
         self.conn.execute(
             "UPDATE messages SET state='queued',detail=NULL,updated=? WHERE id=?",
             params![now(), id],
+        )?;
+        // A held message's refused-socket mark belongs to the outage it was set in.
+        self.conn.execute(
+            "UPDATE message_context SET destination=json_remove(destination,'$.refused_endpoint') WHERE id=?",
+            [id],
         )?;
         self.get(id)
     }

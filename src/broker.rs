@@ -3880,6 +3880,63 @@ mod machine_tests {
         dispatcher.abort();
     }
 
+    /// A bind that lands between the claim and the refused attempt's outcome releases the
+    /// message at once and wakes nobody: the outage it describes is already over.
+    #[tokio::test]
+    async fn a_rebind_between_the_attempt_and_its_outcome_releases_the_message_without_a_wake() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let (live, live_listener) = claude_listener(directory.path(), "sender.sock");
+        std::mem::forget(live_listener);
+        let sender = bind_claude(broker, SENDER_SESSION, &live);
+        let (stale, listener) = claude_listener(directory.path(), "stale.sock");
+        let recipient = bind_claude(broker, RECIPIENT_SESSION, &stale);
+        drop(listener);
+        let sent = send_to(broker, &sender, &recipient, "hello");
+        let id = sent["id"].as_str().unwrap();
+        let claim = || {
+            let readiness = broker.native_readiness();
+            broker
+                .db
+                .lock()
+                .unwrap()
+                .claim_excluding_codex(&[], Some(&readiness))
+                .unwrap()
+        };
+        let (message, agent) = claim().unwrap();
+        let outcome = crate::delivery::deliver(
+            &agent,
+            &message,
+            std::path::Path::new("/missing/codex"),
+            directory.path(),
+        )
+        .await;
+        assert_eq!(outcome.state, "offline", "{}", outcome.detail);
+        // The session binds a new socket before the outcome is recorded.
+        let (fresh, fresh_listener) = claude_listener(directory.path(), "new.sock");
+        bind_claude(broker, RECIPIENT_SESSION, &fresh);
+        let newly_held = broker
+            .db
+            .lock()
+            .unwrap()
+            .finish_offline(id, &agent.endpoint, &outcome.detail)
+            .unwrap();
+        assert!(!newly_held, "no outage, so no wake");
+        let released = broker.request(Request::Get { id: id.into() }).unwrap();
+        assert!(released["detail"].is_null(), "{released}");
+        let (message, agent) = claim().expect("claimable at once on the new socket");
+        let outcome = crate::delivery::deliver(
+            &agent,
+            &message,
+            std::path::Path::new("/missing/codex"),
+            directory.path(),
+        )
+        .await;
+        assert_eq!(outcome.state, "submitted", "{}", outcome.detail);
+        assert!(claude_frame_id(&fresh_listener).contains("hello"));
+    }
+
     /// The shared 1000-message queue cap counts messages held for offline sessions, so a dead
     /// session can fill it. Pinned here so the owner's decision on limits is easy to apply.
     #[tokio::test]
