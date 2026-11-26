@@ -3140,6 +3140,29 @@ mod tests {
         assert_eq!(view.selection.as_ref().unwrap().area(), area);
     }
 
+    /// A control with the same ID and authored label as `message_field("one", "alpha")` and the given owner.
+    fn message_owned_by(
+        name: &str,
+        provider: crate::protocol::Provider,
+        session: &str,
+        endpoint: &str,
+    ) -> String {
+        let marker = crate::board_messages::Marker {
+            instance: "00000000-0000-4000-8000-000000000001".into(),
+            id: "one".into(),
+            label: "Message alpha".into(),
+            owner: crate::board_messages::Owner {
+                name: name.into(),
+                provider,
+                session: session.into(),
+                endpoint: endpoint.into(),
+            },
+        };
+        format!(
+            "<!-- board-message: {} -->\n",
+            serde_json::to_string(&marker).unwrap()
+        )
+    }
     fn message_field(id: &str, route: &str) -> String {
         let marker = crate::board_messages::Marker {
             instance: "00000000-0000-4000-8000-000000000001".into(),
@@ -3284,6 +3307,50 @@ mod tests {
         // A board with no message controls never resolves.
         polled(&board, &mut held, "# Plain\n", &resolved);
         assert_eq!(resolved.get(), 6);
+    }
+    #[test]
+    fn a_change_of_only_the_owner_resolves_names_again() {
+        use crate::protocol::Provider::{Claude, Inbox};
+        const SESSION: &str = "11111111-1111-4111-8111-111111111111";
+        let board = Name::default();
+        let resolved = std::cell::Cell::new(0);
+        let mut held = None;
+        polled(
+            &board,
+            &mut held,
+            &message_owned_by("alpha", Inbox, SESSION, ""),
+            &resolved,
+        );
+        assert_eq!(resolved.get(), 1);
+        // Same control ID, instance and authored label every time; one owner field changes per step.
+        for (step, changed) in [
+            message_owned_by("renamed", Inbox, SESSION, ""),
+            message_owned_by("renamed", Claude, SESSION, ""),
+            message_owned_by(
+                "renamed",
+                Claude,
+                "22222222-2222-4222-8222-222222222222",
+                "",
+            ),
+            message_owned_by(
+                "renamed",
+                Claude,
+                "22222222-2222-4222-8222-222222222222",
+                "/tmp/new.sock",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            polled(&board, &mut held, changed, &resolved);
+            assert_eq!(resolved.get(), 2 + step, "owner field change {step}");
+            polled(&board, &mut held, changed, &resolved);
+            assert_eq!(
+                resolved.get(),
+                2 + step,
+                "unchanged poll after change {step}"
+            );
+        }
     }
     #[test]
     fn a_broker_that_cannot_inspect_gives_no_names_and_is_not_asked_again() {
