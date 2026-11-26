@@ -98,4 +98,6 @@ payloads, and `tests/monitor_http.rs` fails if the removed heuristics return. Th
 (`board_tui`, `board inspect`) uses the same labels: the broker's `BoardInspect` reply carries `message_labels`
 from the same resolver (`Broker::board_message_labels`), computed in `Broker::request` after the database lock
 is released, once per inspect request. The terminal never derives a name from the owner's ID or the marker's
-text; a control the broker did not label shows "Agent", as the web page does.
+text; a control the broker did not label shows "Agent", as the web page does. The terminal composer re-reads the
+board every second and on file changes, so a board with message controls costs one native name read per provider
+that owns a control (a `claude agents --json` for Claude) on each of those reads; nothing is kept between reads.
