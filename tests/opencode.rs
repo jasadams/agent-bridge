@@ -36,20 +36,19 @@ impl PluginSocket {
         let instance = uuid::Uuid::new_v4().to_string();
         let path = root.path().join(format!("{instance}.sock"));
         let listener = UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
         let worker = std::thread::spawn(move || {
-            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                        continue;
-                    }
-                };
-                stream.set_nonblocking(false).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().expect("plugin accept");
+                // finish() wakes this blocking accept with a connection of its own.
+                if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                // The listener is blocking, so this socket is too. Never configure
+                // an accepted socket: on macOS set_nonblocking fails with EINVAL
+                // when the client already wrote its frame and closed.
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
@@ -98,6 +97,9 @@ impl PluginSocket {
     }
     fn finish(self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The connect only wakes a blocking accept. If it fails the worker has
+        // already dropped its listener (it panicked), and join reports that.
+        let _ = std::os::unix::net::UnixStream::connect(&self.path);
         self.worker.join().unwrap();
     }
 }
