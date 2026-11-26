@@ -573,10 +573,14 @@ send uses a new UUID. Queue rejection and errors retain the draft.
 
 Both interfaces keep compact message boxes stacked at the bottom, below the
 independently scrollable board. Each box shows a cosmetic label, an editable input
-and Send. Labels use an explicit alias or a concise provider fallback; native
-titles never route or authorize a destination. A replacement session cannot supply
-metadata to an old pinned target. Labels do not change board text, revision,
-timestamp or draft identity.
+and Send. The label is the owner's name as the broker resolver reports it (see
+`docs/naming.md`) in both interfaces: the browser's board read and the terminal's
+board inspect (`message_labels`) resolve it after the database lock is released.
+Neither interface derives a name from the owner's ID or the marker's authored label;
+an owner with no client name shows the single provider fallback (for example
+`Claude 9f3c`). Names never route or authorize a destination. A replacement session
+cannot supply metadata to an old pinned target. Labels do not change board text,
+revision, timestamp or draft identity.
 Click an input or Tab/Shift-Tab into it to type directly;
 there is no activation step. A bounded stack scrolls when many inputs are present,
 and keyboard focus brings the selected input into view. Errors and pending or stale

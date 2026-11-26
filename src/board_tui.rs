@@ -1163,7 +1163,7 @@ impl View {
             .take(visible)
             .enumerate()
         {
-            let Kind::Message { owner, .. } = &control.kind else {
+            let Kind::Message { .. } = &control.kind else {
                 continue;
             };
             let row = Rect::new(area.x, area.y + slot as u16 * 3, area.width, 3);
@@ -1198,7 +1198,8 @@ impl View {
                 .as_ref()
                 .and_then(|key| self.message_labels.get(key))
                 .cloned()
-                .unwrap_or_else(|| crate::board_messages::fallback_label(owner, &control.label));
+                // The broker labels every control it reports (`message_labels`); the viewer never derives a name.
+                .unwrap_or_else(|| "Agent".into());
             let mut title = if rows.len() > visible {
                 format!(
                     "{} · {}/{}",
@@ -3103,12 +3104,50 @@ mod tests {
         assert_eq!(raw, original);
         assert_eq!(board_interaction::controls(&raw).len(), 1);
     }
+    /// What the broker reports for each control: the owner's resolved name (here the owner route, which
+    /// the viewer must show exactly as given).
+    fn broker_labels(view: &mut View) {
+        let snapshot = view.snapshot.as_ref().unwrap();
+        view.message_labels = board_interaction::controls(&snapshot.markdown)
+            .iter()
+            .filter_map(|control| match &control.kind {
+                Kind::Message { owner, .. } => control
+                    .message_key(&snapshot.control_scope())
+                    .map(|key| (key, owner.name.clone())),
+                _ => None,
+            })
+            .collect();
+    }
+    #[test]
+    fn message_box_title_is_the_broker_name_and_never_derived_from_the_owner_or_label() {
+        let mut view = View::default();
+        view.update(Ok(snapshot(
+            &message_field("coordinator", "alpha"),
+            &"a".repeat(64),
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+        // The broker reported no name for this control: the viewer shows "Agent", not the owner or label.
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(!buffer_text(&terminal).contains("alpha"));
+        assert!(buffer_text(&terminal).contains("Agent"));
+        let key = {
+            let snapshot = view.snapshot.as_ref().unwrap();
+            board_interaction::controls(&snapshot.markdown)[0]
+                .message_key(&snapshot.control_scope())
+                .unwrap()
+        };
+        view.message_labels.insert(key, "Claude 9f3c".into());
+        terminal.draw(|frame| view.draw(frame)).unwrap();
+        assert!(buffer_text(&terminal).contains("Claude 9f3c"));
+        assert!(!buffer_text(&terminal).contains("alpha"));
+    }
     fn message_view() -> View {
         let mut view = View::default();
         view.update(Ok(snapshot(
             &message_field("coordinator", "alpha"),
             &"a".repeat(64),
         )));
+        broker_labels(&mut view);
         press(&mut view, KeyCode::Tab, KeyModifiers::NONE);
         assert!(
             view.editor.is_some(),
@@ -3125,6 +3164,7 @@ mod tests {
             + &message_field("three", "gamma");
         let mut view = View::default();
         view.update(Ok(snapshot(&markdown, &"a".repeat(64))));
+        broker_labels(&mut view);
         let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
         terminal.draw(|frame| view.draw(frame)).unwrap();
         let board = view.viewport.as_ref().unwrap().area();

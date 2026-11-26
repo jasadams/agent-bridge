@@ -95,5 +95,7 @@ a rename shows on the next board load.
 The old `/api/agents` name list, the page's name polling and its ID-pattern heuristics are gone.
 `tests/web/labels.js` (run by `tests/web_labels.rs`, needs Node) exercises the label helpers with ID-bearing
 payloads, and `tests/monitor_http.rs` fails if the removed heuristics return. The terminal board composer
-(`board_tui`, `board inspect`) still labels owners with `board_messages::fallback_label`, a separate fallback
-that is not part of the web interface and remains to be moved onto this resolver.
+(`board_tui`, `board inspect`) uses the same labels: the broker's `BoardInspect` reply carries `message_labels`
+from the same resolver (`Broker::board_message_labels`), computed in `Broker::request` after the database lock
+is released, once per inspect request. The terminal never derives a name from the owner's ID or the marker's
+text; a control the broker did not label shows "Agent", as the web page does.

@@ -617,7 +617,7 @@ impl Broker {
     }
     /// The resolved name of each message control's owner, by control key (AGB-57). Labels are the broker
     /// resolver's names, never derived from the owner's ID; call without the database lock.
-    fn board_message_labels(
+    pub(crate) fn board_message_labels(
         &self,
         snapshot: &Snapshot,
     ) -> std::collections::BTreeMap<String, String> {
@@ -885,6 +885,71 @@ mod tests {
         assert_eq!(labels["b"], "planner (2)");
         assert_eq!(labels["c"], "planner (1)");
         assert_eq!(labels["d"], "solo");
+    }
+    #[tokio::test]
+    async fn terminal_board_inspect_labels_come_from_the_resolver() {
+        let (root, bound, old) = setup();
+        let broker = &bound.broker;
+        let owner = |name: &str, session: &str| crate::board_messages::Owner {
+            name: name.into(),
+            provider: crate::protocol::Provider::Claude,
+            session: session.into(),
+            endpoint: "/tmp/owner.sock".into(),
+        };
+        let named = owner("coordinator", "885b5a56-af8d-4a72-9b43-8ad930e945b6");
+        let other = "11111111-2222-4333-8444-555555555555";
+        let nameless = owner(&format!("claude-{other}"), other);
+        let mut text = String::new();
+        for (id, owner) in [("named", &named), ("nameless", &nameless)] {
+            // The authored label is deliberately misleading: it must never be used as the name.
+            let marker = crate::board_messages::Marker {
+                id: id.into(),
+                instance: uuid::Uuid::new_v4().to_string(),
+                label: format!("Message {} (authored)", owner.name),
+                owner: owner.clone(),
+            };
+            text.push_str(&format!(
+                "\n<!-- board-message: {} -->\n",
+                serde_json::to_string(&marker).unwrap()
+            ));
+        }
+        board::update_named(
+            root.path(),
+            &Name::default(),
+            &old.revision,
+            &[board::Edit::Append { text }],
+        )
+        .unwrap();
+        broker
+            .db
+            .lock()
+            .unwrap()
+            .register(
+                &crate::protocol::Agent {
+                    name: named.name.clone(),
+                    provider: named.provider.clone(),
+                    session: named.session.clone(),
+                    endpoint: String::new(),
+                },
+                false,
+            )
+            .unwrap();
+        let value = broker
+            .request(crate::protocol::Request::BoardInspect {
+                board: Name::default(),
+            })
+            .unwrap();
+        let labels: std::collections::BTreeSet<String> = value["message_labels"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|label| label.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            labels,
+            ["coordinator".to_owned(), "Claude 5555".to_owned()].into()
+        );
+        assert!(!value["message_labels"].to_string().contains(other));
     }
     #[tokio::test]
     async fn main_cosmetic_labels_do_not_change_board_identity() {
