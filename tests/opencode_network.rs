@@ -24,32 +24,50 @@ use tokio::{task::JoinHandle, time::timeout};
 const A: &str = "ses_0123456789abcdefghijklmnop";
 const B: &str = "ses_0123456789abcdefghijklmnox";
 
-// Accepted sockets can inherit O_NONBLOCK on macOS. Only accept is polled;
-// each connected socket uses bounded blocking I/O for complete native frames.
+// The fixture listener is blocking, so every accepted socket is blocking too.
+// Never configure an accepted socket (`set_nonblocking`, `set_read_timeout`):
+// on macOS both fail with EINVAL when the peer has already written its frame
+// and closed (a broker that times out or is stopped), although the buffered
+// frame is still readable. The 5 second bound is a channel timeout instead.
 fn read_native_frame(stream: &UnixStream) -> Value {
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(stream.try_clone().unwrap())
-        .read_line(&mut line)
+    let stream = stream.try_clone().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = BufReader::new(stream).read_line(&mut line);
+        let _ = sender.send(read.map(|_| line));
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native frame within 5 seconds")
         .unwrap();
     serde_json::from_str(&line).unwrap()
 }
 
 #[test]
-fn native_fixture_reads_delayed_frames_from_nonblocking_connections() {
-    let (reader, mut writer) = UnixStream::pair().unwrap();
-    // Reproduce inherited flags on every platform, including Linux where
-    // accept normally returns a blocking socket from a nonblocking listener.
-    reader.set_nonblocking(true).unwrap();
+fn native_fixture_reads_delayed_frames_and_frames_from_closed_peers() {
+    let root = temp();
+    let path = root.path().join("probe.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let delayed = UnixStream::connect(&path).unwrap();
+    let (reader, _) = listener.accept().unwrap();
     let worker = std::thread::spawn(move || read_native_frame(&reader));
+    let mut writer = delayed;
     std::thread::sleep(Duration::from_millis(50));
     write!(writer, "{{\"op\":\"probe\",").unwrap();
     std::thread::sleep(Duration::from_millis(50));
     writeln!(writer, "\"session\":\"{A}\"}}").unwrap();
     assert_eq!(worker.join().unwrap(), json!({"op":"probe", "session":A}));
+
+    // A peer that wrote its frame and closed before the fixture accepted it.
+    let mut closed = UnixStream::connect(&path).unwrap();
+    writeln!(closed, "{{\"op\":\"probe\",\"session\":\"{A}\"}}").unwrap();
+    drop(closed);
+    let (reader, _) = listener.accept().unwrap();
+    assert_eq!(
+        read_native_frame(&reader),
+        json!({"op":"probe", "session":A})
+    );
 }
 
 struct Native {
@@ -67,22 +85,18 @@ impl Native {
         let instance = uuid::Uuid::new_v4().to_string();
         let path = root.path().join(format!("{instance}.sock"));
         let listener = UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let frames = Arc::new(Mutex::new(Vec::new()));
         let received = frames.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let worker = std::thread::spawn(move || {
-            while !stopping.load(Ordering::SeqCst) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(error) => panic!("native accept: {error}"),
-                };
+            loop {
+                let (mut stream, _) = listener.accept().expect("native accept");
+                // Drop wakes this blocking accept with a connection of its own.
+                if stopping.load(Ordering::SeqCst) {
+                    break;
+                }
                 let frame = read_native_frame(&stream);
                 assert!(frame["op"] == "state_list" || frame["session"] == session);
                 let mut receipt =
@@ -154,7 +168,12 @@ impl Native {
 impl Drop for Native {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.worker.take().unwrap().join().unwrap();
+        let worker = self.worker.take().unwrap();
+        // A finished worker (it panicked) has dropped its listener; join reports it.
+        if !worker.is_finished() {
+            UnixStream::connect(&self.path).expect("wake native accept");
+        }
+        worker.join().unwrap();
     }
 }
 struct Running {
