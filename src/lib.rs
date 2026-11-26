@@ -22,6 +22,7 @@ pub mod db;
 pub mod delivery;
 pub mod opencode_install;
 mod opencode_state;
+mod orca_wake;
 pub use clients::codex_discovery as discovery;
 pub use clients::lifecycle as hook;
 pub mod mcp;

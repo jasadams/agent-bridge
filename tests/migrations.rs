@@ -309,3 +309,54 @@ fn version_twenty_one_drops_only_the_removed_registration_table_by_prefix() {
     conn.query_row("SELECT count(*) FROM opencode_deliveries", [], |_| Ok(()))
         .unwrap();
 }
+
+/// AGB-72: the previous schema (v21, no Orca column on the Claude bindings) migrates with the
+/// stored messages and bindings intact, and the new columns start empty.
+#[test]
+fn version_twenty_one_database_gains_the_orca_columns_without_losing_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut conn = Connection::open(&path).unwrap();
+    agent_bridge::migrations::migrate(&mut conn).unwrap();
+    let session = "11111111-2222-4333-8444-555555555555";
+    conn.execute_batch(&format!(
+        "INSERT INTO claude_bindings(session,endpoint) VALUES('{session}','/tmp/old.sock');
+         INSERT INTO messages VALUES('held-id','user','claude-{session}','{session}','hello',NULL,0,'queued','offline: kept',10,10);
+         INSERT INTO message_context(id,source,destination) VALUES('held-id','{{}}','{{\"provider\":\"claude\"}}');
+         ALTER TABLE claude_bindings DROP COLUMN orca_session;
+         PRAGMA user_version=21;"
+    ))
+    .unwrap();
+    drop(conn);
+    let db = Db::open(&path).unwrap();
+    let held = db.get("held-id").unwrap();
+    assert_eq!(
+        (held.state.as_str(), held.body.as_str()),
+        ("queued", "hello")
+    );
+    assert_eq!(held.detail.as_deref(), Some("offline: kept"));
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(user_version(&conn), SCHEMA_VERSION);
+    let row: (String, Option<String>) = conn
+        .query_row(
+            "SELECT endpoint,orca_session FROM claude_bindings WHERE session=?",
+            [session],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("/tmp/old.sock".into(), None));
+}
+
+/// A binary older than this schema refuses the newer database instead of misreading it.
+#[test]
+fn a_newer_database_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut conn = Connection::open(&path).unwrap();
+    agent_bridge::migrations::migrate(&mut conn).unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        .unwrap();
+    drop(conn);
+    assert!(Db::open(&path).is_err());
+}

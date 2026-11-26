@@ -163,10 +163,14 @@ pub enum Request {
         #[serde(default)]
         replace: bool,
     },
-    /// Start a Claude SessionStart binding without creating route membership.
+    /// Start a Claude SessionStart binding without creating route membership. `orca_session`
+    /// is the Orca chat the session runs in, when it runs in one, so a message held for it can
+    /// wake the chat.
     ClaudeBind {
         session: String,
         endpoint: String,
+        #[serde(default)]
+        orca_session: Option<String>,
     },
     /// End only the matching normalized Claude endpoint, never its replacement.
     ClaudeUnbind {

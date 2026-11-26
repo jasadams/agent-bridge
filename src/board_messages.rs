@@ -92,11 +92,12 @@ pub struct Owner {
     pub endpoint: String,
 }
 impl Owner {
+    /// The exact agent, provider and session the input was created for. `endpoint` is not part
+    /// of the identity: a Claude socket path changes whenever its process restarts, and older
+    /// inputs still carry the path they were created with. The live endpoint is read from the
+    /// current binding when the message is sent.
     pub fn matches(&self, agent: &crate::protocol::Agent) -> bool {
-        self.name == agent.name
-            && self.provider == agent.provider
-            && self.session == agent.session
-            && self.endpoint == agent.endpoint
+        self.name == agent.name && self.provider == agent.provider && self.session == agent.session
     }
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -129,10 +130,12 @@ impl Marker {
                 Provider::Codex | Provider::Inbox | Provider::OpenCode => {
                     self.owner.endpoint.is_empty()
                 }
+                // Empty for new inputs; inputs written before the target was resolved by name
+                // keep the socket path they were created with.
                 Provider::Claude => {
-                    !self.owner.endpoint.is_empty()
-                        && self.owner.endpoint.len() <= 4096
-                        && std::path::Path::new(&self.owner.endpoint).is_absolute()
+                    self.owner.endpoint.is_empty()
+                        || (self.owner.endpoint.len() <= 4096
+                            && std::path::Path::new(&self.owner.endpoint).is_absolute())
                 }
             }
     }

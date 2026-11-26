@@ -1211,7 +1211,10 @@ async fn send_accepts_a_unique_name_and_stores_the_id() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(unknown.contains("Unknown agent"), "{unknown}");
+    assert!(
+        unknown.contains("exists right now. Double-check it"),
+        "{unknown}"
+    );
     // A second agent with the same title makes the name ambiguous: an error listing both IDs.
     let twin = PluginSocket::start(|frame, instance| {
         let row = state_row(OTHER, Value::Null);

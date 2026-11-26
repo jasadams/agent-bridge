@@ -940,6 +940,7 @@ async fn http_response_notifies_only_the_selected_boards_native_subscriber() {
             .request(Request::ClaudeBind {
                 session,
                 endpoint: path.to_string_lossy().into_owned(),
+                orca_session: None,
             })
             .unwrap();
         running

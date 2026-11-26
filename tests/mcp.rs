@@ -72,6 +72,7 @@ impl Native {
         running.request(Request::ClaudeBind {
             session: session.clone(),
             endpoint: socket.to_string_lossy().into_owned(),
+            orca_session: None,
         });
         let (captured, received) = tokio::sync::mpsc::channel(32);
         let task = tokio::spawn(async move {

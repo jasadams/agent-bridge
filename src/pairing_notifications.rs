@@ -335,7 +335,7 @@ pub(crate) async fn run(broker: Broker) -> Result<()> {
                 crate::clients::ControlNotice::Pairing(&text),
             )
             .await;
-            if outcome.state == "failed" {
+            if matches!(outcome.state, "failed" | "offline") {
                 eprintln!(
                     "Pairing notification {} failed: {}",
                     notice.id, outcome.detail

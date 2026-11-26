@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY, provider TEXT NOT NULL, session TEXT NOT NULL, endpoint TEXT NOT NULL, enabled INTEGER NOT NULL);
@@ -361,6 +361,19 @@ DROP TABLE IF EXISTS remote_agents;",
             tx.execute_batch("ALTER TABLE opencode_deliveries DROP COLUMN generation;")?;
         }
         tx.pragma_update(None, "user_version", 21)?;
+    }
+    if version < 22 {
+        // Where a Claude session runs in Orca, recorded by its start hook so a message held for
+        // it can wake the chat. NULL for existing rows and for sessions outside Orca.
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('claude_bindings') WHERE name='orca_session')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !present {
+            tx.execute_batch("ALTER TABLE claude_bindings ADD COLUMN orca_session TEXT;")?;
+        }
+        tx.pragma_update(None, "user_version", 22)?;
     }
     tx.commit()?;
     Ok(())

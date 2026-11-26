@@ -609,15 +609,63 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn claude_bind(&self, session: &str, endpoint: &str) -> Result<()> {
+    pub fn claude_bind(
+        &self,
+        session: &str,
+        endpoint: &str,
+        orca_session: Option<&str>,
+    ) -> Result<()> {
         crate::clients::validate_session(&Provider::Claude, session)?;
         let normalized = crate::clients::claude::validate_socket(Path::new(endpoint))?
             .to_string_lossy()
             .into_owned();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO claude_bindings(session,endpoint,orca_session) VALUES(?1,?2,?3)
+             ON CONFLICT(session) DO UPDATE SET endpoint=excluded.endpoint,orca_session=excluded.orca_session",
+            // Only a well-formed Orca ID is kept; anything else means "not in Orca".
+            params![
+                session,
+                normalized,
+                orca_session.filter(|id| crate::orca_wake::valid_session(id))
+            ],
+        )?;
+        // The session is back: whatever was held as offline is an ordinary queued message again,
+        // and is claimed now rather than after the retry backoff.
+        tx.execute(
+            "UPDATE messages SET detail=NULL WHERE recipient_session=?1 AND state='queued' AND detail LIKE ?2",
+            params![session, crate::clients::claude::OFFLINE_LIKE],
+        )?;
+        tx.execute(
+            "UPDATE message_context SET destination=json_remove(destination,'$.refused_endpoint') WHERE json_type(destination,'$.refused_endpoint') IS NOT NULL AND id IN (SELECT id FROM messages WHERE recipient_session=?1 AND state='queued')",
+            params![session],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The Orca chat recorded for a bound Claude session, if it runs in one.
+    pub(crate) fn claude_orca(&self, session: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT orca_session FROM claude_bindings WHERE session=?",
+                [session],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Add the outcome of a wake to a message still held as offline.
+    pub(crate) fn offline_note(&self, id: &str, note: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO claude_bindings(session,endpoint) VALUES(?,?)
-             ON CONFLICT(session) DO UPDATE SET endpoint=excluded.endpoint",
-            params![session, normalized],
+            "UPDATE messages SET detail=?2 WHERE id=?1 AND state='queued' AND detail LIKE ?3",
+            params![
+                id,
+                format!("{}; {note}", crate::clients::claude::OFFLINE_DETAIL),
+                crate::clients::claude::OFFLINE_LIKE
+            ],
         )?;
         Ok(())
     }
@@ -647,6 +695,18 @@ impl Db {
         hops: u32,
     ) -> Result<Message> {
         insert_message_in(&self.conn, id, source, destination, body, parent, hops)?;
+        // A Claude session whose bound socket is gone keeps an ordinary message queued; say so.
+        // Topic notifications and controls do not come through here.
+        if destination.provider == Provider::Claude
+            && !destination.endpoint.is_empty()
+            && (crate::clients::claude::socket_gone(&destination.endpoint)
+                || self.held_ahead(id, &destination.session)?)
+        {
+            self.conn.execute(
+                "UPDATE messages SET detail=?1 WHERE id=?2 AND state='queued'",
+                params![crate::clients::claude::OFFLINE_DETAIL, id],
+            )?;
+        }
         self.get(id)
     }
 
@@ -985,6 +1045,9 @@ impl Db {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let time = now();
+        // Claude sessions found offline in this pass. Their later messages wait behind the
+        // first, so a session that comes back mid-pass cannot see them out of send order.
+        let mut offline_sessions = std::collections::HashSet::new();
         for (id, rowid, recipient, session, provider) in candidates {
             let Some(provider) = provider.and_then(|value| value.parse::<Provider>().ok()) else {
                 continue;
@@ -1049,10 +1112,38 @@ impl Db {
                     continue;
                 }
             } else if provider == Provider::Claude {
+                let holds = self.holds_when_offline(&id)?;
+                if holds && offline_sessions.contains(&session) {
+                    // Waiting behind an earlier held message: say so.
+                    self.conn.execute(
+                        "UPDATE messages SET detail=?1 WHERE id=?2 AND state='queued' AND detail IS NULL",
+                        params![crate::clients::claude::OFFLINE_DETAIL, id],
+                    )?;
+                    continue;
+                }
                 endpoint = self.binding_endpoint(&provider, &session)?;
+                // The session's process is down: keep the message queued until it binds a new
+                // socket. Nothing is attempted, so nothing can fail or duplicate. A file that is
+                // gone needs no connection to tell; a socket that refused an attempt is held
+                // until the session binds a different one (which also clears the mark).
+                if holds && !endpoint.is_empty() {
+                    let refused: bool = self.conn.query_row(
+                        "SELECT coalesce(json_extract(destination,'$.refused_endpoint')=?2,0) FROM message_context WHERE id=?1",
+                        params![id, endpoint],
+                        |row| row.get(0),
+                    )?;
+                    if refused || crate::clients::claude::socket_gone(&endpoint) {
+                        self.conn.execute(
+                            "UPDATE messages SET detail=?1 WHERE id=?2 AND state='queued' AND detail IS NULL",
+                            params![crate::clients::claude::OFFLINE_DETAIL, id],
+                        )?;
+                        offline_sessions.insert(session);
+                        continue;
+                    }
+                }
             }
             self.conn.execute(
-                "UPDATE messages SET state='sending',updated=? WHERE id=? AND state IN ('queued','uncertain')",
+                "UPDATE messages SET state='sending',updated=?1 WHERE id=?2 AND state IN ('queued','uncertain')",
                 params![time, id],
             )?;
             let msg = self.get(&id)?;
@@ -1074,6 +1165,87 @@ impl Db {
             params![state, detail, now(), id],
         )?;
         Ok(())
+    }
+
+    /// A delivery attempt found the recipient's socket gone or refusing, and wrote nothing. An
+    /// ordinary message goes back to the queue, marked with the endpoint that refused it so it
+    /// is not retried until the session binds another; notifications and controls keep their
+    /// existing rule, a definite failure which a topic subscriber answers by reading history.
+    /// Returns true when the message was newly held (it was not already marked offline).
+    pub(crate) fn finish_offline(&self, id: &str, attempted: &str, detail: &str) -> Result<bool> {
+        if !self.holds_when_offline(id)? {
+            self.finish(id, "failed", detail)?;
+            return Ok(false);
+        }
+        // The session may have bound another socket while the attempt was in flight (the bind
+        // could not touch a message that was `sending`). Then the refusal is already history:
+        // requeue it plainly, claimable at once, and there is no outage to wake anyone for.
+        let current: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT b.endpoint FROM claude_bindings b JOIN messages m ON m.recipient_session=b.session WHERE m.id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(attempted) {
+            self.conn.execute(
+                "UPDATE messages SET state='queued',detail=CASE WHEN detail LIKE ?2 THEN NULL ELSE detail END,updated=?3 WHERE id=?1 AND state='sending'",
+                params![id, crate::clients::claude::OFFLINE_LIKE, now()],
+            )?;
+            return Ok(false);
+        }
+        let previous: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT detail FROM messages WHERE id=?1 AND state='sending'",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let changed = self.conn.execute(
+            "UPDATE messages SET state='queued',detail=CASE WHEN detail LIKE ?3 THEN detail ELSE ?2 END,updated=?4 WHERE id=?1 AND state='sending'",
+            params![
+                id,
+                crate::clients::claude::OFFLINE_DETAIL,
+                crate::clients::claude::OFFLINE_LIKE,
+                now()
+            ],
+        )?;
+        if changed == 1 {
+            self.conn.execute(
+                "UPDATE message_context SET destination=json_set(destination,'$.refused_endpoint',?2) WHERE id=?1",
+                params![id, attempted],
+            )?;
+        }
+        Ok(changed == 1
+            && !previous
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with(crate::clients::claude::OFFLINE_PREFIX)))
+    }
+
+    /// Another message for this session is already held as offline, so this one waits behind it
+    /// too, whatever state the socket file is in.
+    fn held_ahead(&self, id: &str, session: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE recipient_session=?1 AND id<>?2 AND state='queued' AND detail LIKE ?3)",
+            params![session, id, crate::clients::claude::OFFLINE_LIKE],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Only an ordinary message is held for an offline Claude session. Topic notifications and
+    /// event controls are best-effort and fail definitely, as they always have.
+    fn holds_when_offline(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM topic_push_work WHERE message_id=?1)
+                AND NOT EXISTS(SELECT 1 FROM message_context c WHERE c.id=?1
+                    AND (json_extract(c.destination,'$.control_notice')=1
+                         OR json_extract(c.destination,'$.event_control') IS NOT NULL))",
+            [id],
+            |row| row.get(0),
+        )?)
     }
 
     /// A local message the claim loop can take now. Keep in step with the candidate
@@ -1152,6 +1324,11 @@ impl Db {
         self.conn.execute(
             "UPDATE messages SET state='queued',detail=NULL,updated=? WHERE id=?",
             params![now(), id],
+        )?;
+        // A held message's refused-socket mark belongs to the outage it was set in.
+        self.conn.execute(
+            "UPDATE message_context SET destination=json_remove(destination,'$.refused_endpoint') WHERE id=?",
+            [id],
         )?;
         self.get(id)
     }

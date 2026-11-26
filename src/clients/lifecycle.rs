@@ -59,6 +59,8 @@ async fn run_inner(state: &Path, provider: Provider) -> Result<()> {
             &Request::ClaudeBind {
                 session: session.into(),
                 endpoint,
+                // Inside Orca: where the chat runs, so it can be woken. Validated by the broker.
+                orca_session: std::env::var("ORCA_AGENT_SESSION_ID").ok(),
             },
         )
         .await?;
