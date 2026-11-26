@@ -29,19 +29,20 @@ const B: &str = "ses_0123456789abcdefghijklmnox";
 // on macOS both fail with EINVAL when the peer has already written its frame
 // and closed (a broker that times out or is stopped), although the buffered
 // frame is still readable. The 5 second bound is a channel timeout instead.
-fn read_native_frame(stream: &UnixStream) -> Value {
+// `None` means the peer closed without sending any frame.
+fn read_native_frame(stream: &UnixStream) -> Option<Value> {
     let stream = stream.try_clone().unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
         let read = BufReader::new(stream).read_line(&mut line);
-        let _ = sender.send(read.map(|_| line));
+        let _ = sender.send(read.map(|read| (read, line)));
     });
-    let line = receiver
+    let (read, line) = receiver
         .recv_timeout(Duration::from_secs(5))
         .expect("native frame within 5 seconds, or the reader thread died")
         .unwrap();
-    serde_json::from_str(&line).unwrap()
+    (read > 0).then(|| serde_json::from_str(&line).unwrap())
 }
 
 #[test]
@@ -51,7 +52,7 @@ fn native_fixture_reads_delayed_frames_and_frames_from_closed_peers() {
     let listener = UnixListener::bind(&path).unwrap();
     let delayed = UnixStream::connect(&path).unwrap();
     let (reader, _) = listener.accept().unwrap();
-    let worker = std::thread::spawn(move || read_native_frame(&reader));
+    let worker = std::thread::spawn(move || read_native_frame(&reader).expect("frame"));
     let mut writer = delayed;
     std::thread::sleep(Duration::from_millis(50));
     write!(writer, "{{\"op\":\"probe\",").unwrap();
@@ -67,10 +68,15 @@ fn native_fixture_reads_delayed_frames_and_frames_from_closed_peers() {
     let mut reader = reader;
     assert_eq!(
         read_native_frame(&reader),
-        json!({"op":"probe", "session":A})
+        Some(json!({"op":"probe", "session":A}))
     );
     // The receipt for that closed peer finds nobody to read it.
     reply(&mut reader, &json!({"ok":true}));
+
+    // A peer that closed without sending any frame.
+    drop(UnixStream::connect(&path).unwrap());
+    let (reader, _) = listener.accept().unwrap();
+    assert_eq!(read_native_frame(&reader), None);
 }
 
 // The frame is already recorded when the receipt is written. A broker that
@@ -115,7 +121,10 @@ impl Native {
                 if stopping.load(Ordering::SeqCst) {
                     break;
                 }
-                let frame = read_native_frame(&stream);
+                // A broker that connected and closed without a frame sent nothing to answer.
+                let Some(frame) = read_native_frame(&stream) else {
+                    continue;
+                };
                 assert!(frame["op"] == "state_list" || frame["session"] == session);
                 let mut receipt =
                     json!({"ok":true,"protocol":2,"session":session,"instance":instance});
