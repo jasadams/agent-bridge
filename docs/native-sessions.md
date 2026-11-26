@@ -63,7 +63,9 @@ and stored, and the sender gets the message ID with state `pending` and the deta
 on the `offline:` prefix). Nothing is attempted while the socket file is missing. A
 socket file that exists with nothing listening is the same: the one attempt writes
 nothing, the message goes back to the queue, and it is not tried against that socket again
-until the session binds a different one. When
+until the session binds a different one. For that case the receipt returned by the send is
+plain `pending`, and the `offline:` detail appears about a second later, after the one
+attempt (a gone socket file is marked when the message is sent). When
 the session starts or resumes, its start hook binds the new socket, and the held
 messages are delivered to that session only, once each, in send order, with the usual
 states and retry rules. A partial write stays Unknown, as before. Messages are held
