@@ -61,8 +61,9 @@ example after Orca suspends the chat or the process restarts. A send to it is ac
 and stored, and the sender gets the message ID with state `pending` and the detail
 `offline: queued until the recipient session reconnects` (also in `get_message`; match
 on the `offline:` prefix). Nothing is attempted while the socket file is missing. A
-socket file that exists with nothing listening is the same: the attempt writes
-nothing, the message goes back to the queue and is retried at most once a second. When
+socket file that exists with nothing listening is the same: the one attempt writes
+nothing, the message goes back to the queue, and it is not tried against that socket again
+until the session binds a different one. When
 the session starts or resumes, its start hook binds the new socket, and the held
 messages are delivered to that session only, once each, in send order, with the usual
 states and retry rules. A partial write stays Unknown, as before. Messages are held

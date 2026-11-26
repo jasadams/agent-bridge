@@ -31,9 +31,6 @@ struct HistoryCursor {
     after: Option<String>,
 }
 
-/// Least time between attempts at a Claude socket that exists but refused the last one.
-const OFFLINE_RETRY_MS: i64 = 1000;
-
 pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -626,7 +623,11 @@ impl Db {
         // The session is back: whatever was held as offline is an ordinary queued message again,
         // and is claimed now rather than after the retry backoff.
         tx.execute(
-            "UPDATE messages SET detail=NULL WHERE recipient_session=?1 AND state='queued' AND detail LIKE 'offline:%'",
+            "UPDATE messages SET detail=NULL WHERE recipient_session=?1 AND state='queued' AND detail LIKE ?2",
+            params![session, crate::clients::claude::OFFLINE_LIKE],
+        )?;
+        tx.execute(
+            "UPDATE message_context SET destination=json_remove(destination,'$.refused_endpoint') WHERE json_type(destination,'$.refused_endpoint') IS NOT NULL AND id IN (SELECT id FROM messages WHERE recipient_session=?1 AND state='queued')",
             params![session],
         )?;
         tx.commit()?;
@@ -671,8 +672,12 @@ impl Db {
     /// Add the outcome of a wake to a message still held as offline.
     pub(crate) fn offline_note(&self, id: &str, note: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE messages SET detail=?2 WHERE id=?1 AND state='queued' AND detail LIKE 'offline:%'",
-            params![id, format!("{}; {note}", crate::clients::claude::OFFLINE_DETAIL)],
+            "UPDATE messages SET detail=?2 WHERE id=?1 AND state='queued' AND detail LIKE ?3",
+            params![
+                id,
+                format!("{}; {note}", crate::clients::claude::OFFLINE_DETAIL),
+                crate::clients::claude::OFFLINE_LIKE
+            ],
         )?;
         Ok(())
     }
@@ -1118,34 +1123,33 @@ impl Db {
                     continue;
                 }
             } else if provider == Provider::Claude {
-                if offline_sessions.contains(&session) {
+                let holds = self.holds_when_offline(&id)?;
+                if holds && offline_sessions.contains(&session) {
                     continue;
                 }
                 endpoint = self.binding_endpoint(&provider, &session)?;
                 // The session's process is down: keep the message queued until it binds a new
-                // socket. Nothing is attempted, so nothing can fail or duplicate.
-                // A file that is gone needs no connection to tell. A socket that refused an
-                // attempt (nothing listens on it) is retried at most once per backoff, so it is
-                // neither spun on nor probed with an extra connection.
-                let backing_off: bool = self.conn.query_row(
-                    "SELECT coalesce(detail LIKE 'offline:%' AND updated>?2,0) FROM messages WHERE id=?1",
-                    params![id, time - OFFLINE_RETRY_MS],
-                    |row| row.get(0),
-                )?;
-                if !endpoint.is_empty()
-                    && self.holds_when_offline(&id)?
-                    && (crate::clients::claude::socket_gone(&endpoint) || backing_off)
-                {
-                    self.conn.execute(
-                        "UPDATE messages SET detail=?1 WHERE id=?2 AND state='queued' AND detail IS NULL",
-                        params![crate::clients::claude::OFFLINE_DETAIL, id],
+                // socket. Nothing is attempted, so nothing can fail or duplicate. A file that is
+                // gone needs no connection to tell; a socket that refused an attempt is held
+                // until the session binds a different one (which also clears the mark).
+                if holds && !endpoint.is_empty() {
+                    let refused: bool = self.conn.query_row(
+                        "SELECT coalesce(json_extract(destination,'$.refused_endpoint')=?2,0) FROM message_context WHERE id=?1",
+                        params![id, endpoint],
+                        |row| row.get(0),
                     )?;
-                    offline_sessions.insert(session);
-                    continue;
+                    if refused || crate::clients::claude::socket_gone(&endpoint) {
+                        self.conn.execute(
+                            "UPDATE messages SET detail=?1 WHERE id=?2 AND state='queued' AND detail IS NULL",
+                            params![crate::clients::claude::OFFLINE_DETAIL, id],
+                        )?;
+                        offline_sessions.insert(session);
+                        continue;
+                    }
                 }
             }
             self.conn.execute(
-                "UPDATE messages SET state='sending',detail=CASE WHEN detail LIKE 'offline:%' THEN NULL ELSE detail END,updated=?1 WHERE id=?2 AND state IN ('queued','uncertain')",
+                "UPDATE messages SET state='sending',updated=?1 WHERE id=?2 AND state IN ('queued','uncertain')",
                 params![time, id],
             )?;
             let msg = self.get(&id)?;
@@ -1161,22 +1165,52 @@ impl Db {
     }
 
     pub fn finish(&self, id: &str, state: &str, detail: &str) -> Result<()> {
-        // Only the worker that still owns an in-flight delivery can finish it. An offline
-        // recipient is not an outcome: nothing was written, so the message goes back to the queue.
-        let (state, detail) = match state {
-            "offline" if self.holds_when_offline(id)? => {
-                ("queued", crate::clients::claude::OFFLINE_DETAIL)
-            }
-            // Notifications and controls keep their existing rule: a definite failure, which a
-            // topic subscriber answers by reading history.
-            "offline" => ("failed", detail),
-            _ => (state, detail),
-        };
+        // Only the worker that still owns an in-flight delivery can finish it.
         self.conn.execute(
             "UPDATE messages SET state=?,detail=?,updated=? WHERE id=? AND state='sending'",
             params![state, detail, now(), id],
         )?;
         Ok(())
+    }
+
+    /// A delivery attempt found the recipient's socket gone or refusing, and wrote nothing. An
+    /// ordinary message goes back to the queue, marked with the endpoint that refused it so it
+    /// is not retried until the session binds another; notifications and controls keep their
+    /// existing rule, a definite failure which a topic subscriber answers by reading history.
+    /// Returns true when the message was newly held (it was not already marked offline).
+    pub(crate) fn finish_offline(&self, id: &str, attempted: &str, detail: &str) -> Result<bool> {
+        if !self.holds_when_offline(id)? {
+            self.finish(id, "failed", detail)?;
+            return Ok(false);
+        }
+        let previous: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT detail FROM messages WHERE id=?1 AND state='sending'",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let changed = self.conn.execute(
+            "UPDATE messages SET state='queued',detail=CASE WHEN detail LIKE ?3 THEN detail ELSE ?2 END,updated=?4 WHERE id=?1 AND state='sending'",
+            params![
+                id,
+                crate::clients::claude::OFFLINE_DETAIL,
+                crate::clients::claude::OFFLINE_LIKE,
+                now()
+            ],
+        )?;
+        if changed == 1 {
+            self.conn.execute(
+                "UPDATE message_context SET destination=json_set(destination,'$.refused_endpoint',?2) WHERE id=?1",
+                params![id, attempted],
+            )?;
+        }
+        Ok(changed == 1
+            && !previous
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with(crate::clients::claude::OFFLINE_PREFIX)))
     }
 
     /// Only an ordinary message is held for an offline Claude session. Topic notifications and

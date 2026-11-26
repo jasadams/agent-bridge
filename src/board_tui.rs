@@ -1574,11 +1574,10 @@ impl View {
             }) = &self.editor
         {
             let details = format!(
-                "Exact pinned owner\nName: {}\nProvider: {}\nSession: {}\nEndpoint: {}\n",
+                "Exact pinned owner\nName: {}\nProvider: {}\nSession: {}\n",
                 safe_line(&owner.name),
                 owner.provider.label(),
-                safe_line(&owner.session),
-                safe_line(&owner.endpoint)
+                safe_line(&owner.session)
             );
             let block =
                 Block::bordered().title("Owner · arrows/PgUp/PgDn inspect · Esc/Ctrl-O return");

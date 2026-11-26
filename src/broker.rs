@@ -439,8 +439,6 @@ impl Broker {
     fn hold_offline(
         &self,
         db: &Db,
-        source: &Agent,
-        destination: &Agent,
         message: crate::protocol::Message,
     ) -> Result<crate::protocol::Message> {
         if !message
@@ -450,11 +448,13 @@ impl Broker {
         {
             return Ok(message);
         }
-        let target = db.claude_orca(&destination.session)?;
-        let from = if source.provider == Provider::Claude {
-            db.claude_orca(&source.session)?
-        } else {
-            None
+        let session = message.recipient_session.clone();
+        let target = db.claude_orca(&session)?;
+        // Only a bound Claude session can send the note; anything else (the board's `user`,
+        // an Inbox, a Codex or OpenCode session) has no Orca chat to send it from.
+        let from = match db.agent(&message.sender) {
+            Ok(source) if source.provider == Provider::Claude => db.claude_orca(&source.session)?,
+            _ => None,
         };
         let (Some((to, cli)), Some((from, _))) = (target.clone(), from.clone()) else {
             let note = if target.is_none() {
@@ -465,19 +465,21 @@ impl Broker {
             db.offline_note(&message.id, note)?;
             return db.get(&message.id);
         };
-        if !self
-            .orca_wakes
-            .lock()
-            .unwrap()
-            .insert(destination.session.clone())
-        {
+        if !self.orca_wakes.lock().unwrap().insert(session.clone()) {
             return Ok(message);
         }
         let broker = self.clone();
-        let (id, session) = (message.id.clone(), destination.session.clone());
+        let id = message.id.clone();
         std::thread::spawn(move || {
             let note = match crate::orca_wake::wake(&cli, &from, &to) {
-                Ok(()) => "wake requested".to_owned(),
+                Ok(()) => {
+                    // The session bound a socket while the call ran: this outage is over, and
+                    // a note on the message would describe the wrong one.
+                    if !broker.orca_wakes.lock().unwrap().contains(&session) {
+                        return;
+                    }
+                    "wake requested".to_owned()
+                }
                 Err(error) => {
                     // A later send may try again.
                     broker.orca_wakes.lock().unwrap().remove(&session);
@@ -1744,9 +1746,7 @@ impl Broker {
                                     "Route changed while preparing the send; retry with the current identity"
                                 );
                                 db.send(&id, &source, &destination, &body, &parent)
-                                    .and_then(|message| {
-                                        self.hold_offline(&db, &source, &destination, message)
-                                    })
+                                    .and_then(|message| self.hold_offline(&db, message))
                             }
                         }
                     };
@@ -2850,7 +2850,7 @@ impl Broker {
                     if raw_codex_notice && outcome.state == "submitted" {
                         outcome.detail = "Native accepted typed control".into();
                     }
-                    if outcome.state == "failed" {
+                    if matches!(outcome.state, "failed" | "offline") {
                         eprintln!("Control {} failed: {}", msg.id, outcome.detail);
                     } else if outcome.state == "uncertain" {
                         eprintln!(
@@ -2859,6 +2859,7 @@ impl Broker {
                         );
                     }
                     let finish_id = msg.id.clone();
+                    let attempted = agent.endpoint.clone();
                     let result = this
                         .blocking(move |finish_broker| {
                             let db = finish_broker.db.lock().unwrap();
@@ -2869,6 +2870,15 @@ impl Broker {
                                     outcome.state,
                                     &outcome.detail,
                                 )
+                            } else if outcome.state == "offline" {
+                                // Nothing was written. A message held for the session may need
+                                // to wake it, which is decided here for a socket that only
+                                // refused (a gone file was already handled when it was sent).
+                                if db.finish_offline(&msg.id, &attempted, &outcome.detail)? {
+                                    let held = db.get(&msg.id)?;
+                                    finish_broker.hold_offline(&db, held)?;
+                                }
+                                Ok(())
                             } else {
                                 db.finish(&msg.id, outcome.state, &outcome.detail)
                             }
@@ -3572,7 +3582,7 @@ mod machine_tests {
             .db
             .lock()
             .unwrap()
-            .finish(&id, outcome.state, &outcome.detail)
+            .finish_offline(&id, &agent.endpoint, &outcome.detail)
             .unwrap();
         let held = broker.request(Request::Get { id: id.clone() }).unwrap();
         assert_eq!(held["state"], "pending", "{held}");
@@ -3792,6 +3802,82 @@ mod machine_tests {
                 })
                 .is_err()
         );
+    }
+
+    /// A control notice behind a held ordinary message is not held with it: it keeps failing
+    /// definitely, as before.
+    #[tokio::test]
+    async fn a_control_behind_a_held_message_is_not_held_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = &bound.broker;
+        let (sender, recipient, _) = offline_pair(directory.path(), broker);
+        let ordinary = send_to(broker, &sender, &recipient, "ordinary");
+        let control = send_to(broker, &sender, &recipient, "control");
+        {
+            let db = broker.db.lock().unwrap();
+            db.conn
+                .execute(
+                    "UPDATE message_context SET destination=json_set(destination,'$.control_notice',1) WHERE id=?",
+                    [control["id"].as_str().unwrap()],
+                )
+                .unwrap();
+        }
+        let readiness = broker.native_readiness();
+        let claimed = broker
+            .db
+            .lock()
+            .unwrap()
+            .claim_excluding_codex(&[], Some(&readiness))
+            .unwrap()
+            .expect("the control is attempted, and fails definitely");
+        assert_eq!(claimed.0.id, control["id"].as_str().unwrap());
+        assert_ne!(claimed.0.id, ordinary["id"].as_str().unwrap());
+    }
+
+    /// A socket file left behind with nothing listening (the process was killed) still wakes
+    /// the chat, once the dispatcher finds it refusing, and is not retried against that socket.
+    #[tokio::test]
+    async fn a_refusing_socket_wakes_the_chat_and_keeps_the_wake_note_on_later_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Broker::bind(directory.path().join("state"), "/missing/codex".into()).unwrap();
+        let broker = bound.broker.clone();
+        let (cli, calls) = fake_orca(directory.path());
+        let (live, live_listener) = claude_listener(directory.path(), "sender.sock");
+        std::mem::forget(live_listener);
+        let sender = bind_claude(&broker, SENDER_SESSION, &live);
+        let (stale, listener) = claude_listener(directory.path(), "stale.sock");
+        let recipient = bind_claude(&broker, RECIPIENT_SESSION, &stale);
+        drop(listener); // the file stays, nothing listens
+        orca_bind(&broker, SENDER_SESSION, SENDER_ORCA, &cli);
+        orca_bind(&broker, RECIPIENT_SESSION, RECIPIENT_ORCA, &cli);
+        let dispatcher = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.dispatch().await })
+        };
+        let sent = send_to(&broker, &sender, &recipient, "hello");
+        let id = sent["id"].as_str().unwrap().to_owned();
+        let detail = {
+            let broker = broker.clone();
+            let id = id.clone();
+            tokio::task::spawn_blocking(move || wait_for_detail(&broker, &id, "wake requested"))
+                .await
+                .unwrap()
+        };
+        assert!(
+            detail.starts_with(crate::clients::claude::OFFLINE_PREFIX),
+            "{detail}"
+        );
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let held = broker.request(Request::Get { id }).unwrap();
+        assert_eq!(held["state"], "pending", "{held}");
+        assert!(
+            held["detail"].as_str().unwrap().contains("wake requested"),
+            "{held}"
+        );
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        dispatcher.abort();
     }
 
     /// The shared 1000-message queue cap counts messages held for offline sessions, so a dead
