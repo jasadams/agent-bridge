@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable local monitor acceptance: messages, boards and local/P2P traffic.
+"""Disposable local web acceptance: messages, boards and local/P2P traffic.
 
 Creates private temporary broker state only. No native sessions, model calls, SSH,
 service installation, or changes to host networking/browser profiles. --browser
@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--browser", action="store_true")
     args = parser.parse_args()
-    output = (args.output or Path(tempfile.mkdtemp(prefix="ab-monitor-qa-", dir="/tmp"))).resolve()
+    output = (args.output or Path(tempfile.mkdtemp(prefix="ab-web-qa-", dir="/tmp"))).resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(output, 0o700)
     binary = output / "frozen-agent-bridge"
@@ -214,7 +214,7 @@ def main():
                     raise AssertionError("MCP notification budget exceeded")
 
                 request(1, "initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
-                                           "clientInfo": {"name": "monitor-board-acceptance", "version": "1"}})
+                                           "clientInfo": {"name": "web-board-acceptance", "version": "1"}})
                 write({"jsonrpc": "2.0", "method": "notifications/initialized"})
                 result = request(2, "tools/call", {"name": "read_board", "arguments": {"board": name}})
                 assert not result.get("isError"), "MCP board tool failed"
@@ -246,10 +246,10 @@ def main():
         assert token not in url and "?" not in url and "#" not in url
         access_url = credentials["access_url"]
         assert access_url == url.rstrip("/") + "/#access_token=" + token
-        monitor_status = rpc(a, "monitor_status")
-        assert "access_token" not in monitor_status and "access_url" not in monitor_status
+        web_status = rpc(a, "monitor_status")
+        assert "access_token" not in web_status and "access_url" not in web_status
         assert not rpc(a, "status")["network"]["enabled"]
-        record("monitor default-off and independent of peer networking; private access link uses a fragment; plain URL/status stay credential-free")
+        record("web default-off and independent of peer networking; private access link uses a fragment; plain URL/status stay credential-free")
 
         for path in ["/", "/style.css", "/app.js"]:
             status, headers, body = http(url, path)
@@ -284,16 +284,16 @@ def main():
                 try:
                     probe = socket.create_connection((host_ip, urlsplit(url).port), timeout=1)
                 except OSError:
-                    record("non-loopback machine address cannot reach monitor listener")
+                    record("non-loopback machine address cannot reach web listener")
                 else:
                     probe.close()
-                    raise AssertionError("Monitor reachable on non-loopback interface")
+                    raise AssertionError("Web reachable on non-loopback interface")
 
-        rpc(a, "machine_set_name", name="monitor-a")
-        rpc(b, "machine_set_name", name="monitor-b")
+        rpc(a, "machine_set_name", name="web-a")
+        rpc(b, "machine_set_name", name="web-b")
         for name in ["speaker", "listener"]:
             rpc(a, "register", name=name, provider="inbox", session=name + "-original", replace=False)
-        local_body = "LOCAL_MONITOR_OK\n<img src=x onerror=window.monitorPwned=1> & literal text"
+        local_body = "LOCAL_WEB_OK\n<img src=x onerror=window.webPwned=1> & literal text"
         local_id = send(a, "listener", local_body, sender="speaker")
         wait("local delivered", lambda: rpc(a, "get", id=local_id)["state"] == "delivered")
         row = next(row for row in messages(url, token) if row["id"] == local_id)
@@ -301,14 +301,14 @@ def main():
         assert row["source"]["session"] == "speaker-original"
         assert row["destination"]["session"] == "listener-original"
         assert row["state"] == "delivered"
-        assert row["source"]["machine_name"] == "monitor-a"
+        assert row["source"]["machine_name"] == "web-a"
         rpc(a, "register", name="listener", provider="inbox", session="listener-replaced", replace=True)
         row = api(url, token, "/api/messages/" + local_id)["message"]
         assert row["destination"]["session"] == "listener-original"
         assert row["body"] == local_body
         assert any(message["id"] == local_id for message in messages(url, token, agent="speaker"))
         assert not messages(url, token, agent="does-not-exist")
-        assert any(message["id"] == local_id for message in messages(url, token, machine="monitor-a", state="delivered"))
+        assert any(message["id"] == local_id for message in messages(url, token, machine="web-a", state="delivered"))
         assert not messages(url, token, since=row["created"] + 1)
         assert not messages(url, token, until=row["created"] - 1)
         record("local history shows exact sessions/body/state and filters; replacement cannot rewrite historical session")
@@ -324,11 +324,11 @@ def main():
         rpc(a, "peer_address", peer="bob", address=addresses[1][0])
         rpc(b, "peer_address", peer="alice", address=addresses[0][0])
         wait("remote directory", lambda: rpc(a, "remote_list"))
-        outbound_id = send(a, "bob/user", "P2P_MONITOR_OUTBOUND")
-        inbound_b = received(b, "P2P_MONITOR_OUTBOUND")
+        outbound_id = send(a, "bob/user", "P2P_WEB_OUTBOUND")
+        inbound_b = received(b, "P2P_WEB_OUTBOUND")
         wait("remote delivery", lambda: rpc(a, "get", id=outbound_id)["state"] == "delivered")
-        reply_id = send(b, "alice/user", "P2P_MONITOR_REPLY", parent=inbound_b["id"])
-        inbound_a = received(a, "P2P_MONITOR_REPLY")
+        reply_id = send(b, "alice/user", "P2P_WEB_REPLY", parent=inbound_b["id"])
+        inbound_a = received(a, "P2P_WEB_REPLY")
         rows = messages(url, token)
         outgoing = next(message for message in rows if message["id"] == outbound_id)
         incoming = next(message for message in rows if message["id"] == inbound_a["id"])
@@ -345,18 +345,18 @@ def main():
         # Streams contain only invalidation revisions, never messages or auth material.
         stream, response = opened_stream(url, token)
         original = next_event(response)
-        changed_id = send(a, "user", "SSE_MONITOR_OK", sender="speaker")
+        changed_id = send(a, "user", "SSE_WEB_OK", sender="speaker")
         changed = next_event(response)
         assert original != changed
         assert set(changed) == {"revision"}
-        assert "SSE_MONITOR_OK" not in json.dumps(changed) and token not in json.dumps(changed)
+        assert "SSE_WEB_OK" not in json.dumps(changed) and token not in json.dumps(changed)
         response.close()
         stream.close()
         record("authenticated live stream reports changes without leaking message bodies")
 
         if args.browser:
             from playwright.sync_api import sync_playwright
-            from monitor_board_qa import board_browser_checks
+            from web_board_qa import board_browser_checks
             with sync_playwright() as playwright, ExitStack() as cleanup:
                 browser_home = output / "browser-home"
                 browser_home.mkdir(mode=0o700)
@@ -407,12 +407,12 @@ def main():
                 assert page.locator("#traffic-view").is_hidden()
                 record("unlock opens the main board as the default page")
                 open_traffic(page)
-                page.get_by_text("LOCAL_MONITOR_OK", exact=False).first.wait_for()
-                assert page.evaluate("typeof window.monitorPwned") == "undefined"
+                page.get_by_text("LOCAL_WEB_OK", exact=False).first.wait_for()
+                assert page.evaluate("typeof window.webPwned") == "undefined"
                 assert page.evaluate("localStorage.length + sessionStorage.length") == 0
                 assert token not in page.url
-                live_id = send(a, "user", "BROWSER_LIVE_MONITOR_OK", sender="speaker")
-                page.get_by_text("BROWSER_LIVE_MONITOR_OK", exact=False).first.wait_for(timeout=15000)
+                live_id = send(a, "user", "BROWSER_LIVE_WEB_OK", sender="speaker")
+                page.get_by_text("BROWSER_LIVE_WEB_OK", exact=False).first.wait_for(timeout=15000)
                 page.locator(f'.message-row[data-id="{local_id}"]').click()
                 page.locator("#panel-body pre.body-text").get_by_text(local_body, exact=True).wait_for()
                 assert "listener-original" in page.locator("#panel-body").inner_text()
@@ -472,11 +472,11 @@ def main():
                 page.get_by_text("HIDDEN_VIEW_CATCHUP", exact=False).first.wait_for(timeout=15000)
                 record("All traffic pauses its hidden-view feed fetches and catches up when returning from a board")
                 page.locator(f'.message-row[data-id="{outbound_id}"]').click()
-                page.locator("#panel-body pre.body-text").get_by_text("P2P_MONITOR_OUTBOUND", exact=True).wait_for()
+                page.locator("#panel-body pre.body-text").get_by_text("P2P_WEB_OUTBOUND", exact=True).wait_for()
                 page.locator("#panel-body .relation").filter(has_text=inbound_a["id"]).click()
-                page.locator("#panel-body pre.body-text").get_by_text("P2P_MONITOR_REPLY", exact=True).wait_for()
+                page.locator("#panel-body pre.body-text").get_by_text("P2P_WEB_REPLY", exact=True).wait_for()
                 page.locator("#panel-body .relation").filter(has_text=outbound_id).click()
-                page.locator("#panel-body pre.body-text").get_by_text("P2P_MONITOR_OUTBOUND", exact=True).wait_for()
+                page.locator("#panel-body pre.body-text").get_by_text("P2P_WEB_OUTBOUND", exact=True).wait_for()
                 page.locator("#agent-filter").fill("speaker")
                 page.locator('#filters button[type="submit"]').click()
                 wait("browser filters exclude remote row", lambda: page.locator(f'.message-row[data-id="{outbound_id}"]').count() == 0)
@@ -484,19 +484,19 @@ def main():
                 page.locator("#reset-filters").click()
                 page.locator(f'.message-row[data-id="{outbound_id}"]').wait_for()
                 page.locator(f'.message-row[data-id="{inbound_a["id"]}"]').click()
-                page.locator("#panel-body pre.body-text").get_by_text("P2P_MONITOR_REPLY", exact=True).wait_for()
-                page.screenshot(path=str(output / "monitor-desktop.png"), full_page=True)
+                page.locator("#panel-body pre.body-text").get_by_text("P2P_WEB_REPLY", exact=True).wait_for()
+                page.screenshot(path=str(output / "web-desktop.png"), full_page=True)
                 page.set_viewport_size({"width": 390, "height": 844})
-                page.screenshot(path=str(output / "monitor-mobile.png"), full_page=True)
+                page.screenshot(path=str(output / "web-mobile.png"), full_page=True)
                 page.set_viewport_size({"width": 1440, "height": 1000})  # the sidebar is off screen on a phone
                 board_browser_checks(page=page, browser=browser, context=context,
                                      rpc=rpc, state=a, second_state=b, url=url,
                                      token=token, record=record, output=output)
-                from monitor_message_qa import message_browser_checks
+                from web_message_qa import message_browser_checks
                 message_browser_checks(page=page, context=context, rpc=rpc, state=a,
                                        url=url, token=token, record=record, output=output,
                                        claude_names=claude_names)
-                from monitor_catalog_qa import catalog_browser_checks
+                from web_catalog_qa import catalog_browser_checks
                 catalog_browser_checks(page=page, context=context, rpc=rpc, state=a,
                                        url=url, token=token, record=record, output=output)
                 board_readback(a, "alpha")
@@ -514,10 +514,10 @@ def main():
         try:
             disconnected = next_event(response) is None
         except socket.timeout as error:
-            raise AssertionError("Disabled monitor left a live idle stream") from error
+            raise AssertionError("Disabled web left a live idle stream") from error
         except (OSError, http_client.HTTPException):
             disconnected = True
-        assert disconnected, "Disabled monitor left stream alive"
+        assert disconnected, "Disabled web left stream alive"
         response.close()
         stream.close()
         newer = rpc(a, "monitor_enable", port=0)
@@ -530,7 +530,7 @@ def main():
         for log in [output / "a.log", output / "b.log"]:
             content = log.read_text()
             assert token not in content and newer["access_token"] not in content
-            assert local_body not in content and "P2P_MONITOR_OUTBOUND" not in content
+            assert local_body not in content and "P2P_WEB_OUTBOUND" not in content
         record("broker logs contain neither browser credentials nor message bodies")
         results["complete"] = True
         return 0

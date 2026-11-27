@@ -1,4 +1,4 @@
-//! Loopback HTTP monitor with read-only messages and narrow board responses.
+//! Loopback HTTP web interface with read-only messages and narrow board responses.
 //!
 //! The HTTP parser is Hyper. API credentials travel in an Authorization header;
 //! a bootstrap URL fragment is consumed and cleared by the browser. Same-user local code and
@@ -94,7 +94,7 @@ fn default_limit() -> usize {
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MonitorQuery {
+pub struct WebQuery {
     pub machine: Option<String>,
     pub agent: Option<String>,
     pub state: Option<String>,
@@ -104,7 +104,7 @@ pub struct MonitorQuery {
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
-impl Default for MonitorQuery {
+impl Default for WebQuery {
     fn default() -> Self {
         Self {
             machine: None,
@@ -150,7 +150,7 @@ struct App {
 impl App {
     fn current(&self) -> bool {
         self.broker
-            .monitor_control
+            .web_control
             .lock()
             .unwrap()
             .current(self.generation)
@@ -412,13 +412,13 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
         return Ok(response(StatusCode::OK, asset.content_type, asset.bytes));
     }
     let response = match path.as_str() {
-        "/api/status" => match app.broker.monitor_metadata() {
+        "/api/status" => match app.broker.web_metadata() {
             Ok(value) => json_response(value),
             Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Web data unavailable"),
         },
         "/api/messages" => {
-            match serde_urlencoded::from_str::<MonitorQuery>(query.as_deref().unwrap_or("")) {
-                Ok(query) => match app.broker.monitor_messages(query) {
+            match serde_urlencoded::from_str::<WebQuery>(query.as_deref().unwrap_or("")) {
+                Ok(query) => match app.broker.web_messages(query) {
                     Ok(value) => json_response(value),
                     Err(_) => error(StatusCode::BAD_REQUEST, "Invalid message filters"),
                 },
@@ -445,7 +445,7 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                         // below is CPU-bound and must not extend the shared DB lock.
                         let result = {
                             let mut db = broker.db.lock().unwrap();
-                            let access = broker.monitor_control.lock().unwrap();
+                            let access = broker.web_control.lock().unwrap();
                             if !access.current(generation) {
                                 return error(StatusCode::UNAUTHORIZED, "Web access expired");
                             }
@@ -466,10 +466,10 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                         match result {
                             Ok(page) => {
                                 let mut value = json!(page);
-                                crate::monitor_board::annotate_topic_page(&mut value);
+                                crate::web_board::annotate_topic_page(&mut value);
                                 broker.attach_topic_agents(&mut value);
                                 // Resolving names can be slow: access may have been revoked meanwhile.
-                                if !broker.monitor_control.lock().unwrap().current(generation) {
+                                if !broker.web_control.lock().unwrap().current(generation) {
                                     return error(StatusCode::UNAUTHORIZED, "Web access expired");
                                 }
                                 json_response(value)
@@ -501,7 +501,7 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                 // Release the locks before resolving names: the resolver reads native clients.
                 let result = {
                     let db = broker.db.lock().unwrap();
-                    let access = broker.monitor_control.lock().unwrap();
+                    let access = broker.web_control.lock().unwrap();
                     if !access.current(generation) {
                         return error(StatusCode::UNAUTHORIZED, "Web access expired");
                     }
@@ -520,7 +520,7 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                     Ok(mut value) => {
                         if agents {
                             broker.attach_topic_agents(&mut value);
-                            if !broker.monitor_control.lock().unwrap().current(generation) {
+                            if !broker.web_control.lock().unwrap().current(generation) {
                                 return error(StatusCode::UNAUTHORIZED, "Web access expired");
                             }
                         }
@@ -548,9 +548,9 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
             match tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 if archived {
-                    broker.monitor_archived_boards(generation)
+                    broker.web_archived_boards(generation)
                 } else {
-                    broker.monitor_boards(generation)
+                    broker.web_boards(generation)
                 }
             })
             .await
@@ -587,13 +587,13 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
                     if query
                         .if_revision
                         .as_deref()
-                        .is_none_or(crate::monitor_board::hash) =>
+                        .is_none_or(crate::web_board::hash) =>
                 {
                     let broker = app.broker.clone();
                     let generation = app.generation;
                     match tokio::task::spawn_blocking(move || {
                         let _permit = permit;
-                        broker.monitor_board(generation, &name, query.if_revision.as_deref())
+                        broker.web_board(generation, &name, query.if_revision.as_deref())
                     })
                     .await
                     {
@@ -613,7 +613,7 @@ async fn route(request: Request<Incoming>, app: App) -> Result<Response<Body>, I
             if id.is_empty() || id.len() > 100 || id.contains('/') {
                 error(StatusCode::BAD_REQUEST, "Invalid message ID")
             } else {
-                match app.broker.monitor_message(id) {
+                match app.broker.web_message(id) {
                     Ok(value) => json_response(value),
                     Err(_) => error(StatusCode::NOT_FOUND, "Message unavailable"),
                 }
@@ -745,7 +745,7 @@ async fn topic_action(request: Request<Incoming>, app: App) -> Response<Body> {
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut db = broker.db.lock().unwrap();
-        let access = broker.monitor_control.lock().unwrap();
+        let access = broker.web_control.lock().unwrap();
         if !access.current(generation) {
             return error(StatusCode::UNAUTHORIZED, "Web access expired");
         }
@@ -779,7 +779,7 @@ async fn topic_action(request: Request<Incoming>, app: App) -> Response<Body> {
             json!({"code":"uncertain","uncertain":true,"error":"Outcome uncertain; retain the exact request for inspection or retry"}).to_string()),
     }
 }
-fn board_reply(reply: crate::monitor_board::Reply) -> Response<Body> {
+fn board_reply(reply: crate::web_board::Reply) -> Response<Body> {
     response(
         StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         "application/json; charset=utf-8",
@@ -877,13 +877,12 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Board response body timed out"),
     };
     enum Write {
-        Response(crate::monitor_board::ResponseRequest),
+        Response(crate::web_board::ResponseRequest),
         Message(crate::board_messages::Submission),
-        Lifecycle(crate::monitor_board::LifecycleRequest, bool),
+        Lifecycle(crate::web_board::LifecycleRequest, bool),
     }
     let request = if lifecycle {
-        let request = match serde_json::from_slice::<crate::monitor_board::LifecycleRequest>(&bytes)
-        {
+        let request = match serde_json::from_slice::<crate::web_board::LifecycleRequest>(&bytes) {
             Ok(request) if request.valid(&name) => request,
             _ => return error(StatusCode::BAD_REQUEST, "Invalid board lifecycle request"),
         };
@@ -898,12 +897,11 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         }
         Write::Message(request)
     } else {
-        let request = match serde_json::from_slice::<crate::monitor_board::ResponseRequest>(&bytes)
-        {
+        let request = match serde_json::from_slice::<crate::web_board::ResponseRequest>(&bytes) {
             Ok(value) => value,
             Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid board response JSON"),
         };
-        if matches!(&request.value, crate::monitor_board::Desired::Text { text } if text.len() > crate::board::MAX_BOARD_BYTES)
+        if matches!(&request.value, crate::web_board::Desired::Text { text } if text.len() > crate::board::MAX_BOARD_BYTES)
         {
             return error(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -925,9 +923,9 @@ async fn board_response(request: Request<Incoming>, app: App) -> Response<Body> 
         // continues. The commit guard checks revocation after the DB queue.
         let _permit = permit;
         match request {
-            Write::Response(request) => broker.monitor_board_response(generation, &name, request),
-            Write::Message(request) => broker.monitor_board_message(generation, &name, request),
-            Write::Lifecycle(request, restore) => broker.monitor_board_lifecycle(generation, &name, request, restore),
+            Write::Response(request) => broker.web_board_response(generation, &name, request),
+            Write::Message(request) => broker.web_board_message(generation, &name, request),
+            Write::Lifecycle(request, restore) => broker.web_board_lifecycle(generation, &name, request, restore),
         }
     }).await {
         Ok(reply) if app.current()=>board_reply(reply),
@@ -952,7 +950,7 @@ async fn read_board_revision(
     app: &App,
     name: &crate::board::Name,
     permit: OwnedSemaphorePermit,
-) -> Result<crate::monitor_board::BoardIdentity, Box<Response<Body>>> {
+) -> Result<crate::web_board::BoardIdentity, Box<Response<Body>>> {
     let broker = app.broker.clone();
     let generation = app.generation;
     let name = name.clone();
@@ -960,7 +958,7 @@ async fn read_board_revision(
         // Keep capacity occupied even if the HTTP future is cancelled while
         // this job waits for the shared broker lock.
         let _permit = permit;
-        broker.monitor_board_revision(generation, &name)
+        broker.web_board_revision(generation, &name)
     })
     .await
     {
@@ -980,7 +978,7 @@ struct BoardEventState {
     app: App,
     name: crate::board::Name,
     _permit: OwnedSemaphorePermit,
-    revision: crate::monitor_board::BoardIdentity,
+    revision: crate::web_board::BoardIdentity,
     initial: bool,
     heartbeat: Instant,
 }
@@ -1072,7 +1070,7 @@ fn events(app: App) -> Response<Body> {
             if !state.app.current() {
                 return None;
             }
-            let revision = match state.app.broker.monitor_revision() {
+            let revision = match state.app.broker.web_revision() {
                 Ok(v) => v,
                 Err(_) => return None,
             };
@@ -1110,7 +1108,7 @@ fn events(app: App) -> Response<Body> {
 pub async fn run(broker: Broker) {
     loop {
         let desired = {
-            let control = broker.monitor_control.lock().unwrap();
+            let control = broker.web_control.lock().unwrap();
             if control.enabled {
                 Some((
                     control.generation,
@@ -1129,7 +1127,7 @@ pub async fn run(broker: Broker) {
             Ok(listener) => listener,
             Err(_) => {
                 {
-                    let mut control = broker.monitor_control.lock().unwrap();
+                    let mut control = broker.web_control.lock().unwrap();
                     if control.current(generation) {
                         control.url = None;
                         control.last_error = Some("Could not bind local web port".into());
@@ -1137,7 +1135,7 @@ pub async fn run(broker: Broker) {
                 }
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    if !broker.monitor_control.lock().unwrap().current(generation) {
+                    if !broker.web_control.lock().unwrap().current(generation) {
                         break;
                     }
                 }
@@ -1149,7 +1147,7 @@ pub async fn run(broker: Broker) {
             Err(_) => continue,
         };
         {
-            let mut control = broker.monitor_control.lock().unwrap();
+            let mut control = broker.web_control.lock().unwrap();
             if !control.current(generation) {
                 continue;
             }
@@ -1265,7 +1263,7 @@ mod board_limits_tests {
     async fn cancelled_http_reads_retain_capacity_until_blocking_work_finishes() {
         let root = tempfile::tempdir().unwrap();
         let bound = Broker::bind(root.path().into(), "/missing/codex".into()).unwrap();
-        let access = bound.broker.monitor_control.lock().unwrap().enable(0);
+        let access = bound.broker.web_control.lock().unwrap().enable(0);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = App {

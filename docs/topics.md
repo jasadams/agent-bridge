@@ -162,7 +162,7 @@ caller-supplied post UUIDs are stable retry keys.
 Create/inspect/rename/archive/restore return a topic object:
 `{reference:{bridge_id,topic_id},name,archived,created,updated,high_water}`.
 List returns `{topics:[...]}`, ordered by creation timestamp then topic UUID.
-The local monitor's mention picker reads a bounded identity catalog of manual Inbox
+The local web interface's mention picker reads a bounded identity catalog of manual Inbox
 configuration and explicit stable aliases (1,000-identity capacity error, never silent
 truncation); it is not an agent registry. Canonical native routes are valid without a
 catalog row; mentions are not delivery requests. No separate

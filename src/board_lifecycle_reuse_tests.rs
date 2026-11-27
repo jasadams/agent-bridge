@@ -1,12 +1,12 @@
-//! Actual stale broker/monitor requests after purging and recreating identical bytes.
+//! Actual stale broker/web requests after purging and recreating identical bytes.
 //! These tests never serve a broker or start discovery/native delivery.
 use crate::{
     board::{Edit, Name, Snapshot},
     board_lifecycle,
     board_messages::Submission,
     broker::{BoundServer, Broker},
-    monitor_board::{Desired, ResponseRequest},
     protocol::{Agent, EventSelector, Provider, Request},
+    web_board::{Desired, ResponseRequest},
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -82,8 +82,8 @@ fn fixture() -> Fixture {
         .unwrap();
     assert_eq!(added["applied"], true);
     let original = serde_json::from_value(added["board"].clone()).unwrap();
-    // Enable only the private monitor admission state. No HTTP listener is run.
-    broker.monitor_control.lock().unwrap().enable(0);
+    // Enable only the private web admission state. No HTTP listener is run.
+    broker.web_control.lock().unwrap().enable(0);
     Fixture {
         bound,
         _root: root,
@@ -191,7 +191,7 @@ fn purge_and_recreate(fixture: &Fixture, archived_at: i64) -> (Snapshot, Snapsho
 async fn identical_name_and_bytes_do_not_reauthorize_old_controls_or_message_intent() {
     let fixture = fixture();
     let broker = &fixture.bound.broker;
-    let before_view = broker.monitor_board(1, &fixture.name, None);
+    let before_view = broker.web_board(1, &fixture.name, None);
     assert_eq!(before_view.status, 200);
     let old_checkbox = control_id(&before_view.body, "checkbox");
     let old_text = control_id(&before_view.body, "text");
@@ -215,7 +215,7 @@ async fn identical_name_and_bytes_do_not_reauthorize_old_controls_or_message_int
     );
     let archived_at = crate::db::now();
     let (archived, recreated) = purge_and_recreate(&fixture, archived_at);
-    let after_view = broker.monitor_board(1, &fixture.name, None);
+    let after_view = broker.web_board(1, &fixture.name, None);
     assert_eq!(after_view.status, 200);
     for kind in ["checkbox", "text", "message"] {
         assert_ne!(
@@ -245,7 +245,7 @@ async fn identical_name_and_bytes_do_not_reauthorize_old_controls_or_message_int
     for expected in [&fixture.original.revision, &recreated.revision] {
         // The second iteration refreshes ONLY the revision: old control IDs
         // must remain unusable even when name, Markdown and marker instance match.
-        let checkbox = broker.monitor_board_response(
+        let checkbox = broker.web_board_response(
             1,
             &fixture.name,
             ResponseRequest {
@@ -256,7 +256,7 @@ async fn identical_name_and_bytes_do_not_reauthorize_old_controls_or_message_int
             },
         );
         assert_eq!(checkbox.status, 409);
-        let text = broker.monitor_board_response(
+        let text = broker.web_board_response(
             1,
             &fixture.name,
             ResponseRequest {
@@ -271,7 +271,7 @@ async fn identical_name_and_bytes_do_not_reauthorize_old_controls_or_message_int
         assert_eq!(text.status, 409);
         let mut attempt = unknown_message.clone();
         attempt.expected_revision = expected.clone();
-        let message = broker.monitor_board_message(1, &fixture.name, attempt);
+        let message = broker.web_board_message(1, &fixture.name, attempt);
         assert_eq!(message.status, 409);
         assert_ne!(message.body["accepted"], true);
         assert_eq!(read(broker, &fixture.name).markdown, recreated.markdown);
@@ -332,10 +332,10 @@ async fn identical_name_and_bytes_do_not_reauthorize_old_controls_or_message_int
         id: uuid::Uuid::new_v4().to_string(),
         text: "Explicit fresh intent for the recreated board".into(),
     };
-    let accepted = broker.monitor_board_message(1, &fixture.name, fresh.clone());
+    let accepted = broker.web_board_message(1, &fixture.name, fresh.clone());
     assert_eq!(accepted.status, 200);
     assert_eq!(accepted.body["accepted"], true);
-    let duplicate = broker.monitor_board_message(1, &fixture.name, fresh.clone());
+    let duplicate = broker.web_board_message(1, &fixture.name, fresh.clone());
     assert_eq!(duplicate.status, 200);
     assert_eq!(duplicate.body["duplicate"], true);
     let history = broker.db.lock().unwrap().history(&None, 100).unwrap();

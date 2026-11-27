@@ -450,7 +450,7 @@ disable and re-enable the web interface to invalidate a copied token.
 
 ## Upgrade and validation
 
-Schema 9 adds local message context snapshots and an ordered monitor index without
+Schema 9 adds local message context snapshots and an ordered web index without
 rewriting message bodies or delivery state. Follow the [backup/rollback guidance](peer-trust.md#upgrade-and-rollback)
 before running this version on existing state. Archive metadata is migrated
 automatically; existing Markdown remains active without manual file moves.
@@ -524,22 +524,22 @@ owner service. None runs in CI.
 
 ```sh
 cargo build --locked
-python3 tools/test_monitor.py --binary ./target/debug/agent-bridge --browser --output /tmp/agb-monitor
-python3 tools/monitor_catalog_qa.py --binary ./target/debug/agent-bridge --output /tmp/agb-catalog
-python3 tools/monitor_board_archive_qa.py --binary "$PWD/target/debug/agent-bridge" \
+python3 tools/test_web.py --binary ./target/debug/agent-bridge --browser --output /tmp/agb-web
+python3 tools/web_catalog_qa.py --binary ./target/debug/agent-bridge --output /tmp/agb-catalog
+python3 tools/web_board_archive_qa.py --binary "$PWD/target/debug/agent-bridge" \
   --binary-sha256 "$(shasum -a 256 target/debug/agent-bridge | cut -d' ' -f1)" \
   --source-checkpoint "$(git rev-parse HEAD)" --output "$HOME/agb-archive"
 python3 tools/test_topics_browser.py ./target/debug/agent-bridge /tmp/agb-topics
 ```
 
-- `test_monitor.py` checks the message API (authentication, origins, filters, historical session pinning,
+- `test_web.py` checks the message API (authentication, origins, filters, historical session pinning,
   the live stream, credential rotation) with a real loopback peer exchange, and with `--browser` the
   private-link unlock, All traffic with the details panel and live delivery-state changes, and then
-  runs the board, code-copy and message checks (`monitor_board_qa.py`, `monitor_code_copy_qa.py` and
-  `monitor_message_qa.py` have no command line of their own; they run from here).
-- `monitor_catalog_qa.py` (also run by `test_monitor.py --browser`) checks automatic board discovery, its cadence, back-off, timeout and
+  runs the board, code-copy and message checks (`web_board_qa.py`, `web_code_copy_qa.py` and
+  `web_message_qa.py` have no command line of their own; they run from here).
+- `web_catalog_qa.py` (also run by `test_web.py --browser`) checks automatic board discovery, its cadence, back-off, timeout and
   single flight, and that a late old response never replaces the current list.
-- `monitor_board_archive_qa.py` checks Archive, Restore and the Archived boards dialog, including held
+- `web_board_archive_qa.py` checks Archive, Restore and the Archived boards dialog, including held
   and dropped real responses. It refuses a binary whose hash differs from `--binary-sha256`.
 - `test_topics_browser.py` checks topic create, rename, archive and restore, publish, reply, mention,
   retry after a lost response, loading older posts, locking with a publish in flight, and a broker restart.

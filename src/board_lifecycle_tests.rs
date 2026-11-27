@@ -352,8 +352,8 @@ async fn startup_and_periodic_cleanup_do_not_depend_on_a_viewer() {
 }
 
 #[tokio::test]
-async fn monitor_lifecycle_contract_freezes_controls_and_preserves_conditional_metadata() {
-    use crate::monitor_board::{Desired, LifecycleRequest, ResponseRequest};
+async fn web_lifecycle_contract_freezes_controls_and_preserves_conditional_metadata() {
+    use crate::web_board::{Desired, LifecycleRequest, ResponseRequest};
     let (_root, bound, name) = setup();
     let broker = &bound.broker;
     let before = set(
@@ -361,8 +361,8 @@ async fn monitor_lifecycle_contract_freezes_controls_and_preserves_conditional_m
         &name,
         "- [ ] Choice\n<!-- board-input: answer -->\n> original\n<!-- /board-input -->\n",
     );
-    broker.monitor_control.lock().unwrap().enable(0);
-    let before_view = broker.monitor_board(1, &name, None).body;
+    broker.web_control.lock().unwrap().enable(0);
+    let before_view = broker.web_board(1, &name, None).body;
     let checkbox = crate::board_interaction::controls(&before.markdown).remove(0);
     let old_response = || ResponseRequest {
         board: name.clone(),
@@ -370,7 +370,7 @@ async fn monitor_lifecycle_contract_freezes_controls_and_preserves_conditional_m
         control_id: crate::board_interaction::control_id(&before, &checkbox),
         value: Desired::Checkbox { checked: true },
     };
-    let wrong = broker.monitor_board_lifecycle(
+    let wrong = broker.web_board_lifecycle(
         1,
         &name,
         LifecycleRequest {
@@ -385,7 +385,7 @@ async fn monitor_lifecycle_contract_freezes_controls_and_preserves_conditional_m
     let main_snapshot = read(broker, &main);
     assert_eq!(
         broker
-            .monitor_board_lifecycle(
+            .web_board_lifecycle(
                 1,
                 &main,
                 LifecycleRequest {
@@ -397,7 +397,7 @@ async fn monitor_lifecycle_contract_freezes_controls_and_preserves_conditional_m
             .status,
         422
     );
-    let saved = broker.monitor_board_lifecycle(
+    let saved = broker.web_board_lifecycle(
         1,
         &name,
         LifecycleRequest {
@@ -409,19 +409,17 @@ async fn monitor_lifecycle_contract_freezes_controls_and_preserves_conditional_m
     assert_eq!(saved.status, 200);
     assert_eq!(saved.body["board"]["read_only"], true);
     let revision = saved.body["board"]["revision"].as_str().unwrap().to_owned();
-    let conditional = broker.monitor_board(1, &name, Some(&revision));
+    let conditional = broker.web_board(1, &name, Some(&revision));
     assert_eq!(conditional.body["unchanged"], true);
     assert_eq!(conditional.body["read_only"], true);
     assert_eq!(conditional.body["state"], "archived");
     assert!(conditional.body["incarnation"].is_string());
     assert!(conditional.body.get("markdown").is_none());
     assert_eq!(
-        broker
-            .monitor_board_response(1, &name, old_response())
-            .status,
+        broker.web_board_response(1, &name, old_response()).status,
         409
     );
-    let restored = broker.monitor_board_lifecycle(
+    let restored = broker.web_board_lifecycle(
         1,
         &name,
         LifecycleRequest {
@@ -440,15 +438,13 @@ async fn monitor_lifecycle_contract_freezes_controls_and_preserves_conditional_m
         &restored.body["board"]["controls"][1]["rebase_key"]
     );
     assert_eq!(
-        broker
-            .monitor_board_response(1, &name, old_response())
-            .status,
+        broker.web_board_response(1, &name, old_response()).status,
         409
     );
-    broker.monitor_control.lock().unwrap().enable(1);
+    broker.web_control.lock().unwrap().enable(1);
     assert_eq!(
         broker
-            .monitor_board_lifecycle(
+            .web_board_lifecycle(
                 1,
                 &name,
                 LifecycleRequest {
@@ -469,11 +465,11 @@ async fn live_identity_reports_expiry_even_when_archive_revision_is_unchanged() 
     let (_root, bound, name) = setup();
     let broker = &bound.broker;
     let before = set(broker, &name, "dated archive");
-    broker.monitor_control.lock().unwrap().enable(0);
+    broker.web_control.lock().unwrap().enable(0);
     let at = crate::db::now();
     let saved = archive(broker, &name, &before.revision, at).unwrap();
     let archived = broker
-        .monitor_board_revision(1, &name)
+        .web_board_revision(1, &name)
         .unwrap_or_else(|reply| panic!("Unexpected status {}", reply.status));
     {
         let db = broker.db.lock().unwrap();
@@ -487,7 +483,7 @@ async fn live_identity_reports_expiry_even_when_archive_revision_is_unchanged() 
     }
     // Wall time is now below the observed deadline; the persisted expiry wins.
     let expired = broker
-        .monitor_board_revision(1, &name)
+        .web_board_revision(1, &name)
         .unwrap_or_else(|reply| panic!("Unexpected status {}", reply.status));
     assert_eq!(archived.revision, expired.revision);
     assert_ne!(archived, expired);
@@ -496,13 +492,13 @@ async fn live_identity_reports_expiry_even_when_archive_revision_is_unchanged() 
         expired.lifecycle.state,
         crate::board::LifecycleState::Purging
     );
-    let conditional = broker.monitor_board(1, &name, Some(&saved.revision));
+    let conditional = broker.web_board(1, &name, Some(&saved.revision));
     assert_eq!(conditional.body["unchanged"], true);
     assert_eq!(conditional.body["state"], "purging");
-    let result = broker.monitor_board_lifecycle(
+    let result = broker.web_board_lifecycle(
         1,
         &name,
-        crate::monitor_board::LifecycleRequest {
+        crate::web_board::LifecycleRequest {
             board: name.clone(),
             expected_revision: saved.revision,
         },
@@ -557,18 +553,18 @@ async fn archived_message_receipt_readback_never_enqueues_an_unknown_old_control
         id: uuid::Uuid::new_v4().to_string(),
         text: "exact original attempt".into(),
     };
-    broker.monitor_control.lock().unwrap().enable(0);
-    let accepted = broker.monitor_board_message(1, &name, attempt.clone());
+    broker.web_control.lock().unwrap().enable(0);
+    let accepted = broker.web_board_message(1, &name, attempt.clone());
     assert_eq!(accepted.status, 200);
     assert_eq!(accepted.body["accepted"], true);
     let at = crate::db::now();
     let saved = archive(broker, &name, &before.revision, at).unwrap();
-    let receipt = broker.monitor_board_message(1, &name, attempt.clone());
+    let receipt = broker.web_board_message(1, &name, attempt.clone());
     assert_eq!(receipt.status, 200);
     assert_eq!(receipt.body["duplicate"], true);
     let mut unknown = attempt.clone();
     unknown.id = uuid::Uuid::new_v4().to_string();
-    let rejected = broker.monitor_board_message(1, &name, unknown.clone());
+    let rejected = broker.web_board_message(1, &name, unknown.clone());
     assert_eq!(rejected.status, 409);
     assert_eq!(rejected.body["code"], "archived");
     assert_eq!(rejected.body["board"]["read_only"], true);
@@ -577,9 +573,9 @@ async fn archived_message_receipt_readback_never_enqueues_an_unknown_old_control
         control.message_key(&before.control_scope()),
         control.message_key(&restored.control_scope())
     );
-    assert_eq!(broker.monitor_board_message(1, &name, unknown).status, 409);
+    assert_eq!(broker.web_board_message(1, &name, unknown).status, 409);
     assert_eq!(
-        broker.monitor_board_message(1, &name, attempt).body["duplicate"],
+        broker.web_board_message(1, &name, attempt).body["duplicate"],
         true
     );
     assert_eq!(

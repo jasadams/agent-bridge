@@ -73,9 +73,9 @@ native receipt overtaking. No new post-save RPC behavior was introduced.
 Reproduce on an isolated build:
 
 ```sh
-python3 tools/monitor_board_archive_qa.py --binary /absolute/agent-bridge --binary-sha256 SHA256 --source-checkpoint SOURCE --output /private/new-web-results
+python3 tools/web_board_archive_qa.py --binary /absolute/agent-bridge --binary-sha256 SHA256 --source-checkpoint SOURCE --output /private/new-web-results
 python3 tools/test_board_archive_tui.py --binary /absolute/agent-bridge --output /private/new-tui-results
-python3 tools/test_monitor.py --binary /absolute/agent-bridge --browser --output /private/new-monitor-results
+python3 tools/test_web.py --binary /absolute/agent-bridge --browser --output /private/new-web-browser-results
 ```
 
 ## Gates and preserved failures
