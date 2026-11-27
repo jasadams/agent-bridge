@@ -24,32 +24,74 @@ use tokio::{task::JoinHandle, time::timeout};
 const A: &str = "ses_0123456789abcdefghijklmnop";
 const B: &str = "ses_0123456789abcdefghijklmnox";
 
-// Accepted sockets can inherit O_NONBLOCK on macOS. Only accept is polled;
-// each connected socket uses bounded blocking I/O for complete native frames.
-fn read_native_frame(stream: &UnixStream) -> Value {
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+// The fixture listener is blocking, so every accepted socket is blocking too.
+// Never configure an accepted socket (`set_nonblocking`, `set_read_timeout`):
+// on macOS both fail with EINVAL when the peer has already written its frame
+// and closed (a broker that times out or is stopped), although the buffered
+// frame is still readable. The 5 second bound is a channel timeout instead.
+// `None` means the peer closed without sending any frame.
+fn read_native_frame(stream: &UnixStream) -> Option<Value> {
+    let stream = stream.try_clone().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = BufReader::new(stream).read_line(&mut line);
+        let _ = sender.send(read.map(|read| (read, line)));
+    });
+    let (read, line) = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native frame within 5 seconds, or the reader thread died")
         .unwrap();
-    let mut line = String::new();
-    BufReader::new(stream.try_clone().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    serde_json::from_str(&line).unwrap()
+    (read > 0).then(|| serde_json::from_str(&line).unwrap())
 }
 
 #[test]
-fn native_fixture_reads_delayed_frames_from_nonblocking_connections() {
-    let (reader, mut writer) = UnixStream::pair().unwrap();
-    // Reproduce inherited flags on every platform, including Linux where
-    // accept normally returns a blocking socket from a nonblocking listener.
-    reader.set_nonblocking(true).unwrap();
-    let worker = std::thread::spawn(move || read_native_frame(&reader));
+fn native_fixture_reads_delayed_frames_and_frames_from_closed_peers() {
+    let root = temp();
+    let path = root.path().join("probe.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let delayed = UnixStream::connect(&path).unwrap();
+    let (reader, _) = listener.accept().unwrap();
+    let worker = std::thread::spawn(move || read_native_frame(&reader).expect("frame"));
+    let mut writer = delayed;
     std::thread::sleep(Duration::from_millis(50));
     write!(writer, "{{\"op\":\"probe\",").unwrap();
     std::thread::sleep(Duration::from_millis(50));
     writeln!(writer, "\"session\":\"{A}\"}}").unwrap();
     assert_eq!(worker.join().unwrap(), json!({"op":"probe", "session":A}));
+
+    // A peer that wrote its frame and closed before the fixture accepted it.
+    let mut closed = UnixStream::connect(&path).unwrap();
+    writeln!(closed, "{{\"op\":\"probe\",\"session\":\"{A}\"}}").unwrap();
+    drop(closed);
+    let (reader, _) = listener.accept().unwrap();
+    let mut reader = reader;
+    assert_eq!(
+        read_native_frame(&reader),
+        Some(json!({"op":"probe", "session":A}))
+    );
+    // The receipt for that closed peer finds nobody to read it.
+    reply(&mut reader, &json!({"ok":true}));
+
+    // A peer that closed without sending any frame.
+    drop(UnixStream::connect(&path).unwrap());
+    let (reader, _) = listener.accept().unwrap();
+    assert_eq!(read_native_frame(&reader), None);
+}
+
+// The frame is already recorded when the receipt is written. A broker that
+// timed out or was stopped has closed its end, so the write may find the peer
+// gone; that is the only error accepted. Any other write error still panics.
+fn reply(stream: &mut UnixStream, receipt: &Value) {
+    if let Err(error) = writeln!(stream, "{receipt}") {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ),
+            "native receipt write: {error}"
+        );
+    }
 }
 
 struct Native {
@@ -67,23 +109,22 @@ impl Native {
         let instance = uuid::Uuid::new_v4().to_string();
         let path = root.path().join(format!("{instance}.sock"));
         let listener = UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let frames = Arc::new(Mutex::new(Vec::new()));
         let received = frames.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let worker = std::thread::spawn(move || {
-            while !stopping.load(Ordering::SeqCst) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(error) => panic!("native accept: {error}"),
+            loop {
+                let (mut stream, _) = listener.accept().expect("native accept");
+                // Drop wakes this blocking accept with a connection of its own.
+                if stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                // A broker that connected and closed without a frame sent nothing to answer.
+                let Some(frame) = read_native_frame(&stream) else {
+                    continue;
                 };
-                let frame = read_native_frame(&stream);
                 assert!(frame["op"] == "state_list" || frame["session"] == session);
                 let mut receipt =
                     json!({"ok":true,"protocol":2,"session":session,"instance":instance});
@@ -97,7 +138,7 @@ impl Native {
                         receipt["sessions"] = json!([row]);
                         receipt["next_cursor"] = Value::Null;
                     }
-                    writeln!(stream, "{receipt}").unwrap();
+                    reply(&mut stream, &receipt);
                     continue;
                 }
                 if frame["op"] == "deliver" {
@@ -125,7 +166,7 @@ impl Native {
                         receipt["status"] = json!("uncertain");
                     }
                 }
-                writeln!(stream, "{receipt}").unwrap();
+                reply(&mut stream, &receipt);
             }
         });
         Self {
@@ -154,7 +195,11 @@ impl Native {
 impl Drop for Native {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.worker.take().unwrap().join().unwrap();
+        let worker = self.worker.take().unwrap();
+        // The connect only wakes a blocking accept. If it fails the worker has
+        // already dropped its listener (it panicked), and join reports that.
+        let _ = UnixStream::connect(&self.path);
+        worker.join().unwrap();
     }
 }
 struct Running {
