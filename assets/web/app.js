@@ -28,11 +28,19 @@
     }
     return true;
   }
+  // A valid link may carry one route beside the token (`#/board/kyomi&access_token=<token>`, either
+  // order; the theme part is already gone, see theme.js). The token is always removed from the address;
+  // the route is the one `&`-separated part that is a route and does not itself name `access_token`, and
+  // it is all that stays, so the unlock below opens it and a reload stays on it. An unreadable link, a
+  // bad token or more than one route leaves an empty fragment, as before.
   function takeAccessLink() {
-    if (!namesAccessToken(window.location.hash)) return null; // an ordinary route such as #/topic/x
-    const candidate = new URLSearchParams(window.location.hash.slice(1)).get("access_token");
-    window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    return candidate !== null && /^[A-Za-z0-9_-]{43}$/.test(candidate) ? candidate : null;
+    const fragment = window.location.hash;
+    if (!namesAccessToken(fragment)) return null; // an ordinary route such as #/topic/x
+    const candidate = new URLSearchParams(fragment.slice(1)).get("access_token");
+    const valid = candidate !== null && /^[A-Za-z0-9_-]{43}$/.test(candidate);
+    const routes = valid ? fragment.slice(1).split("&").filter(part => !namesAccessToken(part) && parseRoute(`#${part}`)) : [];
+    window.history.replaceState(null, "", window.location.pathname + window.location.search + (routes.length === 1 ? `#${routes[0]}` : ""));
+    return valid ? candidate : null;
   }
   let accessFromLink = takeAccessLink();
   const $ = id => document.getElementById(id);

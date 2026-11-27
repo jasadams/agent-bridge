@@ -758,6 +758,128 @@ def run_access_link_section(playwright, url_for, report):
     browser.close()
 
 
+def run_board_link_section(playwright, url_for, broker, report, themes):
+    """AGB-74: the board route, the theme and the access token share one fragment. After unlocking the page
+    opens the named board in the theme, and only the route stays in the address. Run late: it adds boards."""
+    base, _, link_fragment = url_for.partition("#")
+    token = dict(part.split("=", 1) for part in link_fragment.split("&"))["access_token"]
+    origin = base.rstrip("/")
+    for name in ("kyomi", "krausen"):
+        broker.rpc("board_create", board=name)
+    browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
+    problems = []
+
+    def open_page(watch=True):
+        time.sleep(1.1)  # the broker allows 100 requests a second in all
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        page = context.new_page()
+        page.requests, page.leaks, page.texts = [], [], []
+        page.on("request", lambda r: page.requests.append(r.url))
+        page.on("request", lambda r: page.leaks.append(r.url) if token in (r.url + (r.headers.get("referer") or "") + (r.post_data or "")) else None)
+        page.on("console", lambda m: page.texts.append(m.text))
+        if watch:  # a board that does not exist makes the page ask for it, and the broker answers 404, as without a token
+            page.on("console", lambda m: problems.append(m.text) if m.type == "error" else None)
+            page.on("pageerror", lambda e: problems.append(str(e)))
+        return context, page
+
+    def board_name(page):
+        return page.locator("#selected-board-name").inner_text()
+
+    def no_token_anywhere(tag, context, page, extra=()):
+        store = page.evaluate("Object.fromEntries(Object.keys(localStorage).concat(Object.keys(sessionStorage)).map(k => [k, 1]))")
+        address = page.evaluate("location.href + ' ' + JSON.stringify(history.state)")
+        report.check(f"{tag} the token is in no address, history entry, storage, cookie, request URL, Referer, body or console message, and nothing left the origin",
+                     token not in address and "access_token" not in address.lower() and set(store) <= {"agent-bridge-theme", "agent-bridge-sidebar", *extra}
+                     and token not in json.dumps(context.cookies()) and not page.leaks and all(u.startswith(origin + "/") for u in page.requests)
+                     and not any(token in text for text in page.texts), page.url.replace(token, "<token>"))
+
+    t = token
+    for theme in themes:
+        shown = sheet_for(theme, "light")
+        orders = [("route, theme, token", f"/board/kyomi&theme={theme}&access_token={t}"),
+                  ("route, token, theme", f"/board/kyomi&access_token={t}&theme={theme}"),
+                  ("theme, route, token", f"theme={theme}&/board/kyomi&access_token={t}"),
+                  ("theme, token, route", f"theme={theme}&access_token={t}&/board/kyomi"),
+                  ("token, route, theme", f"access_token={t}&/board/kyomi&theme={theme}"),
+                  ("token, theme, route", f"access_token={t}&theme={theme}&/board/kyomi")]
+        for label, fragment in orders:
+            tag = f"[board link {theme}: {label}]"
+            context, page = open_page()
+            page.goto(f"{base}#{fragment}")
+            page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+            until(page, "document.querySelector('#boards-view') && !document.querySelector('#boards-view').hidden && document.querySelector('#selected-board-name').textContent === 'kyomi'", 15000)
+            report.check(f"{tag} unlocks and opens the named board, not the default one", board_name(page) == "kyomi" and page.locator("#workspace").is_visible(), board_name(page))
+            report.check(f"{tag} the theme is applied", page.evaluate("document.documentElement.dataset.theme") == shown)
+            report.check(f"{tag} only the route is left in the address", page.evaluate("location.hash") == "#/board/kyomi" and page.url == f"{base}#/board/kyomi", page.url.replace(token, "<token>"))
+            no_token_anywhere(tag, context, page)
+            page.reload()
+            page.wait_for_selector("#login:not([hidden])", timeout=8000)
+            report.check(f"{tag} a reload stays locked, keeps the route and has neither the token nor the theme in the address", page.evaluate("location.hash") == "#/board/kyomi" and page.locator("#workspace").is_hidden(), page.url)
+            context.close()
+        # The same without the theme, and the other board, once per theme run.
+        for label, fragment, expected in [("no theme, route first", f"/board/krausen&access_token={t}", "krausen"),
+                                          ("no theme, route last", f"access_token={t}&/board/krausen", "krausen")]:
+            tag = f"[board link {theme}: {label}]"
+            context, page = open_page()
+            page.add_init_script(f"try {{ if (!sessionStorage.getItem('seeded')) {{ sessionStorage.setItem('seeded', '1'); localStorage.setItem('agent-bridge-theme', '{theme}') }} }} catch (e) {{}}")
+            page.goto(f"{base}#{fragment}")
+            page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+            until(page, f"document.querySelector('#selected-board-name').textContent === '{expected}'", 15000)
+            report.check(f"{tag} unlocks, opens the named board and keeps the saved theme", board_name(page) == expected and page.evaluate("document.documentElement.dataset.theme") == shown)
+            report.check(f"{tag} only the route is left in the address", page.url == f"{base}#/board/{expected}", page.url.replace(token, "<token>"))
+            no_token_anywhere(tag, context, page, extra=("seeded",))  # `seeded` is this test's own marker
+            context.close()
+
+    # A route that names no board, typed with and without the token, ends the same way.
+    context, page = open_page(False)
+    page.goto(f"{base}#/board/nonesuch")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    page.fill("#access-token", token)
+    page.click("#login-form button[type=submit]")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    time.sleep(1.5)
+    plain = (board_name(page), page.evaluate("location.hash"))
+    context.close()
+    context, page = open_page(False)
+    page.goto(f"{base}#/board/nonesuch&access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    time.sleep(1.5)
+    linked = (board_name(page), page.evaluate("location.hash"))
+    report.check("[board link missing board] a route to a board that does not exist ends as it does without a token", linked == plain, f"{linked} vs {plain}")
+    no_token_anywhere("[board link missing board]", context, page)
+    context.close()
+
+    # Malformed, repeated and unreadable parts: nothing new is accepted, nothing is stored, no token stays.
+    bad = "x" * 43 + "="
+    cases = [("two different routes", f"/board/kyomi&/board/krausen&access_token={t}", True, ""),
+             ("the same route twice", f"/board/kyomi&/board/kyomi&access_token={t}", True, ""),
+             ("route naming access_token", f"/board/access_token_x&access_token={t}", True, ""),
+             ("unknown theme beside a route", f"/board/kyomi&theme=nope&access_token={t}", True, "#/board/kyomi"),
+             ("repeated theme beside a route", f"/board/kyomi&theme=orca&theme=sticker&access_token={t}", True, "#/board/kyomi"),
+             ("route with a semicolon", f"/board/kyomi;access_token={t}", False, ""),
+             ("route, then a bad token", f"/board/kyomi&access_token={bad}", False, ""),
+             ("route, then a short token", "/board/kyomi&access_token=x", False, ""),
+             ("route, then an empty token", "/board/kyomi&access_token=", False, "")]
+    for label, fragment, unlocks, left in cases:
+        tag = f"[board link {label}]"
+        context, page = open_page()
+        page.goto(f"{base}#{fragment}")
+        if unlocks:
+            page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+            time.sleep(1)
+            report.check(f"{tag} unlocks and opens {'the route' if left else 'the default board'}", board_name(page) == ("kyomi" if left else "main"), board_name(page))
+        else:
+            page.wait_for_selector("#login:not([hidden])", timeout=8000)
+            time.sleep(.5)
+            report.check(f"{tag} stays locked", page.locator("#workspace").is_hidden())
+        shown_hash = page.evaluate("location.hash")
+        report.check(f"{tag} what is left in the address is {left or 'nothing'}", shown_hash == left or (not left and shown_hash == "#/board/main"), page.url.replace(token, "<token>"))
+        no_token_anywhere(tag, context, page)
+        context.close()
+    report.check("[board link] the page raised no console error or exception", not problems, str(problems[:3]))
+    browser.close()
+
+
 def run_access_link_board_section(playwright, url_for, broker, report):
     """AGB-69: a board whose name contains `access_token` cannot be opened by a link, but choosing it in the
     sidebar works (documented). Run last, because it adds a board the other sections do not expect."""
@@ -1522,6 +1644,7 @@ def main():
             for theme in themes:
                 for scheme in (["light", "dark"] if theme == "orca-system" else ["light"]):
                     run_theme(playwright, theme, credentials["access_url"], topic_id, report, out, scheme)
+            run_board_link_section(playwright, credentials["access_url"], broker, report, themes)
             run_access_link_board_section(playwright, credentials["access_url"], broker, report)
     finally:
         if broker:

@@ -330,13 +330,44 @@ sent in a request, and the token is consumed and removed exactly as without a th
   chose from the menu in the meantime. Opening a link that carries a theme (a new tab, a bookmark, a
   pasted link in a fresh load) selects that theme again; changing only the fragment of a page that is
   already open does not reload it and does not apply a theme.
-- Supported forms: `#theme=<name>`, `#theme=<name>&access_token=<token>` (either order), and a route
-  with a theme (`#/board/main&theme=orca` or `#theme=orca&/board/main`). The page removes only the
-  `theme=…` part of the fragment, as text; every other character, the route included, stays exactly as
-  typed, so the route opens as it would without a theme. With the access token, the page consumes the
-  whole fragment after unlocking (as it always does), so a route does not survive an access link.
-  With only a theme, the address is empty after it is removed, so once unlocked the page opens the
-  default board, exactly as a reload of the plain address does.
+- Supported forms without the token: `#theme=<name>`, and a route with a theme (`#/board/main&theme=orca`
+  or `#theme=orca&/board/main`). The page removes only the `theme=…` part of the fragment, as text; every
+  other character, the route included, stays exactly as typed, so the route opens as it would without a
+  theme. With only a theme, the address is empty after it is removed, so once unlocked the page opens the
+  default board, exactly as a reload of the plain address does. The access link also carries a route; see
+  below.
+
+### Opening a board from the access link
+
+A coordinator that opens the board for the owner in a browser tab (one per project, for example a `kyomi`
+board and a `krausen` board) puts the existing board route, the theme and the access token in the one
+fragment. Nothing is new: the route is `#/board/<name>` exactly as in a link without a token, and the
+`&`-separated parts may come in any order. To build it, take the link `agent-bridge web enable` printed
+(`<url>#access_token=<token>`), and add the route and, if wanted, the theme as further `&`-separated parts
+of the fragment. Percent-encode the board name as `encodeURIComponent` does (a `&` or `/` in a name would
+otherwise end or split the part):
+
+```text
+http://127.0.0.1:<port>/#/board/kyomi&theme=orca&access_token=<token>
+http://127.0.0.1:<port>/#theme=orca&access_token=<token>&/board/kyomi
+http://127.0.0.1:<port>/#/board/kyomi&access_token=<token>
+```
+
+All orders of route, theme and token work, with or without the theme. After the page unlocks it opens
+the named board in the chosen theme, with no click.
+
+- The token is removed from the address, history entry, storage, cookies, requests and console exactly as
+  for any access link. What stays in the address is the route: after unlocking it is `#/board/kyomi`, and
+  a reload shows the locked screen with that route in the address (the token and the theme are not kept),
+  so entering the token opens the same board.
+- The route is the one `&`-separated part that is a route (`/board/<name>`, `/topic/<id>`, `/dm/<id>` or
+  `/traffic`) and does not itself contain the text `access_token`. If there is more than one such part
+  (even the same one twice), or none, no route is kept and the page opens the default board.
+- A route to a board that does not exist behaves as it does for a link without a token. A malformed or
+  repeated theme or token part is handled as described above and under [Browser access](#browser-access).
+- The route survives only when the token part is valid and the link unlocks. A link that stays locked
+  (an unreadable shape, a bad token) is cleared completely, route included.
+- A board whose name contains the text `access_token` still cannot be opened by a link.
 
 ## Browser access
 
@@ -352,12 +383,13 @@ The page removes the token from the address bar and the current history entry fo
 shape, including one it cannot read. It unlocks only when the first `access_token` parameter of the
 fragment, after splitting on `&` (a leading `?` and percent-encoding of the key or value are
 accepted), holds a valid token; this covers `#access_token=<token>` and, with a theme,
-`#theme=<name>&access_token=<token>` in either order. A fragment that contains the text
+`#theme=<name>&access_token=<token>` in either order, each with a route beside them
+([Opening a board from the access link](#opening-a-board-from-the-access-link)). A fragment that contains the text
 `access_token` in any other shape, for example joined with `;`, `,` or a space, after an `&?`,
 inside a route (`#/x?access_token=<token>`), as another parameter's value, in upper case or encoded
 more than once, or as a repeated key whose first value is not the token, does not unlock: the page
 shows the normal locked screen, replaces the whole fragment with an empty one (a route in it is
-lost too) and stores nothing. It sends nothing either, except in one case: a repeated `access_token`
+lost too) and stores nothing. A link that does unlock keeps only its route in the address. It sends nothing either, except in one case: a repeated `access_token`
 key whose first value is a well-formed token is tried as if typed and refused, and the address,
 storage and every URL still hold no token. Open the link as `agent-bridge web enable` printed it,
 or enter the token by hand. The same applies when such a link is pasted into a page that is already
@@ -373,7 +405,7 @@ Tokens are not stored in cookies,
 referrers or browser storage; the page stores only the theme and sidebar preferences described above. Static login assets contain no message history or
 credentials. A theme can be added to the access link's fragment
 ([Choosing the theme from the link](#choosing-the-theme-from-the-link)); the token is still
-removed from the address and never stored.
+removed from the address and never stored. The board route can join them in the same fragment.
 
 Exact Host validation, Origin and browser fetch-metadata checks reject DNS rebinding
 and cross-origin requests. The server supplies no CORS permission, uses restrictive
@@ -424,7 +456,8 @@ migration and reads without delivery writes.
 
 The disposable browser acceptance starts a private broker with seeded boards, topics and agent
 conversations and drives every theme choice with an already installed Playwright and Chromium. It checks
-choosing each theme from the plain address and from the access link (first paint, only that theme's
+choosing each theme from the plain address and from the access link, and opening a named board from a link
+that carries the route, the theme and the token in every order (first paint, only that theme's
 sheet requested, the token and theme removed from the address and absent from storage, cookies and
 requests, a menu choice surviving a reload, and ignored unknown, empty and repeated values),
 unlocking, the sidebar, Markdown topics, mentions and publishing, read-only conversations and the
