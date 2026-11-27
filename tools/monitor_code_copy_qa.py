@@ -8,6 +8,10 @@ from playwright.sync_api import expect
 
 
 def code_copy_browser_checks(*, page, rpc, state, token, record, output):
+    def go(name):
+        """A board is opened from its sidebar item (hash route #/board/<name>)."""
+        page.locator(f'#sidebar .nav-item[data-route="#/board/{name}"]').click()
+
     def read(name):
         return rpc(state, "named_board_read", board=name)
 
@@ -36,9 +40,7 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
             rpc(state, "board_create", board=name)
         write("copy-alpha", markdown)
         write("copy-beta", '# Copy beta\n\n`beta payload`\n')
-        page.locator("#messages-tab").click()
-        page.locator("#boards-tab").click()
-        page.locator("#board-selector").select_option("copy-alpha")
+        go("copy-alpha")
         expect(page.locator("#board-document h1")).to_have_text("Copy fixture")
         expect(page.locator("#board-status")).to_contain_text("Live")
         before = read("copy-alpha")
@@ -51,12 +53,12 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
         # Fresh page state fences pending callbacks, selections, mutated UI-only
         # fixtures and prior failed authentication without rewriting board data.
         page.evaluate("() => { window.__copyRelease?.(); getSelection().removeAllRanges(); }")
-        page.goto(page.url)
+        page.reload()
         page.locator("#access-token").fill(token)
         page.locator("#login-form button[type=submit]").click()
         expect(page.locator("#workspace")).to_be_visible()
         expect(page.locator("#board-status")).to_contain_text("Live")
-        page.locator("#board-selector").select_option("copy-alpha")
+        go("copy-alpha")
         expect(page.locator("#board-document h1")).to_have_text("Copy fixture")
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.evaluate("""() => {
@@ -213,7 +215,7 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
           }}});
         }""")
         inline.nth(0).click()
-        page.locator("#board-selector").select_option("copy-beta")
+        go("copy-beta")
         expect(page.locator("#board-document h1")).to_have_text("Copy beta")
         page.evaluate("window.__copyRelease()")
         expect(page.locator("#board-copy-feedback")).to_have_text("")
@@ -224,7 +226,7 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
         expect(page.locator("#board-document code")).to_have_text("updated payload")
         page.locator("#board-document .board-code-copy").click()
         assert page.evaluate("window.__copyWrites.at(-1)") == "updated payload", "Reconciled button retained stale text"
-        page.set_viewport_size({"width": 320, "height": 844})
+        page.set_viewport_size({"width": 390, "height": 844})
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
         page.screenshot(path=str(output / "boards-code-copy-mobile.png"), full_page=True)
         page.set_viewport_size({"width": 1440, "height": 1000})
@@ -248,6 +250,8 @@ def code_copy_browser_checks(*, page, rpc, state, token, record, output):
         assert not page.locator("#board-raw").text_content()
         if page.locator("#board-last-updated").count():
             assert not page.locator("#board-last-updated").text_content()
+        # The new generation opens the board named in the address.
+        page.evaluate("location.hash = '#/board/main'")
         page.locator("#access-token").fill(token)
         page.locator("#login-form button[type=submit]").click()
         expect(page.locator("#workspace")).to_be_visible()
