@@ -356,21 +356,21 @@ http://127.0.0.1:<port>/#/board/kyomi&access_token=<token>
 All orders of route, theme and token work, with or without the theme. After the page unlocks it opens
 the named board in the chosen theme, with no click.
 
-- The token is removed from the address, history entry, storage, cookies, requests and console exactly as
-  for any access link. What stays in the address is the route: after unlocking it is `#/board/kyomi`, and
-  a reload shows the locked screen with that route in the address (the token and the theme are not kept),
-  so entering the token opens the same board.
-- The route is the one `&`-separated part that is a route (`/board/<name>`, `/topic/<id>`, `/dm/<id>` or
-  `/traffic`), is written exactly as `encodeURIComponent` writes the name (the page keeps its own text of
-  the route, never the link's), and carries neither the text `access_token` nor any 16 consecutive
-  characters of the token, at any level of percent-encoding. If there is more than one such part (even the
-  same one twice), or none, no route is kept and the page opens the default board.
-- A route to a board that does not exist behaves as it does for a link without a token. A malformed or
-  repeated theme or token part is handled as described above and under [Browser access](#browser-access).
-- The route is kept only when the token is well formed (43 characters of `A-Z a-z 0-9 - _`). A link that
-  stays locked because its shape is unreadable or its token is malformed is cleared completely, route
-  included. A well-formed token that the broker refuses (a stale link) leaves the locked page with the
-  route, and no token, in the address.
+- **Nothing of the link is written back.** The whole fragment is cleared from the address and the history
+  entry exactly as for any access link (the token, the theme and the board part all go). The board's name
+  is held in memory only. After unlocking, the page opens it only if its own board list holds exactly that
+  name, and then the address shows the page's own text for it, `#/board/kyomi`. A reload shows the locked
+  screen with that address (no token, no theme), so entering the token opens the same board.
+- Only a board that exists is opened. A board the page does not list, a name the page cannot read, more
+  than one board part (even the same one twice) or none opens the default board with a clean address. This
+  is deliberate and for security: only names the page itself lists are ever shown back, so a crafted link
+  cannot put text of its own, or a piece of the token, into the address, the title or the page. It differs
+  from a link without a token, where a board that does not exist shows the board error.
+- Only a board route is used (not a topic or a conversation), and a part that contains the text
+  `access_token` (at any encoding level) is never a board name.
+- A malformed or repeated theme or token part is handled as described above and under
+  [Browser access](#browser-access). A link that stays locked (an unreadable shape, a malformed token, or a
+  well-formed token the broker refuses) is cleared completely and keeps no board.
 - A board whose name contains the text `access_token` still cannot be opened by a link.
 
 ## Browser access
@@ -387,7 +387,7 @@ The page removes the token from the address bar and the current history entry fo
 shape, including one it cannot read. It unlocks only when the first `access_token` parameter of the
 fragment, after splitting on `&` (a leading `?` and percent-encoding of the key or value are
 accepted), holds a valid token; this covers `#access_token=<token>` and, with a theme,
-`#theme=<name>&access_token=<token>` in either order, each with a route beside them
+`#theme=<name>&access_token=<token>` in either order, each with a board beside them
 ([Opening a board from the access link](#opening-a-board-from-the-access-link)). A fragment that contains the text
 `access_token` in any other shape, for example joined with `;`, `,` or a space, after an `&?`,
 inside a route (`#/x?access_token=<token>`), as another parameter's value, in upper case or encoded
@@ -395,7 +395,7 @@ more than once, or as a repeated key whose first value is not the token, does no
 shows the normal locked screen, replaces the whole fragment with an empty one (a route in it is
 lost too) and stores nothing. It sends nothing either, except in one case: a repeated `access_token`
 key whose first value is a well-formed token is tried as if typed and refused, and the address,
-storage and every URL still hold no token. A link that does unlock keeps only its route in the address. Open the link as `agent-bridge web enable` printed it,
+storage and every URL still hold no token. A link that does unlock leaves nothing of itself in the address; a board it names is opened only if the page lists it. Open the link as `agent-bridge web enable` printed it,
 or enter the token by hand. The same applies when such a link is pasted into a page that is already
 open: the open session and its route are kept and the fragment is cleared. A fragment encoded eight or more
 times is cleared too. A board or topic whose own name contains the text `access_token` cannot be

@@ -19,6 +19,7 @@ profiles.
 import argparse
 import json
 import os
+import base64
 import re
 from pathlib import Path
 import shutil
@@ -28,6 +29,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.parse import quote
 
 CHROMIUM_ARGS = ["--no-sandbox", "--use-mock-keychain", "--password-store=basic"]
 ORCA_THEMES = ["orca", "orca-light", "orca-system"]
@@ -831,22 +833,13 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
             no_token_anywhere(tag, context, page, extra=("seeded",))  # `seeded` is this test's own marker
             context.close()
 
-    # A route that names no board, typed with and without the token, ends the same way.
-    context, page = open_page(False)
-    page.goto(f"{base}#/board/nonesuch")
-    page.wait_for_selector("#login:not([hidden])", timeout=8000)
-    page.fill("#access-token", token)
-    page.click("#login-form button[type=submit]")
-    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
-    time.sleep(1.5)
-    plain = (board_name(page), page.evaluate("location.hash"))
-    context.close()
-    context, page = open_page(False)
+    # A link's board that the page's own list does not hold opens the default board (deliberate: only names the
+    # page itself lists are ever shown back), with a clean address and without the page asking for it.
+    context, page = open_page()
     page.goto(f"{base}#/board/nonesuch&access_token={token}")
     page.wait_for_selector("#sidebar .nav-item", timeout=15000)
     time.sleep(1.5)
-    linked = (board_name(page), page.evaluate("location.hash"))
-    report.check("[board link missing board] a route to a board that does not exist ends as it does without a token", linked == plain, f"{linked} vs {plain}")
+    report.check("[board link missing board] a board the page does not list opens the default board with a clean address", board_name(page) == "main" and page.evaluate("location.hash") == "#/board/main" and not any("nonesuch" in u for u in page.requests), f"{board_name(page)} {page.evaluate('location.hash')}")
     no_token_anywhere("[board link missing board]", context, page)
     context.close()
 
@@ -862,7 +855,7 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
              ("route with a semicolon", f"/board/kyomi;access_token={t}", False, ""),
              ("route, then a bad token", f"/board/kyomi&access_token={bad}", False, ""),
              ("route, then a short token", "/board/kyomi&access_token=x", False, ""),
-             ("route, then a refused token", f"/board/kyomi&access_token={'A' * 43}", False, "#/board/kyomi"),
+             ("route, then a refused token", f"/board/kyomi&access_token={'A' * 43}", False, ""),
              ("route, then an empty token", "/board/kyomi&access_token=", False, "")]
     for label, fragment, unlocks, left in cases:
         tag = f"[board link {label}]"
@@ -932,16 +925,28 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
               ("board, raw 20-character piece", f"/board/{t[:20]}&access_token={t}"),
               ("board, 20-character piece with the rest in another part", f"/board/{t[:20]}&{t[20:]}&access_token={t}"),
               ("route last, doubly encoded token", f"access_token={t}&/board/{dbl(t)}")]
+    pieces = [t[:15], t[15:30], t[30:]]
+    for name, separator in [("dot", "."), ("hyphen", "-"), ("underscore", "_"), ("exclamation mark", "!"), ("tilde", "~"), ("asterisk", "*"),
+                            ("apostrophe", "'"), ("parenthesis", "("), ("a letter", "a"), ("encoded space", "%20"), ("soft hyphen", "%C2%AD"),
+                            ("zero-width space", "%E2%80%8B"), ("word joiner", "%E2%81%A0")]:
+        shapes.append((f"15-character pieces joined by {name}", f"/board/{separator.join(pieces)}&access_token={t}"))
+    shapes += [("pieces with one character dropped between them", f"/board/{t[:15]}.{t[16:31]}.{t[32:]}&access_token={t}"),
+               ("lower case token", f"/board/{t.lower()}&access_token={t}"), ("upper case token", f"/board/{t.upper()}&access_token={t}"),
+               ("reversed token", f"/board/{t[::-1]}&access_token={t}"),
+               ("base64 of the token", f"/board/{quote(base64.b64encode(t.encode()).decode(), safe='')}&access_token={t}"),
+               ("fullwidth token", f"/board/{quote(''.join(chr(ord(c) + 0xFEE0) if c.isalnum() else c for c in t), safe='')}&access_token={t}"),
+               ("alphabet mapping", f"/board/{t.replace('-', '.').replace('_', '~')}&access_token={t}"),
+               ("whole token as the board", f"/board/{t}&access_token={t}")]
     for label, fragment in shapes:
         tag = f"[board link smuggled token: {label}]"
         context, page = open_page(False)  # a made-up board makes the page ask for it and the broker answers 404
         page.goto(f"{base}#{fragment}")
         page.wait_for_selector("#sidebar .nav-item", timeout=15000)
         time.sleep(1)
-        report.check(f"{tag} on load: no piece of the token in the address, history, page text or title", not token_pieces_in(surfaces(context, page)))
+        report.check(f"{tag} on load: no piece of the token in the address, history, page text or title, and the default board is open", not token_pieces_in(surfaces(context, page)) and page.evaluate("location.hash") == "#/board/main" and board_name(page) == "main")
         page.reload()
         page.wait_for_selector("#login:not([hidden])", timeout=8000)
-        report.check(f"{tag} after a reload: no piece of the token anywhere", not token_pieces_in(surfaces(context, page)))
+        report.check(f"{tag} after a reload: no piece of the token anywhere and a clean address", not token_pieces_in(surfaces(context, page)) and page.evaluate("location.hash") == "#/board/main")
         context.close()
         # pasted into the locked page after the broker refused a well-formed token
         context, page = open_page(False)
@@ -951,7 +956,7 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
         page.evaluate("fragment => { location.hash = fragment }", fragment)
         page.wait_for_selector("#sidebar .nav-item", timeout=15000)
         time.sleep(1)
-        report.check(f"{tag} pasted after a refused token: no piece of the token anywhere", not token_pieces_in(surfaces(context, page)))
+        report.check(f"{tag} pasted after a refused token: no piece of the token anywhere, and the default board is open", not token_pieces_in(surfaces(context, page)) and page.evaluate("location.hash") == "#/board/main")
         context.close()
 
     report.check("[board link] the page raised no console error or exception", not problems, str(problems[:3]))

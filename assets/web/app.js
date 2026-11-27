@@ -9,63 +9,39 @@
   // Consume the private link before making requests or displaying the workspace.
   // Fragments never travel in HTTP requests; replace this history entry as well.
   // URLSearchParams reads only `&`-separated parameters, so a link with another separator (`;`), a `?`
-  // inside the fragment, or the key inside a route would not be recognised and its valid token would
-  // stay in the address bar and the history. A fragment is therefore treated as an access link whenever
-  // the text `access_token` appears in it in any case, raw or percent-encoded (up to eight levels),
-  // whatever the separators. The token is always removed from the address; the link unlocks the page only
-  // when the token is a parameter this page can read, exactly as before. A route beside a readable token
-  // may stay (see takeAccessLink), but a board whose own name contains the text cannot be opened by a link.
-  // The forms of `text` with one more level of percent-encoding removed each, the text itself first.
-  // Eight levels is far beyond any real link; `exhausted` says it was still changing after that, and
-  // such a text is treated as naming the token, so a long run of `%25` costs at most eight linear passes.
-  function decodings(text) {
-    const forms = [text];
-    for (let pass = 0; pass < 8; pass++) {
-      const next = forms[forms.length - 1].replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-      if (next === forms[forms.length - 1]) return { forms, exhausted: false };
-      forms.push(next);
-    }
-    return { forms, exhausted: true };
-  }
+  // inside the fragment, or the key inside a route would not be recognised and its valid token would stay
+  // in the address bar and the history. A fragment is therefore treated as an access link whenever the
+  // text `access_token` appears in it in any case, raw or percent-encoded (up to eight levels), whatever the
+  // separators. It is always cleared; it unlocks the page only when the token is a parameter this page
+  // can read, exactly as before. There is no exception: a board whose own name contains the text cannot
+  // be opened by a link.
   function namesAccessToken(hash) {
-    const { forms, exhausted } = decodings(hash);
-    return exhausted || forms.some(form => /access_token/i.test(form));
-  }
-  // True when any 16 consecutive characters of `token` appear in `text` at any level of encoding: a
-  // route must not carry the token, or a piece long enough to be worth keeping, into the address.
-  function carriesToken(text, token) {
-    const { forms, exhausted } = decodings(text);
-    if (exhausted) return true;
-    for (let start = 0; start + 16 <= token.length; start++) {
-      const piece = token.slice(start, start + 16);
-      if (forms.some(form => form.includes(piece))) return true;
+    // Each pass decodes one more level of encoding. Eight levels is far beyond any real link; a
+    // fragment still changing after that is cleared as an access link, so a long run of `%25` cannot
+    // make this loop cost more than eight linear passes.
+    let text = hash;
+    for (let pass = 0; pass < 8; pass++) {
+      if (/access_token/i.test(text)) return true;
+      const next = text.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+      if (next === text) return false;
+      text = next;
     }
-    return false;
+    return true;
   }
-  // The one route that may stay beside a readable token: an `&`-separated part that is a route, is
-  // written exactly as the page would write it (so the address holds the page's own text, never the
-  // link's), and neither names `access_token` nor carries the token. Any other count leaves nothing.
-  function routeBesideToken(fragment, token) {
-    const routes = fragment.slice(1).split("&").filter(part => {
-      if (namesAccessToken(part) || carriesToken(part, token)) return false;
-      const parsed = parseRoute(`#${part}`);
-      return parsed !== null && routeHash(parsed) === `#${part}`;
-    });
-    return routes.length === 1 ? `#${routes[0]}` : "";
-  }
-  // A valid link may carry a route beside the token (`#/board/kyomi&access_token=<token>`, either order;
-  // the theme part is already gone, see theme.js). The token is always removed from the address and the
-  // route is all that stays, so the unlock below opens it and a reload stays on it. An unreadable link, a
-  // token of the wrong shape or no single acceptable route leaves an empty fragment, as before. A
-  // well-formed token the broker refuses leaves the route in the address of the locked page, with no token.
+  // A valid link may name one board beside the token (`#/board/kyomi&access_token=<token>`, either order;
+  // the theme part is already gone, see theme.js). Nothing of the link is ever written back: the whole
+  // fragment is cleared exactly as without a board. The board's name is kept in memory only, and the
+  // unlock opens it only if the page's own board list holds exactly that name (then the address is the
+  // page's own text for it); any other name, or no single board part, opens the default board.
   function takeAccessLink() {
-    const fragment = window.location.hash;
-    if (!namesAccessToken(fragment)) return null; // an ordinary route such as #/topic/x
-    const candidate = new URLSearchParams(fragment.slice(1)).get("access_token");
-    const valid = candidate !== null && /^[A-Za-z0-9_-]{43}$/.test(candidate);
-    const kept = valid ? routeBesideToken(fragment, candidate) : "";
-    window.history.replaceState(null, "", window.location.pathname + window.location.search + kept);
-    return valid ? candidate : null;
+    if (!namesAccessToken(window.location.hash)) return null; // an ordinary route such as #/topic/x
+    const fragment = window.location.hash.slice(1);
+    const candidate = new URLSearchParams(fragment).get("access_token");
+    const boardParts = fragment.split("&").filter(part => !namesAccessToken(part))
+      .map(part => parseRoute(`#${part}`)).filter(parsed => parsed?.kind === "board");
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    if (candidate === null || !/^[A-Za-z0-9_-]{43}$/.test(candidate)) return null;
+    return { token: candidate, board: boardParts.length === 1 ? boardParts[0].id : null };
   }
   let accessFromLink = takeAccessLink();
   const $ = id => document.getElementById(id);
@@ -73,6 +49,7 @@
   let token = null, boards = null, topics = null;
   let generation = 0, sessionAbort = null, streamAbort = null, reconnectTimer = null, refreshTimer = null, reconnectDelay = 1000;
   let route = null, navigating = false, queuedRoute = null;
+  let linkedBoard = null; // the board named by the access link being used to unlock; in memory only
   const catalog = { boardNames: [], currentBoard: "main", topics: [], boardPoll: null };
 
   // ---------- small UI helpers ----------
@@ -512,7 +489,7 @@
 
   // ---------- routing ----------
   const sameRoute = (a, b) => !!a && !!b && a.kind === b.kind && a.id === b.id;
-  function routeHash(r) { return r.kind === "traffic" ? "#/traffic" : `#/${r.kind}/${encodeURIComponent(r.id)}`; }
+  const routeHash = r => r.kind === "traffic" ? "#/traffic" : `#/${r.kind}/${encodeURIComponent(r.id)}`;
   function parseRoute(hash) {
     if (hash === "#/traffic") return { kind: "traffic" };
     const match = /^#\/(board|topic|dm)\/(.+)$/.exec(hash);
@@ -583,11 +560,11 @@
     // A pasted access link is always consumed first so the token never lingers in the address bar.
     if (namesAccessToken(location.hash)) {
       // A link pasted once a token is held (a session is open, or its unlock has started) is ignored, and
-      // so is its route: the address returns to the current route, or to nothing while the unlock has
-      // not opened one yet.
+      // so is its board: the address returns to the current route (or stays empty while the unlock has
+      // not opened one yet).
       const ignored = !!token;
       unlockFromLink(takeAccessLink());
-      if (ignored) history.replaceState(null, "", location.pathname + location.search + (route ? routeHash(route) : ""));
+      if (ignored) restoreHash();
       return;
     }
     if (!token) return;
@@ -656,17 +633,18 @@
     onViewChange: () => {},
     onCatalog: (names, current) => { catalog.boardNames = names; catalog.currentBoard = current; renderSidebar(); },
   });
+  async function boardNames(current) {
+    const data = await api("/api/boards", current);
+    return Array.isArray(data.boards) ? data.boards.map(row => row.name).filter(name => typeof name === "string").sort() : null;
+  }
   async function pollBoardNames() {
     clearTimeout(catalog.boardPoll);
     if (!token) return;
     const current = generation;
     try {
       if (route?.kind !== "board" && !document.hidden) {
-        const data = await api("/api/boards", current);
-        if (current === generation && Array.isArray(data.boards)) {
-          const names = data.boards.map(row => row.name).filter(name => typeof name === "string").sort();
-          if (names.join("\n") !== catalog.boardNames.join("\n")) { catalog.boardNames = names; renderSidebar(); }
-        }
+        const names = await boardNames(current);
+        if (current === generation && names && names.join("\n") !== catalog.boardNames.join("\n")) { catalog.boardNames = names; renderSidebar(); }
       }
     } catch (error) { /* keep the previous list */ }
     if (current === generation && token) catalog.boardPoll = setTimeout(pollBoardNames, 10000);
@@ -793,6 +771,7 @@
     event.preventDefault();
     const entered = $("access-token").value.trim();
     if (!entered) return;
+    const wanted = linkedBoard; linkedBoard = null;
     lock();
     token = entered;
     sessionAbort = new AbortController();
@@ -810,7 +789,13 @@
       for (const id of ["sidebar-toggle", "open-switcher", "lock-button"]) $(id).hidden = false;
       topics.start();
       void scanPairs(); void pollBoardNames();
-      const first = parseRoute(location.hash) || defaultRoute();
+      let first = parseRoute(location.hash) || defaultRoute();
+      // The link's board is opened only if this page's own board list has exactly that name.
+      if (wanted !== null) {
+        const listed = (await boardNames(current))?.find(name => name === wanted);
+        if (current !== generation) return;
+        if (listed !== undefined) first = { kind: "board", id: listed };
+      }
       route = null;
       await navigate(first, true);
       if (current === generation && token) stream(current);
@@ -838,10 +823,11 @@
   $("older-button").addEventListener("click", () => loadTraffic(true));
   window.addEventListener("pagehide", () => lock());
   window.addEventListener("beforeunload", event => { if (topics.hasDrafts()) { event.preventDefault(); event.returnValue = ""; } });
-  function unlockFromLink(value) {
+  function unlockFromLink(link) {
     // A link must not replace an active session or discard its response draft.
-    if (!value || token) return;
-    $("access-token").value = value;
+    if (!link || token) return;
+    linkedBoard = link.board;
+    $("access-token").value = link.token;
     $("login-form").requestSubmit();
   }
   unlockFromLink(accessFromLink);
