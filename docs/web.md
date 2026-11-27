@@ -503,7 +503,13 @@ directory may be new, empty, or one an earlier run made (once the directory is c
 left directly in it (`state`, `home`, `bin`, `s` and `broker.log`), removes any symbolic link directly in it
 (never what it points to), and overwrites the copied binary and the screenshots. A directory that has other contents and no such file, a symbolic link, a file, or a `--binary`
 inside the directory (other than the copy an earlier run made) is refused with a message and exit status 2,
-and nothing is touched. If the broker fails to start, the run stops it before it exits. The path must be short
+and nothing is touched. If the broker fails to start, the run stops it before it exits. A run that is
+cancelled leaves nothing running: the script runs itself as a child of `tools/run_with_cleanup.py`, which keeps
+the run, its broker and the Playwright driver in a process group of its own from the start. Whether the run is
+cancelled with `SIGINT` (Ctrl-C), `SIGTERM`, `SIGHUP` (a closed terminal) or `SIGKILL`, the helper notices within
+a moment that the run has ended or is gone and stops the group (the browser ends with the driver), on macOS and
+Linux, with no manual clean-up. Killing only the helper process leaves the run going; it finishes and cleans up on
+its own. The path must be short
 enough for the broker's Unix socket path. It is not run in CI.
 
 Four further manual harnesses in `tools/` cover behaviour the theme test does not: the board drafts,
