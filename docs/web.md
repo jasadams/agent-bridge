@@ -23,7 +23,8 @@ the browser's local timezone, including DST; missing/unreliable times show Unkno
 Snapshots, conditional responses and successful saves retain `last_updated_source`
 (`file_mtime` or `unknown`). Selected-board events also carry existence and time
 metadata, so explicitly creating empty `main` refreshes its footer even though its
-content revision stays unchanged. Refresh uses the existing bounded read/reconnect
+content revision stays unchanged. The page has no Refresh button: it reads the board again when
+that event arrives and, after its live connection drops, through the existing bounded reconnect
 path. A draft or selected old document keeps its
 matching timestamp until the new content is reviewed; locking or changing boards
 clears the old footer. Sending a message never updates board content time.
@@ -528,9 +529,9 @@ python3 tools/test_topics_browser.py ./target/debug/agent-bridge /tmp/agb-topics
 - `test_monitor.py` checks the message API (authentication, origins, filters, historical session pinning,
   the live stream, credential rotation) with a real loopback peer exchange, and with `--browser` the
   private-link unlock, All traffic with the details panel and live delivery-state changes, and then
-  runs the board, code-copy and message checks below (`monitor_board_qa.py`, `monitor_code_copy_qa.py`
-  and `monitor_message_qa.py` have no command line of their own; they run from here).
-- `monitor_catalog_qa.py` checks automatic board discovery, its cadence, back-off, timeout and
+  runs the board, code-copy and message checks (`monitor_board_qa.py`, `monitor_code_copy_qa.py` and
+  `monitor_message_qa.py` have no command line of their own; they run from here).
+- `monitor_catalog_qa.py` (also run by `test_monitor.py --browser`) checks automatic board discovery, its cadence, back-off, timeout and
   single flight, and that a late old response never replaces the current list.
 - `monitor_board_archive_qa.py` checks Archive, Restore and the Archived boards dialog, including held
   and dropped real responses. It refuses a binary whose hash differs from `--binary-sha256`.
@@ -544,9 +545,10 @@ editing the board, and use the sidebar to open boards and topics.
 ## Message agents from the board
 
 Recognized message-input declarations are hidden in the rendered document and
-remain byte-for-byte available in Raw Markdown. Malformed or unrecognized text
-remains visible and inert. Agent-authored message inputs show their label and exact pinned recipient
-(name, provider, session and endpoint). Use Tab/Shift+Tab to reach or leave an
+remain byte-for-byte in the board's Markdown source (the page has no Raw Markdown view; read it with
+`agent-bridge board <name> --raw`). Malformed or unrecognized text remains visible and inert. Each message
+input is labelled with the broker's resolved name of its exact pinned recipient, never an ID (a session
+without a name shows "Claude" and the last four characters of its ID). Use Tab/Shift+Tab to reach or leave an
 input. Enter sends; Shift+Enter inserts a newline. IME composition Enter does not
 send, and blank text is not submitted. A Send button is also available. The
 composer keeps focus after acceptance and remains available for another message.

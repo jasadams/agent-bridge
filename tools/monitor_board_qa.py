@@ -386,8 +386,11 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#response-save").click(); expect(page.locator("#response-review")).to_be_visible()
         page.locator("#response-review").click(); expect(page.locator("#response-rebase")).to_be_hidden()
         expect(page.locator("#response-text")).to_have_value("deleted field draft"); page.locator("#response-cancel").click()
+        # The page shows the board without the deleted field; only the re-read after this write can bring it back.
+        expect(page.locator("#board-document .board-inline-text")).to_have_count(0)
         write("alpha", alpha)
         expect(page.locator("#board-document .board-inline-text")).to_be_visible()
+        wait("re-read shows the written Markdown", lambda: page.locator("#board-raw").text_content() == alpha)
         record("revision conflicts retain intent; explicit unchanged-field rebase is revision-reviewed; changed/deleted fields require reopening")
 
         # The real POST commits before its JSON continuation is released. While
