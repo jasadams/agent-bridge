@@ -28,11 +28,20 @@
     }
     return true;
   }
+  // A valid link may name one board beside the token (`#/board/kyomi&access_token=<token>`, either order;
+  // the theme part is already gone, see theme.js). Nothing of the link is ever written back: the whole
+  // fragment is cleared exactly as without a board. The board's name is kept in memory only, and the
+  // unlock opens it only if the page's own board list holds exactly that name (then the address is the
+  // page's own text for it); any other name, or no single board part, opens the default board.
   function takeAccessLink() {
     if (!namesAccessToken(window.location.hash)) return null; // an ordinary route such as #/topic/x
-    const candidate = new URLSearchParams(window.location.hash.slice(1)).get("access_token");
+    const fragment = window.location.hash.slice(1);
+    const candidate = new URLSearchParams(fragment).get("access_token");
+    const boardParts = fragment.split("&").filter(part => !namesAccessToken(part))
+      .map(part => parseRoute(`#${part}`)).filter(parsed => parsed?.kind === "board");
     window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    return candidate !== null && /^[A-Za-z0-9_-]{43}$/.test(candidate) ? candidate : null;
+    if (candidate === null || !/^[A-Za-z0-9_-]{43}$/.test(candidate)) return null;
+    return { token: candidate, board: boardParts.length === 1 ? boardParts[0].id : null };
   }
   let accessFromLink = takeAccessLink();
   const $ = id => document.getElementById(id);
@@ -40,6 +49,7 @@
   let token = null, boards = null, topics = null;
   let generation = 0, sessionAbort = null, streamAbort = null, reconnectTimer = null, refreshTimer = null, reconnectDelay = 1000;
   let route = null, navigating = false, queuedRoute = null;
+  let linkedBoard = null; // the board named by the access link being used to unlock; in memory only
   const catalog = { boardNames: [], currentBoard: "main", topics: [], boardPoll: null };
 
   // ---------- small UI helpers ----------
@@ -548,7 +558,15 @@
   }
   window.addEventListener("hashchange", () => {
     // A pasted access link is always consumed first so the token never lingers in the address bar.
-    if (namesAccessToken(location.hash)) { unlockFromLink(takeAccessLink()); if (token && route) restoreHash(); return; }
+    if (namesAccessToken(location.hash)) {
+      // A link pasted once a token is held (a session is open, or its unlock has started) is ignored, and
+      // so is its board: the address returns to the current route (or stays empty while the unlock has
+      // not opened one yet).
+      const ignored = !!token;
+      unlockFromLink(takeAccessLink());
+      if (ignored) restoreHash();
+      return;
+    }
     if (!token) return;
     void navigate(parseRoute(location.hash) || defaultRoute(), true);
   });
@@ -615,17 +633,19 @@
     onViewChange: () => {},
     onCatalog: (names, current) => { catalog.boardNames = names; catalog.currentBoard = current; renderSidebar(); },
   });
+  async function boardNames(current) {
+    const data = await api("/api/boards", current);
+    if (!Array.isArray(data.boards)) throw new Error("Invalid board list");
+    return data.boards.map(row => row.name).filter(name => typeof name === "string").sort();
+  }
   async function pollBoardNames() {
     clearTimeout(catalog.boardPoll);
     if (!token) return;
     const current = generation;
     try {
       if (route?.kind !== "board" && !document.hidden) {
-        const data = await api("/api/boards", current);
-        if (current === generation && Array.isArray(data.boards)) {
-          const names = data.boards.map(row => row.name).filter(name => typeof name === "string").sort();
-          if (names.join("\n") !== catalog.boardNames.join("\n")) { catalog.boardNames = names; renderSidebar(); }
-        }
+        const names = await boardNames(current);
+        if (current === generation && names.join("\n") !== catalog.boardNames.join("\n")) { catalog.boardNames = names; renderSidebar(); }
       }
     } catch (error) { /* keep the previous list */ }
     if (current === generation && token) catalog.boardPoll = setTimeout(pollBoardNames, 10000);
@@ -752,6 +772,7 @@
     event.preventDefault();
     const entered = $("access-token").value.trim();
     if (!entered) return;
+    const wanted = linkedBoard; linkedBoard = null;
     lock();
     token = entered;
     sessionAbort = new AbortController();
@@ -764,12 +785,19 @@
       if (current !== generation) return;
       $("local-machine").textContent = status.machine?.machine_name || "Local bridge";
       localPeer = status.machine?.peer_id || null;
+      // The link's board is opened only if this page's own board list has exactly that name. This waits
+      // while the login screen is still shown, so nothing can be opened or clicked in the meantime.
+      let first = parseRoute(location.hash) || defaultRoute();
+      if (wanted !== null) {
+        const listed = (await boardNames(current)).find(name => name === wanted);
+        if (current !== generation) return;
+        if (listed !== undefined) first = { kind: "board", id: listed };
+      }
       login.hidden = true; workspace.hidden = false;
       $("sidebar").hidden = false; body.classList.add("has-sidebar");
       for (const id of ["sidebar-toggle", "open-switcher", "lock-button"]) $(id).hidden = false;
       topics.start();
       void scanPairs(); void pollBoardNames();
-      const first = parseRoute(location.hash) || defaultRoute();
       route = null;
       await navigate(first, true);
       if (current === generation && token) stream(current);
@@ -797,10 +825,11 @@
   $("older-button").addEventListener("click", () => loadTraffic(true));
   window.addEventListener("pagehide", () => lock());
   window.addEventListener("beforeunload", event => { if (topics.hasDrafts()) { event.preventDefault(); event.returnValue = ""; } });
-  function unlockFromLink(value) {
+  function unlockFromLink(link) {
     // A link must not replace an active session or discard its response draft.
-    if (!value || token) return;
-    $("access-token").value = value;
+    if (!link || token) return;
+    linkedBoard = link.board;
+    $("access-token").value = link.token;
     $("login-form").requestSubmit();
   }
   unlockFromLink(accessFromLink);

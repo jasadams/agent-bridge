@@ -214,6 +214,12 @@ in the opposite appearance, to show it ignores it), on these screens: the board 
   `#theme=orca&access_token=<token>`. Anything but exactly one known name is ignored and stores
   nothing. It is a fragment, not a query, so it is never sent to the broker (which rejects unknown
   queries) and cannot interfere with the token handling.
+- **Board from the link.** The existing route `#/board/<name>` can sit in the same fragment as the theme and
+  the token, in any order: `#/board/kyomi&theme=orca&access_token=<token>`. Build it by adding the
+  percent-encoded route (and theme) as `&`-separated parts to the printed access link. The whole fragment is
+  cleared as always; the name is kept in memory and opened after unlocking only if the page's own board list
+  holds exactly that name, and the address is then the page's own text. An unlisted name, a name that cannot be parsed, or
+  more than one board part, opens the default board. See `docs/web.md`.
 
 ## Decisions Log
 | Date | Decision | Rationale |
@@ -235,6 +241,7 @@ in the opposite appearance, to show it ignores it), on these screens: the board 
 | 2026-11-26 | Add Orca Light (`orca-light`) and Orca (system) (`orca-system`) next to the dark Orca theme, whose id `orca` and look are unchanged; the menu entry for `orca` is now labelled Orca Dark | With Orca in its light appearance the dark page was a slab inside a light window, the problem the Orca theme set out to fix. Values come from Orca's shipped light tokens (`tools/check_orca_tokens.py`); the system choice follows `prefers-color-scheme` live and stores its own name, so a saved choice keeps following Orca |
 | 2026-11-26 | Light text-grade colours are the palette's 700 steps, not Orca's light blue-500 unread colour | Blue-500 is 3.7:1 on white; the 700 steps reach 4.5:1 on white and on the grey rows, and are still Orca's shipped colours |
 | 2026-11-26 | The rendered-contrast and palette checks read `color-mix()` results (computed as `color(srgb …)`) | They were parsed as 0-255 channels, so tinted backgrounds were measured as near-black. Found while adding the light theme; the dark theme still passes with the correction |
+| 2026-11-27 | The access link may name a board beside the theme and token; it is opened only if the unlocked page lists that exact name | A coordinator opens one board per project for the owner. Writing any of the link's text back to the address (even a filtered route) could carry pieces of the token, so the fragment is cleared whole as in AGB-69 and only a name from the page's own list is shown. A board that does not exist opens the default board instead of an error |
 
 ## Known gaps
 - **Dark Sticker Bomb:** not designed (see Color).
