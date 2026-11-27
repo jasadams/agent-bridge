@@ -19,6 +19,7 @@ profiles.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -900,6 +901,58 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
     report.check("[board link pasted into the locked page] it unlocks, opens the named board and only the route stays", board_name(page) == "kyomi" and page.url == f"{base}#/board/kyomi", page.url.replace(token, "<token>"))
     no_token_anywhere("[board link pasted into the locked page]", context, page)
     context.close()
+
+    # AGB-74 audit: no 16-character piece of the token, at up to five levels of decoding, may reach the address,
+    # any history entry, the page text or the title, whatever way the link smuggles it into a route.
+    def decoded_levels(text, levels=5):
+        forms = [text]
+        for _ in range(levels):
+            forms.append(re.sub(r"%([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), forms[-1]))
+        return forms
+
+    def token_pieces_in(texts):
+        found = []
+        for text in texts:
+            for form in decoded_levels(text):
+                found += [i for i in range(len(token) - 15) if token[i:i + 16] in form]
+        return found
+
+    def surfaces(context, page):
+        history = context.new_cdp_session(page).send("Page.getNavigationHistory")["entries"]
+        return [page.url, page.evaluate("location.hash"), page.title(), page.content(), *[entry["url"] for entry in history]]
+
+    pct, dbl = percent, lambda text: percent(percent(text))
+    shapes = [("board, doubly encoded token", f"/board/{dbl(t)}&access_token={t}"),
+              ("board, one raw character then 42 doubly encoded", f"/board/{t[0]}{dbl(t[1:])}&access_token={t}"),
+              ("board, %25 then the raw token", f"/board/%25{t[1:]}&access_token={t}"),
+              ("board, mixed levels", f"/board/{pct(t[:20])}{dbl(t[20:])}&access_token={t}"),
+              ("board, triply encoded token", f"/board/{percent(dbl(t))}&access_token={t}"),
+              ("dm, doubly encoded token", f"/dm/{dbl(t)}&access_token={t}"),
+              ("topic, raw 30-character piece", f"/topic/{t[:30]}&access_token={t}"),
+              ("board, raw 20-character piece", f"/board/{t[:20]}&access_token={t}"),
+              ("board, 20-character piece with the rest in another part", f"/board/{t[:20]}&{t[20:]}&access_token={t}"),
+              ("route last, doubly encoded token", f"access_token={t}&/board/{dbl(t)}")]
+    for label, fragment in shapes:
+        tag = f"[board link smuggled token: {label}]"
+        context, page = open_page(False)  # a made-up board makes the page ask for it and the broker answers 404
+        page.goto(f"{base}#{fragment}")
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        time.sleep(1)
+        report.check(f"{tag} on load: no piece of the token in the address, history, page text or title", not token_pieces_in(surfaces(context, page)))
+        page.reload()
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        report.check(f"{tag} after a reload: no piece of the token anywhere", not token_pieces_in(surfaces(context, page)))
+        context.close()
+        # pasted into the locked page after the broker refused a well-formed token
+        context, page = open_page(False)
+        page.goto(f"{base}#access_token={'A' * 43}")
+        page.wait_for_selector("#login:not([hidden])", timeout=8000)
+        time.sleep(1.5)
+        page.evaluate("fragment => { location.hash = fragment }", fragment)
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        time.sleep(1)
+        report.check(f"{tag} pasted after a refused token: no piece of the token anywhere", not token_pieces_in(surfaces(context, page)))
+        context.close()
 
     report.check("[board link] the page raised no console error or exception", not problems, str(problems[:3]))
     browser.close()

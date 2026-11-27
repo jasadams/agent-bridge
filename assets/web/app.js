@@ -9,38 +9,62 @@
   // Consume the private link before making requests or displaying the workspace.
   // Fragments never travel in HTTP requests; replace this history entry as well.
   // URLSearchParams reads only `&`-separated parameters, so a link with another separator (`;`), a `?`
-  // inside the fragment, or the key inside a route would not be recognised and its valid token would stay
-  // in the address bar and the history. A fragment is therefore treated as an access link whenever the
-  // text `access_token` appears in it in any case, raw or percent-encoded (up to eight levels), whatever the
-  // separators. The token is always removed from the address; the link unlocks the page only when the token
-  // is a parameter this page can read, exactly as before (a route beside it may stay, see takeAccessLink). There is no exception: a board whose own name contains the text cannot
-  // be opened by a link.
-  function namesAccessToken(hash) {
-    // Each pass decodes one more level of encoding. Eight levels is far beyond any real link; a
-    // fragment still changing after that is cleared as an access link, so a long run of `%25` cannot
-    // make this loop cost more than eight linear passes.
-    let text = hash;
+  // inside the fragment, or the key inside a route would not be recognised and its valid token would
+  // stay in the address bar and the history. A fragment is therefore treated as an access link whenever
+  // the text `access_token` appears in it in any case, raw or percent-encoded (up to eight levels),
+  // whatever the separators. The token is always removed from the address; the link unlocks the page only
+  // when the token is a parameter this page can read, exactly as before. A route beside a readable token
+  // may stay (see takeAccessLink), but a board whose own name contains the text cannot be opened by a link.
+  // The forms of `text` with one more level of percent-encoding removed each, the text itself first.
+  // Eight levels is far beyond any real link; `exhausted` says it was still changing after that, and
+  // such a text is treated as naming the token, so a long run of `%25` costs at most eight linear passes.
+  function decodings(text) {
+    const forms = [text];
     for (let pass = 0; pass < 8; pass++) {
-      if (/access_token/i.test(text)) return true;
-      const next = text.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-      if (next === text) return false;
-      text = next;
+      const next = forms[forms.length - 1].replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+      if (next === forms[forms.length - 1]) return { forms, exhausted: false };
+      forms.push(next);
     }
-    return true;
+    return { forms, exhausted: true };
   }
-  // A valid link may carry one route beside the token (`#/board/kyomi&access_token=<token>`, either
-  // order; the theme part is already gone, see theme.js). The token is always removed from the address;
-  // the route is the one `&`-separated part that is a route and holds neither `access_token` nor the token, and
-  // it is all that stays, so the unlock below opens it and a reload stays on it. An unreadable link, a
-  // token of the wrong shape or more than one route leaves an empty fragment, as before. A well-formed
-  // token the broker refuses leaves the route in the address of the locked page (no token is there).
+  function namesAccessToken(hash) {
+    const { forms, exhausted } = decodings(hash);
+    return exhausted || forms.some(form => /access_token/i.test(form));
+  }
+  // True when any 16 consecutive characters of `token` appear in `text` at any level of encoding: a
+  // route must not carry the token, or a piece long enough to be worth keeping, into the address.
+  function carriesToken(text, token) {
+    const { forms, exhausted } = decodings(text);
+    if (exhausted) return true;
+    for (let start = 0; start + 16 <= token.length; start++) {
+      const piece = token.slice(start, start + 16);
+      if (forms.some(form => form.includes(piece))) return true;
+    }
+    return false;
+  }
+  // The one route that may stay beside a readable token: an `&`-separated part that is a route, is
+  // written exactly as the page would write it (so the address holds the page's own text, never the
+  // link's), and neither names `access_token` nor carries the token. Any other count leaves nothing.
+  function routeBesideToken(fragment, token) {
+    const routes = fragment.slice(1).split("&").filter(part => {
+      if (namesAccessToken(part) || carriesToken(part, token)) return false;
+      const parsed = parseRoute(`#${part}`);
+      return parsed !== null && routeHash(parsed) === `#${part}`;
+    });
+    return routes.length === 1 ? `#${routes[0]}` : "";
+  }
+  // A valid link may carry a route beside the token (`#/board/kyomi&access_token=<token>`, either order;
+  // the theme part is already gone, see theme.js). The token is always removed from the address and the
+  // route is all that stays, so the unlock below opens it and a reload stays on it. An unreadable link, a
+  // token of the wrong shape or no single acceptable route leaves an empty fragment, as before. A
+  // well-formed token the broker refuses leaves the route in the address of the locked page, with no token.
   function takeAccessLink() {
     const fragment = window.location.hash;
     if (!namesAccessToken(fragment)) return null; // an ordinary route such as #/topic/x
     const candidate = new URLSearchParams(fragment.slice(1)).get("access_token");
     const valid = candidate !== null && /^[A-Za-z0-9_-]{43}$/.test(candidate);
-    const routes = valid ? fragment.slice(1).split("&").filter(part => !namesAccessToken(part) && !part.includes(candidate) && !(parseRoute(`#${part}`)?.id ?? "").includes(candidate) && parseRoute(`#${part}`)) : [];
-    window.history.replaceState(null, "", window.location.pathname + window.location.search + (routes.length === 1 ? `#${routes[0]}` : ""));
+    const kept = valid ? routeBesideToken(fragment, candidate) : "";
+    window.history.replaceState(null, "", window.location.pathname + window.location.search + kept);
     return valid ? candidate : null;
   }
   let accessFromLink = takeAccessLink();
@@ -488,7 +512,7 @@
 
   // ---------- routing ----------
   const sameRoute = (a, b) => !!a && !!b && a.kind === b.kind && a.id === b.id;
-  const routeHash = r => r.kind === "traffic" ? "#/traffic" : `#/${r.kind}/${encodeURIComponent(r.id)}`;
+  function routeHash(r) { return r.kind === "traffic" ? "#/traffic" : `#/${r.kind}/${encodeURIComponent(r.id)}`; }
   function parseRoute(hash) {
     if (hash === "#/traffic") return { kind: "traffic" };
     const match = /^#\/(board|topic|dm)\/(.+)$/.exec(hash);
@@ -558,8 +582,9 @@
   window.addEventListener("hashchange", () => {
     // A pasted access link is always consumed first so the token never lingers in the address bar.
     if (namesAccessToken(location.hash)) {
-      // A link pasted while a session is open or unlocking is ignored, and so is its route: the address
-      // returns to the current route (or to nothing while the first unlock has not opened one yet).
+      // A link pasted once a token is held (a session is open, or its unlock has started) is ignored, and
+      // so is its route: the address returns to the current route, or to nothing while the unlock has
+      // not opened one yet.
       const ignored = !!token;
       unlockFromLink(takeAccessLink());
       if (ignored) history.replaceState(null, "", location.pathname + location.search + (route ? routeHash(route) : ""));
