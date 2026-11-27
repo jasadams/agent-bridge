@@ -784,18 +784,19 @@
       if (current !== generation) return;
       $("local-machine").textContent = status.machine?.machine_name || "Local bridge";
       localPeer = status.machine?.peer_id || null;
-      login.hidden = true; workspace.hidden = false;
-      $("sidebar").hidden = false; body.classList.add("has-sidebar");
-      for (const id of ["sidebar-toggle", "open-switcher", "lock-button"]) $(id).hidden = false;
-      topics.start();
-      void scanPairs(); void pollBoardNames();
+      // The link's board is opened only if this page's own board list has exactly that name. This waits
+      // while the login screen is still shown, so nothing can be opened or clicked in the meantime.
       let first = parseRoute(location.hash) || defaultRoute();
-      // The link's board is opened only if this page's own board list has exactly that name.
       if (wanted !== null) {
         const listed = (await boardNames(current))?.find(name => name === wanted);
         if (current !== generation) return;
         if (listed !== undefined) first = { kind: "board", id: listed };
       }
+      login.hidden = true; workspace.hidden = false;
+      $("sidebar").hidden = false; body.classList.add("has-sidebar");
+      for (const id of ["sidebar-toggle", "open-switcher", "lock-button"]) $(id).hidden = false;
+      topics.start();
+      void scanPairs(); void pollBoardNames();
       route = null;
       await navigate(first, true);
       if (current === generation && token) stream(current);

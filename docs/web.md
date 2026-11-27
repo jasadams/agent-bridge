@@ -368,6 +368,8 @@ the named board in the chosen theme, with no click.
   from a link without a token, where a board that does not exist shows the board error.
 - Only a board route is used (not a topic or a conversation), and a part that contains the text
   `access_token` (at any encoding level) is never a board name.
+- The board list is read once after the token is accepted, before the workspace is shown. If it cannot
+  be read, the page stays locked with its usual "could not be reached" message and keeps nothing of the link.
 - A malformed or repeated theme or token part is handled as described above and under
   [Browser access](#browser-access). A link that stays locked (an unreadable shape, a malformed token, or a
   well-formed token the broker refuses) is cleared completely and keeps no board.

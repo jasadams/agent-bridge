@@ -763,7 +763,7 @@ def run_access_link_section(playwright, url_for, report):
 
 def run_board_link_section(playwright, url_for, broker, report, themes):
     """AGB-74: the board route, the theme and the access token share one fragment. After unlocking the page
-    opens the named board in the theme, and only the route stays in the address. Run late: it adds boards."""
+    opens the named board in the theme, and only the page's own text for the board stays in the address. Run late: it adds boards."""
     base, _, link_fragment = url_for.partition("#")
     token = dict(part.split("=", 1) for part in link_fragment.split("&"))["access_token"]
     origin = base.rstrip("/")
@@ -958,6 +958,17 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
         time.sleep(1)
         report.check(f"{tag} pasted after a refused token: no piece of the token anywhere, and the default board is open", not token_pieces_in(surfaces(context, page)) and page.evaluate("location.hash") == "#/board/main")
         context.close()
+
+    # The board list cannot be read after the token was accepted: the page stays locked with its usual message
+    # and keeps nothing of the link (no board, no token, a clean address).
+    context, page = open_page(False)
+    page.route("**/api/boards", lambda route: route.abort())
+    page.goto(f"{base}#/board/kyomi&access_token={token}")
+    page.wait_for_selector("#login:not([hidden])", timeout=15000)
+    time.sleep(1)
+    report.check("[board link board list unreadable] the page stays locked with the usual message and a clean address", page.locator("#login-error").is_visible() and page.locator("#workspace").is_hidden() and page.evaluate("location.hash") == "", page.evaluate("location.hash"))
+    no_token_anywhere("[board link board list unreadable]", context, page)
+    context.close()
 
     report.check("[board link] the page raised no console error or exception", not problems, str(problems[:3]))
     browser.close()
