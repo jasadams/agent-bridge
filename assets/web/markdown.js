@@ -1,5 +1,5 @@
 "use strict";
-// Renders the server's parsed Markdown node tree (see `markdown_nodes` in src/monitor_board.rs) as
+// Renders the server's parsed Markdown node tree (see `markdown_nodes` in src/web_board.rs) as
 // DOM. Agent-authored text is untrusted: nothing here parses HTML or builds markup from strings.
 // Text is always a text node, tags come from a fixed allow-list, and links are re-validated client-side.
 // Throws on anything unexpected so callers can fall back to showing the plain text.

@@ -1,4 +1,4 @@
-//! Board-specific monitor DTOs and safe, bounded Markdown structure.
+//! Board-specific web DTOs and safe, bounded Markdown structure.
 use crate::{
     board::{self, Name, Snapshot},
     board_interaction::{self, Kind},
@@ -436,13 +436,13 @@ fn number_shared_names(
 }
 
 impl Broker {
-    pub(crate) fn monitor_board_revision(
+    pub(crate) fn web_board_revision(
         &self,
         generation: u64,
         name: &Name,
     ) -> Result<BoardIdentity, Reply> {
         let db = self.db.lock().unwrap();
-        let access = self.monitor_control.lock().unwrap();
+        let access = self.web_control.lock().unwrap();
         if !access.current(generation) {
             return Err(reply(401, "unauthorized", "Web access expired"));
         }
@@ -463,9 +463,9 @@ impl Broker {
                 )
             })
     }
-    pub(crate) fn monitor_boards(&self, generation: u64) -> Reply {
+    pub(crate) fn web_boards(&self, generation: u64) -> Reply {
         let db = self.db.lock().unwrap();
-        let access = self.monitor_control.lock().unwrap();
+        let access = self.web_control.lock().unwrap();
         if !access.current(generation) {
             return reply(401, "unauthorized", "Web access expired");
         }
@@ -477,9 +477,9 @@ impl Broker {
             Err(_) => reply(500, "unavailable", "Boards unavailable"),
         }
     }
-    pub(crate) fn monitor_archived_boards(&self, generation: u64) -> Reply {
+    pub(crate) fn web_archived_boards(&self, generation: u64) -> Reply {
         let db = self.db.lock().unwrap();
-        let access = self.monitor_control.lock().unwrap();
+        let access = self.web_control.lock().unwrap();
         if !access.current(generation) {
             return reply(401, "unauthorized", "Web access expired");
         }
@@ -492,7 +492,7 @@ impl Broker {
         }
     }
 
-    pub(crate) fn monitor_board_lifecycle(
+    pub(crate) fn web_board_lifecycle(
         &self,
         generation: u64,
         name: &Name,
@@ -500,7 +500,7 @@ impl Broker {
         restore: bool,
     ) -> Reply {
         let db = self.db.lock().unwrap();
-        let access = self.monitor_control.lock().unwrap();
+        let access = self.web_control.lock().unwrap();
         if !access.current(generation) {
             return reply(401, "unauthorized", "Web access expired");
         }
@@ -577,7 +577,7 @@ impl Broker {
             }
         }
     }
-    pub(crate) fn monitor_board(
+    pub(crate) fn web_board(
         &self,
         generation: u64,
         name: &Name,
@@ -585,7 +585,7 @@ impl Broker {
     ) -> Reply {
         let inspected = {
             let db = self.db.lock().unwrap();
-            let access = self.monitor_control.lock().unwrap();
+            let access = self.web_control.lock().unwrap();
             if !access.current(generation) {
                 return reply(401, "unauthorized", "Web access expired");
             }
@@ -595,7 +595,7 @@ impl Broker {
             Ok(snapshot) => {
                 // Names are resolved without holding the database lock: the resolver reads native clients.
                 let labels = self.board_message_labels(&snapshot);
-                if !self.monitor_control.lock().unwrap().current(generation) {
+                if !self.web_control.lock().unwrap().current(generation) {
                     return reply(401, "unauthorized", "Web access expired");
                 }
                 let mut body = if conditional == Some(snapshot.revision.as_str()) {
@@ -639,14 +639,14 @@ impl Broker {
         }
         number_shared_names(owners)
     }
-    pub(crate) fn monitor_board_message(
+    pub(crate) fn web_board_message(
         &self,
         generation: u64,
         name: &Name,
         request: crate::board_messages::Submission,
     ) -> Reply {
         let db = self.db.lock().unwrap();
-        let access = self.monitor_control.lock().unwrap();
+        let access = self.web_control.lock().unwrap();
         if !access.current(generation) {
             return reply(401, "unauthorized", "Web access expired");
         }
@@ -666,14 +666,14 @@ impl Broker {
             body,
         }
     }
-    pub(crate) fn monitor_board_response(
+    pub(crate) fn web_board_response(
         &self,
         generation: u64,
         name: &Name,
         request: ResponseRequest,
     ) -> Reply {
         let db = self.db.lock().unwrap();
-        let access = self.monitor_control.lock().unwrap();
+        let access = self.web_control.lock().unwrap();
         if !access.current(generation) {
             return reply(401, "unauthorized", "Web access expired");
         }
@@ -1024,8 +1024,8 @@ mod tests {
                 false,
             )
             .unwrap();
-        broker.monitor_control.lock().unwrap().enable(0);
-        let first = broker.monitor_board(1, &Name::default(), None);
+        broker.web_control.lock().unwrap().enable(0);
+        let first = broker.web_board(1, &Name::default(), None);
         assert_eq!(first.status, 200);
         assert!(
             first.body["message_labels"]
@@ -1044,7 +1044,7 @@ mod tests {
         );
         assert!(!first.body["message_labels"].to_string().contains(other));
         let identity = broker
-            .monitor_board_revision(1, &Name::default())
+            .web_board_revision(1, &Name::default())
             .unwrap_or_else(|reply| {
                 panic!(
                     "Main label identity read failed: HTTP {}: {}",
@@ -1052,7 +1052,7 @@ mod tests {
                 )
             });
         let updated = broker
-            .monitor_board_revision(1, &Name::default())
+            .web_board_revision(1, &Name::default())
             .unwrap_or_else(|reply| {
                 panic!(
                     "Main label identity read failed: HTTP {}: {}",
@@ -1136,7 +1136,7 @@ mod tests {
         let before: Snapshot = serde_json::from_value(added["board"].clone()).unwrap();
         assert!(before.last_updated.is_some());
         let file_before = std::fs::metadata(board::read(&broker.state_dir).unwrap().path).unwrap();
-        broker.monitor_control.lock().unwrap().enable(0);
+        broker.web_control.lock().unwrap().enable(0);
         let control = board_interaction::controls(&before.markdown)
             .into_iter()
             .find(|control| matches!(control.kind, Kind::Message { .. }))
@@ -1148,12 +1148,12 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             text: "Only a native message, never a board edit".into(),
         };
-        let sent = broker.monitor_board_message(1, &Name::default(), submission.clone());
+        let sent = broker.web_board_message(1, &Name::default(), submission.clone());
         assert_eq!(sent.status, 200);
         assert_eq!(sent.body["accepted"], true);
         assert_eq!(
             broker
-                .monitor_board_message(1, &Name::default(), submission.clone())
+                .web_board_message(1, &Name::default(), submission.clone())
                 .body["duplicate"],
             true
         );
@@ -1168,7 +1168,7 @@ mod tests {
         );
         submission.expected_revision = "0".repeat(64);
         submission.id = uuid::Uuid::new_v4().to_string();
-        let conflict = broker.monitor_board_message(1, &Name::default(), submission);
+        let conflict = broker.web_board_message(1, &Name::default(), submission);
         assert_eq!(conflict.status, 409);
         assert_eq!(
             conflict.body["board"]["last_updated"],
@@ -1270,8 +1270,8 @@ mod tests {
     async fn desired_states_noop_exact_bytes_rebase_and_cross_board_conflicts() {
         let (root, bound, snapshot) = setup();
         let broker = &bound.broker;
-        broker.monitor_control.lock().unwrap().enable(0);
-        let same = broker.monitor_board_response(
+        broker.web_control.lock().unwrap().enable(0);
+        let same = broker.web_board_response(
             1,
             &Name::default(),
             request(&snapshot, 0, Desired::Checkbox { checked: true }),
@@ -1282,7 +1282,7 @@ mod tests {
             board::read(root.path()).unwrap().markdown,
             snapshot.markdown
         );
-        let saved = broker.monitor_board_response(
+        let saved = broker.web_board_response(
             1,
             &Name::default(),
             request(&snapshot, 1, Desired::Checkbox { checked: true }),
@@ -1295,7 +1295,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .monitor_board_response(
+                .web_board_response(
                     1,
                     &Name::default(),
                     request(&snapshot, 1, Desired::Checkbox { checked: false })
@@ -1327,8 +1327,8 @@ mod tests {
         let mut forged = request(&current, 1, Desired::Checkbox { checked: false });
         forged.board = other.clone();
         forged.expected_revision = other_snapshot.revision;
-        assert_eq!(broker.monitor_board_response(1, &other, forged).status, 409);
-        let response = broker.monitor_board_response(
+        assert_eq!(broker.web_board_response(1, &other, forged).status, 409);
+        let response = broker.web_board_response(
             1,
             &Name::default(),
             request(
@@ -1352,17 +1352,17 @@ mod tests {
     async fn queued_job_checks_revocation_after_database_queue() {
         let (root, bound, snapshot) = setup();
         let broker = bound.broker.clone();
-        broker.monitor_control.lock().unwrap().enable(0);
+        broker.web_control.lock().unwrap().enable(0);
         let guard = broker.db.lock().unwrap();
         let queued = broker.clone();
         let response = request(&snapshot, 1, Desired::Checkbox { checked: true });
         let (ready, waiting) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             ready.send(()).unwrap();
-            queued.monitor_board_response(1, &Name::default(), response)
+            queued.web_board_response(1, &Name::default(), response)
         });
         waiting.recv().unwrap();
-        broker.monitor_control.lock().unwrap().enable(1);
+        broker.web_control.lock().unwrap().enable(1);
         drop(guard);
         assert_eq!(worker.join().unwrap().status, 401);
         assert_eq!(

@@ -158,7 +158,7 @@ Exact implementation boundaries: `src/main.rs` removes `Commands::Ack`;
 `src/protocol.rs` removes `Request::Ack`; `src/broker.rs` removes its dispatch;
 `src/db.rs` removes `Db::ack`. There is no remaining local acknowledgement writer.
 The historical-label readers are `protocol::delivery_state`, the immutable-provider
-projection in `Db::delivery_state`/`counts`, and the monitor's pre-pagination SQL.
+projection in `Db::delivery_state`/`counts`, and the web interface's pre-pagination SQL.
 `network::store::apply_events` alone can still import `acknowledged` from an old
 authenticated peer. `sync_events` retains v1 labels and maps read-only OpenCode
 reconciliation back to `uncertain` so another bridge cannot mistake proof lookup

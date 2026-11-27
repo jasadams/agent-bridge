@@ -23,7 +23,7 @@ impl Running {
     }
     async fn enable(&self, port: u16) -> Value {
         self.broker
-            .request_async(Request::MonitorEnable { port })
+            .request_async(Request::WebEnable { port })
             .await
             .unwrap()
     }
@@ -91,7 +91,7 @@ fn auth(access: &Value) -> String {
 }
 
 #[tokio::test]
-async fn topic_catalog_requires_monitor_access_and_respects_browser_origin() {
+async fn topic_catalog_requires_web_access_and_respects_browser_origin() {
     let root = tempfile::Builder::new()
         .prefix("ab-topic-http-")
         .tempdir_in("/tmp")
@@ -266,7 +266,7 @@ async fn board_events_follow_only_selected_revision_including_external_edits_and
             .await
             .is_err()
     );
-    running.broker.request(Request::MonitorDisable).unwrap();
+    running.broker.request(Request::WebDisable).unwrap();
     let mut rest = Vec::new();
     timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
         .await
@@ -377,13 +377,13 @@ async fn board_and_message_events_share_the_live_connection_limit() {
     }
 }
 #[tokio::test]
-async fn monitor_requires_bearer_and_enforces_browser_boundaries_on_assets_and_api() {
+async fn web_requires_bearer_and_enforces_browser_boundaries_on_assets_and_api() {
     let root = tempfile::Builder::new()
         .prefix("ab-http-")
         .tempdir_in("/tmp")
         .unwrap();
     let running = Running::start(root.path());
-    let status = running.broker.request(Request::MonitorStatus).unwrap();
+    let status = running.broker.request(Request::WebStatus).unwrap();
     assert_eq!(status["enabled"], false);
     assert!(status.get("access_token").is_none());
     let access = running.enable(0).await;
@@ -470,8 +470,7 @@ async fn monitor_requires_bearer_and_enforces_browser_boundaries_on_assets_and_a
     assert!(!root.path().join("identity.key").exists());
 }
 #[tokio::test]
-async fn disabling_monitor_closes_live_streams_and_rotates_credentials_independently_of_networking()
-{
+async fn disabling_web_closes_live_streams_and_rotates_credentials_independently_of_networking() {
     let root = tempfile::Builder::new()
         .prefix("ab-http-live-")
         .tempdir_in("/tmp")
@@ -485,7 +484,7 @@ async fn disabling_monitor_closes_live_streams_and_rotates_credentials_independe
     let same = running.enable(0).await;
     assert_eq!(same["url"], access["url"]);
     assert_eq!(same["access_token"], access["access_token"]);
-    running.broker.request(Request::MonitorDisable).unwrap();
+    running.broker.request(Request::WebDisable).unwrap();
     let mut rest = Vec::new();
     timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
         .await
@@ -516,7 +515,7 @@ async fn occupied_port_reports_failure_without_disrupting_the_broker() {
     assert!(
         running
             .broker
-            .request_async(Request::MonitorEnable { port })
+            .request_async(Request::WebEnable { port })
             .await
             .is_err()
     );
@@ -532,12 +531,12 @@ async fn occupied_port_reports_failure_without_disrupting_the_broker() {
     assert!(
         running
             .broker
-            .request(Request::MonitorStatus)
+            .request(Request::WebStatus)
             .unwrap()
             .get("access_token")
             .is_none()
     );
-    running.broker.request(Request::MonitorDisable).unwrap();
+    running.broker.request(Request::WebDisable).unwrap();
     assert!(running.enable(0).await["url"].is_string());
 }
 
@@ -884,7 +883,7 @@ async fn body_bounds_malformed_unknown_fields_and_revocation_never_change_board(
     assert!(bytes.starts_with(b"HTTP/1.1 413"));
     let mut body = TcpStream::connect(host(&access)).await.unwrap();
     body.write_all(format!("POST /api/boards/main/responses HTTP/1.1\r\nHost: {}\r\n{}{}Content-Length: 1000\r\n\r\n{{", host(&access), auth(&access), post_headers(&access)).as_bytes()).await.unwrap();
-    running.broker.request(Request::MonitorDisable).unwrap();
+    running.broker.request(Request::WebDisable).unwrap();
     let _ = body.write_all(&[b' '; 999]).await;
     let mut rest = Vec::new();
     let _ = timeout(Duration::from_secs(2), body.read_to_end(&mut rest)).await;

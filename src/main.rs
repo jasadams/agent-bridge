@@ -1003,10 +1003,10 @@ async fn main() -> Result<()> {
         // IPC request names are intentionally unchanged: an older running broker must still
         // understand a freshly upgraded CLI.
         Commands::Web { action } => match action {
-            WebAction::Enable { port } => Request::MonitorEnable { port },
-            WebAction::Disable => Request::MonitorDisable,
-            WebAction::Status => Request::MonitorStatus,
-            WebAction::Access => Request::MonitorAccess,
+            WebAction::Enable { port } => Request::WebEnable { port },
+            WebAction::Disable => Request::WebDisable,
+            WebAction::Status => Request::WebStatus,
+            WebAction::Access => Request::WebAccess,
         },
         Commands::Relay { action } => match action {
             RelayAction::Serve {

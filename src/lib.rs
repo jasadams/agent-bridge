@@ -34,9 +34,9 @@ pub mod service;
 pub mod topics;
 pub mod update;
 
-pub mod monitor;
-mod monitor_board;
-mod monitor_data;
+pub mod web;
+mod web_board;
+mod web_data;
 
 mod pairing_notifications;
 

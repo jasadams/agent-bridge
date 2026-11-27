@@ -2369,7 +2369,7 @@ async fn logical_board_projections_cover_mcp_rpc_cli_and_lifecycle_without_backi
     assert_eq!(metadata["name"], "logical");
     let access = running
         .broker
-        .request_async(Request::MonitorEnable { port: 0 })
+        .request_async(Request::WebEnable { port: 0 })
         .await
         .unwrap();
     let address = access["url"]

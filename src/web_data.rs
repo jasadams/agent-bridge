@@ -1,9 +1,9 @@
-//! Read-only monitor views use the broker's existing connection. Opening a second
+//! Read-only web views use the broker's existing connection. Opening a second
 //! Db would run delivery recovery and must never be done by a browser read.
 use crate::{
     broker::{AgentRefs, Broker},
     db::Db,
-    monitor::MonitorQuery,
+    web::WebQuery,
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, named_params};
@@ -46,14 +46,14 @@ WITH contexts AS (
 )
 "#;
 
-fn query_valid(query: &MonitorQuery) -> Result<Option<(i64, String)>> {
+fn query_valid(query: &WebQuery) -> Result<Option<(i64, String)>> {
     ensure!((1..=100).contains(&query.limit), "Limit must be 1–100");
     for filter in [&query.machine, &query.agent, &query.state] {
         ensure!(
             filter.as_ref().is_none_or(|s| !s.is_empty()
                 && s.len() <= 256
                 && !s.chars().any(char::is_control)),
-            "Invalid monitor filter"
+            "Invalid web filter"
         );
     }
     ensure!(
@@ -94,7 +94,7 @@ fn row_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 const PREVIEW: &str = "SELECT id,created,updated,public_state,substr(detail,1,512),substr(body,1,512),parent,source,destination,direction,length(body)>512,json_extract(envelope,'$.parent') FROM rows ";
 
 impl Db {
-    fn monitor_page(&self, query: &MonitorQuery, machine: &Value) -> Result<Value> {
+    fn web_page(&self, query: &WebQuery, machine: &Value) -> Result<Value> {
         let cursor = query_valid(query)?;
         let sql = format!(
             "{ROWS}{PREVIEW} WHERE ($machine IS NULL OR json_extract(source,'$.machine_name')=$machine OR json_extract(destination,'$.machine_name')=$machine OR json_extract(source,'$.peer_id')=$machine OR json_extract(destination,'$.peer_id')=$machine) AND ($agent IS NULL OR json_extract(source,'$.agent')=$agent OR json_extract(destination,'$.agent')=$agent OR json_extract(source,'$.session')=$agent OR json_extract(destination,'$.session')=$agent) AND ($state IS NULL OR public_state=$state) AND ($since IS NULL OR created>=$since) AND ($until IS NULL OR created<=$until) AND ($before_time IS NULL OR created<$before_time OR (created=$before_time AND id<$before_id)) ORDER BY created DESC,id DESC LIMIT $limit"
@@ -120,7 +120,7 @@ impl Db {
         };
         Ok(json!({"messages":messages,"next_cursor":next}))
     }
-    fn monitor_detail(&self, id: &str, machine: &Value) -> Result<Value> {
+    fn web_detail(&self, id: &str, machine: &Value) -> Result<Value> {
         let parsed = uuid::Uuid::parse_str(id).context("Invalid message ID")?;
         ensure!(parsed.to_string() == id, "Invalid message ID");
         let sql = format!(
@@ -136,21 +136,21 @@ impl Db {
 }
 
 impl Broker {
-    pub(crate) fn monitor_messages(&self, query: MonitorQuery) -> Result<Value> {
+    pub(crate) fn web_messages(&self, query: WebQuery) -> Result<Value> {
         let mut page = {
             let db = self.db.lock().unwrap();
             let machine = self.local_machine(&db)?;
-            db.monitor_page(&query, &machine)?
+            db.web_page(&query, &machine)?
         };
         let mut seen = AgentRefs::default();
         for message in page["messages"].as_array_mut().into_iter().flatten() {
-            self.attach_monitor_agents(message, &mut seen);
+            self.attach_web_agents(message, &mut seen);
         }
         Ok(page)
     }
-    /// Adds the resolved `source_agent`/`destination_agent` to one monitor row. `seen` only dedupes
+    /// Adds the resolved `source_agent`/`destination_agent` to one web row. `seen` only dedupes
     /// the agents of this request; it is dropped with it.
-    fn attach_monitor_agents(&self, message: &mut Value, seen: &mut AgentRefs) {
+    fn attach_web_agents(&self, message: &mut Value, seen: &mut AgentRefs) {
         let direction = message["direction"].as_str().unwrap_or("local").to_owned();
         let id = message["id"].as_str().unwrap_or_default().to_owned();
         for (side, remote) in [
@@ -209,24 +209,24 @@ impl Broker {
             }
         }
     }
-    pub(crate) fn monitor_message(&self, id: &str) -> Result<Value> {
+    pub(crate) fn web_message(&self, id: &str) -> Result<Value> {
         let mut detail = {
             let db = self.db.lock().unwrap();
             let machine = self.local_machine(&db)?;
-            db.monitor_detail(id, &machine)?
+            db.web_detail(id, &machine)?
         };
         let mut seen = AgentRefs::default();
-        self.attach_monitor_agents(&mut detail["message"], &mut seen);
+        self.attach_web_agents(&mut detail["message"], &mut seen);
         for message in detail["related"].as_array_mut().into_iter().flatten() {
-            self.attach_monitor_agents(message, &mut seen);
+            self.attach_web_agents(message, &mut seen);
         }
         Ok(detail)
     }
-    pub(crate) fn monitor_metadata(&self) -> Result<Value> {
+    pub(crate) fn web_metadata(&self) -> Result<Value> {
         let db = self.db.lock().unwrap();
         Ok(json!({"machine":self.local_machine(&db)?,"read_only":true,"version":crate::VERSION}))
     }
-    pub(crate) fn monitor_revision(&self) -> Result<(u64, u64)> {
+    pub(crate) fn web_revision(&self) -> Result<(u64, u64)> {
         let db = self.db.lock().unwrap();
         Ok((
             db.conn.total_changes(),
@@ -250,7 +250,7 @@ mod tests {
         }
     }
     #[test]
-    fn monitor_lists_details_and_threads_exclude_durable_typed_controls() {
+    fn web_lists_details_and_threads_exclude_durable_typed_controls() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir.path().join("db")).unwrap();
         let native = Agent {
@@ -278,16 +278,16 @@ mod tests {
             )
             .unwrap();
         let machine = json!({"peer_id":null,"machine_name":"local"});
-        let page = db.monitor_page(&MonitorQuery::default(), &machine).unwrap();
+        let page = db.web_page(&WebQuery::default(), &machine).unwrap();
         assert_eq!(page["messages"].as_array().unwrap().len(), 1);
         assert_eq!(page["messages"][0]["id"], peer.id);
-        assert!(db.monitor_detail(&notice.id, &machine).is_err());
-        assert!(db.monitor_detail(&peer.id, &machine).is_ok());
+        assert!(db.web_detail(&notice.id, &machine).is_err());
+        assert!(db.web_detail(&peer.id, &machine).is_ok());
         assert_eq!(db.get(&notice.id).unwrap().state, "queued");
     }
 
     #[test]
-    fn monitor_preserves_sessions_filters_pages_and_reads_without_delivery_recovery() {
+    fn web_preserves_sessions_filters_pages_and_reads_without_delivery_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir.path().join("db")).unwrap();
         db.register(&agent("alice", "original-source"), false)
@@ -314,11 +314,11 @@ mod tests {
             .unwrap();
         let machine = json!({"peer_id":null,"machine_name":"local"});
         let before = db.conn.total_changes();
-        let query = MonitorQuery {
+        let query = WebQuery {
             agent: Some("original-source".into()),
             ..Default::default()
         };
-        let page = db.monitor_page(&query, &machine).unwrap();
+        let page = db.web_page(&query, &machine).unwrap();
         assert_eq!(page["messages"][0]["source"]["session"], "original-source");
         assert_eq!(
             page["messages"][0]["destination"]["session"],
@@ -326,14 +326,14 @@ mod tests {
         );
         assert_eq!(page["messages"][0]["body_truncated"], true);
         assert_eq!(
-            db.monitor_detail(&id, &machine).unwrap()["message"]["body"],
+            db.web_detail(&id, &machine).unwrap()["message"]["body"],
             body
         );
         assert_eq!(db.get(&id).unwrap().state, "sending");
         assert_eq!(db.conn.total_changes(), before);
         assert!(
-            db.monitor_page(
-                &MonitorQuery {
+            db.web_page(
+                &WebQuery {
                     state: Some("delivered".into()),
                     ..Default::default()
                 },
@@ -354,13 +354,13 @@ mod tests {
             )
             .unwrap();
         }
-        let mut query = MonitorQuery {
+        let mut query = WebQuery {
             limit: 1,
             ..Default::default()
         };
         let mut seen = std::collections::HashSet::new();
         loop {
-            let page = db.monitor_page(&query, &machine).unwrap();
+            let page = db.web_page(&query, &machine).unwrap();
             for row in page["messages"].as_array().unwrap() {
                 assert!(seen.insert(row["id"].as_str().unwrap().to_string()));
             }
@@ -371,25 +371,25 @@ mod tests {
         }
         assert_eq!(seen.len(), 4);
         for query in [
-            MonitorQuery {
+            WebQuery {
                 limit: 101,
                 ..Default::default()
             },
-            MonitorQuery {
+            WebQuery {
                 before: Some("bad".into()),
                 ..Default::default()
             },
-            MonitorQuery {
+            WebQuery {
                 since: Some(2),
                 until: Some(1),
                 ..Default::default()
             },
         ] {
-            assert!(db.monitor_page(&query, &machine).is_err());
+            assert!(db.web_page(&query, &machine).is_err());
         }
     }
     #[test]
-    fn monitor_public_outcomes_filter_before_pagination_and_match_receipts() {
+    fn web_public_outcomes_filter_before_pagination_and_match_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir.path().join("db")).unwrap();
         db.register(&agent("bob", "original-destination"), false)
@@ -432,21 +432,21 @@ mod tests {
         expected.entry("unknown").or_default().push(id);
         let before = db.conn.total_changes();
         for (outcome, ids) in expected {
-            let mut query = MonitorQuery {
+            let mut query = WebQuery {
                 state: Some(outcome.into()),
                 limit: 1,
                 ..Default::default()
             };
             let mut seen = std::collections::HashSet::new();
             loop {
-                let page = db.monitor_page(&query, &machine).unwrap();
+                let page = db.web_page(&query, &machine).unwrap();
                 for message in page["messages"].as_array().unwrap() {
                     let id = message["id"].as_str().unwrap();
                     assert_eq!(message["state"], outcome);
                     assert!(seen.insert(id.to_string()));
                     assert_eq!(db.delivery_state(&db.get(id).unwrap()).unwrap(), outcome);
                     assert_eq!(
-                        db.monitor_detail(id, &machine).unwrap()["message"]["state"],
+                        db.web_detail(id, &machine).unwrap()["message"]["state"],
                         outcome
                     );
                 }
@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(db.conn.total_changes(), before);
     }
     #[test]
-    fn monitor_sending_reconciliation_is_unknown_but_dispatched_is_pending() {
+    fn web_sending_reconciliation_is_unknown_but_dispatched_is_pending() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir.path().join("db")).unwrap();
         db.register(&agent("bob", "original-destination"), false)
@@ -481,14 +481,14 @@ mod tests {
             db.conn.execute("INSERT INTO opencode_deliveries(id,session,namespace,native_id,phase,deadline) VALUES(?1,'original-destination','legacy','pending',?2,0)", [&id, phase]).unwrap();
             let before = db.conn.total_changes();
             assert_eq!(
-                db.monitor_detail(&id, &machine).unwrap()["message"]["state"],
+                db.web_detail(&id, &machine).unwrap()["message"]["state"],
                 outcome,
                 "sending phase {phase}"
             );
             for filter in ["pending", "unknown"] {
                 let page = db
-                    .monitor_page(
-                        &MonitorQuery {
+                    .web_page(
+                        &WebQuery {
                             state: Some(filter.into()),
                             ..Default::default()
                         },
@@ -526,7 +526,7 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         let message = db
-            .monitor_detail(&id, &json!({"machine_name":"local","peer_id":null}))
+            .web_detail(&id, &json!({"machine_name":"local","peer_id":null}))
             .unwrap();
         assert!(message["message"]["source"]["session"].is_null());
         assert_eq!(

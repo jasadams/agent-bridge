@@ -1,4 +1,4 @@
-# Design System — Agent Bridge Monitor
+# Design System — Agent Bridge Web
 
 The web interface served by `agent-bridge web enable`. Source of truth for its visual and
 interaction decisions. It ships five choices on one layout (three looks, one of them in a dark and a light
@@ -20,7 +20,7 @@ describe Sticker Bomb unless they say otherwise; the Orca themes are described u
 and a teletext theme) were explored and rejected; they are not part of the product.
 
 ## Product Context
-- **What this is:** A Slack-like local monitor for agents: read shared boards, follow topics,
+- **What this is:** A Slack-like local web interface for agents: read shared boards, follow topics,
   watch agent-to-agent direct messages, and debug delivery.
 - **Who it's for:** Developers running several coding agents (Claude, Codex, OpenCode) across
   one or more machines.
@@ -199,10 +199,10 @@ in the opposite appearance, to show it ignores it), on these screens: the board 
   `style=` attributes, no inline scripts or handlers, and no `setAttribute("style", …)`. Colour per
   agent is a class, not an inline style; script-driven layout uses the CSS object model
   (`element.style.height = …`). The theme is applied by the external, blocking `theme.js`.
-  `tests/monitor_http.rs` fails the build if any of this regresses.
+  `tests/web_http.rs` fails the build if any of this regresses.
 - **Themes are files.** `style.css` holds structure and the Classic tokens; each `theme-*.css` overrides
   tokens and decorates components, scoped under `[data-theme="…"]`. Adding a theme means adding one
-  sheet and an entry in `theme.js`, a route in `src/monitor.rs`, and a menu item. Only the selected
+  sheet and an entry in `theme.js`, a route in `src/web.rs`, and a menu item. Only the selected
   sheet is loaded. `data-theme` on `<html>` names the sheet that is applied; a choice that is not a
   sheet of its own (Orca (system)) is resolved to one by `theme.js`, which remembers the choice, not the
   sheet.
@@ -247,6 +247,5 @@ in the opposite appearance, to show it ignores it), on these screens: the board 
 - **Dark Sticker Bomb:** not designed (see Color).
 - **Older QA harnesses:** the Python browser harnesses in `tools/` other than `test_web_browser.py`
   still target the previous tabbed interface's element ids.
-- **Internal naming:** modules and IPC messages are still called "monitor"; only user-visible names
-  changed to "web interface".
+- **Internal naming:** modules, files and Rust identifiers say "web". The IPC op names keep their earlier `monitor_*` strings (a CLI and a running broker of different versions must still understand each other), and the `agent-bridge monitor` alias stays. All user-visible names say "web interface".
 - **Reduced-motion and keyboard paths** are implemented but only partly covered by automated tests.

@@ -311,12 +311,18 @@ pub enum Request {
         actor: Option<String>,
     },
     Status,
-    MonitorEnable {
+    // The `monitor_*` op names are the wire contract with a running broker of another version
+    // (the interface was renamed to "web" in AGB-54); only the Rust names changed.
+    #[serde(rename = "monitor_enable")]
+    WebEnable {
         port: u16,
     },
-    MonitorDisable,
-    MonitorStatus,
-    MonitorAccess,
+    #[serde(rename = "monitor_disable")]
+    WebDisable,
+    #[serde(rename = "monitor_status")]
+    WebStatus,
+    #[serde(rename = "monitor_access")]
+    WebAccess,
     Identity,
     MachineShow,
     MachineSetName {
@@ -655,5 +661,42 @@ mod board_compatibility_tests {
             Request::board_inspect(crate::board::Name::default()),
             Request::BoardRead
         ));
+    }
+}
+
+#[cfg(test)]
+mod web_wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    // The web requests keep the op names they had as "monitor_*": a CLI and a running broker of
+    // different versions must still understand each other. Literal strings, not derived from the
+    // Rust names.
+    #[test]
+    fn web_requests_serialize_to_the_monitor_op_names() {
+        let fixtures = [
+            (
+                Request::WebEnable { port: 4321 },
+                json!({"op":"monitor_enable","port":4321}),
+            ),
+            (Request::WebDisable, json!({"op":"monitor_disable"})),
+            (Request::WebStatus, json!({"op":"monitor_status"})),
+            (Request::WebAccess, json!({"op":"monitor_access"})),
+        ];
+        for (request, wire) in fixtures {
+            assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+            let parsed: Request = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn web_op_names_are_not_accepted_under_the_rust_names() {
+        for op in ["web_enable", "web_disable", "web_status", "web_access"] {
+            assert!(
+                serde_json::from_value::<Request>(json!({"op":op,"port":0})).is_err(),
+                "{op} must not be a wire name"
+            );
+        }
     }
 }

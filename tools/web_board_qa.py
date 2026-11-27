@@ -1,4 +1,4 @@
-"""Real monitor board browser acceptance; called by disposable test_monitor.py.
+"""Real web board browser acceptance; called by disposable test_web.py.
 
 Backend responses are never fabricated. Gates delay decoding an actual response,
 and the uncertainty case commits a real POST before dropping its response.
@@ -183,7 +183,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             "<!-- board-input: duplicate -->\n> second\n<!-- /board-input -->\n"
             "ordinary [ ] brackets\n")
     try:
-        assert not read("main")["exists"], "Fresh monitor fixture should retain virtual absent main"
+        assert not read("main")["exists"], "Fresh web fixture should retain virtual absent main"
         for name, markdown in (("alpha", alpha), ("beta", beta)):
             rpc(state, "board_create", board=name)
             write(name, markdown)
@@ -507,8 +507,8 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         assert page.evaluate("typeof window.boardPwned") == "undefined"
         record("board reconnect, keyboard labels/focus/modal escape, desktop/mobile layout and memory-only privacy hold without resource requests")
 
-        # Credential rotation gets its own private monitor; main credentials stay
-        # unchanged for the remainder of the existing monitor acceptance harness.
+        # Credential rotation gets its own private web; main credentials stay
+        # unchanged for the remainder of the existing web acceptance harness.
         private_main = rpc(second_state, "named_board_read", board="main")
         rpc(second_state, "named_board_update", board="main",
             expected_revision=private_main["revision"], actor=None,
@@ -543,10 +543,10 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             assert renewed["access_token"] != second["access_token"]
         finally:
             isolated.close(); rpc(second_state, "monitor_disable")
-        record("actual private monitor credential rotation clears boards and invalidates delayed old-auth data")
+        record("actual private web credential rotation clears boards and invalidates delayed old-auth data")
         inline_control_checks(page=page, context=context, rpc=rpc, state=state,
                               origin=origin, token=token, record=record, output=output)
-        from monitor_code_copy_qa import code_copy_browser_checks
+        from web_code_copy_qa import code_copy_browser_checks
         code_copy_browser_checks(page=page, rpc=rpc, state=state, token=token, record=record, output=output)
         # Real file timestamps, real HTTP snapshots, and a viewer-zone context:
         # July is Sydney winter; January is Sydney summer. Never fake API data.

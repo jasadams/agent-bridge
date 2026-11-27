@@ -78,7 +78,7 @@ pub(crate) struct AgentRefs {
 pub struct Broker {
     service_lock: std::sync::Weak<File>,
     pub(crate) db: Arc<Mutex<Db>>,
-    pub(crate) monitor_control: Arc<Mutex<crate::monitor::Control>>,
+    pub(crate) web_control: Arc<Mutex<crate::web::Control>>,
     pub(crate) wake: Arc<Notify>,
     /// Claude sessions an Orca wake was requested for and that have not bound a socket since.
     orca_wakes: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -366,7 +366,7 @@ impl Broker {
         let broker = Self {
             service_lock: Arc::downgrade(&lock),
             db: Arc::new(Mutex::new(db)),
-            monitor_control: Arc::new(Mutex::new(crate::monitor::Control::default())),
+            web_control: Arc::new(Mutex::new(crate::web::Control::default())),
             wake: Arc::new(Notify::new()),
             orca_wakes: Arc::new(Mutex::new(std::collections::HashSet::new())),
             orca_cli: crate::orca_wake::default_cli(),
@@ -1082,11 +1082,11 @@ impl Broker {
                 provider: Provider::OpenCode,
                 ..
             } => self.blocking(move |broker| broker.request(req)).await,
-            Request::MonitorEnable { port } => {
-                self.monitor_control.lock().unwrap().enable(port);
+            Request::WebEnable { port } => {
+                self.web_control.lock().unwrap().enable(port);
                 timeout(Duration::from_secs(5), async {
                     loop {
-                        let value = self.monitor_control.lock().unwrap().credentials();
+                        let value = self.web_control.lock().unwrap().credentials();
                         ensure!(
                             value["requested_port"].as_u64() == Some(port as u64),
                             "Web enable was superseded"
@@ -1821,10 +1821,10 @@ impl Broker {
                     db.pause(paused)?;
                     json!({"paused":paused})
                 }
-                Request::MonitorEnable { .. } => anyhow::bail!("Use the asynchronous monitor RPC"),
-                Request::MonitorDisable => self.monitor_control.lock().unwrap().disable(),
-                Request::MonitorStatus => self.monitor_control.lock().unwrap().status(),
-                Request::MonitorAccess => self.monitor_control.lock().unwrap().credentials(),
+                Request::WebEnable { .. } => anyhow::bail!("Use the asynchronous web RPC"),
+                Request::WebDisable => self.web_control.lock().unwrap().disable(),
+                Request::WebStatus => self.web_control.lock().unwrap().status(),
+                Request::WebAccess => self.web_control.lock().unwrap().credentials(),
                 Request::Status => {
                     let mut network = self.network_status.lock().unwrap().clone();
                     network["configured"] = json!(db.network_config()?);
@@ -1832,7 +1832,7 @@ impl Broker {
                         Ok(status) => json!(status),
                         Err(error) => json!({"error": format!("{error:#}")}),
                     };
-                    json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.monitor_control.lock().unwrap().status(),"machine":self.local_machine(&db)?,"updates":updates,"board_archives":crate::board_lifecycle::diagnostics(&db)?})
+                    json!({"version":crate::VERSION,"build_commit":crate::BUILD_COMMIT,"pid":std::process::id(),"state_dir":self.state_dir,"paused":db.paused()?,"messages":db.counts()?,"codex_discovery":self.discovery_status.lock().unwrap().clone(),"network":network,"monitor":self.web_control.lock().unwrap().status(),"machine":self.local_machine(&db)?,"updates":updates,"board_archives":crate::board_lifecycle::diagnostics(&db)?})
                 }
                 Request::RemoteList | Request::RemoteListPeer { .. } => {
                     anyhow::bail!("Use the asynchronous on-demand peer directory RPC")
@@ -2715,7 +2715,7 @@ impl Broker {
     }
 
     /// Caller holds the local DB administration mutex. HTTP additionally retains
-    /// its monitor generation guard through this update and both observations.
+    /// its web generation guard through this update and both observations.
     pub(crate) fn update_board_locked(
         &self,
         db: &Db,
@@ -2992,8 +2992,8 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
     let broker = bound.broker.clone();
     let dispatcher = broker.dispatch();
     tokio::pin!(dispatcher);
-    let monitoring = crate::monitor::run(broker.clone());
-    tokio::pin!(monitoring);
+    let web_server = crate::web::run(broker.clone());
+    tokio::pin!(web_server);
     let pairing_notifications = crate::pairing_notifications::run(broker.clone());
     tokio::pin!(pairing_notifications);
     let board_notifications = crate::board_notifications::run(broker.clone());
@@ -3029,7 +3029,7 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
             },
             Some(_)=connections.join_next(),if !connections.is_empty()=>{},
             res=&mut dispatcher=>break res,
-            _=&mut monitoring=>unreachable!("Monitor worker runs until shutdown"),
+            _=&mut web_server=>unreachable!("Web worker runs until shutdown"),
             res=&mut pairing_notifications=>break res,
             res=&mut board_notifications=>break res,
             _=&mut board_cleanup=>unreachable!("Board archive cleanup runs until shutdown"),
@@ -3040,7 +3040,7 @@ pub async fn serve_with_discovery(bound: BoundServer, codex_home: Option<PathBuf
             _=terminate.recv()=>break Ok(()),
         }
     };
-    broker.monitor_control.lock().unwrap().disable();
+    broker.web_control.lock().unwrap().disable();
     connections.abort_all();
     result
 }
@@ -3451,10 +3451,10 @@ mod machine_tests {
             1,
             "history resolves every agent from one Claude read"
         );
-        let query: crate::monitor::MonitorQuery = serde_urlencoded::from_str("").unwrap();
-        let page = broker.monitor_messages(query).unwrap();
+        let query: crate::web::WebQuery = serde_urlencoded::from_str("").unwrap();
+        let page = broker.web_messages(query).unwrap();
         assert_eq!(page["messages"].as_array().unwrap().len(), 3);
-        assert_eq!(reads(), 2, "a monitor page is one more Claude read");
+        assert_eq!(reads(), 2, "a web page is one more Claude read");
     }
 
     #[tokio::test]
@@ -4600,8 +4600,8 @@ mod machine_tests {
             })
             .unwrap();
         assert_named(&since["messages"][0]);
-        let query: crate::monitor::MonitorQuery = serde_urlencoded::from_str("").unwrap();
-        let page = broker.monitor_messages(query).unwrap();
+        let query: crate::web::WebQuery = serde_urlencoded::from_str("").unwrap();
+        let page = broker.web_messages(query).unwrap();
         let row = &page["messages"][0];
         assert_eq!(row["source_agent"]["id"], "alpha");
         assert_eq!(row["source_agent"]["name"], "alpha");
@@ -4615,7 +4615,7 @@ mod machine_tests {
                 parent: Some(id.clone()),
             })
             .unwrap();
-        let detail = broker.monitor_message(&id).unwrap();
+        let detail = broker.web_message(&id).unwrap();
         assert_eq!(detail["message"]["destination_agent"]["name"], "beta");
         assert_eq!(detail["related"][0]["source_agent"]["id"], "beta");
         assert_eq!(detail["related"][0]["destination_agent"]["id"], "alpha");
