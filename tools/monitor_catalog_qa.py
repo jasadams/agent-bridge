@@ -17,17 +17,20 @@ from urllib.parse import urlsplit
 import uuid
 
 
+# Without these macOS shows the owner a "Chrome Safe Storage" keychain prompt.
+CHROMIUM_ARGS = ["--use-mock-keychain", "--password-store=basic"]
+
 def catalog_browser_checks(*, page, context, rpc, state, url, token, record, output):
     from playwright.sync_api import expect
 
     origin = url.rstrip("/")
+    page.set_viewport_size({"width": 1440, "height": 900})  # on a phone the sidebar is off screen
     results, requests = [], []
     board = "catalog-home"
     body = ("# Catalog fixture\n\n- [ ] Keep checkbox\n\n"
             "<!-- board-input: answer -->\n> original\n<!-- /board-input -->\n\n"
             + "Long document content\n\n" * 120)
-    rpc(state, "register", agent={"name": "catalog-agent", "provider": "inbox",
-        "session": str(uuid.uuid4()), "endpoint": "", "enabled": True})
+    rpc(state, "register", name="catalog-agent", provider="inbox", session=str(uuid.uuid4()), replace=False)
     rpc(state, "board_create", board=board)
     before = rpc(state, "named_board_read", board=board)
     seeded = rpc(state, "named_board_update", board=board, expected_revision=before["revision"],
@@ -47,6 +50,13 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
                 return
             page.wait_for_timeout(30)
         raise AssertionError("Timed out: " + label)
+
+    def go(name):
+        """A board is opened from its sidebar item (hash route #/board/<name>)."""
+        page.locator(f'#sidebar .nav-item[data-route="#/board/{name}"]').click()
+
+    def sidebar_boards(target=page):
+        return target.locator('#sidebar .nav-item[data-route^="#/board/"] .grow').all_text_contents()
 
     def names():
         return page.locator("#board-selector option").evaluate_all("rows => rows.map(row => row.value)")
@@ -80,7 +90,7 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         rpc(state, "named_board_update", board=board, expected_revision=snapshot["revision"],
             edits=[{"op": "set", "markdown": fixture}])
         login()
-        page.locator("#board-selector").select_option(board)
+        go(board)
         expect(page.locator("#selected-board-name")).to_have_text(board)
         expect(page.locator("#board-raw")).to_have_text(fixture)
         expect(page.locator(".message-composer[data-field-id=compose] textarea")).to_be_visible()
@@ -118,7 +128,7 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         page.evaluate("window.dispatchEvent(new Event('online'))")
 
     def case_discovery():
-        page.locator("#board-selector").focus()
+        page.locator(f'#sidebar .nav-item[data-route="#/board/{board}"]').focus()
         page.evaluate("""() => {
           window.__catalogOptions = new Map(Array.from(document.querySelector('#board-selector').options, o => [o.value,o]));
           window.__catalogDocument = document.querySelector('#board-document').firstChild;
@@ -128,11 +138,13 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         actual = names()
         assert actual == sorted(set(actual))
         assert page.locator("#board-selector").input_value() == board
-        expect(page.locator("#board-selector")).to_be_focused()
+        # The sidebar mirrors the catalog, in the same order, and keeps keyboard focus on the same board.
+        assert sidebar_boards() == actual, sidebar_boards()
+        expect(page.locator(f'#sidebar .nav-item[data-route="#/board/{board}"]')).to_be_focused()
         assert page.evaluate("""() => Array.from(window.__catalogOptions).every(([name,old]) =>
           Array.from(document.querySelector('#board-selector').options).find(o => o.value===name)===old)
           && window.__catalogDocument===document.querySelector('#board-document').firstChild""")
-        page.locator("#board-selector").select_option("catalog-alpha")
+        go("catalog-alpha")
         expect(page.locator("#board-document")).to_contain_text("Discovered content")
         expect(page.locator("#selected-board-name")).to_have_text("catalog-alpha")
 
@@ -156,8 +168,8 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         message = page.locator(".message-composer[data-field-id=compose] textarea")
         message.fill("Independent unsent message")
         response.fill("Retained ordinary response")
-        response.evaluate("""e => { e.focus(); e.setSelectionRange(3,9); window.scrollTo(0,500);
-          window.__catalogDraft=e; window.__catalogScroll=scrollY;
+        response.evaluate("""e => { e.focus(); e.setSelectionRange(3,9); document.querySelector('.board-scroll').scrollTop = 500;
+          window.__catalogDraft=e; window.__catalogScroll=document.querySelector('.board-scroll').scrollTop;
           window.__catalogDocument=document.querySelector('#board-document').firstChild; }""")
         start = len(requests)
         discover("catalog-response-draft")
@@ -165,7 +177,7 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         expect(message).to_have_value("Independent unsent message")
         expect(response).to_be_focused()
         assert response.evaluate("e => e===window.__catalogDraft && e.selectionStart===3 && e.selectionEnd===9")
-        assert page.evaluate("scrollY===window.__catalogScroll && window.__catalogDocument===document.querySelector('#board-document').firstChild")
+        assert page.evaluate("document.querySelector('.board-scroll').scrollTop===window.__catalogScroll && window.__catalogDocument===document.querySelector('#board-document').firstChild")
         message.focus()
         message.evaluate("e => e.setSelectionRange(4,8)")
         discover("catalog-message-draft")
@@ -212,9 +224,10 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         expect(page.locator(".message-feedback")).to_contain_text("Acceptance is uncertain")
         discover("catalog-uncertain")
         expect(message).to_have_value("Catalog uncertain message")
-        # Explicit Refresh catches up the catalog without retrying the message.
+        # An explicit catch-up (the page has no Refresh button; focus, visibility and reconnection ask for one)
+        # lists the new board without retrying the message.
         create("catalog-explicit")
-        page.locator("#board-refresh").click()
+        request_catalog()
         wait("explicit catalog", lambda: "catalog-explicit" in names())
         expect(message).to_have_value("Catalog uncertain message")
         rows = rpc(state, "history", agent=None, limit=100)
@@ -234,16 +247,18 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         gate("/api/boards")
         request_catalog()
         wait("held actual catalog", lambda: page.evaluate("!!window.__catalogGate.decoded"))
-        page.locator("#messages-tab").click()
+        page.locator('#sidebar .nav-item[data-route="#/traffic"]').click()
         expect(page.locator("#boards-view")).to_be_hidden()
         # Deliberately remove only this fixture's file in the private test state.
         board_path = Path(state) / "boards" / "catalog-retired.md"
         assert board_path.is_file(), "Missing disposable catalog-retired backing file"
         board_path.unlink()
         start = sum(path == "/api/boards" for _, path in requests)
-        page.wait_for_timeout(4200)
-        assert sum(path == "/api/boards" for _, path in requests) == start
-        page.locator("#boards-tab").click()
+        # The board view's own 2-4 second discovery stops; elsewhere the sidebar keeps its list fresh with
+        # one light request every ten seconds, so a window of eight seconds holds at most one.
+        page.wait_for_timeout(8200)
+        assert sum(path == "/api/boards" for _, path in requests) - start <= 1, "Discovery kept its board-view cadence while hidden"
+        go(board)
         wait("fresh reentry catalog", lambda: "catalog-retired" not in names())
         release()
         page.wait_for_timeout(100)
@@ -266,7 +281,7 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
         create("catalog-missing")
         request_catalog()
         wait("missing fixture initially listed", lambda: "catalog-missing" in names())
-        page.locator("#board-selector").select_option("catalog-missing")
+        go("catalog-missing")
         expect(page.locator("#selected-board-name")).to_have_text("catalog-missing")
 
         # Deliberately remove only this fixture's file in the private test state.
@@ -350,7 +365,7 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
                 completed += 1
                 twait("n=>window.__catStats.completed===n", arg=completed)
                 assert p.evaluate("window.__catStats.starts.length") == count + 1
-            p.locator("#board-selector").focus()
+            p.locator('#sidebar .nav-item[data-route="#/board/main"]').focus()
             p.evaluate("window.__catOptions=new Map(Array.from(document.querySelector('#board-selector').options,o=>[o.value,o]))")
             for mode in ("malformed", "duplicate", "oversized", "empty", "missing-main"):
                 p.evaluate("mode=>{window.__catMode=mode;window.dispatchEvent(new Event('online'));}", mode)
@@ -360,7 +375,7 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
                 assert p.evaluate("""() => Array.from(window.__catOptions).every(([name,old]) =>
                   Array.from(document.querySelector('#board-selector').options).find(o=>o.value===name)===old)""")
                 expect(p.locator("#board-selector")).to_have_value("main")
-                expect(p.locator("#board-selector")).to_be_focused()
+                expect(p.locator('#sidebar .nav-item[data-route="#/board/main"]')).to_be_focused()
             p.evaluate("window.__catMode='pass';window.dispatchEvent(new Event('online'))")
             completed += 1
             twait("n=>window.__catStats.completed===n", arg=completed)
@@ -378,10 +393,12 @@ def catalog_browser_checks(*, page, context, rpc, state, url, token, record, out
             twait("window.__catStats.aborted===1 && window.__catStats.flight===0")
             assert p.evaluate("window.__catStats.max") == 1
             assert p.evaluate("window.__catStats.starts.length") == count + 1
-            p.locator("#messages-tab").click()
+            p.locator('#sidebar .nav-item[data-route="#/traffic"]').click()
             count = p.evaluate("window.__catStats.starts.length")
             p.clock.run_for(120000)
-            assert p.evaluate("window.__catStats.starts.length") == count
+            # Only the sidebar's light ten-second poll runs away from a board, never the board cadence.
+            assert p.evaluate("window.__catStats.starts.length") - count <= 12
+            assert p.evaluate("window.__catStats.max") == 1
 
     try:
         for label, scenario in [
@@ -465,7 +482,7 @@ def main():
             from playwright.sync_api import sync_playwright
             with sync_playwright() as playwright:
                 home = output / "browser-home"; home.mkdir(mode=0o700)
-                browser = playwright.chromium.launch(headless=True, env={"HOME": str(home), "TMPDIR": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"})
+                browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS, env={"HOME": str(home), "TMPDIR": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"})
                 try:
                     with browser.new_context(viewport={"width": 1200, "height": 900}) as context:
                         page = context.new_page()

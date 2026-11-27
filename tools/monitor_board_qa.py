@@ -10,6 +10,55 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+FETCH_HOOKS = """() => {
+  if (window.__boardOriginalFetch) return;
+  window.__boardOriginalFetch = window.fetch;
+  window.__liveStreams = [];
+  window.fetch = async (input, options = {}) => {
+    const gate = window.__boardGate;
+    const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+    const match = gate && gate.armed && (options.method || 'GET') === gate.method && url.pathname === gate.path;
+    if (match) { gate.armed = false; url.searchParams.delete('if_revision'); input = url.pathname + url.search; }
+    const response = await window.__boardOriginalFetch(input, options);
+    if (url.pathname.endsWith('/events') && url.pathname.startsWith('/api/boards/')) {
+      // The real live stream, passed through unchanged; only the test can end it, as a dropped connection.
+      const reader = response.body.getReader();
+      const body = new ReadableStream({
+        start(controller) { window.__liveStreams.push(controller); },
+        async pull(controller) { const { value, done } = await reader.read(); if (done) controller.close(); else controller.enqueue(value); },
+        cancel(reason) { return reader.cancel(reason); }
+      });
+      return new Response(body, { status: response.status, headers: response.headers });
+    }
+    if (!match) return response;
+    const json = response.json.bind(response);
+    response.json = async () => {
+      const actual = await json();
+      gate.waiting = true;
+      await new Promise(resolve => { gate.release = resolve; });
+      return actual;
+    };
+    return response;
+  };
+}"""
+
+
+def install_fetch_hooks(target):
+    """Idempotent. Must run before the board's live connection is opened (navigate to a board after)."""
+    target.evaluate(FETCH_HOOKS)
+
+
+def drop_live(target):
+    """End the page's live board connection as a network fault: it reconnects and reads the board again."""
+    assert target.evaluate("""() => { const stream = window.__liveStreams?.at(-1);
+      if (!stream) return false; stream.error(new TypeError('QA dropped the live connection')); return true; }"""), \
+        "No live connection was captured; install the fetch hooks before opening the board"
+
+
+# What the page itself loads; any other request from a board document is a leak.
+ASSETS = ("/", "/app.js", "/boards.js", "/topics.js", "/util.js", "/markdown.js", "/theme.js", "/style.css", "/favicon.svg")
+
+
 def board_browser_checks(*, page, browser, context, rpc, state, second_state,
                          url, token, record, output):
     from playwright.sync_api import expect
@@ -22,14 +71,14 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
     def guard(route):
         request = route.request
         path = urlsplit(request.url).path
-        if request.url.startswith(origin + "/") and (path in ("/", "/app.js", "/boards.js", "/style.css")
-                or path.startswith("/api/")):
+        if request.url.startswith(origin + "/") and (path in ASSETS or path.startswith(("/api/", "/fonts/", "/theme-"))):
             route.continue_()
         else:
             unexpected.append(request.url)
             route.abort()
 
     page.route("**/*", guard)
+    install_fetch_hooks(page)
 
     def read(name):
         return rpc(state, "named_board_read", board=name)
@@ -63,10 +112,23 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         assert snapshot["last_updated"] == read(name)["last_updated"]
         return snapshot["last_updated"]
 
+    def expected_document_width():
+        """The document uses the whole board area (the page caps a reading column at 960px): no column is
+        reserved for an unused response panel or sidebar."""
+        return page.evaluate("""() => {
+          const area = document.querySelector('.board-scroll'), style = getComputedStyle(area);
+          return Math.min(960, area.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
+        }""")
+
+    def go(name):
+        """Navigate to a board the way a person does: its sidebar item (hash route #/board/<name>)."""
+        page.locator(f'#sidebar .nav-item[data-route="#/board/{name}"]').click()
+
+    def open_traffic():
+        page.locator('#sidebar .nav-item[data-route="#/traffic"]').click()
+
     def pick(name):
-        if page.locator("#boards-view").is_hidden():
-            page.locator("#boards-tab").click()
-        page.locator("#board-selector").select_option(name)
+        go(name)
         expect(page.locator("#selected-board-name")).to_have_text(name)
         wait("selected board snapshot", lambda: page.locator("#board-raw").text_content() == read(name)["markdown"])
         wait("board controls loaded", lambda: page.locator("#board-document .board-control").count() > 0)
@@ -79,39 +141,18 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         wait("response persisted", lambda: "> " + value in read("alpha")["markdown"])
         expect(page.locator("#response-text")).to_be_hidden()
 
-    def refresh():
-        page.locator("#board-refresh").click()
-        expect(page.locator("#board-error")).to_be_hidden()
-
     def install_gate(target=page):
-        target.evaluate("""() => {
-          if (window.__boardOriginalFetch) return;
-          window.__boardOriginalFetch = window.fetch;
-          window.fetch = async (input, options = {}) => {
-            const gate = window.__boardGate;
-            const url = new URL(typeof input === 'string' ? input : input.url, location.href);
-            const match = gate && gate.armed && (options.method || 'GET') === gate.method && url.pathname === gate.path;
-            if (match) { gate.armed = false; url.searchParams.delete('if_revision'); input = url.pathname + url.search; }
-            const response = await window.__boardOriginalFetch(input, options);
-            if (!match) return response;
-            const json = response.json.bind(response);
-            response.json = async () => {
-              const actual = await json();
-              gate.waiting = true;
-              await new Promise(resolve => { gate.release = resolve; });
-              return actual;
-            };
-            return response;
-          };
-        }""")
+        install_fetch_hooks(target)
 
     def arm_gate(name, target=page, method="GET"):
+        """Hold the next real response's JSON after it is decoded. A GET is provoked by dropping the live
+        connection: the page reconnects and then reads the board again, with unchanged content."""
         install_gate(target)
         path = "/api/boards/" + name + ("/responses" if method == "POST" else "")
         target.evaluate("spec => { window.__boardGate = {...spec, armed:true, waiting:false}; }",
                         {"path": path, "method": method})
         if method == "GET":
-            target.locator("#board-refresh").click()
+            drop_live(target)
 
     def gate_wait(target=page):
         deadline = time.monotonic() + 15
@@ -146,7 +187,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         for name, markdown in (("alpha", alpha), ("beta", beta)):
             rpc(state, "board_create", board=name)
             write(name, markdown)
-        page.locator("#boards-tab").click()
+        go("main")
         expect(page.locator("#selected-board-name")).to_have_text("main")
         expect(page.locator("#board-document")).to_contain_text("has not been written")
         expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_hidden()
@@ -163,8 +204,12 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         expect(page.locator("#board-document")).to_contain_text("This board is empty.")
         before = {name: read(name) for name in ("main", "alpha", "beta")}
         record("creating virtual empty main refreshes authoritative live metadata without changing Markdown or its content revision")
+        # Discovery polls the catalog every few seconds; the sidebar mirrors the (hidden) selector.
+        wait("catalog lists the created boards", lambda: page.locator("#board-selector option").all_text_contents() == ["alpha", "beta", "main"])
         names = page.locator("#board-selector option").all_text_contents()
-        assert names == sorted(names) and names == ["alpha", "beta", "main"]
+        assert names == sorted(names)
+        board_items = page.locator('#sidebar .nav-item[data-route^="#/board/"] .grow').all_text_contents()
+        assert board_items == names, board_items
         pick("alpha")
         footer_matches("alpha")
         expect(page.locator("#board-document h1")).to_have_text("Alpha 世界")
@@ -202,9 +247,8 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         }""")
         assert page.evaluate("typeof window.boardPwned") == "undefined"
         assert not page.locator('#board-document a[href^="javascript:"], #board-document a[href^="data:"]').count()
-        page.locator("#board-raw-toggle").click()
+        # The exact source is kept beside the rendered document (hidden: the page has no raw view).
         assert page.locator("#board-raw").text_content() == alpha
-        page.locator("#board-raw-toggle").click()
         for name in before:
             assert read(name) == before[name], "Loading or rendering wrote the board"
         record("boards list virtual main and named documents deterministically; safe Markdown/raw/control metadata render without writes/resources")
@@ -212,16 +256,14 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         # Read-only documents should have the same space as editable boards,
         # without reserving a column or displaying an empty Responses panel.
         write("main", "# Ticket board\n\n| Ticket | Status |\n| --- | --- |\n| AGB-12 | Done |\n")
-        page.locator("#board-selector").select_option("main")
+        go("main")
         expect(page.locator("#board-document h1")).to_have_text("Ticket board")
         expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_hidden()
         page.set_viewport_size({"width": 1440, "height": 1000})
-        page.evaluate("window.scrollTo(0, 0)")
         document = page.locator(".board-document-panel").bounding_box()
-        board_view = page.locator("#boards-view").bounding_box()
-        assert document and board_view
+        assert document
         assert document["y"] < 230, "Board content is pushed below excessive header space"
-        assert abs(document["width"] - board_view["width"]) <= 2, "Board loses width to an unused sidebar"
+        assert abs(document["width"] - expected_document_width()) <= 2, "Board loses width to an unused sidebar"
         page.screenshot(path=str(output / "boards-read-only-desktop.png"), full_page=True)
         pick("alpha")
         expect(page.locator('.board-responses[aria-labelledby="responses-heading"]')).to_be_hidden()
@@ -278,10 +320,10 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         for destination in ("board", "messages", "lock"):
             edit("keep draft " + destination)
             page.evaluate("location.hash = 'access_token=' + 'x'.repeat(43)")
-            wait("active-session fragment cleared", lambda: not urlsplit(page.url).fragment)
+            wait("active-session fragment cleared", lambda: "access_token" not in page.url and urlsplit(page.url).fragment == "/board/alpha")
             expect(page.locator("#response-text")).to_have_value("keep draft " + destination)
-            if destination == "board": page.locator("#board-selector").select_option("beta")
-            elif destination == "messages": page.locator("#messages-tab").click()
+            if destination == "board": go("beta")
+            elif destination == "messages": open_traffic()
             else: page.locator("#lock-button").click()
             expect(page.locator("#unsaved-dialog")).to_be_visible()
             page.locator("#unsaved-cancel").click()
@@ -289,11 +331,11 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             expect(page.locator("#selected-board-name")).to_have_text("alpha")
             page.locator("#response-cancel").click()
         edit("discard draft")
-        page.locator("#board-selector").select_option("beta"); page.locator("#unsaved-discard").click()
+        go("beta"); page.locator("#unsaved-discard").click()
         expect(page.locator("#selected-board-name")).to_have_text("beta")
         pick("alpha"); edit("save before navigation")
-        page.locator("#messages-tab").click(); page.locator("#unsaved-save").click()
-        expect(page.locator("#messages-view")).to_be_visible(); saved("save before navigation")
+        open_traffic(); page.locator("#unsaved-save").click()
+        expect(page.locator("#traffic-view")).to_be_visible(); saved("save before navigation")
         pick("alpha")
         record("dirty board/view/lock cancellation preserves drafts; explicit discard and successful save-before-navigation work")
 
@@ -344,8 +386,11 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         page.locator("#response-save").click(); expect(page.locator("#response-review")).to_be_visible()
         page.locator("#response-review").click(); expect(page.locator("#response-rebase")).to_be_hidden()
         expect(page.locator("#response-text")).to_have_value("deleted field draft"); page.locator("#response-cancel").click()
-        write("alpha", alpha); refresh()
+        # The page shows the board without the deleted field; only the re-read after this write can bring it back.
+        expect(page.locator("#board-document .board-inline-text")).to_have_count(0)
+        write("alpha", alpha)
         expect(page.locator("#board-document .board-inline-text")).to_be_visible()
+        wait("re-read shows the written Markdown", lambda: page.locator("#board-raw").text_content() == alpha)
         record("revision conflicts retain intent; explicit unchanged-field rebase is revision-reviewed; changed/deleted fields require reopening")
 
         # The real POST commits before its JSON continuation is released. While
@@ -359,9 +404,9 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         expect(page.locator('#board-document input[type="checkbox"]')).to_be_disabled()
         expect(page.locator("#response-text")).to_be_disabled()
         page.locator("#response-save").evaluate("button => { button.click(); button.click(); }")
-        page.locator("#board-selector").select_option("beta")
+        go("beta")
         expect(page.locator("#selected-board-name")).to_have_text("alpha")
-        page.locator("#messages-tab").click()
+        open_traffic()
         expect(page.locator("#boards-view")).to_be_visible()
         page.locator("#lock-button").click()
         expect(page.locator("#workspace")).to_be_visible()
@@ -379,9 +424,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         arm_gate("alpha"); gate_wait()
         page.locator("#response-save").click(); saved("fresh save beats old GET")
         release_gate(); page.wait_for_timeout(150)
-        page.locator("#board-raw-toggle").click()
         assert "fresh save beats old GET" in page.locator("#board-raw").text_content()
-        page.locator("#board-raw-toggle").click()
         record("a delayed actual pre-save GET JSON continuation cannot overwrite a successful save")
 
         edit("committed uncertain response")
@@ -403,7 +446,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         record("real committed POST with lost response retains intent, requires readback/review and never automatically retries")
 
         arm_gate("alpha"); gate_wait()
-        page.locator("#board-selector").select_option("beta")
+        go("beta")
         expect(page.locator("#selected-board-name")).to_have_text("beta")
         expect(page.locator("#board-document h1")).to_have_text("Beta")
         release_gate(); page.wait_for_timeout(150)
@@ -419,6 +462,9 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         assert not page.locator("#response-text").input_value()
         assert page.locator("#response-text").get_attribute("aria-label") in (None, "", "Response"), "Lock retained the private response question in its accessible name"
         assert not page.locator("#board-last-updated").text_content()
+        # The new generation opens the board named in the address, so address another board than the
+        # one whose old response is still held.
+        page.evaluate("location.hash = '#/board/main'")
         page.locator("#access-token").fill(token); page.locator("#login-form button[type=submit]").click()
         expect(page.locator("#boards-view")).to_be_visible()
         expect(page.locator("#selected-board-name")).to_have_text("main")
@@ -432,32 +478,29 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         pick("alpha")
         # A temporary read failure retains existing private content and recovers.
         page.route("**/api/boards/alpha*", lambda route: route.abort("failed"), times=1)
-        page.locator("#board-refresh").click()
+        drop_live(page)
         expect(page.locator("#board-status")).to_contain_text("Stale")
         expect(page.locator("#board-document h1")).to_have_text("Alpha 世界")
         expect(page.locator("#board-error")).to_be_hidden(timeout=15000)
-        page.locator("#board-selector").focus(); page.keyboard.press("Tab")
-        assert page.locator("#board-refresh").evaluate("e => e === document.activeElement")
         page.locator("#board-document .board-inline-text").focus()
         expect(page.locator("#response-text")).to_be_focused()
         page.locator("#response-text").fill("keyboard draft"); page.keyboard.press("Tab")
         expect(page.locator("#response-save")).to_be_focused()
-        page.locator("#messages-tab").click(); page.keyboard.press("Escape")
+        open_traffic(); expect(page.locator("#unsaved-dialog")).to_be_visible(); page.keyboard.press("Escape")
         expect(page.locator("#response-text")).to_have_value("keyboard draft")
         page.locator("#response-cancel").click()
-        for width, height, filename in ((1440, 1000, "boards-desktop.png"), (320, 844, "boards-mobile.png")):
+        for width, height, filename in ((1440, 1000, "boards-desktop.png"), (390, 844, "boards-mobile.png")):
             page.set_viewport_size({"width": width, "height": height})
-            page.evaluate("window.scrollTo(0, 0)")
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1"), "Page overflow hides response controls"
             document = page.locator(".board-document-panel").bounding_box()
             responses = page.locator("#board-document .board-inline-text").bounding_box()
-            board_view = page.locator("#boards-view").bounding_box()
-            assert document and responses and board_view
-            assert abs(document["width"] - board_view["width"]) <= 2, "Editable board reserves document width for responses"
+            assert document and responses
+            assert abs(document["width"] - expected_document_width()) <= 2, "Editable board reserves document width for responses"
             assert responses["y"] >= document["y"] and responses["y"] < document["y"] + document["height"], "Response is outside the document"
             if width >= 1000:
                 assert document["y"] < 230, "Editable board content is pushed below excessive header space"
             page.screenshot(path=str(output / filename), full_page=True)
+        page.set_viewport_size({"width": 1440, "height": 1000})  # on a phone the sidebar is off screen
         assert page.evaluate("localStorage.length + sessionStorage.length") == 0
         assert context.cookies() == []
         assert not unexpected, unexpected
@@ -473,11 +516,12 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         second = rpc(second_state, "monitor_enable", port=0)
         isolated = browser.new_context()
         try:
-            other = isolated.new_page(); other.goto(second["url"])
+            other = isolated.new_page()
+            other.add_init_script("(" + FETCH_HOOKS + ")()")
+            other.goto(second["url"])
             other.locator("#access-token").fill(second["access_token"])
             other.locator("#login-form button[type=submit]").click()
             expect(other.locator("#workspace")).to_be_visible()
-            other.locator("#boards-tab").click()
             expect(other.locator("#board-selector option")).to_have_count(1)
             expect(other.locator("#board-raw")).to_contain_text("REVOKED_PRIVATE_BOARD_DATA")
             other.locator("#board-document .board-inline-text").focus()
@@ -519,7 +563,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
             expect(local.locator("#boards-view")).to_be_visible()
             expect(local.locator("#board-raw")).to_have_text(read("main")["markdown"])
             expect(local.locator("#board-status")).to_contain_text("Live")
-            local.locator("#board-selector").select_option("timezone")
+            local.locator('#sidebar .nav-item[data-route="#/board/timezone"]').click()
             expect(local.locator("#selected-board-name")).to_have_text("timezone")
             expect(local.locator("#board-document h1")).to_have_text("Timestamp baseline")
             expect(local.locator("#board-status")).to_contain_text("Live")
@@ -537,9 +581,7 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
                 assert any(value in footer.inner_text() for value in zone), footer.inner_text()
                 actual = api_view("timezone")
                 assert actual["last_updated"] == stamp == read("timezone")["last_updated"]
-                local.locator("#board-raw-toggle").click()
                 expect(footer).to_be_visible()
-                local.locator("#board-raw-toggle").click()
             # Freeze old January body/time/code together while July arrives.
             local.evaluate("""() => {
               window.__timestampCopy = [];
@@ -592,8 +634,8 @@ def board_browser_checks(*, page, browser, context, rpc, state, second_state,
         finally:
             zoned.close()
         record("authoritative footer follows actual saves/external edits, holds with selected content, clears on lock and displays Sydney winter/summer offsets without changing UTC metadata")
-        page.locator("#messages-tab").click()
-        expect(page.locator("#messages-view")).to_be_visible()
+        open_traffic()
+        expect(page.locator("#traffic-view")).to_be_visible()
     finally:
         page.unroute("**/*", guard)
         # Never leave a deliberate JSON-decode gate suspended after assertions.
@@ -637,9 +679,8 @@ def inline_control_checks(*, page, context, rpc, state, origin, token, record, o
 
     rpc(state, "board_create", board=name)
     write(source)
-    page.locator("#messages-tab").click()
-    page.locator("#boards-tab").click()
-    page.locator("#board-selector").select_option(name)
+    page.locator('#sidebar .nav-item[data-route="#/traffic"]').click()
+    page.locator('#sidebar .nav-item[data-route="#/board/' + name + '"]').click()
     expect(page.locator("#board-document h1")).to_have_text("Inline controls 世界")
     controls = view()["controls"]
     assert [c.get("field_id") for c in controls if c["kind"] == "text"] == ["first", "second"]
@@ -652,9 +693,7 @@ def inline_control_checks(*, page, context, rpc, state, origin, token, record, o
         assert value in visible, value
     assert "first original" not in visible and "second original" not in visible
     assert page.evaluate("typeof window.boardPwned") == "undefined"
-    page.locator("#board-raw-toggle").click()
     assert page.locator("#board-raw").text_content() == source
-    page.locator("#board-raw-toggle").click()
 
     before = read()
     field("second").locator(".board-inline-text").focus()
@@ -690,17 +729,16 @@ def inline_control_checks(*, page, context, rpc, state, origin, token, record, o
     expect(field("second").locator(".board-inline-text")).to_be_disabled()
     assert not page.locator("#board-controls textarea:visible").count(), "Ordinary editor duplicated in fallback panel"
     page.locator("#response-text").evaluate("e => e.setSelectionRange(5,9)")
-    page.evaluate("window.scrollTo(0, 240)")
-    scroll = page.evaluate("scrollY")
+    # The page itself never scrolls; the board scrolls inside its pane.
+    page.evaluate("document.querySelector('.board-scroll').scrollTop = 240")
+    scroll = page.evaluate("document.querySelector('.board-scroll').scrollTop")
+    assert scroll > 0, "The fixture does not scroll, so the position check proves nothing"
     write(read()["markdown"] + "External tail update\r\n")
     expect(page.locator("#board-newer")).to_be_visible(timeout=15000)
     expect(page.locator("#response-text")).to_have_value("live draft with caret")
     expect(page.locator("#response-text")).to_be_focused()
     assert page.locator("#response-text").evaluate("e => [e.selectionStart,e.selectionEnd]") == [5, 9]
-    assert page.evaluate("scrollY") == scroll
-    page.locator("#board-raw-toggle").click()
-    expect(page.locator("#response-text")).to_have_value("live draft with caret")
-    page.locator("#board-raw-toggle").click()
+    assert page.evaluate("document.querySelector('.board-scroll').scrollTop") == scroll
     page.locator("#response-save").click()
     expect(page.locator("#response-review")).to_be_visible()
     page.locator("#response-review").click()
@@ -710,7 +748,20 @@ def inline_control_checks(*, page, context, rpc, state, origin, token, record, o
     expect(page.locator("#response-text")).to_have_value("live draft with caret")
     page.locator("#response-cancel").click()
     # Explicit same-revision refresh must leave newly mapped inline handlers live.
-    page.locator("#board-refresh").click()
+    # The page reconnects after a short back-off and then reads the board again: wait for that read, so
+    # the checks below run after the newly mapped handlers exist rather than before the read began.
+    reads = []
+    watch = lambda request: reads.append(request.url) if request.method == "GET" and urlsplit(request.url).path == "/api/boards/" + name else None
+    page.on("request", watch)
+    try:
+        drop_live(page)
+        deadline = time.monotonic() + 20
+        while not reads and time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+        assert reads, "The page did not read the board again after its live connection dropped"
+    finally:
+        page.remove_listener("request", watch)
+    expect(page.locator("#board-status")).to_contain_text("Live")
     expect(field("first").locator(".board-inline-text")).to_be_enabled()
     field("first").locator(".board-inline-text").focus()
     expect(page.locator("#response-text")).to_be_focused()
@@ -719,7 +770,7 @@ def inline_control_checks(*, page, context, rpc, state, origin, token, record, o
     field("first").locator(".board-inline-text").focus()
     expect(page.locator("#response-text")).to_be_focused()
     page.locator("#response-cancel").click()
-    for width in (1440, 320):
+    for width in (1440, 390):
         page.set_viewport_size({"width": width, "height": 844})
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
         alignment = page.locator('#board-document input[type="checkbox"]').evaluate_all("""inputs => inputs.map(input => {
@@ -748,4 +799,4 @@ def inline_control_checks(*, page, context, rpc, state, origin, token, record, o
                 f"Checkbox does not precede its source label at {width}px: {item}")
         page.screenshot(path=str(output / f"boards-inline-{width}.png"), full_page=True)
     page.set_viewport_size({"width": 1440, "height": 1000})
-    record("inline draft focus, selection range and page scroll survive real live edits and raw-view changes; checkboxes sit alongside source labels and controls fit narrow and desktop layouts")
+    record("inline draft focus, selection range and page scroll survive real live edits; checkboxes sit alongside source labels and controls fit narrow and desktop layouts")

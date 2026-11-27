@@ -23,7 +23,8 @@ the browser's local timezone, including DST; missing/unreliable times show Unkno
 Snapshots, conditional responses and successful saves retain `last_updated_source`
 (`file_mtime` or `unknown`). Selected-board events also carry existence and time
 metadata, so explicitly creating empty `main` refreshes its footer even though its
-content revision stays unchanged. Refresh uses the existing bounded read/reconnect
+content revision stays unchanged. The page has no Refresh button: it reads the board again when
+that event arrives and, after its live connection drops, through the existing bounded reconnect
 path. A draft or selected old document keeps its
 matching timestamp until the new content is reviewed; locking or changing boards
 clears the old footer. Sending a message never updates board content time.
@@ -503,17 +504,51 @@ left directly in it (`state`, `home`, `bin`, `s` and `broker.log`), removes any 
 (never what it points to), and overwrites the copied binary and the screenshots. A directory that has other contents and no such file, a symbolic link, a file, or a `--binary`
 inside the directory (other than the copy an earlier run made) is refused with a message and exit status 2,
 and nothing is touched. If the broker fails to start, the run stops it before it exits. The path must be short
-enough for the broker's Unix socket path. It is not run in CI. The older harnesses in
-`tools/` (`test_monitor.py --browser`, `monitor_board_qa.py` and related scripts) drive the element
-ids of the tabbed interface of earlier releases and have not yet been ported to this one; their
-HTTP and API checks still apply.
+enough for the broker's Unix socket path. It is not run in CI.
+
+Four further manual harnesses in `tools/` cover behaviour the theme test does not: the board drafts,
+rebase, archive and restore flows, catalog discovery, code copy, message send and retry, and topic
+publishing. Each starts its own disposable broker with a throwaway state directory, drives Chromium
+through the same sidebar and `#/board/<name>` address routes a person uses (they pass
+`--use-mock-keychain --password-store=basic`, and read the page through `page.evaluate` because the
+content-security policy blocks `wait_for_function`), and needs Python 3.11 or newer with Playwright and
+a matching Chromium. Run them from the repository root against a binary built from the same tree, each
+with a new, short output directory (the archive harness refuses an existing one), never against a running
+owner service. None runs in CI.
+
+```sh
+cargo build --locked
+python3 tools/test_monitor.py --binary ./target/debug/agent-bridge --browser --output /tmp/agb-monitor
+python3 tools/monitor_catalog_qa.py --binary ./target/debug/agent-bridge --output /tmp/agb-catalog
+python3 tools/monitor_board_archive_qa.py --binary "$PWD/target/debug/agent-bridge" \
+  --binary-sha256 "$(shasum -a 256 target/debug/agent-bridge | cut -d' ' -f1)" \
+  --source-checkpoint "$(git rev-parse HEAD)" --output "$HOME/agb-archive"
+python3 tools/test_topics_browser.py ./target/debug/agent-bridge /tmp/agb-topics
+```
+
+- `test_monitor.py` checks the message API (authentication, origins, filters, historical session pinning,
+  the live stream, credential rotation) with a real loopback peer exchange, and with `--browser` the
+  private-link unlock, All traffic with the details panel and live delivery-state changes, and then
+  runs the board, code-copy and message checks (`monitor_board_qa.py`, `monitor_code_copy_qa.py` and
+  `monitor_message_qa.py` have no command line of their own; they run from here).
+- `monitor_catalog_qa.py` (also run by `test_monitor.py --browser`) checks automatic board discovery, its cadence, back-off, timeout and
+  single flight, and that a late old response never replaces the current list.
+- `monitor_board_archive_qa.py` checks Archive, Restore and the Archived boards dialog, including held
+  and dropped real responses. It refuses a binary whose hash differs from `--binary-sha256`.
+- `test_topics_browser.py` checks topic create, rename, archive and restore, publish, reply, mention,
+  retry after a lost response, loading older posts, locking with a publish in flight, and a broker restart.
+
+The page has no Refresh button, Raw Markdown view or board dropdown; these harnesses read the exact
+Markdown the page keeps (in its hidden `#board-raw`), provoke a re-read by dropping the live connection or
+editing the board, and use the sidebar to open boards and topics.
 
 ## Message agents from the board
 
 Recognized message-input declarations are hidden in the rendered document and
-remain byte-for-byte available in Raw Markdown. Malformed or unrecognized text
-remains visible and inert. Agent-authored message inputs show their label and exact pinned recipient
-(name, provider, session and endpoint). Use Tab/Shift+Tab to reach or leave an
+remain byte-for-byte in the board's Markdown source (the page has no Raw Markdown view; read it with
+`agent-bridge board <name> --raw`). Malformed or unrecognized text remains visible and inert. Each message
+input is labelled with the broker's resolved name of its exact pinned recipient, never an ID (a session
+without a name shows "Claude" and the last four characters of its ID). Use Tab/Shift+Tab to reach or leave an
 input. Enter sends; Shift+Enter inserts a newline. IME composition Enter does not
 send, and blank text is not submitted. A Send button is also available. The
 composer keeps focus after acceptance and remains available for another message.

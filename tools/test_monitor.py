@@ -22,6 +22,9 @@ from urllib.parse import urlencode, urlsplit
 import uuid
 
 
+# Without these macOS shows the owner a "Chrome Safe Storage" keychain prompt.
+CHROMIUM_ARGS = ["--use-mock-keychain", "--password-store=basic"]
+
 def wait(label, check, seconds=35):
     until = time.monotonic() + seconds
     last = None
@@ -53,6 +56,13 @@ def main():
     results = {"scope": "isolated local brokers and real loopback P2P; no model calls",
                "binary_sha256": digest, "checks": [], "browser_requested": args.browser}
     processes, files, environments = [], [], {}
+    # A stand-in `claude` on the brokers' PATH answers `claude agents --json` with the file below, which is how
+    # the broker names Claude sessions (the board message composers show those names).
+    claude_bin, claude_names = output / "claude-bin", output / "claude-names.json"
+    claude_bin.mkdir(mode=0o700)
+    claude_names.write_text("[]")
+    (claude_bin / "claude").write_text(f"#!/bin/sh\ncat '{claude_names}'\n")
+    (claude_bin / "claude").chmod(0o700)
 
     def record(name, **details):
         results["checks"].append({"check": name, "passed": True, **details})
@@ -74,7 +84,7 @@ def main():
         state.mkdir(mode=0o700)
         home = output / (name + "-home")
         home.mkdir(mode=0o700)
-        environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        environment = {"PATH": f"{claude_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
                        "HOME": str(home), "LANG": "C.UTF-8"}
         for variable, relative in [("XDG_CONFIG_HOME", ".config"),
                                    ("XDG_DATA_HOME", ".local/share"),
@@ -126,6 +136,16 @@ def main():
     def received(state, body):
         return wait("inbox message", lambda: next((message for message in rpc(
             state, "history", agent=None, limit=100) if message["body"] == body), None))
+
+    def clean_address(address, secret):
+        """The address is the page itself (optionally with a route), never carrying a token."""
+        parts = urlsplit(address)
+        return (parts.path == "/" and not parts.query and secret not in address and "access_token" not in address
+                and parts.fragment in ("", "/board/main"))
+
+    def open_traffic(page):
+        page.locator('#sidebar .nav-item[data-route="#/traffic"]').click()
+        page.locator("#traffic-view").wait_for(state="visible")
 
     def opened_stream(url, token):
         address = urlsplit(url)
@@ -272,26 +292,23 @@ def main():
         rpc(a, "machine_set_name", name="monitor-a")
         rpc(b, "machine_set_name", name="monitor-b")
         for name in ["speaker", "listener"]:
-            rpc(a, "register", agent={"name": name, "provider": "inbox", "session": name + "-original",
-                                      "endpoint": "", "enabled": True}, replace=False)
+            rpc(a, "register", name=name, provider="inbox", session=name + "-original", replace=False)
         local_body = "LOCAL_MONITOR_OK\n<img src=x onerror=window.monitorPwned=1> & literal text"
         local_id = send(a, "listener", local_body, sender="speaker")
-        wait("local submitted", lambda: rpc(a, "get", id=local_id)["state"] == "submitted")
-        rpc(a, "ack", id=local_id, agent="listener")
+        wait("local delivered", lambda: rpc(a, "get", id=local_id)["state"] == "delivered")
         row = next(row for row in messages(url, token) if row["id"] == local_id)
         assert row["direction"] == "local"
         assert row["source"]["session"] == "speaker-original"
         assert row["destination"]["session"] == "listener-original"
-        assert row["state"] == "acknowledged"
+        assert row["state"] == "delivered"
         assert row["source"]["machine_name"] == "monitor-a"
-        rpc(a, "register", agent={"name": "listener", "provider": "inbox", "session": "listener-replaced",
-                                   "endpoint": "", "enabled": True}, replace=True)
+        rpc(a, "register", name="listener", provider="inbox", session="listener-replaced", replace=True)
         row = api(url, token, "/api/messages/" + local_id)["message"]
         assert row["destination"]["session"] == "listener-original"
         assert row["body"] == local_body
         assert any(message["id"] == local_id for message in messages(url, token, agent="speaker"))
         assert not messages(url, token, agent="does-not-exist")
-        assert any(message["id"] == local_id for message in messages(url, token, machine="monitor-a", state="acknowledged"))
+        assert any(message["id"] == local_id for message in messages(url, token, machine="monitor-a", state="delivered"))
         assert not messages(url, token, since=row["created"] + 1)
         assert not messages(url, token, until=row["created"] - 1)
         record("local history shows exact sessions/body/state and filters; replacement cannot rewrite historical session")
@@ -309,11 +326,9 @@ def main():
         wait("remote directory", lambda: rpc(a, "remote_list"))
         outbound_id = send(a, "bob/user", "P2P_MONITOR_OUTBOUND")
         inbound_b = received(b, "P2P_MONITOR_OUTBOUND")
-        rpc(b, "ack", id=inbound_b["id"], agent="user")
-        wait("remote ACK", lambda: rpc(a, "get", id=outbound_id)["state"] == "acknowledged")
+        wait("remote delivery", lambda: rpc(a, "get", id=outbound_id)["state"] == "delivered")
         reply_id = send(b, "alice/user", "P2P_MONITOR_REPLY", parent=inbound_b["id"])
         inbound_a = received(a, "P2P_MONITOR_REPLY")
-        rpc(a, "ack", id=inbound_a["id"], agent="user")
         rows = messages(url, token)
         outgoing = next(message for message in rows if message["id"] == outbound_id)
         incoming = next(message for message in rows if message["id"] == inbound_a["id"])
@@ -325,7 +340,7 @@ def main():
         assert incoming["parent"]["local_id"] == outbound_id
         detail = api(url, token, "/api/messages/" + outbound_id)
         assert any(message["id"] == inbound_a["id"] for message in detail["related"])
-        record("real P2P inbox exchange and ACK/reply correlation show pinned machine/session provenance")
+        record("real P2P inbox exchange and delivery/reply correlation show pinned machine/session provenance")
 
         # Streams contain only invalidation revisions, never messages or auth material.
         stream, response = opened_stream(url, token)
@@ -345,7 +360,7 @@ def main():
             with sync_playwright() as playwright, ExitStack() as cleanup:
                 browser_home = output / "browser-home"
                 browser_home.mkdir(mode=0o700)
-                browser = playwright.chromium.launch(headless=True, env={
+                browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS, env={
                     "HOME": str(browser_home), "TMPDIR": str(browser_home),
                     "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"})
                 cleanup.callback(browser.close)
@@ -357,8 +372,8 @@ def main():
                         (request.url, request.headers.get("referer", ""))))
                     linked_page.goto(access_url)
                     linked_page.locator("#boards-view").wait_for(state="visible")
-                    linked_page.locator("#board-selector option").first.wait_for(state="attached")
-                    assert linked_page.url == url.rstrip("/") + "/"
+                    linked_page.locator("#sidebar .nav-item").first.wait_for()
+                    assert clean_address(linked_page.url, token)
                     assert linked_page.locator("#access-token").input_value() == ""
                     assert linked_page.evaluate("localStorage.length + sessionStorage.length") == 0
                     assert linked_context.cookies() == []
@@ -369,12 +384,12 @@ def main():
                     assert linked_page.locator("#workspace").is_hidden()
                     linked_page.goto(url + "#access_token=" + "x" * 43)
                     linked_page.locator("#login-error").wait_for(state="visible")
-                    assert linked_page.url == url.rstrip("/") + "/"
+                    assert clean_address(linked_page.url, "x" * 43)
                     assert linked_page.locator("#workspace").is_hidden()
                     assert linked_page.locator("#access-token").input_value() == ""
                     linked_page.goto(access_url)
                     linked_page.locator("#boards-view").wait_for(state="visible")
-                    assert linked_page.url == url.rstrip("/") + "/"
+                    assert clean_address(linked_page.url, token)
                 record("private fragment link unlocks Boards, clears URL/input, avoids request/referrer/storage leaks; reload and invalid link stay locked")
                 context = browser.new_context(viewport={"width": 1440, "height": 1000})
                 cleanup.callback(context.close)
@@ -388,10 +403,10 @@ def main():
                 page.locator("#login-form button[type=submit]").click()
                 page.locator("#workspace").wait_for(state="visible")
                 page.locator("#boards-view").wait_for(state="visible")
-                assert page.locator("#boards-tab").get_attribute("aria-pressed") == "true"
-                assert page.locator("#messages-view").is_hidden()
-                record("unlock opens Boards as the default page")
-                page.locator("#messages-tab").click()
+                assert page.locator("#sidebar .nav-item[aria-current=page]").get_attribute("data-route") == "#/board/main"
+                assert page.locator("#traffic-view").is_hidden()
+                record("unlock opens the main board as the default page")
+                open_traffic(page)
                 page.get_by_text("LOCAL_MONITOR_OK", exact=False).first.wait_for()
                 assert page.evaluate("typeof window.monitorPwned") == "undefined"
                 assert page.evaluate("localStorage.length + sessionStorage.length") == 0
@@ -399,61 +414,69 @@ def main():
                 live_id = send(a, "user", "BROWSER_LIVE_MONITOR_OK", sender="speaker")
                 page.get_by_text("BROWSER_LIVE_MONITOR_OK", exact=False).first.wait_for(timeout=15000)
                 page.locator(f'.message-row[data-id="{local_id}"]').click()
-                page.locator("#detail-content pre.body-text").get_by_text(local_body, exact=True).wait_for()
-                assert "listener-original" in page.locator("#detail-content").inner_text()
-                assert "listener-replaced" not in page.locator("#detail-content").inner_text()
+                page.locator("#panel-body pre.body-text").get_by_text(local_body, exact=True).wait_for()
+                assert "listener-original" in page.locator("#panel-body").inner_text()
+                assert "listener-replaced" not in page.locator("#panel-body").inner_text()
                 page.evaluate("""id => {
                   window.__stableMessage = document.querySelector(`.message-row[data-id="${id}"]`);
-                  window.__stableBody = document.querySelector('#detail-content pre.body-text');
+                  window.__stableBody = document.querySelector('#panel-body pre.body-text');
                   const range = document.createRange(); range.selectNodeContents(window.__stableBody);
                   const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
                   window.__stableBodyText = selection.toString();
                   window.__steadyMutations = [];
                   window.__steadyObserver = new MutationObserver(records => window.__steadyMutations.push(...records));
-                  window.__steadyObserver.observe(document.getElementById('detail-content'), {childList:true,subtree:true});
+                  window.__steadyObserver.observe(document.getElementById('panel-body'), {childList:true,subtree:true});
                 }""", local_id)
                 send(a, "user", "STEADY_LIVE_UPDATE", sender="speaker")
                 page.get_by_text("STEADY_LIVE_UPDATE", exact=False).first.wait_for(timeout=15000)
                 page.wait_for_timeout(500)
                 assert page.evaluate('id => window.__stableMessage === document.querySelector(`.message-row[data-id="${id}"]`)', local_id)
-                assert page.evaluate("window.__stableBody === document.querySelector('#detail-content pre.body-text')")
+                assert page.evaluate("window.__stableBody === document.querySelector('#panel-body pre.body-text')")
                 assert page.evaluate("getSelection().toString() === window.__stableBodyText")
                 assert page.evaluate("window.__steadyMutations.length") == 0, "Unchanged detail was rebuilt during live refresh"
                 page.evaluate("() => { window.__steadyObserver.disconnect(); getSelection().removeAllRanges(); }")
+                # A real state change: a message sent while the broker is paused stays pending and is
+                # delivered when the broker resumes.
+                rpc(a, "pause", paused=True)
                 state_id = send(a, "listener", "STEADY_STATE_CHANGE", sender="speaker")
                 state_row = page.locator(f'.message-row[data-id="{state_id}"]')
                 state_row.wait_for()
+                state_row.locator(".state-badge.pending").wait_for(timeout=15000)
                 state_row.click()
-                page.locator("#detail-content pre.body-text").get_by_text("STEADY_STATE_CHANGE", exact=True).wait_for()
+                page.locator("#panel-body pre.body-text").get_by_text("STEADY_STATE_CHANGE", exact=True).wait_for()
+                page.locator("#panel-body .detail-header .state-badge.pending").wait_for(timeout=15000)
                 page.evaluate("""id => {
                   window.__stateRow = document.querySelector(`.message-row[data-id="${id}"]`);
-                  window.__stateBody = document.querySelector('#detail-content pre.body-text');
+                  window.__stateBody = document.querySelector('#panel-body pre.body-text');
                   window.__stateRow.focus();
                 }""", state_id)
-                rpc(a, "ack", id=state_id, agent="listener")
-                state_row.locator(".state-badge.acknowledged").wait_for(timeout=15000)
-                page.locator("#detail-content .detail-header .state-badge.acknowledged").wait_for(timeout=15000)
+                rpc(a, "pause", paused=False)
+                state_row.locator(".state-badge.delivered").wait_for(timeout=15000)
+                page.locator("#panel-body .detail-header .state-badge.delivered").wait_for(timeout=15000)
                 assert page.evaluate("window.__stateRow === document.activeElement")
-                assert page.evaluate("window.__stateBody === document.querySelector('#detail-content pre.body-text')")
+                assert page.evaluate("window.__stateBody === document.querySelector('#panel-body pre.body-text')")
                 record("message push preserves unchanged DOM/selection and patches real delivery-state changes without losing body or focus")
-                page.locator("#boards-tab").click()
+                page.locator('#sidebar .nav-item[data-route="#/board/main"]').click()
                 page.locator("#boards-view").wait_for(state="visible")
                 page.wait_for_timeout(500)
-                hidden_message_reads = []
-                page.on("request", lambda request: hidden_message_reads.append(request.url)
-                        if urlsplit(request.url).path == "/api/messages" else None)
+                # The sidebar's conversation scan keeps reading /api/messages (limit=100); only the feed
+                # of All traffic (limit=50) must pause while that view is hidden.
+                hidden_feed_reads = []
+                page.on("request", lambda request: hidden_feed_reads.append(request.url)
+                        if urlsplit(request.url).path == "/api/messages"
+                        and "limit=50" in urlsplit(request.url).query else None)
                 send(a, "user", "HIDDEN_VIEW_CATCHUP", sender="speaker")
                 page.wait_for_timeout(1000)
-                assert not hidden_message_reads, "Hidden Messages still refreshes in the background"
-                page.locator("#messages-tab").click()
+                assert not hidden_feed_reads, "Hidden All traffic still refreshes its feed in the background"
+                open_traffic(page)
                 page.get_by_text("HIDDEN_VIEW_CATCHUP", exact=False).first.wait_for(timeout=15000)
-                record("Messages pauses hidden-view fetches and catches up when returning from Boards")
+                record("All traffic pauses its hidden-view feed fetches and catches up when returning from a board")
                 page.locator(f'.message-row[data-id="{outbound_id}"]').click()
-                page.locator("#detail-content pre.body-text").get_by_text("P2P_MONITOR_OUTBOUND", exact=True).wait_for()
-                page.locator("#detail-content .relation").filter(has_text=inbound_a["id"]).click()
-                page.locator("#detail-content pre.body-text").get_by_text("P2P_MONITOR_REPLY", exact=True).wait_for()
-                page.locator("#detail-content .relation").filter(has_text=outbound_id).click()
-                page.locator("#detail-content pre.body-text").get_by_text("P2P_MONITOR_OUTBOUND", exact=True).wait_for()
+                page.locator("#panel-body pre.body-text").get_by_text("P2P_MONITOR_OUTBOUND", exact=True).wait_for()
+                page.locator("#panel-body .relation").filter(has_text=inbound_a["id"]).click()
+                page.locator("#panel-body pre.body-text").get_by_text("P2P_MONITOR_REPLY", exact=True).wait_for()
+                page.locator("#panel-body .relation").filter(has_text=outbound_id).click()
+                page.locator("#panel-body pre.body-text").get_by_text("P2P_MONITOR_OUTBOUND", exact=True).wait_for()
                 page.locator("#agent-filter").fill("speaker")
                 page.locator('#filters button[type="submit"]').click()
                 wait("browser filters exclude remote row", lambda: page.locator(f'.message-row[data-id="{outbound_id}"]').count() == 0)
@@ -461,16 +484,18 @@ def main():
                 page.locator("#reset-filters").click()
                 page.locator(f'.message-row[data-id="{outbound_id}"]').wait_for()
                 page.locator(f'.message-row[data-id="{inbound_a["id"]}"]').click()
-                page.locator("#detail-content pre.body-text").get_by_text("P2P_MONITOR_REPLY", exact=True).wait_for()
+                page.locator("#panel-body pre.body-text").get_by_text("P2P_MONITOR_REPLY", exact=True).wait_for()
                 page.screenshot(path=str(output / "monitor-desktop.png"), full_page=True)
                 page.set_viewport_size({"width": 390, "height": 844})
                 page.screenshot(path=str(output / "monitor-mobile.png"), full_page=True)
+                page.set_viewport_size({"width": 1440, "height": 1000})  # the sidebar is off screen on a phone
                 board_browser_checks(page=page, browser=browser, context=context,
                                      rpc=rpc, state=a, second_state=b, url=url,
                                      token=token, record=record, output=output)
                 from monitor_message_qa import message_browser_checks
                 message_browser_checks(page=page, context=context, rpc=rpc, state=a,
-                                       url=url, token=token, record=record, output=output)
+                                       url=url, token=token, record=record, output=output,
+                                       claude_names=claude_names)
                 from monitor_catalog_qa import catalog_browser_checks
                 catalog_browser_checks(page=page, context=context, rpc=rpc, state=a,
                                        url=url, token=token, record=record, output=output)

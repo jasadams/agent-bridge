@@ -19,6 +19,9 @@ from urllib.parse import urlsplit
 import uuid
 
 
+# Without these macOS shows the owner a "Chrome Safe Storage" keychain prompt.
+CHROMIUM_ARGS = ["--use-mock-keychain", "--password-store=basic"]
+
 GATE = """() => {
   window.__archiveGateInstalled = true;
   const original = window.fetch;
@@ -137,11 +140,10 @@ def main():
         credentials = rpc("monitor_enable", port=0)
         origin = credentials["url"].rstrip("/")
         token = credentials["access_token"]
-        rpc("register", agent={"name": "archive-inbox", "provider": "inbox",
-                               "session": str(uuid.uuid4()), "endpoint": "", "enabled": True})
+        rpc("register", name="archive-inbox", provider="inbox", session=str(uuid.uuid4()), replace=False)
         from playwright.sync_api import expect, sync_playwright
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True, env=private_env(output / "browser-home"))
+            browser = playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS, env=private_env(output / "browser-home"))
             try:
                 context = browser.new_context(permissions=["clipboard-write"], viewport={"width": 1100, "height": 800})
                 page = context.new_page()
@@ -185,6 +187,16 @@ def main():
                         agent="archive-inbox", id="coordinator", label="Message archive inbox")
                     return inspect(name)
 
+                def go(name):
+                    """A board is opened from its sidebar item (hash route #/board/<name>)."""
+                    page.locator(f'#sidebar .nav-item[data-route="#/board/{name}"]').click()
+
+                def menu_item(selector):
+                    """Archive and Archived boards are items of the board's overflow menu."""
+                    if page.locator("#board-menu").is_hidden():
+                        page.locator("#board-menu-button").click()
+                    return page.locator(selector)
+
                 def reload_pick(name):
                     accept_dialog = lambda dialog: dialog.accept()
                     page.on("dialog", accept_dialog)
@@ -193,11 +205,11 @@ def main():
                         page.goto(origin + "/#access_token=" + token, wait_until="domcontentloaded")
                     finally:
                         page.remove_listener("dialog", accept_dialog)
-                    expect(page.locator("#board-selector")).to_be_visible()
+                    expect(page.locator("#boards-view")).to_be_visible()
                     assert page.evaluate("window.__archiveGateInstalled === true"), "Actual-response gate init script was not installed"
                     until("catalog includes " + name,
                           lambda: name in page.locator("#board-selector option").evaluate_all("nodes => nodes.map(n => n.value)"))
-                    page.locator("#board-selector").select_option(name)
+                    go(name)
                     expect(page.locator("#selected-board-name")).to_have_text(name)
                     until("exact visible raw", lambda: page.locator("#board-raw").text_content() == inspect(name)["markdown"])
 
@@ -242,12 +254,12 @@ def main():
                 baseline = fixture("archive-basic")
                 reload_pick("archive-basic")
                 footer = page.locator("#board-last-updated").inner_text()
-                page.locator("#board-archive").click()
+                menu_item("#board-archive").click()
                 expect(page.locator("#archive-confirm-dialog")).to_contain_text("30")
                 page.screenshot(path=str(output / "archive-confirm-1100.png"), full_page=True)
                 page.locator("#archive-confirm-cancel").click()
                 assert inspect("archive-basic")["state"] == "active"
-                page.locator("#board-archive").click()
+                menu_item("#board-archive").click()
                 page.locator("#archive-confirm-submit").click()
                 freeze("archive-basic")
                 archived = inspect("archive-basic")
@@ -257,7 +269,7 @@ def main():
                 assert archived["expires_at"] - archived["archived_at"] == 30 * 24 * 60 * 60 * 1000
                 assert page.locator("#board-last-updated").inner_text() == footer
                 assert "archive-basic" not in [row["name"] for row in rpc("board_list")]
-                page.locator("#board-archived-open").click()
+                menu_item("#board-archived-open").click()
                 row = page.locator('#archived-list [data-board-name="archive-basic"]')
                 for date_field in ("archived_at", "expires_at"):
                     expected_iso = page.evaluate("value => new Date(value).toISOString()", archived[date_field])
@@ -266,7 +278,7 @@ def main():
                     expect(date).to_have_attribute("datetime", expected_iso)
                     assert date.inner_text().strip(), "Persisted archive date has no visible local formatting"
                 page.screenshot(path=str(output / "archived-dialog-1100.png"), full_page=True)
-                page.set_viewport_size({"width": 320, "height": 800})
+                page.set_viewport_size({"width": 390, "height": 800})
                 expect(row.locator('[data-archive-action="restore"]')).to_be_visible()
                 for date_field in ("archived_at", "expires_at"):
                     expect(row.locator(f'time[data-archive-date="{date_field}"]')).to_be_visible()
@@ -277,7 +289,7 @@ def main():
                 }""")
                 assert layout["left"] >= 0 and layout["right"] <= layout["width"], layout
                 assert layout["scroll"] <= layout["client"] + 1, layout
-                page.screenshot(path=str(output / "archived-dialog-320.png"), full_page=True)
+                page.screenshot(path=str(output / "archived-dialog-390.png"), full_page=True)
                 page.set_viewport_size({"width": 1100, "height": 800})
                 row.locator('[data-archive-action="restore"]').click()
                 until("restore active", lambda: inspect("archive-basic")["state"] == "active")
@@ -291,7 +303,7 @@ def main():
 
                 # Main UI protection plus actual HTTP rejection (no mocked backend).
                 reload_pick("main")
-                expect(page.locator("#board-archive")).to_be_disabled()
+                expect(menu_item("#board-archive")).to_be_disabled()
                 current = api("main")
                 protected = context.request.post(origin + "/api/boards/main/archive",
                     headers={"Authorization": "Bearer " + token, "Origin": origin},
@@ -306,7 +318,7 @@ def main():
                     reload_pick(name)
                     edit("local " + choice)
                     before = count_posts("/archive")
-                    page.locator("#board-archive").click()
+                    menu_item("#board-archive").click()
                     expect(page.locator("#unsaved-dialog")).to_be_visible()
                     page.locator("#unsaved-" + choice).click()
                     if choice == "cancel":
@@ -339,12 +351,14 @@ def main():
                             expect(page.locator("#response-feedback")).to_contain_text("may have applied")
                     else:
                         arm(name)
-                        page.locator("#board-refresh").click()
+                        # An external edit makes the page read the board again; that real read is held.
+                        rpc("named_board_update", board=name, expected_revision=inspect(name)["revision"],
+                            edits=[{"op": "set", "markdown": inspect(name)["markdown"] + "External read trigger\r\n"}], actor=None)
                         gated()
                     if fault in ("pending-save", "uncertain-save"):
                         local_before = count_posts("/archive")
-                        if page.locator("#board-archive").is_enabled():
-                            page.locator("#board-archive").click()
+                        if menu_item("#board-archive").is_enabled():
+                            menu_item("#board-archive").click()
                             if page.locator("#unsaved-dialog").is_visible():
                                 expect(page.locator("#unsaved-save")).to_be_disabled()
                                 page.locator("#unsaved-cancel").click()
@@ -366,7 +380,6 @@ def main():
                     assert view["read_only"] and view["lifecycle_generation"] == archived["lifecycle_generation"]
                     transition(name, "restore")
                     page.evaluate("getSelection().removeAllRanges()")
-                    page.locator("#board-refresh").click()
                     until("restored generation inspected", lambda: api(name)["state"] == "active")
                     page.wait_for_timeout(800)
                     expect(page.locator("#response-text")).to_have_value("kept " + fault)
@@ -440,13 +453,13 @@ def main():
                         if action == "restore":
                             transition(name, "archive")
                             freeze(name)
-                            page.locator("#board-archived-open").click()
+                            menu_item("#board-archived-open").click()
                             expect(page.locator(f'#archived-list [data-board-name="{name}"]')).to_be_visible()
                         current = inspect(name)
                         before_posts = count_posts("/" + action)
                         arm(name, "/" + action, "POST", mode, current["lifecycle_generation"])
                         if action == "archive":
-                            page.locator("#board-archive").click()
+                            menu_item("#board-archive").click()
                             page.locator("#archive-confirm-submit").click()
                         else:
                             page.locator(f'#archived-list [data-board-name="{name}"] [data-archive-action="restore"]').click()
@@ -466,14 +479,19 @@ def main():
                         assert submitted == {"board": name, "expected_revision": current["revision"]}
                         if mode == "hold":
                             expect(page.locator("#board-selector")).to_be_disabled()
-                            expect(page.locator("#board-archive")).to_be_disabled()
+                            # Leaving the board is refused until the operation's outcome is known (while a
+                            # restore runs, the open archived-boards dialog is modal and blocks navigation).
+                            if action == "archive":
+                                page.locator('#sidebar .nav-item[data-route="#/board/main"]').click()
+                                expect(page.locator("#selected-board-name")).to_have_text(name)
+                                expect(menu_item("#board-archive")).to_be_disabled()
                             assert count_posts("/" + action) == before_posts + 1
                             release()
                         else:
                             expect(page.locator("#board-lifecycle-status")).to_contain_text("uncertain")
-                            expect(page.locator("#board-archive")).to_be_disabled()
                             if page.locator("#archived-dialog").is_visible():
                                 page.locator("#archived-close").click()
+                            expect(menu_item("#board-archive")).to_be_disabled()
                             page.wait_for_timeout(800)
                             assert count_posts("/" + action) == before_posts + 1
                             page.locator("#board-lifecycle-review").click()
@@ -494,19 +512,17 @@ def main():
                                 assert readback.get(date_field) is None
                         record("actual lifecycle accepted body " + mode + " preserves target/deadline without replay: " + action)
 
-                # Copy/raw/footer and catalog survive the lifecycle; fresh tab state.
+                # Copy/raw/footer and catalog survive the lifecycle; fresh page state.
                 name = "copy-private"
                 fixture(name)
                 reload_pick(name)
                 page.locator(".board-code-copy").first.click()
                 expect(page.locator("#board-copy-feedback")).to_contain_text("copied")
                 source = inspect(name)["markdown"]
-                page.locator("#board-raw-toggle").click()
                 expect(page.locator("#board-raw")).to_have_text(source)
                 expect(page.locator("#board-last-updated")).to_be_visible()
                 assert page.evaluate("localStorage.length + sessionStorage.length") == 0
                 assert token not in page.url
-                page.locator("#board-raw-toggle").click()
                 edit("PRIVATE_DRAFT_SENTINEL")
                 page.locator("#lock-button").click()
                 page.locator("#unsaved-discard").click()

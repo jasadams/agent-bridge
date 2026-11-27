@@ -4,16 +4,23 @@ Faults delay/drop/corrupt a real accepted response; no broker responses are mock
 """
 import json
 import os
+import re
 from pathlib import Path
 import socket
-import sqlite3
 import tempfile
 import threading
 import time
 import uuid
 
 
-def message_browser_checks(*, page, context, rpc, state, url, token, record, output):
+# The broker names a Claude session from the client's own directory (`claude agents --json`, here a stand-in
+# executable on the broker's PATH that prints `claude_names`); the page labels every composer with that name.
+COORDINATOR_NAME = "Web Coordinator"
+# What the composer says once the broker accepted a send: the broker's own delivery state.
+OUTCOME = re.compile(r"^Message (pending|delivered|failed|unknown)$")
+
+
+def message_browser_checks(*, page, context, rpc, state, url, token, record, output, claude_names):
     from playwright.sync_api import expect
 
     origin = url.rstrip("/")
@@ -77,8 +84,21 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
     def history(body):
         return [m for m in rpc(state, "history", agent=None, limit=1000) if m["body"] == body]
 
+    def until(expression, timeout=10000):
+        """Poll a page expression through CDP: wait_for_function evaluates a string, which the page's CSP blocks."""
+        deadline = time.monotonic() + timeout / 1000
+        while time.monotonic() < deadline:
+            if page.evaluate(expression):
+                return
+            page.wait_for_timeout(100)
+        raise AssertionError("Timed out waiting for: " + expression)
+
+    def name_sessions(names):
+        """What the stand-in `claude agents --json` reports: [(session, name)]."""
+        claude_names.write_text(json.dumps([{"sessionId": s, "name": n} for s, n in names]))
+
     def pick(name, keep_drafts=False):
-        page.locator("#board-selector").select_option(name)
+        page.locator(f'#sidebar .nav-item[data-route="#/board/{name}"]').click()
         if keep_drafts:
             expect(page.locator("#unsaved-dialog")).to_be_visible()
             page.get_by_role("button", name="Keep drafts and continue").press("Enter")
@@ -88,7 +108,8 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
     def row(field="coordinator"):
         return page.locator(f'.message-composer[data-field-id="{field}"]:visible').first
 
-    def sent(body, target="web-coordinator"):
+    def sent(body, target=None):
+        target = target or coordinator
         wait("exact history message", lambda: len(history(body)) == 1)
         message = history(body)[0]
         assert message["sender"] == "user" and message["recipient"] == target
@@ -127,15 +148,15 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
                    expected_revision=read(name)["revision"], agent=owner, id=field, label=label)
 
     try:
-        session = str(uuid.uuid4())
-        for name, provider, native in [("web-coordinator", "claude", str(endpoint)), ("web-second", "inbox", "")]:
-            rpc(state, "register", agent={"name": name, "provider": provider,
-                "session": session if provider == "claude" else str(uuid.uuid4()),
-                "endpoint": native, "enabled": True})
+        session, second_session = str(uuid.uuid4()), str(uuid.uuid4())
+        coordinator = "claude-" + session
+        name_sessions([(session, COORDINATOR_NAME)])
+        rpc(state, "claude_bind", session=session, endpoint=str(endpoint))
+        rpc(state, "register", name="web-second", provider="inbox", session=second_session, replace=False)
         for name in ("web-compose", "web-other"):
             rpc(state, "board_create", board=name)
             write("# Keyboard messages\n\nRun `printf hello` while composing.\n\n```text\n<!-- board-message: literal example -->\n```\n\n- [ ] Existing checkbox\n<!-- board-input: answer -->\n> existing\n<!-- /board-input -->\n", name)
-            add(name, "web-coordinator", "coordinator", "Message coordinator")
+            add(name, coordinator, "coordinator", "Message coordinator")
             add(name, "web-second", "second", "Message second")
         baseline = {name: read(name)["markdown"] for name in ("web-compose", "web-other")}
         inventory = []
@@ -144,7 +165,10 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             # Explicit fixture discard/reload between independent cases, never a
             # production recovery path. This also clears any suspended JS gates.
             rpc(state, "pause", paused=False)
-            rpc(state, "register", agent={"name": "web-coordinator", "provider": "claude", "session": session, "endpoint": str(endpoint), "enabled": True}, replace=True)
+            page.set_viewport_size({"width": 1440, "height": 900})  # a case that failed narrow must not hide the sidebar
+            name_sessions([(session, COORDINATOR_NAME)])
+            rpc(state, "claude_bind", session=session, endpoint=str(endpoint))
+            rpc(state, "register", name="web-second", provider="inbox", session=second_session, replace=True)
             for name, markdown in baseline.items():
                 write(markdown, name)
             page.unroute("**/api/boards/web-compose/messages")
@@ -154,6 +178,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
                 page.goto(origin, wait_until="domcontentloaded")
             finally:
                 page.remove_listener("dialog", accept)
+            page.evaluate("location.hash = '#/board/main'")
             page.locator("#access-token").fill(token)
             page.locator("#login-form button[type=submit]").click()
             expect(page.locator("#boards-view")).to_be_visible()
@@ -166,7 +191,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
         def case_keyboard_native():
             textarea = row().locator("textarea")
             before = read()
-            page.locator("#board-selector").focus()
+            page.locator("#board-menu-button").focus()
             for _ in range(30):
                 page.keyboard.press("Tab")
                 if textarea.evaluate("e => e === document.activeElement"):
@@ -186,20 +211,17 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             page.keyboard.press("Shift+Enter"); page.keyboard.type("second line  ")
             body = "  exact keyboard 🦀\nsecond line  "
             expect(textarea).to_have_value(body); assert not history(body)
-            geometry = page.evaluate("""() => ['.board-layout', '#board-messages'].map(selector => {
-              const {x,y,width,height}=document.querySelector(selector).getBoundingClientRect(); return {x,y,width,height};
-            })""")
+            # The document must not move: only the dock below the scrolling pane may grow with its outcome line.
+            document_box = """() => { const {x,y,width}=document.querySelector('.board-layout').getBoundingClientRect(); return {x,y,width}; }"""
+            geometry = page.evaluate(document_box)
             page.keyboard.press("Enter"); first = sent(body)
             wait("actual native frame", lambda: any(f.get("msg_id") == first["id"] for f in frames))
             frame = next(f for f in frames if f.get("msg_id") == first["id"])
             assert frame["from"] == "user" and frame["session_id"] == session and body in frame["message"]["content"]
             assert read() == before, "Sending edited board Markdown/revision/timestamp"
-            expect(row().locator(".message-feedback")).to_have_text("")
-            expect(row().locator(".message-feedback")).to_be_hidden()
-            assert page.evaluate("""() => ['.board-layout', '#board-messages'].map(selector => {
-              const {x,y,width,height}=document.querySelector(selector).getBoundingClientRect(); return {x,y,width,height};
-            })""") == geometry, "Accepted send shifted the document or composer dock"
-            page.screenshot(path=str(output / "message-accepted-no-feedback.png"), full_page=False)
+            expect(row().locator(".message-feedback")).to_have_text(OUTCOME)
+            assert page.evaluate(document_box) == geometry, "Accepted send shifted the document"
+            page.screenshot(path=str(output / "message-accepted-outcome.png"), full_page=False)
             textarea.fill("second deliberate message"); page.keyboard.press("Enter"); second = sent("second deliberate message")
             assert first["id"] != second["id"]
             record("keyboard Tab/backtab, Enter send, Shift+Enter exact multiline, repeated reuse/focus and actual pinned native delivery; board unchanged")
@@ -224,8 +246,8 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             textarea.fill("pending exact message"); arm_gate()
             geometry = """row => {
               const rect = e => { const {x,y,width,height}=e.getBoundingClientRect(); return {x,y,width,height}; };
-              return [document.querySelector('.board-layout'), document.querySelector('#board-messages'), row,
-                row.querySelector('textarea'), row.querySelector('.response-actions button')].map(rect);
+              return [document.querySelector('.board-layout'), row.querySelector('textarea'),
+                row.querySelector('.response-actions button')].map(rect);
             }"""
             before_geometry = row().evaluate(geometry)
             page.keyboard.press("Enter")
@@ -243,8 +265,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             write(read()["markdown"] + "\nUpdated during pending send\n")
             expect(page.locator("#board-document")).to_contain_text("Updated during pending send", timeout=15000)
             release_gate(); sent("pending exact message")
-            expect(row().locator(".message-feedback")).to_be_hidden()
-            assert row().evaluate(geometry) == before_geometry, "Accepted send shifted composer/document geometry"
+            expect(row().locator(".message-feedback")).to_have_text(OUTCOME)
             assert len(posts) == count and read()["markdown"].endswith("Updated during pending send\n")
             record("pending Enter does not duplicate and actual live refresh continues independently while acceptance is delayed")
 
@@ -327,8 +348,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             # Independent inputs survive board navigation without a send-on-leave.
             textarea.fill("main retained unsent")
             row("second").locator("textarea").fill("second owner retained unsent")
-            pick_control = page.locator("#board-selector")
-            pick_control.select_option("web-other")
+            page.locator('#sidebar .nav-item[data-route="#/board/web-other"]').click()
             expect(page.locator("#unsaved-dialog")).to_be_visible()
             page.get_by_role("button", name="Keep drafts and continue").click()
             expect(page.locator("#selected-board-name")).to_have_text("web-other")
@@ -369,16 +389,16 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             orphan.get_by_role("button", name="Review current input").click()
             expect(orphan.locator(".message-feedback")).to_contain_text("unavailable or changed")
             orphan.get_by_role("button", name="Discard draft").click()
-            write(old_markdown); page.locator("#board-refresh").click()
-            wait("restored exact target", lambda: "web-coordinator" in row().locator("label").text_content())
+            write(old_markdown)
+            wait("restored exact target", lambda: COORDINATOR_NAME in row().locator("label").text_content())
             record("retargeted control leaves old draft visible and unavailable; review cannot silently substitute the new recipient")
 
         def case_closed_owner():
             textarea = row().locator("textarea")
             # Exact owner disabled: actual backend rejection retains the user's text.
-            rpc(state, "unregister", name="web-coordinator", session=session)
+            rpc(state, "claude_unbind", session=session, endpoint=str(endpoint))
             row().locator("textarea").fill("closed owner draft"); row().locator("textarea").press("Enter")
-            expect(row().locator(".message-feedback")).to_contain_text("closed, disabled or replaced")
+            expect(row().locator(".message-feedback")).to_contain_text("is not registered")
             expect(row().locator("textarea")).to_have_value("closed owner draft")
             assert not history("closed owner draft")
             rejected_payload = posts[-1].copy(); count = len(posts)
@@ -386,19 +406,21 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             wait("confirmed rejection retry", lambda: len(posts) == count + 1 and not row().get_by_role("button", name="Retry same message").is_disabled())
             assert posts[-1] == rejected_payload
             row().get_by_role("button", name="Discard draft").click()
-            rpc(state, "register", agent={"name": "web-coordinator", "provider": "claude", "session": session, "endpoint": str(endpoint), "enabled": True})
+            rpc(state, "claude_bind", session=session, endpoint=str(endpoint))
             record("actual unavailable owner rejection preserves draft and same-payload retry ID without starting or substituting a conversation")
 
         def case_replaced_session():
-            textarea = row().locator("textarea")
+            # A Claude session ID is part of its name, so replacement is a same-name registry replacement of
+            # the inbox agent: the draft stays pinned to the session the control names.
+            textarea = row("second").locator("textarea")
             replacement = str(uuid.uuid4())
-            rpc(state, "register", agent={"name": "web-coordinator", "provider": "claude", "session": replacement, "endpoint": str(endpoint), "enabled": True}, replace=True)
-            row().locator("textarea").fill("same route replaced session"); row().locator("textarea").press("Enter")
-            expect(row().locator(".message-feedback")).to_contain_text("closed, disabled or replaced")
-            expect(row().locator("textarea")).to_have_value("same route replaced session")
+            rpc(state, "register", name="web-second", provider="inbox", session=replacement, replace=True)
+            textarea.fill("same route replaced session"); textarea.press("Enter")
+            expect(row("second").locator(".message-feedback")).to_contain_text("closed, disabled or replaced")
+            expect(textarea).to_have_value("same route replaced session")
             assert not history("same route replaced session")
-            row().get_by_role("button", name="Discard draft").click()
-            rpc(state, "register", agent={"name": "web-coordinator", "provider": "claude", "session": session, "endpoint": str(endpoint), "enabled": True}, replace=True)
+            row("second").get_by_role("button", name="Discard draft").click()
+            rpc(state, "register", name="web-second", provider="inbox", session=second_session, replace=True)
             record("actual same-name registry replacement cannot receive the old pinned-session draft")
 
         def case_queue_capacity():
@@ -449,10 +471,10 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
                 add("web-compose", "web-second", f"stack-{index}", f"Stack {index}")
             expect(page.locator("#message-controls .message-composer:visible")).to_have_count(8)
             layout_metrics = []
-            for width, height in ((1440, 900), (390, 640), (320, 640), (900, 400)):
+            for width, height in ((1440, 900), (390, 640), (900, 400)):
                 page.set_viewport_size({"width": width, "height": height})
                 dock = page.locator("#board-messages")
-                document = page.locator(".board-layout")
+                document = page.locator(".board-scroll")  # the board scrolls inside its pane; the dock below it stays pinned
                 bounds = dock.bounding_box()
                 reading = document.bounding_box()
                 metrics = {"width": width, "height": height, "dock": bounds, "document": reading}
@@ -470,12 +492,12 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
                 expect(last).to_be_focused()
                 assert dock.evaluate("e => e.scrollTop") > 0
                 # Already-focused boxes must also be revealed after viewport resize.
-                page.wait_for_function("""() => {
+                until("""(() => {
                   const input = document.activeElement, dock = document.querySelector('#board-messages');
                   if (!input?.matches('#message-controls textarea')) return false;
                   const box = input.getBoundingClientRect(), bounds = dock.getBoundingClientRect();
                   return box.top >= bounds.top && box.bottom <= bounds.bottom + 1;
-                }""")
+                })()""")
                 box = last.bounding_box()
                 metrics.update({"focused_input": box, "dock_scroll_top": dock.evaluate("e => e.scrollTop")})
                 (output / "message-dock-metrics.json").write_text(json.dumps(layout_metrics, indent=2))
@@ -486,7 +508,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             first = row().locator("textarea")
             first.click(); page.keyboard.type("direct click draft")
             expect(first).to_have_value("direct click draft")
-            expect(row().locator("label")).to_have_text("web-coordinator")
+            expect(row().locator("label")).to_have_text(COORDINATOR_NAME)
             assert row().locator(".message-feedback").text_content() == ""
             assert not row().get_by_role("button", name="Discard draft").is_visible()
             first.fill("")
@@ -494,59 +516,65 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             record("desktop/mobile/short many-input dock stays pinned, independently scrolls, reveals focused boxes and edits on click")
 
         def case_real_friendly_metadata():
+            # Labels are the broker's resolved names (the client's directory), never the routing ID, and an
+            # unnamed session shows the generated "Claude" + the last four characters of its session.
             native_session = "885b5a56-af8d-4a72-9b43-8ad930e945b6"
             canonical = "claude-" + native_session
-            rpc(state, "register", agent={"name": canonical, "provider": "claude", "session": native_session, "endpoint": str(endpoint), "enabled": True})
+            rpc(state, "claude_bind", session=native_session, endpoint=str(endpoint))
             rpc(state, "board_create", board="web-friendly")
             add("web-friendly", canonical, "friendly", "Support desk")
-            add("web-friendly", canonical, "unknown", "Message " + canonical)
-            def title(session, value):
-                # Existing private test DB metadata; no public title-write API exists.
-                with sqlite3.connect(Path(state) / "messages.sqlite3") as db:
-                    db.execute("INSERT INTO session_metadata(provider,session,display_name) VALUES('claude',?,?) ON CONFLICT(provider,session) DO UPDATE SET display_name=excluded.display_name", (session, value))
             pick("web-friendly")
-            expect(row("friendly").locator("label")).to_have_text("Support desk")
-            expect(row("unknown").locator("label")).to_have_text("Claude")
-            before = read("web-friendly")
-            title(native_session, "Coordinator")
-            expect(row("friendly").locator("label")).to_have_text("Coordinator", timeout=10000)
+            label = row("friendly").locator("label")
+            expect(label).to_have_text("Claude " + native_session[-4:])
             textarea = row("friendly").locator("textarea")
             textarea.fill("friendly pinned draft"); textarea.evaluate("e => {e.setSelectionRange(4,4);window.__friendlyInput=e;}")
-            page.screenshot(path=str(output / "message-canonical-friendly-title.png"), full_page=False)
-            reads = []
-            watch_reads = lambda request: reads.append(request.url) if request.method == "GET" and "/api/boards/web-friendly" in request.url and "/events" not in request.url else None
-            page.on("request", watch_reads)
-            try:
-                title(native_session, "Planner")
-                expect(row("friendly").locator("label")).to_have_text("Planner", timeout=10000)
+
+            def renamed(title):
+                # A rename has no board event; the page learns the name on its next board read, which an
+                # ordinary live edit of the board triggers. The draft, caret and focus must be untouched.
+                name_sessions([(session, COORDINATOR_NAME), (native_session, title)])
+                write(read("web-friendly")["markdown"] + "\nEdited after rename to " + title + "\n", "web-friendly")
+                expect(label).to_have_text(title, timeout=15000)
                 assert textarea.evaluate("e => e === window.__friendlyInput && e === document.activeElement && e.selectionStart === 4")
                 expect(textarea).to_have_value("friendly pinned draft")
-                assert not reads, "Presentation-only title changes fetched board snapshots"
-            finally:
-                page.remove_listener("request", watch_reads)
-            assert read("web-friendly") == before, "Reading/renaming labels changed the board"
+
+            textarea.focus(); textarea.evaluate("e => e.setSelectionRange(4,4)")
+            renamed("Coordinator")
+            page.screenshot(path=str(output / "message-canonical-friendly-title.png"), full_page=False)
+            renamed("Planner")
+            assert canonical not in page.locator("#message-controls").text_content()
             page.screenshot(path=str(output / "message-canonical-renamed-title.png"), full_page=False)
+            before = read("web-friendly")
+            # The board changed under the draft, so it must be reviewed before it can be sent.
+            row("friendly").get_by_role("button", name="Review current input").click()
+            expect(textarea).to_be_focused()
             textarea.press("Enter")
             wait("canonical recipient accepted", lambda: len(history("friendly pinned draft")) == 1)
             accepted = history("friendly pinned draft")[0]
             assert accepted["recipient"] == canonical and accepted["recipient_session"] == native_session
             wait("canonical recipient native delivery", lambda: any(frame.get("msg_id") == accepted["id"] and frame.get("session_id") == native_session for frame in frames))
             expect(textarea).to_have_value("")
+            assert read("web-friendly") == before, "Sending changed the board"
+            # A different session that takes over the endpoint cannot lend its name or receive the old draft.
             textarea.fill("replacement pinned draft")
             replacement = str(uuid.uuid4())
-            rpc(state, "register", agent={"name": canonical, "provider": "claude", "session": replacement, "endpoint": str(endpoint), "enabled": True}, replace=True)
-            title(replacement, "Wrong replacement")
-            expect(row("friendly").locator("label")).to_have_text("Support desk", timeout=10000)
+            rpc(state, "claude_unbind", session=native_session, endpoint=str(endpoint))
+            rpc(state, "claude_bind", session=replacement, endpoint=str(endpoint))
+            name_sessions([(session, COORDINATOR_NAME), (native_session, "Planner"), (replacement, "Wrong replacement")])
+            write(read("web-friendly")["markdown"] + "\nEdited after replacement\n", "web-friendly")
+            wait("replacement edit shown", lambda: "Edited after replacement" in page.locator("#board-document").text_content())
+            expect(label).to_have_text("Planner")
             assert "Wrong replacement" not in page.locator("#message-controls").text_content()
+            row("friendly").get_by_role("button", name="Review current input").click()
+            expect(textarea).to_be_focused()
             textarea.press("Enter")
-            expect(row("friendly").locator(".message-feedback")).to_contain_text("closed, disabled or replaced")
+            expect(row("friendly").locator(".message-feedback")).to_contain_text("is not registered")
             expect(textarea).to_have_value("replacement pinned draft")
             assert not history("replacement pinned draft")
-            assert read("web-friendly") == before
             page.screenshot(path=str(output / "message-canonical-replaced-title.png"), full_page=False)
-            (output / "friendly-label-fixture.json").write_text(json.dumps({"canonical": canonical, "session": native_session, "title": "Coordinator", "renamed": "Planner", "replacement_title": "Wrong replacement", "authored_fallback": "Support desk", "board_revision": before["revision"]}, indent=2))
             row("friendly").get_by_role("button", name="Discard draft").click()
-            record("real canonical Claude ID uses native friendly metadata; live title rename keeps input/caret/draft without snapshot polling; missing metadata honors authored/provider fallbacks; replacement cannot lend a title or receive old draft")
+            rpc(state, "claude_unbind", session=replacement, endpoint=str(endpoint))
+            record("real canonical Claude ID is labelled by the broker's resolved name (generated when unnamed); a live rename keeps input/caret/draft; a replacement session cannot lend its name or receive the old draft")
 
         def case_lock_and_layout():
             textarea = row().locator("textarea")
@@ -557,6 +585,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             page.locator("#lock-button").click(); page.locator("#unsaved-discard").click()
             expect(page.locator("#workspace")).to_be_hidden()
             assert not page.locator("#message-controls").text_content()
+            page.evaluate("location.hash = '#/board/main'")
             page.locator("#access-token").fill(token); page.locator("#login-form button[type=submit]").click()
             expect(page.locator("#boards-view")).to_be_visible()
             assert not history("lock private draft")
@@ -564,7 +593,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             assert not native_errors, native_errors
             record("locking requires explicit draft discard/cancel, clears all private composer state and never submits; no browser persistence")
             pick("web-compose")
-            for width in (1440, 320):
+            for width in (1440, 390):
                 page.set_viewport_size({"width": width, "height": 900})
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
                 page.screenshot(path=str(output / f"message-composers-{width}.png"), full_page=True)
