@@ -769,6 +769,7 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
     origin = base.rstrip("/")
     for name in ("kyomi", "krausen"):
         broker.rpc("board_create", board=name)
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
     browser = playwright.chromium.launch(args=CHROMIUM_ARGS)
     problems = []
 
@@ -959,15 +960,42 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
         report.check(f"{tag} pasted after a refused token: no piece of the token anywhere, and the default board is open", not token_pieces_in(surfaces(context, page)) and page.evaluate("location.hash") == "#/board/main")
         context.close()
 
-    # The board list cannot be read after the token was accepted: the page stays locked with its usual message
-    # and keeps nothing of the link (no board, no token, a clean address).
+    # The board list cannot be read after the token was accepted (the request fails, or the answer is not a
+    # list): the page stays locked with its usual message and keeps nothing of the link (no board, no token,
+    # a clean address). A bounded wait that records the outcome, so a page that unlocks anyway is a FAIL.
+    def stays_locked(page):
+        try:
+            page.wait_for_selector("#login-error:not([hidden])", timeout=15000)
+            return True
+        except PlaywrightTimeout:
+            return False
+
+    for label, handler in [("the request fails", lambda route: route.abort()),
+                           ("the answer is not a list", lambda route: route.fulfill(status=200, content_type="application/json", body='{"boards": "kyomi"}'))]:
+        tag = f"[board link board list unreadable: {label}]"
+        context, page = open_page(False)
+        page.route("**/api/boards", handler)
+        page.goto(f"{base}#/board/kyomi&access_token={token}")
+        locked = stays_locked(page)
+        report.check(f"{tag} the page stays locked with the usual message and a clean address", locked and page.locator("#workspace").is_hidden() and page.evaluate("location.hash") == "", page.evaluate("location.hash"))
+        no_token_anywhere(tag, context, page)
+        context.close()
+
+    # A refused link keeps nothing: a later hand-typed login, and one after that, open the default board.
     context, page = open_page(False)
-    page.route("**/api/boards", lambda route: route.abort())
-    page.goto(f"{base}#/board/kyomi&access_token={token}")
-    page.wait_for_selector("#login:not([hidden])", timeout=15000)
-    time.sleep(1)
-    report.check("[board link board list unreadable] the page stays locked with the usual message and a clean address", page.locator("#login-error").is_visible() and page.locator("#workspace").is_hidden() and page.evaluate("location.hash") == "", page.evaluate("location.hash"))
-    no_token_anywhere("[board link board list unreadable]", context, page)
+    page.goto(f"{base}#/board/kyomi&access_token={'A' * 43}")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    time.sleep(1.5)
+    for attempt in ("first", "second"):
+        page.fill("#access-token", token)
+        page.click("#login-form button[type=submit]")
+        page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+        time.sleep(2.5)  # settle, then report what the page shows (a wrong board is a FAIL, not a timeout)
+        report.check(f"[board link refused, then typed login] the {attempt} hand-typed login opens the default board and a clean address", board_name(page) == "main" and page.evaluate("location.hash") == "#/board/main", f"{board_name(page)} {page.evaluate('location.hash')}")
+        no_token_anywhere(f"[board link refused, then typed login {attempt}]", context, page)
+        if attempt == "first":
+            page.click("#lock-button")
+            page.wait_for_selector("#login:not([hidden])", timeout=8000)
     context.close()
 
     report.check("[board link] the page raised no console error or exception", not problems, str(problems[:3]))

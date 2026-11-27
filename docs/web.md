@@ -366,14 +366,13 @@ the named board in the chosen theme, with no click.
   is deliberate and for security: only names the page itself lists are ever shown back, so a crafted link
   cannot put text of its own, or a piece of the token, into the address, the title or the page. It differs
   from a link without a token, where a board that does not exist shows the board error.
-- Only a board route is used (not a topic or a conversation), and a part that contains the text
-  `access_token` (at any encoding level) is never a board name.
+- Only a board route is used (not a topic or a conversation). A board whose name contains the text
+  `access_token` cannot be opened by a link, as described under [Browser access](#browser-access).
 - The board list is read once after the token is accepted, before the workspace is shown. If it cannot
   be read, the page stays locked with its usual "could not be reached" message and keeps nothing of the link.
 - A malformed or repeated theme or token part is handled as described above and under
   [Browser access](#browser-access). A link that stays locked (an unreadable shape, a malformed token, or a
   well-formed token the broker refuses) is cleared completely and keeps no board.
-- A board whose name contains the text `access_token` still cannot be opened by a link.
 
 ## Browser access
 
@@ -389,15 +388,14 @@ The page removes the token from the address bar and the current history entry fo
 shape, including one it cannot read. It unlocks only when the first `access_token` parameter of the
 fragment, after splitting on `&` (a leading `?` and percent-encoding of the key or value are
 accepted), holds a valid token; this covers `#access_token=<token>` and, with a theme,
-`#theme=<name>&access_token=<token>` in either order, each with a board beside them
-([Opening a board from the access link](#opening-a-board-from-the-access-link)). A fragment that contains the text
+`#theme=<name>&access_token=<token>` in either order, each with a board beside them. A fragment that contains the text
 `access_token` in any other shape, for example joined with `;`, `,` or a space, after an `&?`,
 inside a route (`#/x?access_token=<token>`), as another parameter's value, in upper case or encoded
 more than once, or as a repeated key whose first value is not the token, does not unlock: the page
 shows the normal locked screen, replaces the whole fragment with an empty one (a route in it is
 lost too) and stores nothing. It sends nothing either, except in one case: a repeated `access_token`
 key whose first value is a well-formed token is tried as if typed and refused, and the address,
-storage and every URL still hold no token. A link that does unlock leaves nothing of itself in the address; a board it names is opened only if the page lists it. Open the link as `agent-bridge web enable` printed it,
+storage and every URL still hold no token. Open the link as `agent-bridge web enable` printed it,
 or enter the token by hand. The same applies when such a link is pasted into a page that is already
 open: the open session and its route are kept and the fragment is cleared. A fragment encoded eight or more
 times is cleared too. A board or topic whose own name contains the text `access_token` cannot be
@@ -406,6 +404,10 @@ page opens, or stays on, the current or default board (choosing it in the sideba
 A route that does not contain the text is left alone. Only a fragment that contains the text
 `access_token` is recognised as a link: a token with no such text beside it cannot be told from an
 ordinary route and is not touched.
+
+A link that does unlock leaves nothing of itself in the address. A board it names is opened only if the
+page's own list holds it
+([Opening a board from the access link](#opening-a-board-from-the-access-link)).
 
 Tokens are not stored in cookies,
 referrers or browser storage; the page stores only the theme and sidebar preferences described above. Static login assets contain no message history or

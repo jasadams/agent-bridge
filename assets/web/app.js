@@ -635,7 +635,8 @@
   });
   async function boardNames(current) {
     const data = await api("/api/boards", current);
-    return Array.isArray(data.boards) ? data.boards.map(row => row.name).filter(name => typeof name === "string").sort() : null;
+    if (!Array.isArray(data.boards)) throw new Error("Invalid board list");
+    return data.boards.map(row => row.name).filter(name => typeof name === "string").sort();
   }
   async function pollBoardNames() {
     clearTimeout(catalog.boardPoll);
@@ -644,7 +645,7 @@
     try {
       if (route?.kind !== "board" && !document.hidden) {
         const names = await boardNames(current);
-        if (current === generation && names && names.join("\n") !== catalog.boardNames.join("\n")) { catalog.boardNames = names; renderSidebar(); }
+        if (current === generation && names.join("\n") !== catalog.boardNames.join("\n")) { catalog.boardNames = names; renderSidebar(); }
       }
     } catch (error) { /* keep the previous list */ }
     if (current === generation && token) catalog.boardPoll = setTimeout(pollBoardNames, 10000);
@@ -788,7 +789,7 @@
       // while the login screen is still shown, so nothing can be opened or clicked in the meantime.
       let first = parseRoute(location.hash) || defaultRoute();
       if (wanted !== null) {
-        const listed = (await boardNames(current))?.find(name => name === wanted);
+        const listed = (await boardNames(current)).find(name => name === wanted);
         if (current !== generation) return;
         if (listed !== undefined) first = { kind: "board", id: listed };
       }
