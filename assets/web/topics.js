@@ -2,7 +2,7 @@
 // Topics: a Slack-style channel timeline. The sidebar list lives in app.js; this module keeps the
 // topic catalog fresh (for unread badges) and, while a topic is open, its posts and composer.
 // Publication, retry and discard semantics are unchanged from the previous interface.
-window.createTopicMonitor = ({ request, onCatalog, openPanel, closePanel }) => {
+window.createTopicsView = ({ request, onCatalog, openPanel, closePanel }) => {
   const $ = id => document.getElementById(id);
   const { el, colorClass, initials, hhmm, dayKey, dayLabel, fullTime, postAuthorLabel } = window.AB;
   const drafts = new Map();

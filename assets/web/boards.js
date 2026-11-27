@@ -1,6 +1,6 @@
 "use strict";
 // No credentials, private drafts or board snapshots leave this tab's memory.
-window.createBoardMonitor = ({ request, connect, authenticated, onViewChange, onCatalog }) => {
+window.createBoardsView = ({ request, connect, authenticated, onViewChange, onCatalog }) => {
   const $ = id => document.getElementById(id);
   const tags = new Set("p h1 h2 h3 h4 h5 h6 blockquote ul ol li pre code em strong del table thead tbody tr th td hr br a span".split(" "));
   let active = false, authEpoch = 0, boardEpoch = 0, sequence = 0;

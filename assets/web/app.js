@@ -613,7 +613,7 @@
     sidebar.replaceChildren(scroll, foot);
     if (focused) [...sidebar.querySelectorAll(".nav-item")].find(item => item.dataset.route === focused)?.focus();
   }
-  topics = window.createTopicMonitor({
+  topics = window.createTopicsView({
     request: (path, options) => api(path, generation, options),
     onCatalog: list => { catalog.topics = list; renderSidebar(); },
     openPanel: (title, content) => openPanel(title, content, "thread"),
@@ -621,7 +621,7 @@
   });
   // The sidebar's board list comes from boards.js while Boards is open (it owns that polling and
   // the unsaved-draft rules). Elsewhere a light poll keeps it fresh.
-  boards = window.createBoardMonitor({
+  boards = window.createBoardsView({
     request: (path, options) => api(path, generation, options),
     connect: async (path, options) => {
       const current = generation;
