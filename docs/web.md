@@ -503,10 +503,42 @@ left directly in it (`state`, `home`, `bin`, `s` and `broker.log`), removes any 
 (never what it points to), and overwrites the copied binary and the screenshots. A directory that has other contents and no such file, a symbolic link, a file, or a `--binary`
 inside the directory (other than the copy an earlier run made) is refused with a message and exit status 2,
 and nothing is touched. If the broker fails to start, the run stops it before it exits. The path must be short
-enough for the broker's Unix socket path. It is not run in CI. The older harnesses in
-`tools/` (`test_monitor.py --browser`, `monitor_board_qa.py` and related scripts) drive the element
-ids of the tabbed interface of earlier releases and have not yet been ported to this one; their
-HTTP and API checks still apply.
+enough for the broker's Unix socket path. It is not run in CI.
+
+Four further manual harnesses in `tools/` cover behaviour the theme test does not: the board drafts,
+rebase, archive and restore flows, catalog discovery, code copy, message send and retry, and topic
+publishing. Each starts its own disposable broker with a throwaway state directory, drives Chromium
+through the same sidebar and `#/board/<name>` address routes a person uses (they pass
+`--use-mock-keychain --password-store=basic`, and read the page through `page.evaluate` because the
+content-security policy blocks `wait_for_function`), and needs Python 3.11 or newer with Playwright and
+a matching Chromium. Run them from the repository root against a binary built from the same tree, each
+with its own new, short output directory, never against a running owner service. None runs in CI.
+
+```sh
+cargo build --locked
+python3 tools/test_monitor.py --binary ./target/debug/agent-bridge --browser --output /tmp/agb-monitor
+python3 tools/monitor_catalog_qa.py --binary ./target/debug/agent-bridge --output /tmp/agb-catalog
+python3 tools/monitor_board_archive_qa.py --binary "$PWD/target/debug/agent-bridge" \
+  --binary-sha256 "$(shasum -a 256 target/debug/agent-bridge | cut -d' ' -f1)" \
+  --source-checkpoint "$(git rev-parse HEAD)" --output /tmp/agb-archive
+python3 tools/test_topics_browser.py ./target/debug/agent-bridge /tmp/agb-topics
+```
+
+- `test_monitor.py` checks the message API (authentication, origins, filters, historical session pinning,
+  the live stream, credential rotation) with a real loopback peer exchange, and with `--browser` the
+  private-link unlock, All traffic with the details panel and live delivery-state changes, and then
+  runs the board, code-copy and message checks below (`monitor_board_qa.py`, `monitor_code_copy_qa.py`
+  and `monitor_message_qa.py` have no command line of their own; they run from here).
+- `monitor_catalog_qa.py` checks automatic board discovery, its cadence, back-off, timeout and
+  single flight, and that a late old response never replaces the current list.
+- `monitor_board_archive_qa.py` checks Archive, Restore and the Archived boards dialog, including held
+  and dropped real responses. It refuses a binary whose hash differs from `--binary-sha256`.
+- `test_topics_browser.py` checks topic create, rename, archive and restore, publish, reply, mention,
+  retry after a lost response, loading older posts, locking with a publish in flight, and a broker restart.
+
+The page has no Refresh button, Raw Markdown view or board dropdown; these harnesses read the exact
+Markdown the page keeps (in its hidden `#board-raw`), provoke a re-read by dropping the live connection or
+editing the board, and use the sidebar to open boards and topics.
 
 ## Message agents from the board
 
