@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Tests for how tools/test_web_browser.py treats its output directory and a broker that fails to start.
+"""Tests for how tools/test_web_browser.py treats its output directory, a broker that fails to start,
+and being killed.
 
 Needs no browser and no Agent Bridge binary. The failed-start test waits out the broker's real startup
-timeout (about 30 seconds).
+timeout (about 30 seconds). The kill tests run the real script against a stand-in broker and a stand-in
+Playwright, and check that no process the run started is left after each signal.
 """
 import contextlib
 import io
 import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -194,6 +199,150 @@ class BrokerStartFailure(unittest.TestCase):
                 web.Broker(binary, root)
             pid = int(pid_file.read_text())
             self.assertFalse(process_exists(pid), "the broker process was left running")
+
+
+STAND_IN_BROKER = """#!{python}
+import json, os, socket, sys
+state = sys.argv[sys.argv.index("--state-dir") + 1]
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(os.path.join(state, "bridge.sock"))
+listener.listen()
+answer = {{"ok": True, "result": {{"revision": 1, "reference": {{"topic_id": "t"}}, "access_url": "http://127.0.0.1:1/#access_token=x"}}}}
+while True:
+    connection, _ = listener.accept()
+    connection.makefile("rb").readline()
+    connection.sendall(json.dumps(answer).encode() + b"\\n")
+    connection.close()
+"""
+
+# What Playwright does for the script: a driver process that starts the browser, stopped when the `with`
+# block ends. The browser is in a session of its own and ends when the driver's pipe closes, as Chromium
+# does; the driver ignores SIGTERM, as a hung one may. Every process carries MARKER in its command line.
+STAND_IN_PLAYWRIGHT = """
+import os, signal, subprocess, sys, time
+
+MARKER = os.environ["STAND_IN_MARKER"]
+DRIVER = "import signal, subprocess, sys, time\\n" \\
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n" \\
+    "subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()  # ' + sys.argv[1]],\\n" \\
+    "                 stdin=subprocess.PIPE, start_new_session=True)\\n" \\
+    "open(sys.argv[2], 'w').close()\\n" \\
+    "time.sleep(300)"
+
+class Chromium:
+    def launch(self, args):
+        self.driver = subprocess.Popen([sys.executable, "-c", DRIVER, MARKER, os.environ["STAND_IN_READY"]])
+        open(os.environ["STAND_IN_SPAWNED"], "w").close()
+        time.sleep(300)
+
+class Playwright:
+    chromium = Chromium()
+
+class Context:
+    def __enter__(self):
+        return Playwright()
+    def __exit__(self, *error):
+        driver = getattr(Playwright.chromium, "driver", None)
+        if driver:
+            driver.kill()
+            driver.wait()
+
+def sync_playwright():
+    return Context()
+"""
+
+
+def processes_with(marker):
+    """The pids of the processes whose command line has `marker`."""
+    table = subprocess.run(["ps", "-axwwo", "pid=,command="], check=True, capture_output=True, text=True).stdout
+    return sorted(int(line.split(None, 1)[0]) for line in table.splitlines() if marker in line)
+
+
+class KilledRun(unittest.TestCase):
+    """The script is killed while its broker and browser are running. Nothing it started may be left."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ab-kill-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.binary = self.root / "agent-bridge"
+        self.binary.write_text(STAND_IN_BROKER.format(python=sys.executable))
+        self.binary.chmod(0o700)
+        fake = self.root / "fake" / "playwright"
+        fake.mkdir(parents=True)
+        (fake / "__init__.py").write_text("")
+        (fake / "sync_api.py").write_text(STAND_IN_PLAYWRIGHT)
+        self.spawned, self.ready = self.root / "spawned", self.root / "ready"
+
+    def start(self, up):
+        """Start the script and return it once the file `up` exists."""
+        env = {**os.environ, "PYTHONPATH": str(self.root / "fake"), "STAND_IN_MARKER": str(self.root),
+               "STAND_IN_SPAWNED": str(self.spawned), "STAND_IN_READY": str(self.ready)}
+        run = subprocess.Popen(
+            [sys.executable, str(Path(web.__file__)), "--binary", str(self.binary), "--output", str(self.root / "run")],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self.stop_leftovers, run)
+        web.wait("the stand-in browser", up.exists, 60)
+        return run
+
+    def stop_leftovers(self, run):
+        for pid in processes_with(str(self.root)):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if run.poll() is None:
+            run.kill()
+        run.wait()
+
+    def kill_and_check(self, number, up, status=None, pid_of=None):
+        """Send `number` to the run (or to the process `pid_of(run)` names), and check that nothing of the run
+        remains 10 seconds later and, if `status` is given, that the run ended with it."""
+        self.kill_with(lambda run: os.kill(pid_of(run) if pid_of else run.pid, number), up, status)
+
+    def kill_with(self, kill, up, status=None):
+        run = self.start(up)
+        self.assertTrue(processes_with(str(self.root)), "no process of the run is running to be killed")
+        kill(run)
+        ended = run.wait(30)
+        if status is not None:
+            self.assertEqual(ended, status)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and processes_with(str(self.root)):
+            time.sleep(0.2)
+        self.assertEqual(processes_with(str(self.root)), [], "processes of the run still running 10 seconds after the kill")
+
+    def worker_of(self, run):
+        """The process that runs the test itself: not the one the test started (run)."""
+        lines = subprocess.run(["ps", "-axwwo", "pid=,command="], check=True, capture_output=True, text=True).stdout.splitlines()
+        found = [int(line.split(None, 1)[0]) for line in lines
+                 if "test_web_browser.py" in line and str(self.root) in line]
+        found.remove(run.pid)
+        self.assertEqual(len(found), 1, found)
+        return found[0]
+
+    def test_sigint_leaves_nothing_running(self):
+        self.kill_and_check(signal.SIGINT, self.ready)
+
+    def test_sigterm_leaves_nothing_running(self):
+        self.kill_and_check(signal.SIGTERM, self.ready)
+
+    def test_sighup_leaves_nothing_running(self):
+        self.kill_and_check(signal.SIGHUP, self.ready)
+
+    def test_sigkill_leaves_nothing_running_after_ten_seconds(self):
+        self.kill_and_check(signal.SIGKILL, self.ready)
+
+    def test_sigkill_the_moment_the_browser_driver_is_started_leaves_nothing_running(self):
+        self.kill_and_check(signal.SIGKILL, self.spawned)
+
+    def test_sigkill_by_the_name_of_the_script_leaves_nothing_running(self):
+        # what `pkill -9 -f test_web_browser.py` matches; the pattern also names this test's own directory
+        pattern = f"test_web_browser.py.*{self.root}/agent-bridge"
+        self.kill_with(lambda run: subprocess.run(["pkill", "-9", "-f", pattern], check=True), self.ready, -signal.SIGKILL)
+
+    def test_the_test_killed_on_its_own_leaves_nothing_running(self):
+        self.kill_and_check(signal.SIGKILL, self.ready, 128 + signal.SIGKILL, self.worker_of)
 
 
 if __name__ == "__main__":

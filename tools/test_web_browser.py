@@ -23,6 +23,7 @@ import base64
 import re
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -31,6 +32,7 @@ import time
 import uuid
 from urllib.parse import quote
 
+INSIDE_CLEANUP = "AGB_WEB_TEST_INSIDE_CLEANUP"
 CHROMIUM_ARGS = ["--no-sandbox", "--use-mock-keychain", "--password-store=basic"]
 ORCA_THEMES = ["orca", "orca-light", "orca-system"]
 ALL_THEMES = ["classic", "sticker"] + ORCA_THEMES
@@ -1721,6 +1723,21 @@ def run_system_section(playwright, url_for, report):
     browser.close()
 
 
+def run_with_cleanup():
+    """Run this script again as a child of tools/run_with_cleanup.py, which stops the child's whole process
+    group (the broker, the Playwright driver) if this process is killed in a way that skips `finally`
+    (SIGKILL). The helper has its own session, so a Ctrl-C at the terminal reaches only this process, which
+    passes it on, as it does SIGTERM and SIGHUP."""
+    helper = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve().parent / "run_with_cleanup.py"), str(os.getpid())],
+        env={**os.environ, INSIDE_CLEANUP: "1",
+             "RUN_WITH_CLEANUP_COMMAND": json.dumps([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])},
+        start_new_session=True)
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, lambda received, frame: helper.send_signal(received))
+    return helper.wait()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
@@ -1782,4 +1799,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() if os.environ.pop(INSIDE_CLEANUP, None) else run_with_cleanup())
