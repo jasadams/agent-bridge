@@ -12,8 +12,8 @@
   // inside the fragment, or the key inside a route would not be recognised and its valid token would stay
   // in the address bar and the history. A fragment is therefore treated as an access link whenever the
   // text `access_token` appears in it in any case, raw or percent-encoded (up to eight levels), whatever the
-  // separators. It is always cleared; it unlocks the page only when the token is a parameter this page
-  // can read, exactly as before. There is no exception: a board whose own name contains the text cannot
+  // separators. The token is always removed from the address; the link unlocks the page only when the token
+  // is a parameter this page can read, exactly as before (a route beside it may stay, see takeAccessLink). There is no exception: a board whose own name contains the text cannot
   // be opened by a link.
   function namesAccessToken(hash) {
     // Each pass decodes one more level of encoding. Eight levels is far beyond any real link; a
@@ -30,15 +30,16 @@
   }
   // A valid link may carry one route beside the token (`#/board/kyomi&access_token=<token>`, either
   // order; the theme part is already gone, see theme.js). The token is always removed from the address;
-  // the route is the one `&`-separated part that is a route and does not itself name `access_token`, and
+  // the route is the one `&`-separated part that is a route and holds neither `access_token` nor the token, and
   // it is all that stays, so the unlock below opens it and a reload stays on it. An unreadable link, a
-  // bad token or more than one route leaves an empty fragment, as before.
+  // token of the wrong shape or more than one route leaves an empty fragment, as before. A well-formed
+  // token the broker refuses leaves the route in the address of the locked page (no token is there).
   function takeAccessLink() {
     const fragment = window.location.hash;
     if (!namesAccessToken(fragment)) return null; // an ordinary route such as #/topic/x
     const candidate = new URLSearchParams(fragment.slice(1)).get("access_token");
     const valid = candidate !== null && /^[A-Za-z0-9_-]{43}$/.test(candidate);
-    const routes = valid ? fragment.slice(1).split("&").filter(part => !namesAccessToken(part) && parseRoute(`#${part}`)) : [];
+    const routes = valid ? fragment.slice(1).split("&").filter(part => !namesAccessToken(part) && !part.includes(candidate) && parseRoute(`#${part}`)) : [];
     window.history.replaceState(null, "", window.location.pathname + window.location.search + (routes.length === 1 ? `#${routes[0]}` : ""));
     return valid ? candidate : null;
   }
@@ -556,7 +557,14 @@
   }
   window.addEventListener("hashchange", () => {
     // A pasted access link is always consumed first so the token never lingers in the address bar.
-    if (namesAccessToken(location.hash)) { unlockFromLink(takeAccessLink()); if (token && route) restoreHash(); return; }
+    if (namesAccessToken(location.hash)) {
+      // A link pasted while a session is open or unlocking is ignored, and so is its route: the address
+      // returns to the current route (or to nothing while the first unlock has not opened one yet).
+      const ignored = !!token;
+      unlockFromLink(takeAccessLink());
+      if (ignored) history.replaceState(null, "", location.pathname + location.search + (route ? routeHash(route) : ""));
+      return;
+    }
     if (!token) return;
     void navigate(parseRoute(location.hash) || defaultRoute(), true);
   });

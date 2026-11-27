@@ -361,12 +361,14 @@ the named board in the chosen theme, with no click.
   a reload shows the locked screen with that route in the address (the token and the theme are not kept),
   so entering the token opens the same board.
 - The route is the one `&`-separated part that is a route (`/board/<name>`, `/topic/<id>`, `/dm/<id>` or
-  `/traffic`) and does not itself contain the text `access_token`. If there is more than one such part
+  `/traffic`) and contains neither the text `access_token` nor the token itself. If there is more than one such part
   (even the same one twice), or none, no route is kept and the page opens the default board.
 - A route to a board that does not exist behaves as it does for a link without a token. A malformed or
   repeated theme or token part is handled as described above and under [Browser access](#browser-access).
-- The route survives only when the token part is valid and the link unlocks. A link that stays locked
-  (an unreadable shape, a bad token) is cleared completely, route included.
+- The route is kept only when the token is well formed (43 characters of `A-Z a-z 0-9 - _`). A link that
+  stays locked because its shape is unreadable or its token is malformed is cleared completely, route
+  included. A well-formed token that the broker refuses (a stale link) leaves the locked page with the
+  route, and no token, in the address.
 - A board whose name contains the text `access_token` still cannot be opened by a link.
 
 ## Browser access
@@ -389,9 +391,9 @@ accepted), holds a valid token; this covers `#access_token=<token>` and, with a 
 inside a route (`#/x?access_token=<token>`), as another parameter's value, in upper case or encoded
 more than once, or as a repeated key whose first value is not the token, does not unlock: the page
 shows the normal locked screen, replaces the whole fragment with an empty one (a route in it is
-lost too) and stores nothing. A link that does unlock keeps only its route in the address. It sends nothing either, except in one case: a repeated `access_token`
+lost too) and stores nothing. It sends nothing either, except in one case: a repeated `access_token`
 key whose first value is a well-formed token is tried as if typed and refused, and the address,
-storage and every URL still hold no token. Open the link as `agent-bridge web enable` printed it,
+storage and every URL still hold no token. A link that does unlock keeps only its route in the address. Open the link as `agent-bridge web enable` printed it,
 or enter the token by hand. The same applies when such a link is pasted into a page that is already
 open: the open session and its route are kept and the fragment is cleared. A fragment encoded eight or more
 times is cleared too. A board or topic whose own name contains the text `access_token` cannot be

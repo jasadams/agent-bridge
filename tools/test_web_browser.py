@@ -856,13 +856,15 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
              ("route naming access_token", f"/board/access_token_x&access_token={t}", True, ""),
              ("unknown theme beside a route", f"/board/kyomi&theme=nope&access_token={t}", True, "#/board/kyomi"),
              ("repeated theme beside a route", f"/board/kyomi&theme=orca&theme=sticker&access_token={t}", True, "#/board/kyomi"),
+             ("route holding the token", f"access_token={t}&/board/{t}", True, ""),
              ("route with a semicolon", f"/board/kyomi;access_token={t}", False, ""),
              ("route, then a bad token", f"/board/kyomi&access_token={bad}", False, ""),
              ("route, then a short token", "/board/kyomi&access_token=x", False, ""),
+             ("route, then a refused token", f"/board/kyomi&access_token={'A' * 43}", False, "#/board/kyomi"),
              ("route, then an empty token", "/board/kyomi&access_token=", False, "")]
     for label, fragment, unlocks, left in cases:
         tag = f"[board link {label}]"
-        context, page = open_page()
+        context, page = open_page(label != "route, then a refused token")  # the broker answers its 401 in the console
         page.goto(f"{base}#{fragment}")
         if unlocks:
             page.wait_for_selector("#sidebar .nav-item", timeout=15000)
@@ -873,9 +875,31 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
             time.sleep(.5)
             report.check(f"{tag} stays locked", page.locator("#workspace").is_hidden())
         shown_hash = page.evaluate("location.hash")
-        report.check(f"{tag} what is left in the address is {left or 'nothing'}", shown_hash == left or (not left and shown_hash == "#/board/main"), page.url.replace(token, "<token>"))
+        report.check(f"{tag} what is left in the address is {left or 'nothing'}", shown_hash == (left or ("#/board/main" if unlocks else "")), page.url.replace(token, "<token>"))
         no_token_anywhere(tag, context, page)
         context.close()
+    # A link pasted into a page that is already open keeps the open session and its route, whatever route it names.
+    context, page = open_page()
+    page.goto(f"{base}#access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "location.hash === '#/board/main'", 15000)
+    page.evaluate("fragment => { location.hash = fragment }", f"/board/kyomi&theme=orca&access_token={token}")
+    until(page, "location.hash === '#/board/main'", 8000)
+    time.sleep(.5)
+    report.check("[board link pasted into an open page] the open board and address are kept and no token stays", board_name(page) == "main" and page.url == f"{base}#/board/main" and page.locator("#workspace").is_visible(), page.url.replace(token, "<token>"))
+    no_token_anywhere("[board link pasted into an open page]", context, page)
+    context.close()
+    # A link pasted into the locked page (only the fragment changes) unlocks it and opens the named board.
+    context, page = open_page()
+    page.goto(f"{base}#/board/krausen")
+    page.wait_for_selector("#login:not([hidden])", timeout=8000)
+    page.evaluate("fragment => { location.hash = fragment }", f"/board/kyomi&access_token={token}")
+    page.wait_for_selector("#sidebar .nav-item", timeout=15000)
+    until(page, "document.querySelector('#selected-board-name').textContent === 'kyomi'", 15000)
+    report.check("[board link pasted into the locked page] it unlocks, opens the named board and only the route stays", board_name(page) == "kyomi" and page.url == f"{base}#/board/kyomi", page.url.replace(token, "<token>"))
+    no_token_anywhere("[board link pasted into the locked page]", context, page)
+    context.close()
+
     report.check("[board link] the page raised no console error or exception", not problems, str(problems[:3]))
     browser.close()
 
