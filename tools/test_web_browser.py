@@ -857,6 +857,7 @@ def run_board_link_section(playwright, url_for, broker, report, themes):
              ("unknown theme beside a route", f"/board/kyomi&theme=nope&access_token={t}", True, "#/board/kyomi"),
              ("repeated theme beside a route", f"/board/kyomi&theme=orca&theme=sticker&access_token={t}", True, "#/board/kyomi"),
              ("route holding the token", f"access_token={t}&/board/{t}", True, ""),
+             ("route holding the token percent-encoded", f"access_token={t}&/board/{percent(t[:3])}{t[3:]}", True, ""),
              ("route with a semicolon", f"/board/kyomi;access_token={t}", False, ""),
              ("route, then a bad token", f"/board/kyomi&access_token={bad}", False, ""),
              ("route, then a short token", "/board/kyomi&access_token=x", False, ""),

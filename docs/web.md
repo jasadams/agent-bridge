@@ -361,7 +361,7 @@ the named board in the chosen theme, with no click.
   a reload shows the locked screen with that route in the address (the token and the theme are not kept),
   so entering the token opens the same board.
 - The route is the one `&`-separated part that is a route (`/board/<name>`, `/topic/<id>`, `/dm/<id>` or
-  `/traffic`) and contains neither the text `access_token` nor the token itself. If there is more than one such part
+  `/traffic`) and contains neither the text `access_token` nor the token itself (also percent-encoded). If there is more than one such part
   (even the same one twice), or none, no route is kept and the page opens the default board.
 - A route to a board that does not exist behaves as it does for a link without a token. A malformed or
   repeated theme or token part is handled as described above and under [Browser access](#browser-access).

@@ -39,7 +39,7 @@
     if (!namesAccessToken(fragment)) return null; // an ordinary route such as #/topic/x
     const candidate = new URLSearchParams(fragment.slice(1)).get("access_token");
     const valid = candidate !== null && /^[A-Za-z0-9_-]{43}$/.test(candidate);
-    const routes = valid ? fragment.slice(1).split("&").filter(part => !namesAccessToken(part) && !part.includes(candidate) && parseRoute(`#${part}`)) : [];
+    const routes = valid ? fragment.slice(1).split("&").filter(part => !namesAccessToken(part) && !part.includes(candidate) && !(parseRoute(`#${part}`)?.id ?? "").includes(candidate) && parseRoute(`#${part}`)) : [];
     window.history.replaceState(null, "", window.location.pathname + window.location.search + (routes.length === 1 ? `#${routes[0]}` : ""));
     return valid ? candidate : null;
   }

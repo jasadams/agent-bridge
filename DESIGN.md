@@ -217,8 +217,9 @@ in the opposite appearance, to show it ignores it), on these screens: the board 
 - **Board from the link.** The existing route `#/board/<name>` can sit in the same fragment as the theme and
   the token, in any order: `#/board/kyomi&theme=orca&access_token=<token>`. Build it by adding the
   percent-encoded route (and theme) as `&`-separated parts to the printed access link. The token is removed
-  as always; the route stays in the address and the page opens that board after unlocking. A link that
-  stays locked, a repeated route or a board name containing `access_token` leaves no route. See
+  as always; the route stays in the address and the page opens that board after unlocking. An unreadable
+  shape, a malformed token, a repeated route, a route holding the token or a board name containing
+  `access_token` leaves no route; a well-formed token the broker refuses leaves the route (no token). See
   `docs/web.md`.
 
 ## Decisions Log
