@@ -745,7 +745,20 @@ def inline_control_checks(*, page, context, rpc, state, origin, token, record, o
     expect(page.locator("#response-text")).to_have_value("live draft with caret")
     page.locator("#response-cancel").click()
     # Explicit same-revision refresh must leave newly mapped inline handlers live.
-    drop_live(page)
+    # The page reconnects after a short back-off and then reads the board again: wait for that read, so
+    # the checks below run after the newly mapped handlers exist rather than before the read began.
+    reads = []
+    watch = lambda request: reads.append(request.url) if request.method == "GET" and urlsplit(request.url).path == "/api/boards/" + name else None
+    page.on("request", watch)
+    try:
+        drop_live(page)
+        deadline = time.monotonic() + 20
+        while not reads and time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+        assert reads, "The page did not read the board again after its live connection dropped"
+    finally:
+        page.remove_listener("request", watch)
+    expect(page.locator("#board-status")).to_contain_text("Live")
     expect(field("first").locator(".board-inline-text")).to_be_enabled()
     field("first").locator(".board-inline-text").focus()
     expect(page.locator("#response-text")).to_be_focused()

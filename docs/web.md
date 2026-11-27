@@ -512,7 +512,8 @@ through the same sidebar and `#/board/<name>` address routes a person uses (they
 `--use-mock-keychain --password-store=basic`, and read the page through `page.evaluate` because the
 content-security policy blocks `wait_for_function`), and needs Python 3.11 or newer with Playwright and
 a matching Chromium. Run them from the repository root against a binary built from the same tree, each
-with its own new, short output directory, never against a running owner service. None runs in CI.
+with a new, short output directory (the archive harness refuses an existing one), never against a running
+owner service. None runs in CI.
 
 ```sh
 cargo build --locked
@@ -520,7 +521,7 @@ python3 tools/test_monitor.py --binary ./target/debug/agent-bridge --browser --o
 python3 tools/monitor_catalog_qa.py --binary ./target/debug/agent-bridge --output /tmp/agb-catalog
 python3 tools/monitor_board_archive_qa.py --binary "$PWD/target/debug/agent-bridge" \
   --binary-sha256 "$(shasum -a 256 target/debug/agent-bridge | cut -d' ' -f1)" \
-  --source-checkpoint "$(git rev-parse HEAD)" --output /tmp/agb-archive
+  --source-checkpoint "$(git rev-parse HEAD)" --output "$HOME/agb-archive"
 python3 tools/test_topics_browser.py ./target/debug/agent-bridge /tmp/agb-topics
 ```
 

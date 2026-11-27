@@ -165,6 +165,7 @@ def message_browser_checks(*, page, context, rpc, state, url, token, record, out
             # Explicit fixture discard/reload between independent cases, never a
             # production recovery path. This also clears any suspended JS gates.
             rpc(state, "pause", paused=False)
+            page.set_viewport_size({"width": 1440, "height": 900})  # a case that failed narrow must not hide the sidebar
             name_sessions([(session, COORDINATOR_NAME)])
             rpc(state, "claude_bind", session=session, endpoint=str(endpoint))
             rpc(state, "register", name="web-second", provider="inbox", session=second_session, replace=True)

@@ -512,7 +512,7 @@ def main():
                                 assert readback.get(date_field) is None
                         record("actual lifecycle accepted body " + mode + " preserves target/deadline without replay: " + action)
 
-                # Copy/raw/footer and catalog survive the lifecycle; fresh tab state.
+                # Copy/raw/footer and catalog survive the lifecycle; fresh page state.
                 name = "copy-private"
                 fixture(name)
                 reload_pick(name)

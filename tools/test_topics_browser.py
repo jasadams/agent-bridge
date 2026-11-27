@@ -81,7 +81,7 @@ def main():
                         assert page.url.endswith("#/topic/" + topic_id), page.url
                         page.locator("#topic-body").fill("Hello <script>window.pwned=1</script>")
                         page.locator("#topic-send").click()
-                        expect(page.locator("#topic-posts")).to_contain_text("Hello")
+                        expect(page.locator("#topic-posts")).to_contain_text("Hello <script>window.pwned=1</script>")
                         assert page.evaluate("window.pwned") is None
                         assert page.locator("#topic-posts script").count() == 0
                         page.screenshot(path=str(output / "topics-desktop.png"))
@@ -90,7 +90,7 @@ def main():
                         other.goto(access["access_url"])
                         # A phone keeps the sidebar off screen: its topic is opened by its address.
                         other.evaluate(f"location.hash = '#/topic/{topic_id}'")
-                        expect(other.locator("#topic-posts")).to_contain_text("Hello")
+                        expect(other.locator("#topic-posts")).to_contain_text("Hello <script>window.pwned=1</script>")
                         page.locator("#topic-posts .msg").first.hover()
                         page.locator("#topic-posts .msg").first.locator("button.js-reply").click(force=True)
                         expect(page.locator("#topic-reply")).to_have_text("You")
@@ -312,10 +312,10 @@ def main():
                         expect(restarted_page.locator("#topic-heading")).to_have_text("# Delivery")
                         expect(restarted_page.locator("#topic-posts")).to_contain_text("new session pending")
                         expect(restarted_page.locator("#topic-posts")).to_contain_text("from session-c")
-                        # Authors are named by the broker, never by their IDs, and three sessions stay distinguishable.
-                        authors = restarted_page.eval_on_selector_all("#topic-posts .author", "els => els.map(e => e.textContent)")
-                        assert authors[-3:] == ["session-a", "session-b", "session-c"], authors
-                        assert not any(author.startswith("inbox-") for author in authors), authors
+                        # Authors are named by the broker, never by their IDs; the exact ID is only the hover title,
+                        # which keeps the three sessions distinguishable.
+                        shown = restarted_page.eval_on_selector_all("#topic-posts .author", "els => els.map(e => [e.textContent, e.title])")[-3:]
+                        assert shown == [["session-a", "inbox-session-a"], ["session-b", "inbox-session-b"], ["session-c", "inbox-session-c"]], shown
                         restarted.close()
                     finally:
                         browser.close()
