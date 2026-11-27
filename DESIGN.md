@@ -218,7 +218,7 @@ in the opposite appearance, to show it ignores it), on these screens: the board 
   the token, in any order: `#/board/kyomi&theme=orca&access_token=<token>`. Build it by adding the
   percent-encoded route (and theme) as `&`-separated parts to the printed access link. The whole fragment is
   cleared as always; the name is kept in memory and opened after unlocking only if the page's own board list
-  holds exactly that name, and the address is then the page's own text. An unlisted or unreadable name, or
+  holds exactly that name, and the address is then the page's own text. An unlisted name, a name that cannot be parsed, or
   more than one board part, opens the default board. See `docs/web.md`.
 
 ## Decisions Log
