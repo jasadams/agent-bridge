@@ -1000,7 +1000,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Status => Request::Status,
-        // IPC request names are intentionally unchanged: an older running broker must still
+        // The IPC op names keep their `monitor_*` wire strings: an older running broker must still
         // understand a freshly upgraded CLI.
         Commands::Web { action } => match action {
             WebAction::Enable { port } => Request::WebEnable { port },

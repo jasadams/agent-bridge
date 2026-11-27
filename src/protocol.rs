@@ -311,8 +311,8 @@ pub enum Request {
         actor: Option<String>,
     },
     Status,
-    // The `monitor_*` op names are the wire contract with a running broker of another version
-    // (the interface was renamed to "web" in AGB-54); only the Rust names changed.
+    // The `monitor_*` op names are the wire contract with a running broker of another version;
+    // only the Rust names changed.
     #[serde(rename = "monitor_enable")]
     WebEnable {
         port: u16,

@@ -247,5 +247,8 @@ in the opposite appearance, to show it ignores it), on these screens: the board 
 - **Dark Sticker Bomb:** not designed (see Color).
 - **Older QA harnesses:** the Python browser harnesses in `tools/` other than `test_web_browser.py`
   still target the previous tabbed interface's element ids.
-- **Internal naming:** modules, files and Rust identifiers say "web". The IPC op names keep their earlier `monitor_*` strings (a CLI and a running broker of different versions must still understand each other), and the `agent-bridge monitor` alias stays. All user-visible names say "web interface".
+- **Internal naming:** modules, files and Rust identifiers say "web". The IPC op names keep their
+  earlier `monitor_*` strings (a CLI and a running broker of different versions must still
+  understand each other), and the `agent-bridge monitor` alias stays. All user-visible names say
+  "web interface".
 - **Reduced-motion and keyboard paths** are implemented but only partly covered by automated tests.
